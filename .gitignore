@@ -3,3 +3,7 @@
 **/*.rs.bk
 .env
 *.log
+# Scripts (Cron/Dev-Loop — nur lokal)
+/scripts/
+/CLAUDE.md
+/.claude-session-state*.md
