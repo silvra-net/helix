@@ -270,7 +270,7 @@ Example: hlxfd5oBCzmDnBJZSKFm3PHA4nyyTK6ueQo3
 - [x] P2P vote propagation between peers
 - [x] Non-proposer validators join a round from a peer-broadcast proposal
 - [ ] Proof of Personhood (social attestation)
-- [ ] Human-readable names (`alice.hlx`)
+- [x] Human-readable names (`alice.hlx`)
 - [ ] Social recovery wallets (3-of-5 guardians)
 
 ### 📋 Phase 6 — Smart Contracts

@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use helix_core::Transaction;
-use helix_crypto::Hash;
+use helix_crypto::{Address, Hash};
 use helix_executor::state::ChainState;
 use helix_mempool::Mempool;
 use helix_storage::{mem::MemBlockStore, BlockStore};
@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use crate::{AccountResponse, BlockResponse, NodeStatus};
+use crate::{AccountResponse, BlockResponse, NameResponse, NodeStatus};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -37,6 +37,8 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/blocks/height/:n", get(get_block_by_height))
         .route("/blocks/hash/:hash", get(get_block_by_hash))
         .route("/accounts/:address", get(get_account))
+        .route("/accounts/:address/name", get(get_account_name))
+        .route("/names/:name", get(resolve_name))
         .route("/mempool", get(get_mempool_info))
         .route("/transactions", post(submit_transaction))
         .layer(CorsLayer::permissive())
@@ -59,6 +61,8 @@ async fn root() -> Json<Value> {
             "GET  /blocks/height/{n}",
             "GET  /blocks/hash/{hash}",
             "GET  /accounts/{address}",
+            "GET  /accounts/{address}/name",
+            "GET  /names/{name}",
             "GET  /mempool",
             "POST /transactions"
         ]
@@ -140,6 +144,56 @@ async fn get_account(
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("account {} not found", address) })),
+        ),
+    }
+}
+
+async fn resolve_name(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let name = name.trim_end_matches(".hlx");
+    let chain = state.chain_state.read().await;
+    match chain.resolve_name(name) {
+        Some(address) => (
+            StatusCode::OK,
+            Json(json!(NameResponse {
+                name: name.to_string(),
+                address: address.to_string(),
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("name {} not registered", name) })),
+        ),
+    }
+}
+
+async fn get_account_name(
+    State(state): State<AppState>,
+    Path(address_str): Path<String>,
+) -> impl IntoResponse {
+    let address = match Address::from_str(&address_str) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid address format" })),
+            )
+        }
+    };
+    let chain = state.chain_state.read().await;
+    match chain.name_of(&address) {
+        Some(name) => (
+            StatusCode::OK,
+            Json(json!(NameResponse {
+                name: name.to_string(),
+                address: address_str,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no name registered for {}", address_str) })),
         ),
     }
 }

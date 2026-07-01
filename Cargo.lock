@@ -1145,6 +1145,7 @@ dependencies = [
  "bincode",
  "helix-core",
  "helix-crypto",
+ "helix-identity",
  "serde",
  "thiserror 1.0.69",
  "tracing",

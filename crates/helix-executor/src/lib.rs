@@ -8,6 +8,7 @@ pub use state::{AccountState, ChainState};
 
 use helix_core::{transaction::TxType, Block, Transaction};
 use helix_crypto::{Address, Hash};
+use helix_identity::HelixName;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -70,9 +71,8 @@ pub fn execute_transaction(
         TxType::Transfer => execute_transfer(state, tx, validator, tx_hash),
         TxType::Stake => execute_stake(state, tx, validator, tx_hash),
         TxType::Unstake => execute_unstake(state, tx, validator, tx_hash),
-        TxType::RegisterIdentity | TxType::RegisterName => {
-            charge_fee_only(state, tx, validator, tx_hash)
-        }
+        TxType::RegisterName => execute_register_name(state, tx, validator, tx_hash),
+        TxType::RegisterIdentity => charge_fee_only(state, tx, validator, tx_hash),
         TxType::DeployContract | TxType::CallContract => {
             // WASM VM is Phase 4 — accept and charge fee, no state change yet
             charge_fee_only(state, tx, validator, tx_hash)
@@ -186,6 +186,45 @@ fn execute_unstake(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
+fn execute_register_name(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+
+    let raw_name = match std::str::from_utf8(&tx.data) {
+        Ok(s) => s,
+        Err(_) => return Receipt::failure(tx_hash, "name payload is not valid UTF-8", 0, 0),
+    };
+    let name = match HelixName::new(raw_name) {
+        Ok(n) => n,
+        Err(e) => return Receipt::failure(tx_hash, &format!("invalid name: {e}"), 0, 0),
+    };
+
+    if state.resolve_name(name.as_str()).is_some() {
+        return Receipt::failure(tx_hash, "name already registered", 0, 0);
+    }
+
+    state.names.insert(name.as_str().to_string(), tx.from.to_string());
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
 fn charge_fee_only(
     state: &mut ChainState,
     tx: &Transaction,
@@ -217,4 +256,83 @@ fn distribute_fee(
         acc.balance += reward;
     });
     Ok((burned, reward))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_core::TxType;
+    use helix_crypto::{KeyPair, Signature};
+
+    fn signed_register_name_tx(kp: &KeyPair, from: &Address, name: &str, nonce: u64, fee: u64) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::RegisterName,
+            from: from.clone(),
+            to: None,
+            amount: 0,
+            fee,
+            nonce,
+            data: name.as_bytes().to_vec(),
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn register_name_succeeds_and_charges_fee() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let tx = signed_register_name_tx(&kp, &addr, "alice", 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.resolve_name("alice"), Some(addr.to_string().as_str()));
+        assert_eq!(state.name_of(&addr), Some("alice"));
+        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000 - 10_000);
+        assert_eq!(state.get(&addr).unwrap().nonce, 1);
+    }
+
+    #[test]
+    fn register_name_rejects_already_taken_name() {
+        let kp_a = KeyPair::generate();
+        let addr_a = Address::from_public_key(&kp_a.public);
+        let kp_b = KeyPair::generate();
+        let addr_b = Address::from_public_key(&kp_b.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr_a, |acc| acc.balance = 1_000_000);
+        state.update_account(&addr_b, |acc| acc.balance = 1_000_000);
+
+        let tx_a = signed_register_name_tx(&kp_a, &addr_a, "alice", 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx_a, &validator).success);
+
+        let tx_b = signed_register_name_tx(&kp_b, &addr_b, "alice", 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx_b, &validator);
+        assert!(!receipt.success);
+        assert_eq!(state.resolve_name("alice"), Some(addr_a.to_string().as_str()));
+    }
+
+    #[test]
+    fn register_name_rejects_invalid_name() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let tx = signed_register_name_tx(&kp, &addr, "AB", 0, 10_000); // too short + uppercase
+        let receipt = execute_transaction(&mut state, &tx, &validator);
+        assert!(!receipt.success);
+        assert!(state.resolve_name("ab").is_none());
+    }
 }

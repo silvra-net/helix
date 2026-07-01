@@ -43,6 +43,8 @@ pub struct ChainState {
     pub total_supply: u64,
     /// Cumulative burned fees — reduces circulating supply
     pub total_burned: u64,
+    /// Registered human-readable names (without the `.hlx` suffix) → owning address string.
+    pub names: HashMap<String, String>,
 }
 
 impl ChainState {
@@ -51,6 +53,7 @@ impl ChainState {
             accounts: HashMap::new(),
             total_supply,
             total_burned: 0,
+            names: HashMap::new(),
         }
     }
 
@@ -102,6 +105,20 @@ impl ChainState {
         acc.staked -= amount;
         self.total_burned += amount;
         amount
+    }
+
+    /// Resolve a registered name (without `.hlx`) to its owning address string.
+    pub fn resolve_name(&self, name: &str) -> Option<&str> {
+        self.names.get(name).map(|s| s.as_str())
+    }
+
+    /// The name (without `.hlx`) registered for an address, if any.
+    pub fn name_of(&self, address: &Address) -> Option<&str> {
+        let addr = address.to_string();
+        self.names
+            .iter()
+            .find(|(_, owner)| **owner == addr)
+            .map(|(name, _)| name.as_str())
     }
 
     /// Addresses with a nonzero staked amount — candidates for the next validator epoch.

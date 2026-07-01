@@ -41,6 +41,12 @@ pub struct AccountResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NameResponse {
+    pub name: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub version: String,
     pub height: u64,

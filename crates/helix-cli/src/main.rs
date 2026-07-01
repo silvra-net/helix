@@ -42,6 +42,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::tx::TxCmd,
     },
+    /// Human-readable name registration (`alice.hlx`)
+    Name {
+        #[command(subcommand)]
+        action: commands::name::NameCmd,
+    },
 }
 
 #[tokio::main]
@@ -54,5 +59,6 @@ async fn main() -> Result<()> {
         Commands::Chain { action } => commands::chain::run(action, &node).await,
         Commands::Account { address } => commands::chain::show_account(&address, &node).await,
         Commands::Tx { action } => commands::tx::run(action, &node).await,
+        Commands::Name { action } => commands::name::run(action, &node).await,
     }
 }

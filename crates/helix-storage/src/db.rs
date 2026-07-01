@@ -10,6 +10,7 @@ use crate::{BlockStore, StorageError, StorageResult};
 const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks");
 const HEIGHT_IDX: TableDefinition<u64, &[u8]> = TableDefinition::new("height_index");
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
+const NAMES: TableDefinition<&str, &str> = TableDefinition::new("names");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const META_HEIGHT: &str = "latest_height";
@@ -28,6 +29,7 @@ impl HelixDb {
         tx.open_table(BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(HEIGHT_IDX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(ACCOUNTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(NAMES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
         Ok(HelixDb { db })
@@ -39,12 +41,17 @@ impl HelixDb {
         let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
         {
             let mut accounts = tx.open_table(ACCOUNTS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut names = tx.open_table(NAMES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
             for (addr, account) in &state.accounts {
                 let encoded = bincode::serialize(account)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 accounts.insert(addr.as_str(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+            for (name, owner) in &state.names {
+                names.insert(name.as_str(), owner.as_str())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
             meta.insert(META_BURNED, &state.total_burned.to_le_bytes()[..])
@@ -56,6 +63,7 @@ impl HelixDb {
     pub fn load_chain_state(&self, total_supply: u64) -> StorageResult<ChainState> {
         let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
         let accounts_table = tx.open_table(ACCOUNTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let names_table = tx.open_table(NAMES).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
         let mut accounts = std::collections::HashMap::new();
@@ -65,6 +73,13 @@ impl HelixDb {
             let account: AccountState = bincode::deserialize(v.value())
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             accounts.insert(k.value().to_string(), account);
+        }
+
+        let mut names = std::collections::HashMap::new();
+        let mut name_iter = names_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = name_iter.next() {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            names.insert(k.value().to_string(), v.value().to_string());
         }
 
         let total_burned = meta_table
@@ -77,7 +92,7 @@ impl HelixDb {
             })
             .unwrap_or(0);
 
-        Ok(ChainState { accounts, total_supply, total_burned })
+        Ok(ChainState { accounts, total_supply, total_burned, names })
     }
 
     pub fn get_account(&self, address: &str) -> StorageResult<Option<AccountState>> {
