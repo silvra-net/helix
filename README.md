@@ -265,7 +265,9 @@ Example: hlxfd5oBCzmDnBJZSKFm3PHA4nyyTK6ueQo3
 ### 🔄 Phase 5 — Multi-Validator (current)
 - [x] Full BFT round state machine (prevote/precommit)
 - [x] ML-DSA signature verification on validator votes
-- [ ] Validator set rotation (epoch-based)
+- [x] Validator set rotation (epoch-based, rebuilt from on-chain stake)
+- [x] Slashing on double-signing (evidence detection + stake burn)
+- [ ] P2P vote propagation between peers
 - [ ] Proof of Personhood (social attestation)
 - [ ] Human-readable names (`alice.hlx`)
 - [ ] Social recovery wallets (3-of-5 guardians)
