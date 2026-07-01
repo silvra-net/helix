@@ -89,6 +89,21 @@ impl ChainState {
         self.accounts.len()
     }
 
+    /// Slash a validator's stake by `fraction_bps` basis points (1/10000) on confirmed
+    /// double-sign evidence. Slashed stake is burned — same deflationary treatment as
+    /// tx fees, and it leaves the validator's stake (and future voting power) reduced.
+    /// Returns the amount actually slashed in nano-HLX (0 if the address is unknown).
+    pub fn slash(&mut self, address: &Address, fraction_bps: u64) -> u64 {
+        let key = address.to_string();
+        let Some(acc) = self.accounts.get_mut(&key) else {
+            return 0;
+        };
+        let amount = (acc.staked as u128 * fraction_bps as u128 / 10_000) as u64;
+        acc.staked -= amount;
+        self.total_burned += amount;
+        amount
+    }
+
     /// Addresses with a nonzero staked amount — candidates for the next validator epoch.
     pub fn stakers(&self) -> Vec<(Address, u64)> {
         self.accounts

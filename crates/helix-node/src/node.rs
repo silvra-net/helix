@@ -193,6 +193,27 @@ async fn block_production_loop(
                     }
                 }
 
+                // Slash any validator caught double-signing during this round. Detected
+                // in helix-consensus::VoteSet (conflicting votes, same validator/height/
+                // round/type, different block hash) — the signature on both votes is
+                // already verified there, so this evidence is trustworthy.
+                for ev in engine.take_evidence() {
+                    if !ev.is_valid() {
+                        continue;
+                    }
+                    let slashed = {
+                        let mut state = chain_state.write().await;
+                        state.slash(&ev.validator, helix_consensus::SLASH_FRACTION_BPS)
+                    };
+                    warn!(
+                        validator = %ev.validator,
+                        height = ev.height,
+                        round = ev.round,
+                        slashed_nano = slashed,
+                        "Double-sign evidence confirmed — validator slashed"
+                    );
+                }
+
                 // Epoch boundary: rebuild the validator set from current stake.
                 // Personhood attestation isn't wired up yet (Phase 6), so rotated-in
                 // validators start uncapped-by-personhood (i.e. capped at 0.5%) until then.

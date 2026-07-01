@@ -32,6 +32,9 @@ pub enum ConsensusError {
     #[error("Duplicate vote from validator {0}")]
     DuplicateVote(Address),
 
+    #[error("Double-sign evidence detected")]
+    DoubleSign(Box<DoubleSignEvidence>),
+
     #[error("Not the proposer for height {height} round {round}")]
     NotProposer { height: u64, round: u32 },
 
@@ -50,6 +53,10 @@ pub type ConsensusResult<T> = Result<T, ConsensusError>;
 /// Number of blocks per validator epoch. At each multiple of this height the
 /// active `ValidatorSet` is rebuilt from current stake (see `BftEngine::rotate_validator_set`).
 pub const EPOCH_LENGTH: u64 = 100;
+
+/// Fraction of a double-signing validator's stake burned per confirmed
+/// `DoubleSignEvidence` (basis points, 1/10000). 500 = 5%.
+pub const SLASH_FRACTION_BPS: u64 = 500;
 
 /// Core consensus engine interface.
 /// Helix uses BFT finality (Tendermint-style) over a PoS + Personhood validator set.

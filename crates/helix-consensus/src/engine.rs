@@ -6,7 +6,7 @@ use tracing::info;
 
 use crate::{
     round::{RoundPhase, RoundState},
-    ConsensusError, ConsensusResult, Validator, ValidatorSet, Vote, VoteType,
+    ConsensusError, ConsensusResult, DoubleSignEvidence, Validator, ValidatorSet, Vote, VoteType,
 };
 
 /// BFT consensus engine — Tendermint-style two-phase commit.
@@ -21,6 +21,9 @@ pub struct BftEngine {
     current_height: u64,
     /// Active round state; None between commits
     round: Option<RoundState>,
+    /// Double-sign evidence collected from finalized rounds, awaiting the caller
+    /// to apply slashing and drain it via `take_evidence()`.
+    pending_evidence: Vec<DoubleSignEvidence>,
 }
 
 impl BftEngine {
@@ -30,6 +33,7 @@ impl BftEngine {
             address,
             current_height: genesis_height,
             round: None,
+            pending_evidence: Vec::new(),
         }
     }
 
@@ -178,6 +182,12 @@ impl BftEngine {
         self.round.is_some()
     }
 
+    /// Drain double-sign evidence accumulated since the last call. Callers should
+    /// apply slashing (stake deduction) for each returned evidence.
+    pub fn take_evidence(&mut self) -> Vec<DoubleSignEvidence> {
+        std::mem::take(&mut self.pending_evidence)
+    }
+
     /// Rotate to a new validator set for the next epoch (called every `EPOCH_LENGTH`
     /// blocks). A no-op if `validators` is empty — an empty set would halt block
     /// production entirely, so the current epoch is kept alive instead.
@@ -249,8 +259,9 @@ impl BftEngine {
         Ok(vote)
     }
 
-    fn finalize(&mut self, height: u64, _round: RoundState) {
+    fn finalize(&mut self, height: u64, round: RoundState) {
         self.current_height = height;
+        self.pending_evidence.extend(round.evidence);
         self.round = None;
     }
 

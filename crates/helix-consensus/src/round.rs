@@ -75,6 +75,10 @@ impl RoundState {
                 // Duplicate — already voted, ignore silently (evidence requires two *different* hashes)
                 return Ok(None);
             }
+            Err(ConsensusError::DoubleSign(evidence)) => {
+                self.evidence.push(*evidence);
+                return Ok(None);
+            }
             Err(e) => return Err(e),
         }
 
@@ -96,6 +100,10 @@ impl RoundState {
         match self.precommits.add(vote) {
             Ok(_) => {}
             Err(ConsensusError::DuplicateVote(_)) => return Ok(None),
+            Err(ConsensusError::DoubleSign(evidence)) => {
+                self.evidence.push(*evidence);
+                return Ok(None);
+            }
             Err(e) => return Err(e),
         }
 

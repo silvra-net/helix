@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use helix_crypto::{Address, Hash};
 
-use crate::{ConsensusError, ConsensusResult, ValidatorSet, Vote, VoteType};
+use crate::{ConsensusError, ConsensusResult, DoubleSignEvidence, ValidatorSet, Vote, VoteType};
 
 /// Collects votes for a single (height, round, vote_type) tuple.
 /// Enforces one vote per validator and tracks accumulated voting power per block hash.
@@ -55,7 +55,20 @@ impl VoteSet {
 
         vote.verify_signature()?;
 
-        if self.votes.contains_key(&addr_str) {
+        if let Some(existing) = self.votes.get(&addr_str) {
+            if existing.block_hash != vote.block_hash {
+                // Same validator, same height/round/type, different block hash — this
+                // validator signed two conflicting votes. The signature check above
+                // already proved both votes came from the claimed validator's key, so
+                // this is real equivocation, not a forgery attempt.
+                return Err(ConsensusError::DoubleSign(Box::new(DoubleSignEvidence {
+                    validator: vote.validator.clone(),
+                    height: vote.height,
+                    round: vote.round,
+                    vote_a: existing.clone(),
+                    vote_b: vote,
+                })));
+            }
             return Err(ConsensusError::DuplicateVote(vote.validator.clone()));
         }
 
@@ -140,6 +153,42 @@ mod tests {
         forged.validator = Address::from_public_key(&kp.public);
 
         assert!(vote_set.add(forged).is_err());
+    }
+
+    /// A validator signing two votes for the same height/round/type but different
+    /// block hashes is equivocation — the second `add()` call must surface it as
+    /// `DoubleSign` evidence, not a plain `DuplicateVote`.
+    #[test]
+    fn detects_double_sign_on_conflicting_votes() {
+        let kp = KeyPair::generate();
+        let hash_a = Hash::digest(b"block a");
+        let hash_b = Hash::digest(b"block b");
+        let mut vote_set = VoteSet::new(1, 0, VoteType::Prevote, validator_set_of(&kp));
+
+        vote_set.add(signed_vote(&kp, 1, 0, hash_a)).unwrap();
+        let err = vote_set.add(signed_vote(&kp, 1, 0, hash_b)).unwrap_err();
+
+        match err {
+            ConsensusError::DoubleSign(evidence) => {
+                assert!(evidence.is_valid());
+                assert_eq!(evidence.validator, Address::from_public_key(&kp.public));
+            }
+            other => panic!("expected DoubleSign, got {other:?}"),
+        }
+    }
+
+    /// Re-sending the exact same vote (e.g. a network retry) is not equivocation —
+    /// it must stay a plain `DuplicateVote`, not trigger slashing evidence.
+    #[test]
+    fn resending_the_same_vote_is_a_plain_duplicate() {
+        let kp = KeyPair::generate();
+        let hash_a = Hash::digest(b"block a");
+        let mut vote_set = VoteSet::new(1, 0, VoteType::Prevote, validator_set_of(&kp));
+
+        vote_set.add(signed_vote(&kp, 1, 0, hash_a)).unwrap();
+        let err = vote_set.add(signed_vote(&kp, 1, 0, hash_a)).unwrap_err();
+
+        assert!(matches!(err, ConsensusError::DuplicateVote(_)));
     }
 
     #[test]
