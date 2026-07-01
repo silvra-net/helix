@@ -21,3 +21,4 @@ pub type P2PResult<T> = Result<T, P2PError>;
 /// Gossipsub topic names — versioned so future protocol upgrades can coexist
 pub const TOPIC_BLOCKS: &str = "helix/blocks/1.0.0";
 pub const TOPIC_TRANSACTIONS: &str = "helix/transactions/1.0.0";
+pub const TOPIC_VOTES: &str = "helix/votes/1.0.0";

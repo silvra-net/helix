@@ -267,7 +267,7 @@ Example: hlxfd5oBCzmDnBJZSKFm3PHA4nyyTK6ueQo3
 - [x] ML-DSA signature verification on validator votes
 - [x] Validator set rotation (epoch-based, rebuilt from on-chain stake)
 - [x] Slashing on double-signing (evidence detection + stake burn)
-- [ ] P2P vote propagation between peers
+- [x] P2P vote propagation between peers
 - [ ] Proof of Personhood (social attestation)
 - [ ] Human-readable names (`alice.hlx`)
 - [ ] Social recovery wallets (3-of-5 guardians)

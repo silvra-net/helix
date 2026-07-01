@@ -1196,6 +1196,7 @@ name = "helix-p2p"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "helix-consensus",
  "helix-core",
  "helix-crypto",
  "libp2p",

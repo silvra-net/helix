@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use helix_consensus::{BftEngine, Validator, ValidatorSet};
-use helix_core::genesis_block;
+use helix_consensus::{BftEngine, ConsensusError, Validator, ValidatorSet};
+use helix_core::{genesis_block, Block};
 use helix_crypto::{Address, KeyPair};
 use helix_executor::{execute_block, genesis::GenesisConfig, state::ChainState};
 use helix_mempool::Mempool;
@@ -15,7 +15,7 @@ use helix_p2p::{
 use helix_rpc::server::{start_rpc_server, AppState};
 use helix_storage::{mem::MemBlockStore, BlockStore};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const BLOCK_TIME_MS: u64 = 2_000;
 const MAX_TXS_PER_BLOCK: usize = 1_000;
@@ -97,13 +97,41 @@ impl HelixNode {
             }
         });
 
+        // BFT engine, shared between the block production loop (which drives
+        // its own proposals) and the P2P event handler (which folds in votes
+        // arriving from other validators against that same active round).
+        let total_stake = 1_000_000_000_000_000u64;
+        let validator = Validator::new(self.address.clone(), total_stake, true);
+        let validator_set = ValidatorSet::new(vec![validator], 0);
+        let genesis_height = self.store.read().await.latest_height();
+        let engine = Arc::new(RwLock::new(BftEngine::new(
+            validator_set,
+            self.address.clone(),
+            genesis_height,
+        )));
+
         // Spawn P2P event handler
         let mempool_for_p2p = self.mempool.clone();
         let peer_count_for_p2p = peer_count.clone();
+        let store_for_p2p = self.store.clone();
+        let chain_state_for_p2p = self.chain_state.clone();
+        let engine_for_p2p = engine.clone();
+        let keypair_for_p2p = self.keypair.clone();
+        let p2p_tx_for_p2p = self.p2p_command_tx.clone();
         let mut p2p_event_rx = self.p2p_event_rx;
         tokio::spawn(async move {
             while let Some(event) = p2p_event_rx.recv().await {
-                handle_p2p_event(event, &mempool_for_p2p, &peer_count_for_p2p).await;
+                handle_p2p_event(
+                    event,
+                    &mempool_for_p2p,
+                    &peer_count_for_p2p,
+                    &store_for_p2p,
+                    &chain_state_for_p2p,
+                    &engine_for_p2p,
+                    &keypair_for_p2p,
+                    &p2p_tx_for_p2p,
+                )
+                .await;
             }
         });
 
@@ -113,7 +141,7 @@ impl HelixNode {
             self.mempool.clone(),
             self.chain_state.clone(),
             self.keypair.clone(),
-            self.address.clone(),
+            engine,
             self.p2p_command_tx.clone(),
         ));
 
@@ -131,10 +159,16 @@ impl HelixNode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_p2p_event(
     event: P2PEvent,
     mempool: &Arc<RwLock<Mempool>>,
     peer_count: &Arc<std::sync::atomic::AtomicUsize>,
+    store: &Arc<RwLock<MemBlockStore>>,
+    chain_state: &Arc<RwLock<ChainState>>,
+    engine: &Arc<RwLock<BftEngine>>,
+    keypair: &KeyPair,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
@@ -145,7 +179,33 @@ async fn handle_p2p_event(
             }
         }
         P2PEvent::NewBlock(_block) => {
-            // Block sync will be handled in Phase 5 (multi-validator)
+            // Non-proposer validators joining an in-progress round on receipt
+            // of a proposal is not wired up yet — only the block's own
+            // proposer currently drives a round (see block_production_loop).
+        }
+        P2PEvent::NewVote(vote) => {
+            let result = { engine.write().await.add_vote(keypair, vote) };
+
+            // add_vote() may itself have cast our own follow-up precommit
+            // (see its doc comment) — broadcast that regardless of outcome.
+            let outbound = { engine.write().await.take_outbound_votes() };
+            for v in outbound {
+                let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(v));
+            }
+
+            match result {
+                Ok(Some(block)) => {
+                    info!(height = block.height(), "Block finalized via peer votes");
+                    apply_finalized_block(block, store, mempool, chain_state, engine, p2p_tx).await;
+                }
+                Ok(None) => {}
+                Err(ConsensusError::NoActiveRound) => {
+                    // We're not currently proposing/awaiting votes for any round —
+                    // expected whenever this node isn't the proposer this height.
+                    debug!("Vote received with no active round — ignored");
+                }
+                Err(e) => warn!("Rejected peer vote: {}", e),
+            }
         }
         P2PEvent::PeerConnected(_) => {
             peer_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -156,21 +216,97 @@ async fn handle_p2p_event(
     }
 }
 
+/// Execute, slash, rotate, broadcast, and persist a block that just reached BFT
+/// finality — whether that happened locally (this node cast the deciding vote
+/// itself in `block_production_loop`) or via a peer's vote arriving through P2P
+/// (`handle_p2p_event`). Both paths must apply identical side effects exactly once.
+async fn apply_finalized_block(
+    block: Block,
+    store: &Arc<RwLock<MemBlockStore>>,
+    mempool: &Arc<RwLock<Mempool>>,
+    chain_state: &Arc<RwLock<ChainState>>,
+    engine: &Arc<RwLock<BftEngine>>,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
+) {
+    let tx_hashes: Vec<_> = block.transactions.iter().map(|t| t.hash()).collect();
+    let height = block.height();
+    let tx_count = block.tx_count();
+
+    // Execute transactions
+    {
+        let mut state = chain_state.write().await;
+        let receipt = execute_block(&mut state, &block);
+        if receipt.failed_txs() > 0 {
+            warn!(height, failed = receipt.failed_txs(), "Tx execution failures");
+        }
+    }
+
+    // Slash any validator caught double-signing during this round. Detected
+    // in helix-consensus::VoteSet (conflicting votes, same validator/height/
+    // round/type, different block hash) — the signature on both votes is
+    // already verified there, so this evidence is trustworthy.
+    for ev in engine.write().await.take_evidence() {
+        if !ev.is_valid() {
+            continue;
+        }
+        let slashed = {
+            let mut state = chain_state.write().await;
+            state.slash(&ev.validator, helix_consensus::SLASH_FRACTION_BPS)
+        };
+        warn!(
+            validator = %ev.validator,
+            height = ev.height,
+            round = ev.round,
+            slashed_nano = slashed,
+            "Double-sign evidence confirmed — validator slashed"
+        );
+    }
+
+    // Epoch boundary: rebuild the validator set from current stake.
+    // Personhood attestation isn't wired up yet (Phase 6), so rotated-in
+    // validators start uncapped-by-personhood (i.e. capped at 0.5%) until then.
+    if height % helix_consensus::EPOCH_LENGTH == 0 {
+        let stakers = chain_state.read().await.stakers();
+        let validators: Vec<Validator> = stakers
+            .into_iter()
+            .map(|(addr, stake)| Validator::new(addr, stake, false))
+            .collect();
+        let had = validators.len();
+        let mut eng = engine.write().await;
+        eng.rotate_validator_set(validators);
+        if had > 0 {
+            info!(height, epoch = eng.validator_set().epoch, validators = had, "Validator set rotated");
+        }
+    }
+
+    // Broadcast to peers before storing (peers can validate against prev_hash)
+    let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone()));
+
+    // Persist
+    {
+        let mut s = store.write().await;
+        if let Err(e) = s.put_block(block) {
+            error!("Failed to store block {}: {}", height, e);
+            return;
+        }
+    }
+
+    { mempool.write().await.remove_committed(&tx_hashes); }
+
+    if tx_count > 0 {
+        info!(height, tx_count, "Block committed");
+    }
+}
+
 async fn block_production_loop(
     store: Arc<RwLock<MemBlockStore>>,
     mempool: Arc<RwLock<Mempool>>,
     chain_state: Arc<RwLock<ChainState>>,
     keypair: Arc<KeyPair>,
-    address: Address,
+    engine: Arc<RwLock<BftEngine>>,
     p2p_tx: mpsc::Sender<P2PCommand>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(BLOCK_TIME_MS));
-
-    let total_stake = 1_000_000_000_000_000u64;
-    let validator = Validator::new(address.clone(), total_stake, true);
-    let validator_set = ValidatorSet::new(vec![validator], 0);
-    let genesis_height = store.read().await.latest_height();
-    let mut engine = BftEngine::new(validator_set, address, genesis_height);
 
     loop {
         interval.tick().await;
@@ -178,77 +314,26 @@ async fn block_production_loop(
         let txs = { mempool.read().await.take(MAX_TXS_PER_BLOCK) };
         let prev_hash = store.read().await.latest_hash();
 
-        match engine.produce_block(&keypair, prev_hash, txs) {
+        let produced = { engine.write().await.produce_block(&keypair, prev_hash, txs) };
+        match produced {
             Ok(block) => {
-                let tx_hashes: Vec<_> = block.transactions.iter().map(|t| t.hash()).collect();
-                let height = block.height();
-                let tx_count = block.tx_count();
-
-                // Execute transactions
-                {
-                    let mut state = chain_state.write().await;
-                    let receipt = execute_block(&mut state, &block);
-                    if receipt.failed_txs() > 0 {
-                        warn!(height, failed = receipt.failed_txs(), "Tx execution failures");
-                    }
-                }
-
-                // Slash any validator caught double-signing during this round. Detected
-                // in helix-consensus::VoteSet (conflicting votes, same validator/height/
-                // round/type, different block hash) — the signature on both votes is
-                // already verified there, so this evidence is trustworthy.
-                for ev in engine.take_evidence() {
-                    if !ev.is_valid() {
-                        continue;
-                    }
-                    let slashed = {
-                        let mut state = chain_state.write().await;
-                        state.slash(&ev.validator, helix_consensus::SLASH_FRACTION_BPS)
-                    };
-                    warn!(
-                        validator = %ev.validator,
-                        height = ev.height,
-                        round = ev.round,
-                        slashed_nano = slashed,
-                        "Double-sign evidence confirmed — validator slashed"
-                    );
-                }
-
-                // Epoch boundary: rebuild the validator set from current stake.
-                // Personhood attestation isn't wired up yet (Phase 6), so rotated-in
-                // validators start uncapped-by-personhood (i.e. capped at 0.5%) until then.
-                if height % helix_consensus::EPOCH_LENGTH == 0 {
-                    let stakers = chain_state.read().await.stakers();
-                    let validators: Vec<Validator> = stakers
-                        .into_iter()
-                        .map(|(addr, stake)| Validator::new(addr, stake, false))
-                        .collect();
-                    let had = validators.len();
-                    engine.rotate_validator_set(validators);
-                    if had > 0 {
-                        info!(height, epoch = engine.validator_set().epoch, validators = had, "Validator set rotated");
-                    }
-                }
-
-                // Broadcast to peers before storing (peers can validate against prev_hash)
-                let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone()));
-
-                // Persist
-                {
-                    let mut s = store.write().await;
-                    if let Err(e) = s.put_block(block) {
-                        error!("Failed to store block {}: {}", height, e);
-                        continue;
-                    }
-                }
-
-                { mempool.write().await.remove_committed(&tx_hashes); }
-
-                if tx_count > 0 {
-                    info!(height, tx_count, "Block committed");
-                }
+                apply_finalized_block(block, &store, &mempool, &chain_state, &engine, &p2p_tx)
+                    .await;
+            }
+            Err(ConsensusError::AwaitingVotes { .. }) => {
+                // Multi-validator: our proposal + own votes are cast, round is
+                // stored in the engine — broadcast the votes below and wait for
+                // peers' votes to arrive via handle_p2p_event.
             }
             Err(e) => warn!("Block production failed: {}", e),
+        }
+
+        // Broadcast any votes this node cast this tick (own prevote/precommit
+        // from produce_block) so other validators can fold them into their
+        // VoteSets.
+        let outbound = { engine.write().await.take_outbound_votes() };
+        for vote in outbound {
+            let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(vote));
         }
     }
 }

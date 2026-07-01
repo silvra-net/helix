@@ -12,7 +12,8 @@ pub use validator::{Validator, ValidatorSet};
 pub use vote::{Vote, VoteType};
 pub use vote_set::VoteSet;
 
-use helix_crypto::{Address, Hash};
+use helix_core::Block;
+use helix_crypto::{Address, Hash, KeyPair};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -61,8 +62,8 @@ pub const SLASH_FRACTION_BPS: u64 = 500;
 /// Core consensus engine interface.
 /// Helix uses BFT finality (Tendermint-style) over a PoS + Personhood validator set.
 pub trait ConsensusEngine: Send + Sync {
-    fn validate_block(&self, block: &helix_core::Block) -> ConsensusResult<()>;
-    fn add_vote(&mut self, vote: Vote) -> ConsensusResult<Option<Hash>>;
+    fn validate_block(&self, block: &Block) -> ConsensusResult<()>;
+    fn add_vote(&mut self, keypair: &KeyPair, vote: Vote) -> ConsensusResult<Option<Block>>;
     fn is_finalized(&self, block_hash: &Hash) -> bool;
     fn validator_set(&self) -> &ValidatorSet;
 }

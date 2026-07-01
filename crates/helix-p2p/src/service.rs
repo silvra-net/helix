@@ -11,16 +11,18 @@ use libp2p::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use helix_consensus::Vote;
 use helix_core::{Block, Transaction};
 
 use crate::config::P2PConfig;
-use crate::{P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_TRANSACTIONS};
+use crate::{P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_TRANSACTIONS, TOPIC_VOTES};
 
 /// Events received FROM the P2P network → node
 #[derive(Debug)]
 pub enum P2PEvent {
     NewBlock(Block),
     NewTransaction(Transaction),
+    NewVote(Vote),
     PeerConnected(String),
     PeerDisconnected(String),
 }
@@ -30,6 +32,7 @@ pub enum P2PEvent {
 pub enum P2PCommand {
     BroadcastBlock(Block),
     BroadcastTransaction(Transaction),
+    BroadcastVote(Vote),
     ConnectPeer(Multiaddr),
 }
 
@@ -104,9 +107,12 @@ impl P2PService {
 
         let block_topic = gossipsub::IdentTopic::new(TOPIC_BLOCKS);
         let tx_topic = gossipsub::IdentTopic::new(TOPIC_TRANSACTIONS);
+        let vote_topic = gossipsub::IdentTopic::new(TOPIC_VOTES);
         swarm.behaviour_mut().gossipsub.subscribe(&block_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
         swarm.behaviour_mut().gossipsub.subscribe(&tx_topic)
+            .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
+        swarm.behaviour_mut().gossipsub.subscribe(&vote_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
 
         let listen_addr: Multiaddr = format!(
@@ -189,6 +195,15 @@ impl P2PService {
                                 }
                             }
                         }
+                        P2PCommand::BroadcastVote(vote) => {
+                            if let Ok(data) = bincode::serialize(&vote) {
+                                if let Err(e) = swarm.behaviour_mut().gossipsub
+                                    .publish(vote_topic.clone(), data)
+                                {
+                                    debug!("Vote broadcast: {}", e);
+                                }
+                            }
+                        }
                         P2PCommand::ConnectPeer(addr) => {
                             let _ = swarm.dial(addr);
                         }
@@ -216,6 +231,13 @@ impl P2PService {
                     let _ = self.event_tx.send(P2PEvent::NewTransaction(tx)).await;
                 }
                 Err(e) => warn!("Invalid tx from peer: {}", e),
+            }
+        } else if topic == TOPIC_VOTES {
+            match bincode::deserialize::<Vote>(&message.data) {
+                Ok(vote) => {
+                    let _ = self.event_tx.send(P2PEvent::NewVote(vote)).await;
+                }
+                Err(e) => warn!("Invalid vote from peer: {}", e),
             }
         }
     }

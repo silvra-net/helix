@@ -9,6 +9,7 @@ description = "libp2p P2P networking for Helix — gossipsub block/tx broadcast,
 [dependencies]
 helix-crypto.workspace = true
 helix-core.workspace = true
+helix-consensus.workspace = true
 libp2p.workspace = true
 serde.workspace = true
 bincode.workspace = true
