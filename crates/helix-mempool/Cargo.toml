@@ -1,0 +1,13 @@
+[package]
+name = "helix-mempool"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Transaction mempool for Helix — fee-prioritized pending transaction pool"
+
+[dependencies]
+helix-crypto.workspace = true
+helix-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

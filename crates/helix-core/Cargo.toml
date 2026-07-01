@@ -1,0 +1,15 @@
+[package]
+name = "helix-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core types for the Helix blockchain: Block, Transaction, State"
+
+[dependencies]
+helix-crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+hex.workspace = true

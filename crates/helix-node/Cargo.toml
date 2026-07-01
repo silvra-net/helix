@@ -1,0 +1,29 @@
+[package]
+name = "helix-node"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Helix blockchain node binary"
+
+[[bin]]
+name = "helix"
+path = "src/main.rs"
+
+[dependencies]
+helix-crypto.workspace = true
+helix-core.workspace = true
+helix-consensus.workspace = true
+helix-executor.workspace = true
+helix-mempool.workspace = true
+helix-p2p.workspace = true
+helix-storage.workspace = true
+helix-identity.workspace = true
+helix-rpc.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+libp2p.workspace = true

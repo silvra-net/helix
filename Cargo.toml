@@ -1,0 +1,81 @@
+[workspace]
+members = [
+    "crates/helix-crypto",
+    "crates/helix-core",
+    "crates/helix-consensus",
+    "crates/helix-executor",
+    "crates/helix-mempool",
+    "crates/helix-p2p",
+    "crates/helix-storage",
+    "crates/helix-identity",
+    "crates/helix-rpc",
+    "crates/helix-node",
+    "crates/helix-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Helix Team"]
+license = "MIT"
+
+[workspace.dependencies]
+# Post-Quantum Cryptography (NIST standards)
+pqcrypto-dilithium = "0.5"
+pqcrypto-sphincsplus = "0.7"
+pqcrypto-traits = "0.3"
+blake3 = "1.5"
+zeroize = { version = "1.7", features = ["derive"] }
+rand = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+hex = "0.4"
+bs58 = "0.5"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# P2P networking
+libp2p = { version = "0.54", features = [
+    "tcp", "noise", "yamux",
+    "gossipsub", "mdns",
+    "tokio", "dns", "macros",
+] }
+
+# Wallet encryption
+aes-gcm = "0.10"
+argon2 = "0.5"
+
+# Persistence
+redb = "2.1"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+# Internal crates
+helix-crypto = { path = "crates/helix-crypto" }
+helix-core = { path = "crates/helix-core" }
+helix-consensus = { path = "crates/helix-consensus" }
+helix-p2p = { path = "crates/helix-p2p" }
+helix-storage = { path = "crates/helix-storage" }
+helix-identity = { path = "crates/helix-identity" }
+helix-executor = { path = "crates/helix-executor" }
+helix-mempool = { path = "crates/helix-mempool" }
+helix-rpc = { path = "crates/helix-rpc" }

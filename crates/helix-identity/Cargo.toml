@@ -1,0 +1,12 @@
+[package]
+name = "helix-identity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Proof of Personhood, DIDs, and human-readable names for Helix"
+
+[dependencies]
+helix-crypto.workspace = true
+serde.workspace = true
+thiserror.workspace = true

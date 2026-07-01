@@ -1,0 +1,17 @@
+[package]
+name = "helix-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Persistent storage layer for Helix blockchain state"
+
+[dependencies]
+helix-crypto.workspace = true
+helix-core.workspace = true
+helix-executor.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+redb.workspace = true
+tracing.workspace = true
