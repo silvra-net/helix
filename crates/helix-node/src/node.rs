@@ -178,10 +178,28 @@ async fn handle_p2p_event(
                 Err(e) => warn!("Rejected peer tx: {}", e),
             }
         }
-        P2PEvent::NewBlock(_block) => {
-            // Non-proposer validators joining an in-progress round on receipt
-            // of a proposal is not wired up yet — only the block's own
-            // proposer currently drives a round (see block_production_loop).
+        P2PEvent::NewBlock(block) => {
+            let result = { engine.write().await.receive_proposal(keypair, block) };
+
+            // receive_proposal() may have cast our prevote (and possibly a
+            // follow-up precommit) for the received proposal — broadcast
+            // those regardless of outcome, same as the NewVote arm below.
+            let outbound = { engine.write().await.take_outbound_votes() };
+            for v in outbound {
+                let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(v));
+            }
+
+            match result {
+                Ok(Some(block)) => {
+                    info!(height = block.height(), "Block finalized via peer proposal");
+                    apply_finalized_block(block, store, mempool, chain_state, engine, p2p_tx).await;
+                }
+                Ok(None) => {}
+                Err(ConsensusError::UnknownValidator(_)) => {
+                    // We're not a validator in the current set — nothing to vote with.
+                }
+                Err(e) => warn!("Rejected peer proposal: {}", e),
+            }
         }
         P2PEvent::NewVote(vote) => {
             let result = { engine.write().await.add_vote(keypair, vote) };
@@ -311,6 +329,14 @@ async fn block_production_loop(
     loop {
         interval.tick().await;
 
+        // A round from a previous tick is still awaiting peer votes — don't
+        // clobber it with a brand-new proposal (different timestamp/hash) for
+        // the same height, which would orphan any votes peers already cast
+        // against the original proposal.
+        if engine.read().await.has_active_round() {
+            continue;
+        }
+
         let txs = { mempool.read().await.take(MAX_TXS_PER_BLOCK) };
         let prev_hash = store.read().await.latest_hash();
 
@@ -322,8 +348,13 @@ async fn block_production_loop(
             }
             Err(ConsensusError::AwaitingVotes { .. }) => {
                 // Multi-validator: our proposal + own votes are cast, round is
-                // stored in the engine — broadcast the votes below and wait for
-                // peers' votes to arrive via handle_p2p_event.
+                // stored in the engine. Broadcast the raw proposal itself so
+                // peers can validate it and cast their own votes — the votes
+                // below only cover this node's own prevote/precommit.
+                let proposal = { engine.read().await.pending_proposal().cloned() };
+                if let Some(block) = proposal {
+                    let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block));
+                }
             }
             Err(e) => warn!("Block production failed: {}", e),
         }

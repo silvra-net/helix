@@ -163,6 +163,62 @@ impl BftEngine {
         Ok(block)
     }
 
+    /// Receive a block proposed by another validator over P2P, join the round
+    /// it starts, and cast this node's own prevote (and, if that single vote
+    /// already tips quorum, the follow-up precommit too — mirroring
+    /// `produce_block`'s own-vote logic). Returns the finalized block if this
+    /// node's vote alone reaches quorum, `None` if the round still awaits
+    /// further peer votes via `add_vote()`.
+    ///
+    /// A proposal for a height we've already finalized (a stale retransmit,
+    /// or our own proposal echoed back by gossipsub) is silently ignored
+    /// rather than treated as an error.
+    pub fn receive_proposal(&mut self, keypair: &KeyPair, block: Block) -> ConsensusResult<Option<Block>> {
+        if block.height() <= self.current_height {
+            return Ok(None);
+        }
+
+        self.assert_is_validator()?;
+        self.validate_block(&block)?;
+
+        let height = block.height();
+        let round_num = 0u32;
+
+        // Already tracking a round for this height — e.g. duplicate gossip
+        // delivery of the same proposal. Don't clobber accumulated votes.
+        if self.round.as_ref().is_some_and(|r| r.height == height) {
+            return Ok(None);
+        }
+
+        let block_hash = block.hash();
+        let mut round = RoundState::new(height, round_num, self.validator_set.clone());
+        round.set_proposal(block)?;
+
+        let prevote = cast_vote(&self.address, keypair, VoteType::Prevote, height, round_num, block_hash.clone())?;
+        round.add_prevote(prevote.clone())?;
+        self.outbound_votes.push(prevote);
+
+        if round.phase == RoundPhase::Precommit {
+            let precommit = cast_vote(&self.address, keypair, VoteType::Precommit, height, round_num, block_hash)?;
+            round.add_precommit(precommit.clone())?;
+            self.outbound_votes.push(precommit);
+        }
+
+        if !round.is_committed() {
+            self.round = Some(round);
+            return Ok(None);
+        }
+
+        let hash = round
+            .committed_hash()
+            .cloned()
+            .expect("is_committed() just confirmed a commit hash is present");
+        let block = round.proposal.take().filter(|b| b.hash() == hash);
+        self.finalize(height, round);
+
+        Ok(block)
+    }
+
     /// Drain votes cast by this node since the last call, for the caller to
     /// broadcast to peers via P2P.
     pub fn take_outbound_votes(&mut self) -> Vec<Vote> {
@@ -437,5 +493,100 @@ mod tests {
             engine.add_vote(&v.self_kp, vote),
             Err(ConsensusError::NoActiveRound)
         ));
+    }
+
+    /// The Phase 5c-follow-up scenario: a non-proposer node receives another
+    /// validator's proposal over P2P via `receive_proposal()`, joins that
+    /// round, and casts its own prevote — then peer votes trickle in over
+    /// `add_vote()` exactly as in the proposer-side test above, until
+    /// precommit quorum finalizes the block.
+    #[test]
+    fn receive_proposal_from_peer_joins_round_and_casts_own_prevote() {
+        let v = four_validators();
+
+        // b is the proposer for height 2, round 0 ((2 + 0) % 4 == 2).
+        let mut proposer_engine = BftEngine::new(
+            v.validator_set.clone(),
+            Address::from_public_key(&v.b_kp.public),
+            1,
+        );
+        let err = proposer_engine
+            .produce_block(&v.b_kp, Hash::digest(b"block-1"), vec![])
+            .unwrap_err();
+        assert!(matches!(err, ConsensusError::AwaitingVotes { height: 2, round: 0 }));
+        let block = proposer_engine.pending_proposal().unwrap().clone();
+        let block_hash = block.hash();
+        let b_prevote = proposer_engine.take_outbound_votes().into_iter().next().unwrap();
+
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        let result = engine.receive_proposal(&v.self_kp, block).unwrap();
+        assert_eq!(result, None, "a single prevote shouldn't reach quorum yet");
+        let outbound = engine.take_outbound_votes();
+        assert_eq!(outbound.len(), 1, "receiving the proposal casts our own prevote");
+        assert_eq!(outbound[0].vote_type, VoteType::Prevote);
+        assert_eq!(outbound[0].validator, v.self_addr);
+
+        // b's own prevote (2 of 4) still isn't quorum.
+        assert_eq!(engine.add_vote(&v.self_kp, b_prevote).unwrap(), None);
+
+        // a's prevote tips prevotes over quorum (3 of 4) — advances the round
+        // and makes this node cast its own precommit, without finalizing yet.
+        let a_prevote = peer_vote(&v.a_kp, VoteType::Prevote, 2, 0, block_hash.clone());
+        assert_eq!(
+            engine.add_vote(&v.self_kp, a_prevote).unwrap(),
+            None,
+            "prevote quorum must not finalize the block"
+        );
+        let outbound = engine.take_outbound_votes();
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].vote_type, VoteType::Precommit);
+
+        let b_precommit = peer_vote(&v.b_kp, VoteType::Precommit, 2, 0, block_hash.clone());
+        assert_eq!(engine.add_vote(&v.self_kp, b_precommit).unwrap(), None);
+
+        let a_precommit = peer_vote(&v.a_kp, VoteType::Precommit, 2, 0, block_hash.clone());
+        let finalized = engine
+            .add_vote(&v.self_kp, a_precommit)
+            .unwrap()
+            .expect("precommit quorum must finalize the block");
+        assert_eq!(finalized.hash(), block_hash);
+        assert!(engine.is_finalized(&block_hash));
+        assert_eq!(engine.current_height(), 2);
+    }
+
+    /// A proposal for a height we've already finalized — e.g. our own block
+    /// echoed back by gossipsub, or a stale retransmit — must be ignored
+    /// rather than rejected as an error or allowed to start a phantom round.
+    #[test]
+    fn receive_proposal_for_already_finalized_height_is_ignored() {
+        let v = four_validators();
+        let mut producer = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let _ = producer.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        let block = producer.pending_proposal().unwrap().clone();
+
+        // Already past height 1.
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        assert_eq!(engine.receive_proposal(&v.self_kp, block).unwrap(), None);
+        assert!(!engine.has_active_round());
+    }
+
+    /// A block claiming to be proposed by a validator other than the one
+    /// actually assigned to this height/round must be rejected — otherwise
+    /// any validator could force through its own proposal out of turn.
+    #[test]
+    fn receive_proposal_from_wrong_proposer_is_rejected() {
+        let v = four_validators();
+        let mut proposer_engine = BftEngine::new(
+            v.validator_set.clone(),
+            Address::from_public_key(&v.b_kp.public),
+            1,
+        );
+        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), vec![]);
+        let mut block = proposer_engine.pending_proposal().unwrap().clone();
+        block.header.validator = Address::from_public_key(&v.a_kp.public);
+
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        let err = engine.receive_proposal(&v.self_kp, block).unwrap_err();
+        assert!(matches!(err, ConsensusError::InvalidBlock { height: 2, .. }));
     }
 }
