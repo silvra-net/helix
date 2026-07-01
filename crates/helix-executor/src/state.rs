@@ -88,4 +88,13 @@ impl ChainState {
     pub fn account_count(&self) -> usize {
         self.accounts.len()
     }
+
+    /// Addresses with a nonzero staked amount — candidates for the next validator epoch.
+    pub fn stakers(&self) -> Vec<(Address, u64)> {
+        self.accounts
+            .values()
+            .filter(|acc| acc.staked > 0)
+            .filter_map(|acc| Address::from_str(&acc.address).ok().map(|addr| (addr, acc.staked)))
+            .collect()
+    }
 }

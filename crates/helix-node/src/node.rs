@@ -193,6 +193,22 @@ async fn block_production_loop(
                     }
                 }
 
+                // Epoch boundary: rebuild the validator set from current stake.
+                // Personhood attestation isn't wired up yet (Phase 6), so rotated-in
+                // validators start uncapped-by-personhood (i.e. capped at 0.5%) until then.
+                if height % helix_consensus::EPOCH_LENGTH == 0 {
+                    let stakers = chain_state.read().await.stakers();
+                    let validators: Vec<Validator> = stakers
+                        .into_iter()
+                        .map(|(addr, stake)| Validator::new(addr, stake, false))
+                        .collect();
+                    let had = validators.len();
+                    engine.rotate_validator_set(validators);
+                    if had > 0 {
+                        info!(height, epoch = engine.validator_set().epoch, validators = had, "Validator set rotated");
+                    }
+                }
+
                 // Broadcast to peers before storing (peers can validate against prev_hash)
                 let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone()));
 

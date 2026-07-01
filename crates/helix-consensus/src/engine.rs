@@ -6,7 +6,7 @@ use tracing::info;
 
 use crate::{
     round::{RoundPhase, RoundState},
-    ConsensusError, ConsensusResult, ValidatorSet, Vote, VoteType,
+    ConsensusError, ConsensusResult, Validator, ValidatorSet, Vote, VoteType,
 };
 
 /// BFT consensus engine — Tendermint-style two-phase commit.
@@ -176,6 +176,17 @@ impl BftEngine {
 
     pub fn has_active_round(&self) -> bool {
         self.round.is_some()
+    }
+
+    /// Rotate to a new validator set for the next epoch (called every `EPOCH_LENGTH`
+    /// blocks). A no-op if `validators` is empty — an empty set would halt block
+    /// production entirely, so the current epoch is kept alive instead.
+    pub fn rotate_validator_set(&mut self, validators: Vec<Validator>) {
+        if validators.is_empty() {
+            return;
+        }
+        let next_epoch = self.validator_set.epoch + 1;
+        self.validator_set = ValidatorSet::new(validators, next_epoch);
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
