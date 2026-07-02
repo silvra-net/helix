@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,46 @@ use helix_storage::{mem::MemBlockStore, BlockStore};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
+/// Load the validator keypair from disk, or generate + persist a new one.
+/// Stored as raw secret-key bytes (4032 B for ML-DSA-65); public key is derived on load.
+fn load_or_create_keypair(path: &PathBuf) -> Result<KeyPair> {
+    use helix_crypto::{PublicKey, SecretKey};
+    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+
+    if path.exists() {
+        let data = std::fs::read(path)?;
+        let sk_len = dilithium3::secret_key_bytes();
+        let pk_len = dilithium3::public_key_bytes();
+        if data.len() != sk_len + pk_len {
+            anyhow::bail!(
+                "Validator key file has unexpected size ({} bytes, expected {})",
+                data.len(), sk_len + pk_len
+            );
+        }
+        let sk_bytes = data[..sk_len].to_vec();
+        let pk_bytes = data[sk_len..].to_vec();
+        // Validate both keys parse correctly
+        dilithium3::SecretKey::from_bytes(&sk_bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid secret key in validator key file: {e:?}"))?;
+        dilithium3::PublicKey::from_bytes(&pk_bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid public key in validator key file: {e:?}"))?;
+        info!("Loaded persistent validator keypair from {}", path.display());
+        Ok(KeyPair {
+            public: PublicKey::from_bytes(pk_bytes),
+            secret: SecretKey::from_bytes(sk_bytes),
+        })
+    } else {
+        let kp = KeyPair::generate();
+        // Persist as sk_bytes || pk_bytes
+        let mut data = kp.secret.as_bytes().to_vec();
+        data.extend_from_slice(kp.public.as_bytes());
+        std::fs::write(path, &data)?;
+        info!("Generated new validator keypair → saved to {}", path.display());
+        Ok(kp)
+    }
+}
+
 const BLOCK_TIME_MS: u64 = 2_000;
 const MAX_TXS_PER_BLOCK: usize = 1_000;
 const RPC_BIND: &str = "127.0.0.1:8545";
@@ -24,6 +65,9 @@ const RPC_BIND: &str = "127.0.0.1:8545";
 pub struct HelixNode {
     keypair: Arc<KeyPair>,
     address: Address,
+    /// Where the validator's 50 % fee share lands.  Defaults to `address` when unset.
+    /// Configure via HELIX_REWARD_ADDRESS env var.
+    reward_address: Option<Address>,
     store: Arc<RwLock<MemBlockStore>>,
     mempool: Arc<RwLock<Mempool>>,
     chain_state: Arc<RwLock<ChainState>>,
@@ -34,8 +78,23 @@ pub struct HelixNode {
 
 impl HelixNode {
     pub async fn new() -> Result<Self> {
-        let keypair = KeyPair::generate();
+        let key_path = PathBuf::from("validator-key.bin");
+        let keypair = load_or_create_keypair(&key_path)?;
         let address = Address::from_public_key(&keypair.public);
+
+        // Optional reward address — fees land here instead of the validator address.
+        let reward_address = std::env::var("HELIX_REWARD_ADDRESS").ok().and_then(|s| {
+            match Address::from_str(&s) {
+                Ok(addr) => {
+                    info!("Fee reward address : {} (HELIX_REWARD_ADDRESS)", addr);
+                    Some(addr)
+                }
+                Err(_) => {
+                    warn!("HELIX_REWARD_ADDRESS is set but invalid — fees go to validator address");
+                    None
+                }
+            }
+        });
 
         info!("Validator address : {}", address);
         info!("PK fingerprint    : {}", keypair.public.fingerprint());
@@ -50,10 +109,7 @@ impl HelixNode {
         // Genesis state
         let genesis_cfg = GenesisConfig::devnet(address.clone());
         let chain_state = genesis_cfg.build_state();
-        info!(
-            "Genesis: {}M HLX allocated to validator",
-            helix_executor::genesis::GENESIS_VALIDATOR_ALLOCATION_HLX / 1_000_000
-        );
+        info!("Genesis: no validator pre-mine — earnings via 50/50 fee split only");
 
         // P2P setup
         let p2p_config = P2PConfig::default();
@@ -62,6 +118,7 @@ impl HelixNode {
         Ok(HelixNode {
             keypair: Arc::new(keypair),
             address,
+            reward_address,
             store: Arc::new(RwLock::new(store)),
             mempool: Arc::new(RwLock::new(Mempool::new())),
             chain_state: Arc::new(RwLock::new(chain_state)),
@@ -118,6 +175,7 @@ impl HelixNode {
         let engine_for_p2p = engine.clone();
         let keypair_for_p2p = self.keypair.clone();
         let p2p_tx_for_p2p = self.p2p_command_tx.clone();
+        let reward_for_p2p = self.reward_address.as_ref().map(|a| Arc::new(a.clone()));
         let mut p2p_event_rx = self.p2p_event_rx;
         tokio::spawn(async move {
             while let Some(event) = p2p_event_rx.recv().await {
@@ -130,6 +188,7 @@ impl HelixNode {
                     &engine_for_p2p,
                     &keypair_for_p2p,
                     &p2p_tx_for_p2p,
+                    reward_for_p2p.clone(),
                 )
                 .await;
             }
@@ -143,6 +202,7 @@ impl HelixNode {
             self.keypair.clone(),
             engine,
             self.p2p_command_tx.clone(),
+            self.reward_address.map(Arc::new),
         ));
 
         tokio::select! {
@@ -169,6 +229,7 @@ async fn handle_p2p_event(
     engine: &Arc<RwLock<BftEngine>>,
     keypair: &KeyPair,
     p2p_tx: &mpsc::Sender<P2PCommand>,
+    reward_address: Option<Arc<Address>>,
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
@@ -192,7 +253,7 @@ async fn handle_p2p_event(
             match result {
                 Ok(Some(block)) => {
                     info!(height = block.height(), "Block finalized via peer proposal");
-                    apply_finalized_block(block, store, mempool, chain_state, engine, p2p_tx).await;
+                    apply_finalized_block(block, store, mempool, chain_state, engine, p2p_tx, reward_address.clone()).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::UnknownValidator(_)) => {
@@ -214,7 +275,7 @@ async fn handle_p2p_event(
             match result {
                 Ok(Some(block)) => {
                     info!(height = block.height(), "Block finalized via peer votes");
-                    apply_finalized_block(block, store, mempool, chain_state, engine, p2p_tx).await;
+                    apply_finalized_block(block, store, mempool, chain_state, engine, p2p_tx, reward_address.clone()).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::NoActiveRound) => {
@@ -245,6 +306,7 @@ async fn apply_finalized_block(
     chain_state: &Arc<RwLock<ChainState>>,
     engine: &Arc<RwLock<BftEngine>>,
     p2p_tx: &mpsc::Sender<P2PCommand>,
+    reward_address: Option<Arc<Address>>,
 ) {
     let tx_hashes: Vec<_> = block.transactions.iter().map(|t| t.hash()).collect();
     let height = block.height();
@@ -253,7 +315,7 @@ async fn apply_finalized_block(
     // Execute transactions
     {
         let mut state = chain_state.write().await;
-        let receipt = execute_block(&mut state, &block);
+        let receipt = execute_block(&mut state, &block, reward_address.as_deref());
         if receipt.failed_txs() > 0 {
             warn!(height, failed = receipt.failed_txs(), "Tx execution failures");
         }
@@ -323,6 +385,7 @@ async fn block_production_loop(
     keypair: Arc<KeyPair>,
     engine: Arc<RwLock<BftEngine>>,
     p2p_tx: mpsc::Sender<P2PCommand>,
+    reward_address: Option<Arc<Address>>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(BLOCK_TIME_MS));
 
@@ -343,7 +406,7 @@ async fn block_production_loop(
         let produced = { engine.write().await.produce_block(&keypair, prev_hash, txs) };
         match produced {
             Ok(block) => {
-                apply_finalized_block(block, &store, &mempool, &chain_state, &engine, &p2p_tx)
+                apply_finalized_block(block, &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone())
                     .await;
             }
             Err(ConsensusError::AwaitingVotes { .. }) => {

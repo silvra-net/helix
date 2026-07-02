@@ -3,6 +3,8 @@
 **/*.rs.bk
 .env
 *.log
+# Validator secret key — never commit
+/validator-key.bin
 # Scripts (Cron/Dev-Loop — nur lokal)
 /scripts/
 /CLAUDE.md
