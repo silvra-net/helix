@@ -11,8 +11,8 @@ use libp2p::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use helix_consensus::Vote;
-use helix_core::{Block, Transaction};
+use helix_consensus::{Proposal, Vote};
+use helix_core::Transaction;
 
 use crate::config::P2PConfig;
 use crate::{P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_TRANSACTIONS, TOPIC_VOTES};
@@ -20,7 +20,7 @@ use crate::{P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_TRANSACTIONS, TOPIC_VOTES};
 /// Events received FROM the P2P network → node
 #[derive(Debug)]
 pub enum P2PEvent {
-    NewBlock(Block),
+    NewProposal(Proposal),
     NewTransaction(Transaction),
     NewVote(Vote),
     PeerConnected(String),
@@ -30,7 +30,7 @@ pub enum P2PEvent {
 /// Commands sent TO the P2P network FROM the node
 #[derive(Debug)]
 pub enum P2PCommand {
-    BroadcastBlock(Block),
+    BroadcastProposal(Proposal),
     BroadcastTransaction(Transaction),
     BroadcastVote(Vote),
     ConnectPeer(Multiaddr),
@@ -177,12 +177,12 @@ impl P2PService {
 
                 Some(cmd) = self.command_rx.recv() => {
                     match cmd {
-                        P2PCommand::BroadcastBlock(block) => {
-                            if let Ok(data) = bincode::serialize(&block) {
+                        P2PCommand::BroadcastProposal(proposal) => {
+                            if let Ok(data) = bincode::serialize(&proposal) {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
                                     .publish(block_topic.clone(), data)
                                 {
-                                    debug!("Block broadcast: {}", e);
+                                    debug!("Proposal broadcast: {}", e);
                                 }
                             }
                         }
@@ -218,12 +218,12 @@ impl P2PService {
     async fn handle_gossipsub_message(&self, message: gossipsub::Message) {
         let topic = message.topic.as_str();
         if topic == TOPIC_BLOCKS {
-            match bincode::deserialize::<Block>(&message.data) {
-                Ok(block) => {
-                    debug!(height = block.height(), "Block from peer");
-                    let _ = self.event_tx.send(P2PEvent::NewBlock(block)).await;
+            match bincode::deserialize::<Proposal>(&message.data) {
+                Ok(proposal) => {
+                    debug!(height = proposal.block.height(), round = proposal.round, "Proposal from peer");
+                    let _ = self.event_tx.send(P2PEvent::NewProposal(proposal)).await;
                 }
-                Err(e) => warn!("Invalid block from peer: {}", e),
+                Err(e) => warn!("Invalid proposal from peer: {}", e),
             }
         } else if topic == TOPIC_TRANSACTIONS {
             match bincode::deserialize::<Transaction>(&message.data) {

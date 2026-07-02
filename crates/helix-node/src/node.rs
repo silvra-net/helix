@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use helix_consensus::{BftEngine, ConsensusError, Validator, ValidatorSet};
+use helix_consensus::{BftEngine, ConsensusError, Proposal, Validator, ValidatorSet};
 use helix_core::{genesis_block, Block};
 use helix_crypto::{Address, KeyPair};
 use helix_executor::{
@@ -251,8 +251,8 @@ async fn handle_p2p_event(
                 Err(e) => warn!("Rejected peer tx: {}", e),
             }
         }
-        P2PEvent::NewBlock(block) => {
-            let result = { engine.write().await.receive_proposal(keypair, block) };
+        P2PEvent::NewProposal(proposal) => {
+            let result = { engine.write().await.receive_proposal(keypair, proposal.round, proposal.block) };
 
             // receive_proposal() may have cast our prevote (and possibly a
             // follow-up precommit) for the received proposal — broadcast
@@ -371,8 +371,12 @@ async fn apply_finalized_block(
         }
     }
 
-    // Broadcast to peers before storing (peers can validate against prev_hash)
-    let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone()));
+    // Broadcast to peers before storing (peers can validate against prev_hash).
+    // Tagged with the round it actually committed in, so a peer that's
+    // exactly one block behind can validate the proposer against the right
+    // round instead of assuming round 0.
+    let round = engine.read().await.last_committed_round().unwrap_or(0);
+    let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal { round, block: block.clone() }));
 
     // Persist block + chain state to the same redb file, under one write lock.
     {
@@ -411,29 +415,52 @@ async fn block_production_loop(
         // A round from a previous tick is still awaiting peer votes — don't
         // clobber it with a brand-new proposal (different timestamp/hash) for
         // the same height, which would orphan any votes peers already cast
-        // against the original proposal.
-        if engine.read().await.has_active_round() {
-            continue;
-        }
+        // against the original proposal. Give it a few more ticks before
+        // concluding it's stalled (e.g. the proposer went offline, or its
+        // block failed validation for enough peers that quorum can never be
+        // reached) and forcing it to the next round via `advance_round`.
+        let stalled = if engine.read().await.has_active_round() {
+            let timed_out = { engine.write().await.note_round_tick() };
+            if !timed_out {
+                continue;
+            }
+            true
+        } else {
+            false
+        };
 
         let txs = { mempool.read().await.take(MAX_TXS_PER_BLOCK) };
         let prev_hash = store.read().await.latest_hash();
 
-        let produced = { engine.write().await.produce_block(&keypair, prev_hash, txs) };
+        let produced = if stalled {
+            engine.write().await.advance_round(&keypair, prev_hash, txs)
+        } else {
+            engine.write().await.produce_block(&keypair, prev_hash, txs)
+        };
         match produced {
             Ok(block) => {
                 apply_finalized_block(block, &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone())
                     .await;
             }
-            Err(ConsensusError::AwaitingVotes { .. }) => {
+            Err(ConsensusError::AwaitingVotes { round, .. }) => {
                 // Multi-validator: our proposal + own votes are cast, round is
-                // stored in the engine. Broadcast the raw proposal itself so
+                // stored in the engine. Broadcast the proposal itself so
                 // peers can validate it and cast their own votes — the votes
                 // below only cover this node's own prevote/precommit.
-                let proposal = { engine.read().await.pending_proposal().cloned() };
-                if let Some(block) = proposal {
-                    let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block));
+                let block = { engine.read().await.pending_proposal().cloned() };
+                if let Some(block) = block {
+                    let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal { round, block }));
                 }
+            }
+            Err(ConsensusError::NotProposer { .. }) => {
+                // Expected every tick for non-proposer validators, and for a
+                // deferring validator right after a round timeout — wait for
+                // the actual proposer's Proposal to arrive over P2P instead.
+            }
+            Err(ConsensusError::NoActiveRound) => {
+                // Benign race: a peer vote arriving via handle_p2p_event
+                // finalized the stalled round between our timeout check and
+                // this call. The height already advanced normally.
             }
             Err(e) => warn!("Block production failed: {}", e),
         }

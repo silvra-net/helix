@@ -9,6 +9,12 @@ use crate::{
     ConsensusError, ConsensusResult, DoubleSignEvidence, Validator, ValidatorSet, Vote, VoteType,
 };
 
+/// Number of block-production ticks a round may sit without reaching
+/// precommit quorum before it's considered stalled and advanced to the next
+/// round (e.g. the proposer was offline, or its block failed validation for
+/// enough peers that quorum can never be reached). See `BftEngine::advance_round`.
+pub const ROUND_TIMEOUT_TICKS: u32 = 3;
+
 /// BFT consensus engine — Tendermint-style two-phase commit.
 ///
 /// Supports both single-validator devnet (auto-commits with own votes) and
@@ -30,6 +36,13 @@ pub struct BftEngine {
     /// Hash of the most recently finalized block, so `is_finalized()` still
     /// answers correctly after the round that committed it has been cleared.
     last_committed: Option<Hash>,
+    /// Round the most recently finalized block was actually committed in —
+    /// needed to re-validate that block's proposer if it's rebroadcast to a
+    /// peer catching up (see `last_committed_round()`).
+    last_committed_round: Option<u32>,
+    /// Ticks the active round has sat without reaching precommit quorum,
+    /// via `note_round_tick()`. Reset whenever a round starts or finalizes.
+    round_ticks: u32,
 }
 
 impl BftEngine {
@@ -42,6 +55,8 @@ impl BftEngine {
             pending_evidence: Vec::new(),
             outbound_votes: Vec::new(),
             last_committed: None,
+            last_committed_round: None,
+            round_ticks: 0,
         }
     }
 
@@ -72,6 +87,64 @@ impl BftEngine {
                 round: round_num,
             });
         }
+
+        self.propose(keypair, height, round_num, prev_hash, transactions)
+    }
+
+    /// Called once per block-production tick while a round is active but not
+    /// yet finalized. Increments the stall counter and reports whether the
+    /// round has now been active long enough (`ROUND_TIMEOUT_TICKS`) to be
+    /// considered stalled and advanced via `advance_round`.
+    pub fn note_round_tick(&mut self) -> bool {
+        self.round_ticks += 1;
+        self.round_ticks >= ROUND_TIMEOUT_TICKS
+    }
+
+    /// Force a stalled round to advance to round+1 — e.g. the proposer was
+    /// offline, or its block failed validation for enough peers that quorum
+    /// could never be reached. Drops the stalled round's accumulated votes
+    /// (they're bucketed under the old round number and don't carry over).
+    ///
+    /// If this node is the proposer for the new round, builds and signs a
+    /// fresh proposal (fresh timestamp — the old one is stale) and casts its
+    /// own votes exactly as `produce_block` does, returning
+    /// `AwaitingVotes`/`Ok` the same way. If some other validator is the new
+    /// proposer, returns `NotProposer` — the caller should just wait for that
+    /// validator's `Proposal` to arrive over P2P and hit `receive_proposal`.
+    pub fn advance_round(
+        &mut self,
+        keypair: &KeyPair,
+        prev_hash: Hash,
+        transactions: Vec<Transaction>,
+    ) -> ConsensusResult<Block> {
+        let stalled = self.round.take().ok_or(ConsensusError::NoActiveRound)?;
+        let height = stalled.height;
+        let round_num = stalled.round + 1;
+        self.pending_evidence.extend(stalled.evidence);
+
+        if !self.validator_set.is_proposer(&self.address, height, round_num) {
+            self.round_ticks = 0;
+            return Err(ConsensusError::NotProposer { height, round: round_num });
+        }
+
+        self.propose(keypair, height, round_num, prev_hash, transactions)
+    }
+
+    /// Build a signed block, start a fresh round for it, cast this node's own
+    /// prevote (and follow-up precommit, if that single vote already reaches
+    /// quorum), and store the round in `self` awaiting further peer votes.
+    /// Shared by `produce_block` (round 0 of a new height) and
+    /// `advance_round` (round N+1 of a stalled height) — the only difference
+    /// between the two call sites is how `height`/`round_num` are computed.
+    fn propose(
+        &mut self,
+        keypair: &KeyPair,
+        height: u64,
+        round_num: u32,
+        prev_hash: Hash,
+        transactions: Vec<Transaction>,
+    ) -> ConsensusResult<Block> {
+        self.round_ticks = 0;
 
         let block = self.build_signed_block(keypair, height, prev_hash, transactions)?;
         let block_hash = block.hash();
@@ -172,27 +245,31 @@ impl BftEngine {
     ///
     /// A proposal for a height we've already finalized (a stale retransmit,
     /// or our own proposal echoed back by gossipsub) is silently ignored
-    /// rather than treated as an error.
-    pub fn receive_proposal(&mut self, keypair: &KeyPair, block: Block) -> ConsensusResult<Option<Block>> {
+    /// rather than treated as an error. Likewise, a proposal for a round
+    /// older than one we're already tracking (or have already advanced past
+    /// via `advance_round`) is stale and ignored rather than clobbering
+    /// newer round state.
+    pub fn receive_proposal(&mut self, keypair: &KeyPair, round_num: u32, block: Block) -> ConsensusResult<Option<Block>> {
         if block.height() <= self.current_height {
             return Ok(None);
         }
 
         self.assert_is_validator()?;
-        self.validate_block(&block)?;
+        self.validate_block(&block, round_num)?;
 
         let height = block.height();
-        let round_num = 0u32;
 
-        // Already tracking a round for this height — e.g. duplicate gossip
-        // delivery of the same proposal. Don't clobber accumulated votes.
-        if self.round.as_ref().is_some_and(|r| r.height == height) {
+        // Already tracking this round (or a later one) for this height —
+        // e.g. duplicate gossip delivery, or a stale proposal that arrived
+        // after we (or the network) already moved past it.
+        if self.round.as_ref().is_some_and(|r| r.height == height && r.round >= round_num) {
             return Ok(None);
         }
 
         let block_hash = block.hash();
         let mut round = RoundState::new(height, round_num, self.validator_set.clone());
         round.set_proposal(block)?;
+        self.round_ticks = 0;
 
         let prevote = cast_vote(&self.address, keypair, VoteType::Prevote, height, round_num, block_hash.clone())?;
         round.add_prevote(prevote.clone())?;
@@ -230,6 +307,13 @@ impl BftEngine {
         self.last_committed.as_ref() == Some(block_hash)
     }
 
+    /// The round the most recently finalized block actually committed in —
+    /// needed to correctly re-validate that block's proposer if it's
+    /// rebroadcast to a peer that's exactly one block behind.
+    pub fn last_committed_round(&self) -> Option<u32> {
+        self.last_committed_round
+    }
+
     /// The block currently proposed for the active round, if any — e.g. so a
     /// caller can inspect what this node is waiting on votes for.
     pub fn pending_proposal(&self) -> Option<&Block> {
@@ -237,7 +321,7 @@ impl BftEngine {
     }
 
     /// Validate a block proposed by another validator (used when receiving from peers).
-    pub fn validate_block(&self, block: &Block) -> ConsensusResult<()> {
+    pub fn validate_block(&self, block: &Block, round: u32) -> ConsensusResult<()> {
         let h = block.height();
 
         if h != self.current_height + 1 {
@@ -262,14 +346,17 @@ impl BftEngine {
             .get(&block.header.validator)
             .ok_or_else(|| ConsensusError::UnknownValidator(block.header.validator.clone()))?;
 
-        // Verify the proposer is correct for this height/round 0
+        // Verify the proposer is correct for this height/round
         if !self
             .validator_set
-            .is_proposer(&block.header.validator, h, 0)
+            .is_proposer(&block.header.validator, h, round)
         {
             return Err(ConsensusError::InvalidBlock {
                 height: h,
-                reason: format!("{} is not the proposer for height {}", block.header.validator, h),
+                reason: format!(
+                    "{} is not the proposer for height {} round {}",
+                    block.header.validator, h, round
+                ),
             });
         }
 
@@ -344,8 +431,10 @@ impl BftEngine {
     fn finalize(&mut self, height: u64, round: RoundState) {
         self.current_height = height;
         self.last_committed = round.committed_hash().cloned();
+        self.last_committed_round = Some(round.round);
         self.pending_evidence.extend(round.evidence);
         self.round = None;
+        self.round_ticks = 0;
     }
 
     fn assert_is_validator(&self) -> ConsensusResult<()> {
@@ -519,7 +608,7 @@ mod tests {
         let b_prevote = proposer_engine.take_outbound_votes().into_iter().next().unwrap();
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        let result = engine.receive_proposal(&v.self_kp, block).unwrap();
+        let result = engine.receive_proposal(&v.self_kp, 0, block).unwrap();
         assert_eq!(result, None, "a single prevote shouldn't reach quorum yet");
         let outbound = engine.take_outbound_votes();
         assert_eq!(outbound.len(), 1, "receiving the proposal casts our own prevote");
@@ -566,7 +655,7 @@ mod tests {
 
         // Already past height 1.
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        assert_eq!(engine.receive_proposal(&v.self_kp, block).unwrap(), None);
+        assert_eq!(engine.receive_proposal(&v.self_kp, 0, block).unwrap(), None);
         assert!(!engine.has_active_round());
     }
 
@@ -586,7 +675,150 @@ mod tests {
         block.header.validator = Address::from_public_key(&v.a_kp.public);
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        let err = engine.receive_proposal(&v.self_kp, block).unwrap_err();
+        let err = engine.receive_proposal(&v.self_kp, 0, block).unwrap_err();
         assert!(matches!(err, ConsensusError::InvalidBlock { height: 2, .. }));
+    }
+
+    /// Proposer selection is strict round-robin ((height + round) % len), so
+    /// after self proposes round 0 (index 1) it is never round 1's proposer
+    /// too (that falls to `b`, index 2) — a stalled round must make self
+    /// defer rather than force through a second proposal of its own.
+    #[test]
+    fn stalled_round_defers_to_next_proposer_when_not_self() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 0);
+
+        let err = engine
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        assert!(matches!(err, ConsensusError::AwaitingVotes { height: 1, round: 0 }));
+        engine.take_outbound_votes();
+
+        // No peer votes ever arrive for round 0 — it stalls.
+        for _ in 0..ROUND_TIMEOUT_TICKS - 1 {
+            assert!(!engine.note_round_tick(), "must not time out early");
+        }
+        assert!(engine.note_round_tick(), "must time out after ROUND_TIMEOUT_TICKS");
+
+        let err = engine
+            .advance_round(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        assert!(matches!(err, ConsensusError::NotProposer { height: 1, round: 1 }));
+        assert!(!engine.has_active_round(), "stalled round is dropped either way");
+        assert!(engine.take_outbound_votes().is_empty(), "no vote cast when deferring");
+    }
+
+    /// The full liveness-fix loop: round 0 stalls, both the original
+    /// proposer and the next-in-line validator (`b`) independently notice
+    /// the timeout, `b` — being round 1's proposer — produces a fresh
+    /// proposal, and the round finalizes normally once quorum is reached on
+    /// round 1.
+    #[test]
+    fn next_proposer_reproposes_after_timeout_and_round_finalizes() {
+        let v = four_validators();
+
+        let mut self_engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let _ = self_engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        let round0_block = self_engine.pending_proposal().unwrap().clone();
+        self_engine.take_outbound_votes();
+        for _ in 0..ROUND_TIMEOUT_TICKS {
+            self_engine.note_round_tick();
+        }
+        let err = self_engine
+            .advance_round(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        assert!(matches!(err, ConsensusError::NotProposer { height: 1, round: 1 }));
+
+        // `b` independently observed the same round-0 proposal (e.g. via
+        // gossip), times out the same way, and — being round 1's proposer —
+        // re-proposes with a fresh block.
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        let mut b_engine = BftEngine::new(v.validator_set.clone(), b_addr, 0);
+        b_engine.receive_proposal(&v.b_kp, 0, round0_block).unwrap();
+        b_engine.take_outbound_votes();
+        for _ in 0..ROUND_TIMEOUT_TICKS {
+            b_engine.note_round_tick();
+        }
+        let err = b_engine
+            .advance_round(&v.b_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        assert!(matches!(err, ConsensusError::AwaitingVotes { height: 1, round: 1 }));
+        let round1_block = b_engine.pending_proposal().unwrap().clone();
+        let round1_hash = round1_block.hash();
+        let b_prevote = b_engine.take_outbound_votes().into_iter().next().unwrap();
+        assert_eq!(b_prevote.round, 1);
+
+        // self picks up b's round-1 proposal, joins the round, and votes it
+        // to finality exactly like any ordinary (non-timed-out) round.
+        let result = self_engine.receive_proposal(&v.self_kp, 1, round1_block).unwrap();
+        assert_eq!(result, None);
+        let outbound = self_engine.take_outbound_votes();
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].round, 1);
+
+        assert_eq!(self_engine.add_vote(&v.self_kp, b_prevote).unwrap(), None);
+        let a_prevote = peer_vote(&v.a_kp, VoteType::Prevote, 1, 1, round1_hash.clone());
+        assert_eq!(
+            self_engine.add_vote(&v.self_kp, a_prevote).unwrap(),
+            None,
+            "prevote quorum must not finalize the block"
+        );
+        let outbound = self_engine.take_outbound_votes();
+        assert_eq!(outbound.len(), 1, "prevote quorum triggers self's own precommit");
+        assert_eq!(outbound[0].vote_type, VoteType::Precommit);
+
+        let a_precommit = peer_vote(&v.a_kp, VoteType::Precommit, 1, 1, round1_hash.clone());
+        assert_eq!(self_engine.add_vote(&v.self_kp, a_precommit).unwrap(), None);
+        let b_precommit = peer_vote(&v.b_kp, VoteType::Precommit, 1, 1, round1_hash.clone());
+        let finalized = self_engine
+            .add_vote(&v.self_kp, b_precommit)
+            .unwrap()
+            .expect("round-1 precommit quorum must finalize the block");
+        assert_eq!(finalized.hash(), round1_hash);
+        assert_eq!(self_engine.current_height(), 1);
+        assert_eq!(self_engine.last_committed_round(), Some(1));
+    }
+
+    /// A round-0 proposal arriving *after* this node already joined round 1
+    /// (e.g. a slow/duplicate gossip delivery of the original, now-stale
+    /// proposal) must not clobber the round-1 state it's already tracking.
+    #[test]
+    fn stale_round_proposal_after_advance_is_ignored() {
+        let v = four_validators();
+
+        let mut self_engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let _ = self_engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        let round0_block = self_engine.pending_proposal().unwrap().clone();
+        self_engine.take_outbound_votes();
+        for _ in 0..ROUND_TIMEOUT_TICKS {
+            self_engine.note_round_tick();
+        }
+        self_engine
+            .advance_round(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        let mut b_engine = BftEngine::new(v.validator_set, b_addr, 0);
+        b_engine.receive_proposal(&v.b_kp, 0, round0_block.clone()).unwrap();
+        for _ in 0..ROUND_TIMEOUT_TICKS {
+            b_engine.note_round_tick();
+        }
+        b_engine
+            .advance_round(&v.b_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        let round1_block = b_engine.pending_proposal().unwrap().clone();
+
+        self_engine.receive_proposal(&v.self_kp, 1, round1_block).unwrap();
+        self_engine.take_outbound_votes();
+        assert_eq!(self_engine.pending_proposal().map(|b| b.height()), Some(1));
+
+        // Re-deliver the stale round-0 proposal.
+        let result = self_engine.receive_proposal(&v.self_kp, 0, round0_block).unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            self_engine.take_outbound_votes().len(),
+            0,
+            "stale round-0 proposal must not cast a new vote or reset round-1 state"
+        );
     }
 }

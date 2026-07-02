@@ -337,7 +337,7 @@ This makes HLX deflationary by design: every transaction reduces supply.
 | `helix-executor` | Transaction execution, account state, genesis, fee distribution |
 | `helix-consensus` | PoS + BFT engine, validator set rotation, slashing |
 | `helix-mempool` | Fee-prioritized pool — sorts by (sender, nonce) within fee tier |
-| `helix-storage` | In-memory block store (MemBlockStore) |
+| `helix-storage` | Persistent redb-backed block + chain-state store (`HelixDb`) |
 | `helix-p2p` | libp2p networking: gossipsub + mDNS discovery |
 | `helix-identity` | Proof of Personhood, human-readable names, social recovery |
 | `helix-rpc` | Axum REST API server (`:8545`) |
@@ -389,6 +389,7 @@ This makes HLX deflationary by design: every transaction reduces supply.
 
 ### 📋 Phase 7 — Production Hardening
 - [x] Persistent block storage (redb on disk)
+- [x] BFT round-timeout — a stalled round (no quorum within 3 block-time ticks) auto-advances to the next round-robin proposer instead of halting the chain
 - [ ] ML-KEM transport encryption (quantum-secure P2P)
 - [ ] ZK-STARK integration (privacy + Proof of Personhood)
 - [ ] Quantum algorithm migration protocol

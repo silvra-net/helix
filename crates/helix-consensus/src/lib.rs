@@ -1,12 +1,14 @@
 pub mod engine;
 pub mod evidence;
+pub mod proposal;
 pub mod round;
 pub mod validator;
 pub mod vote;
 pub mod vote_set;
 
-pub use engine::BftEngine;
+pub use engine::{BftEngine, ROUND_TIMEOUT_TICKS};
 pub use evidence::DoubleSignEvidence;
+pub use proposal::Proposal;
 pub use round::{RoundPhase, RoundState};
 pub use validator::{Validator, ValidatorSet};
 pub use vote::{Vote, VoteType};
