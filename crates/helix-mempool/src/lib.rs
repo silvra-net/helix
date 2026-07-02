@@ -74,6 +74,10 @@ impl Mempool {
 
     /// Take up to `max_count` highest-fee transactions for block inclusion.
     /// Does NOT remove them — call `remove_committed` after the block is finalized.
+    ///
+    /// TXs are sorted by (sender, nonce) after the fee-priority pass so that a
+    /// sender's sequential nonces always land in the correct order in the block.
+    /// Without this, nonce N+1 arriving before N would be dropped by the executor.
     pub fn take(&self, max_count: usize) -> Vec<Transaction> {
         let mut result = Vec::with_capacity(max_count);
         'outer: for hashes in self.by_fee.values() {
@@ -86,6 +90,10 @@ impl Mempool {
                 }
             }
         }
+        // Within a sender, nonces must be strictly ascending — sort to guarantee that.
+        result.sort_by(|a, b| {
+            a.from.to_string().cmp(&b.from.to_string()).then_with(|| a.nonce.cmp(&b.nonce))
+        });
         result
     }
 
@@ -151,21 +159,30 @@ mod tests {
 
     #[test]
     fn test_add_and_take() {
-        let kp = KeyPair::generate();
+        let kp1 = KeyPair::generate();
+        let kp2 = KeyPair::generate();
         let mut pool = Mempool::new();
 
-        let tx1 = make_tx(&kp, 5_000, 0);
-        let tx2 = make_tx(&kp, 10_000, 1);
+        // Two TXs from same sender — must come out in nonce order (not fee order)
+        let tx_lo = make_tx(&kp1, 5_000, 0);
+        let tx_hi = make_tx(&kp1, 10_000, 1);
+        pool.add(tx_lo).unwrap();
+        pool.add(tx_hi).unwrap();
 
-        pool.add(tx1).unwrap();
-        pool.add(tx2).unwrap();
+        // TX from a second sender (higher fee) also in pool
+        let tx_other = make_tx(&kp2, 20_000, 0);
+        pool.add(tx_other).unwrap();
 
-        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.len(), 3);
 
         let taken = pool.take(10);
-        // Higher fee comes first
-        assert_eq!(taken[0].fee, 10_000);
-        assert_eq!(taken[1].fee, 5_000);
+        assert_eq!(taken.len(), 3);
+
+        // kp1's TXs must be consecutive and nonce-ordered (0 before 1)
+        let kp1_addr = Address::from_public_key(&kp1.public).to_string();
+        let kp1_taken: Vec<_> = taken.iter().filter(|t| t.from.to_string() == kp1_addr).collect();
+        assert_eq!(kp1_taken[0].nonce, 0);
+        assert_eq!(kp1_taken[1].nonce, 1);
     }
 
     #[test]
@@ -174,6 +191,20 @@ mod tests {
         let mut pool = Mempool::new();
         let tx = make_tx(&kp, 500, 0); // below 1000 min
         assert!(matches!(pool.add(tx), Err(MempoolError::FeeTooLow { .. })));
+    }
+
+    #[test]
+    fn test_nonce_ordering_preserved() {
+        // Submitting nonces out of order should still produce them sorted in take()
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        // Insert nonce 2 first, then 0, then 1 — all same fee
+        for nonce in [2u64, 0, 1] {
+            pool.add(make_tx(&kp, 5_000, nonce)).unwrap();
+        }
+        let taken = pool.take(10);
+        assert_eq!(taken.iter().map(|t| t.nonce).collect::<Vec<_>>(), vec![0, 1, 2]);
     }
 
     #[test]
