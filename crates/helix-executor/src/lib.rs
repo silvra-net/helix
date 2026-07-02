@@ -7,8 +7,8 @@ pub use receipt::{BlockReceipt, Receipt};
 pub use state::{AccountState, ChainState};
 
 use helix_core::{transaction::TxType, Block, Transaction};
-use helix_crypto::{Address, Hash};
-use helix_identity::HelixName;
+use helix_crypto::{Address, Hash, PublicKey};
+use helix_identity::{GuardianSet, HelixName, RecoveryRequest};
 use thiserror::Error;
 
 pub use helix_identity::{PersonhoodError, PersonhoodStatus};
@@ -67,7 +67,7 @@ pub fn execute_transaction(
     let tx_hash = tx.hash();
 
     // Signature check first — fee is still charged on nonce/balance failure
-    if tx.verify_signature().is_err() {
+    if !verify_tx_signature(state, tx) {
         return Receipt::failure(tx_hash, "invalid signature", 0, 0);
     }
 
@@ -77,10 +77,27 @@ pub fn execute_transaction(
         TxType::Unstake => execute_unstake(state, tx, validator, tx_hash),
         TxType::RegisterName => execute_register_name(state, tx, validator, tx_hash),
         TxType::RegisterIdentity => execute_register_identity(state, tx, validator, tx_hash, height),
+        TxType::RegisterGuardians => execute_register_guardians(state, tx, validator, tx_hash),
+        TxType::ApproveRecovery => execute_approve_recovery(state, tx, validator, tx_hash),
         TxType::DeployContract | TxType::CallContract => {
             // WASM VM is Phase 4 — accept and charge fee, no state change yet
             charge_fee_only(state, tx, validator, tx_hash)
         }
+    }
+}
+
+/// Verify a transaction's signature, accounting for social recovery: if `tx.from`'s
+/// control was ever rotated by guardian quorum (see [`execute_approve_recovery`]), the
+/// active override key must have produced the signature — the address no longer needs to
+/// derive from `tx.public_key`, since that's the whole point of a recovered account.
+/// Otherwise this falls back to the normal address-derivation + ML-DSA check.
+fn verify_tx_signature(state: &ChainState, tx: &Transaction) -> bool {
+    match state.recovery_key(&tx.from) {
+        Some(active_key) => {
+            tx.public_key.as_bytes() == active_key.as_bytes()
+                && helix_crypto::verify(active_key, tx.signing_hash().as_bytes(), &tx.signature).is_ok()
+        }
+        None => tx.verify_signature().is_ok(),
     }
 }
 
@@ -261,6 +278,137 @@ fn execute_register_identity(
         Err(e) => return Receipt::failure(tx_hash, &e.to_string(), 0, 0),
     };
     state.set_personhood_status(&attestee, updated);
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// Owner registers (or replaces) their social-recovery guardian set. `tx.data` is a
+/// newline-separated list of guardian address strings. Blocked while a recovery vote is
+/// in progress, so guardians can't be swapped out mid-recovery to sabotage a quorum.
+fn execute_register_guardians(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+    if state.recovery_request(&tx.from).is_some() {
+        return Receipt::failure(
+            tx_hash,
+            "cannot change guardians while a recovery request is pending",
+            0,
+            0,
+        );
+    }
+
+    let raw = match std::str::from_utf8(&tx.data) {
+        Ok(s) => s,
+        Err(_) => return Receipt::failure(tx_hash, "guardian payload is not valid UTF-8", 0, 0),
+    };
+    let mut guardians = Vec::new();
+    for line in raw.lines().filter(|l| !l.is_empty()) {
+        match Address::from_str(line) {
+            Ok(addr) => guardians.push(addr),
+            Err(e) => {
+                return Receipt::failure(tx_hash, &format!("invalid guardian address: {e}"), 0, 0)
+            }
+        }
+    }
+
+    let set = match GuardianSet::new(&tx.from, guardians) {
+        Ok(s) => s,
+        Err(e) => return Receipt::failure(tx_hash, &e.to_string(), 0, 0),
+    };
+    state.set_guardians(&tx.from, set);
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// A registered guardian (`tx.from`) approves rotating `tx.to`'s controlling public key to
+/// the one carried in `tx.data`. Once `threshold` (3-of-5) distinct guardians approve the
+/// *same* key, it becomes the address's active recovery override (see
+/// [`verify_tx_signature`]) — from that point on, only that key can sign for the address.
+/// Approving a different key than the one currently pending restarts the vote.
+fn execute_approve_recovery(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+
+    let Some(target) = tx.to.clone() else {
+        return Receipt::failure(
+            tx_hash,
+            "recovery approval requires a target address (tx.to)",
+            0,
+            0,
+        );
+    };
+
+    let Some(guardian_set) = state.guardians(&target) else {
+        return Receipt::failure(tx_hash, "target address has no registered guardians", 0, 0);
+    };
+    if !guardian_set.contains(&tx.from) {
+        return Receipt::failure(
+            tx_hash,
+            "sender is not a registered guardian for this address",
+            0,
+            0,
+        );
+    }
+    let threshold = guardian_set.threshold();
+
+    let new_key = PublicKey::from_bytes(tx.data.clone());
+    if !new_key.is_valid() {
+        return Receipt::failure(tx_hash, "proposed public key is not a valid ML-DSA key", 0, 0);
+    }
+
+    let mut request = state
+        .recovery_request(&target)
+        .filter(|r| r.new_public_key == new_key)
+        .cloned()
+        .unwrap_or_else(|| RecoveryRequest::new(new_key.clone()));
+
+    let finalized = match request.approve(tx.from.clone(), threshold) {
+        Ok(reached) => reached,
+        Err(e) => return Receipt::failure(tx_hash, &e.to_string(), 0, 0),
+    };
+
+    if finalized {
+        state.set_recovery_key(&target, new_key);
+        state.clear_recovery_request(&target);
+    } else {
+        state.set_recovery_request(&target, request);
+    }
 
     state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
@@ -473,5 +621,197 @@ mod tests {
         let tx = signed_attest_tx(&attester_kp, &attester, &attestee, 0, 10_000);
         let receipt = execute_transaction(&mut state, &tx, &validator, 10);
         assert!(!receipt.success);
+    }
+
+    fn signed_register_guardians_tx(
+        kp: &KeyPair,
+        from: &Address,
+        guardians: &[Address],
+        nonce: u64,
+        fee: u64,
+    ) -> Transaction {
+        let data = guardians
+            .iter()
+            .map(|g| g.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::RegisterGuardians,
+            from: from.clone(),
+            to: None,
+            amount: 0,
+            fee,
+            nonce,
+            data,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    fn signed_approve_recovery_tx(
+        kp: &KeyPair,
+        from: &Address,
+        target: &Address,
+        new_public_key: &helix_crypto::PublicKey,
+        nonce: u64,
+        fee: u64,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::ApproveRecovery,
+            from: from.clone(),
+            to: Some(target.clone()),
+            amount: 0,
+            fee,
+            nonce,
+            data: new_public_key.as_bytes().to_vec(),
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn register_guardians_succeeds_with_valid_set() {
+        let owner_kp = KeyPair::generate();
+        let owner = Address::from_public_key(&owner_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&owner, |acc| acc.balance = 1_000_000);
+
+        let guardians: Vec<Address> = (0..5)
+            .map(|_| Address::from_public_key(&KeyPair::generate().public))
+            .collect();
+        let tx = signed_register_guardians_tx(&owner_kp, &owner, &guardians, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.guardians(&owner).unwrap().guardians.len(), 5);
+        assert_eq!(state.guardians(&owner).unwrap().threshold(), 3);
+    }
+
+    #[test]
+    fn register_guardians_rejects_too_few() {
+        let owner_kp = KeyPair::generate();
+        let owner = Address::from_public_key(&owner_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&owner, |acc| acc.balance = 1_000_000);
+
+        let guardians: Vec<Address> = (0..2)
+            .map(|_| Address::from_public_key(&KeyPair::generate().public))
+            .collect();
+        let tx = signed_register_guardians_tx(&owner_kp, &owner, &guardians, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success);
+        assert!(state.guardians(&owner).is_none());
+    }
+
+    #[test]
+    fn recovery_quorum_rotates_control_and_old_key_stops_working() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let owner_kp = KeyPair::generate();
+        let owner = Address::from_public_key(&owner_kp.public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&owner, |acc| acc.balance = 1_000_000);
+
+        let guardian_kps: Vec<KeyPair> = (0..5).map(|_| KeyPair::generate()).collect();
+        let guardian_addrs: Vec<Address> = guardian_kps
+            .iter()
+            .map(|kp| Address::from_public_key(&kp.public))
+            .collect();
+        for addr in &guardian_addrs {
+            state.update_account(addr, |acc| acc.balance = 1_000_000);
+        }
+
+        let reg_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 0, 10_000);
+        assert!(execute_transaction(&mut state, &reg_tx, &validator, 0).success);
+
+        // Owner loses their key; guardians agree on a new one.
+        let new_kp = KeyPair::generate();
+
+        // 2 of 5 approvals — below the 3-of-5 threshold, no rotation yet.
+        for i in 0..2 {
+            let tx = signed_approve_recovery_tx(
+                &guardian_kps[i],
+                &guardian_addrs[i],
+                &owner,
+                &new_kp.public,
+                0,
+                10_000,
+            );
+            let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+            assert!(receipt.success, "approval {i} failed: {:?}", receipt.error);
+        }
+        assert!(state.recovery_key(&owner).is_none());
+
+        // 3rd approval reaches threshold — control rotates.
+        let tx = signed_approve_recovery_tx(
+            &guardian_kps[2],
+            &guardian_addrs[2],
+            &owner,
+            &new_kp.public,
+            0,
+            10_000,
+        );
+        assert!(execute_transaction(&mut state, &tx, &validator, 1).success);
+        assert!(state.recovery_key(&owner).is_some());
+
+        // Old key can no longer sign for this address.
+        let old_key_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 1, 10_000);
+        let receipt = execute_transaction(&mut state, &old_key_tx, &validator, 2);
+        assert!(!receipt.success, "old key should no longer control the account");
+
+        // New key now controls the address.
+        let mut transfer_tx = Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: owner.clone(),
+            to: Some(guardian_addrs[0].clone()),
+            amount: 100,
+            fee: 10_000,
+            nonce: 1,
+            data: vec![],
+            signature: Signature::from_bytes(vec![]),
+            public_key: new_kp.public.clone(),
+        };
+        transfer_tx.signature = new_kp.sign(transfer_tx.signing_hash().as_bytes()).unwrap();
+        let receipt = execute_transaction(&mut state, &transfer_tx, &validator, 3);
+        assert!(receipt.success, "new key should control the account: {:?}", receipt.error);
+    }
+
+    #[test]
+    fn approve_recovery_rejects_non_guardian() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let owner_kp = KeyPair::generate();
+        let owner = Address::from_public_key(&owner_kp.public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&owner, |acc| acc.balance = 1_000_000);
+
+        let guardian_addrs: Vec<Address> = (0..5)
+            .map(|_| Address::from_public_key(&KeyPair::generate().public))
+            .collect();
+        let reg_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 0, 10_000);
+        assert!(execute_transaction(&mut state, &reg_tx, &validator, 0).success);
+
+        let outsider_kp = KeyPair::generate();
+        let outsider = Address::from_public_key(&outsider_kp.public);
+        state.update_account(&outsider, |acc| acc.balance = 1_000_000);
+
+        let new_kp = KeyPair::generate();
+        let tx = signed_approve_recovery_tx(&outsider_kp, &outsider, &owner, &new_kp.public, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+        assert!(!receipt.success);
+        assert!(state.recovery_key(&owner).is_none());
     }
 }

@@ -52,6 +52,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::identity::IdentityCmd,
     },
+    /// Social recovery wallets (guardian quorum key rotation)
+    Recovery {
+        #[command(subcommand)]
+        action: commands::recovery::RecoveryCmd,
+    },
 }
 
 #[tokio::main]
@@ -66,5 +71,6 @@ async fn main() -> Result<()> {
         Commands::Tx { action } => commands::tx::run(action, &node).await,
         Commands::Name { action } => commands::name::run(action, &node).await,
         Commands::Identity { action } => commands::identity::run(action, &node).await,
+        Commands::Recovery { action } => commands::recovery::run(action, &node).await,
     }
 }

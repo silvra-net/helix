@@ -1,8 +1,10 @@
 pub mod name;
 pub mod personhood;
+pub mod recovery;
 
 pub use name::{HelixName, NameError};
 pub use personhood::{PersonhoodError, PersonhoodProof, PersonhoodStatus, ATTESTATION_THRESHOLD};
+pub use recovery::{GuardianSet, RecoveryError, RecoveryRequest, MAX_GUARDIANS, MIN_GUARDIANS};
 
 use helix_crypto::Address;
 

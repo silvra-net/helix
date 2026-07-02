@@ -16,6 +16,10 @@ pub enum TxType {
     RegisterIdentity,
     /// Register a human-readable name (e.g. `alice.hlx`)
     RegisterName,
+    /// Register (or replace) an address's social-recovery guardian set
+    RegisterGuardians,
+    /// A guardian approves rotating another address's controlling public key
+    ApproveRecovery,
     /// Deploy a WASM smart contract
     DeployContract,
     /// Call a deployed smart contract

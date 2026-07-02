@@ -35,6 +35,11 @@ impl PublicKey {
         let h = Hash::digest(&self.0);
         hex::encode(&h.as_bytes()[..8])
     }
+
+    /// True if these bytes parse as a structurally valid ML-DSA (Dilithium3) public key.
+    pub fn is_valid(&self) -> bool {
+        dilithium3::PublicKey::from_bytes(&self.0).is_ok()
+    }
 }
 
 impl fmt::Debug for PublicKey {

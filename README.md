@@ -153,6 +153,11 @@ hlx name resolve <name>                  # Resolve a name to its address
 hlx identity attest <address> [--key wallet.json] [--fee <nano_hlx>]  # Attest a human
 hlx identity status <address>            # Show personhood verification status
 
+# Social recovery (3-of-5 guardians)
+hlx recovery register-guardians <addr>... [--key wallet.json] [--fee <nano_hlx>]  # Set guardians
+hlx recovery approve <target> <new_pubkey_hex> [--key wallet.json] [--fee <nano_hlx>]  # Guardian vote
+hlx recovery status <address>            # Show guardian set & pending recovery vote
+
 # Options (global)
 --node http://127.0.0.1:8545             # Override RPC node
 ```
@@ -186,6 +191,8 @@ All endpoints return JSON. Base URL: `http://127.0.0.1:8545`
 | GET | `/accounts/:address` | Account balance, nonce, stake |
 | GET | `/accounts/:address/name` | Registered name for an address |
 | GET | `/accounts/:address/personhood` | Proof of Personhood status for an address |
+| GET | `/accounts/:address/guardians` | Registered social-recovery guardians for an address |
+| GET | `/accounts/:address/recovery` | Pending/active social-recovery status for an address |
 | GET | `/names/:name` | Resolve a name to its owning address |
 | GET | `/mempool` | Pending transaction count |
 | POST | `/transactions` | Submit a signed transaction |
@@ -256,7 +263,7 @@ Example: hlxfd5oBCzmDnBJZSKFm3PHA4nyyTK6ueQo3
 - [x] BFT consensus engine (single-validator devnet)
 - [x] Block production loop (2s block time)
 - [x] Fee-prioritized mempool
-- [x] Axum REST API (7 endpoints)
+- [x] Axum REST API (11 endpoints)
 
 ### ✅ Phase 3 — State Machine
 - [x] Transaction execution (Transfer, Stake, Unstake)
@@ -282,7 +289,7 @@ Example: hlxfd5oBCzmDnBJZSKFm3PHA4nyyTK6ueQo3
 - [x] Non-proposer validators join a round from a peer-broadcast proposal
 - [x] Proof of Personhood (social attestation)
 - [x] Human-readable names (`alice.hlx`)
-- [ ] Social recovery wallets (3-of-5 guardians)
+- [x] Social recovery wallets (3-of-5 guardians)
 
 ### 📋 Phase 6 — Smart Contracts
 - [ ] WASM VM integration

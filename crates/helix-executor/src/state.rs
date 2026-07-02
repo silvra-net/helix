@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use helix_crypto::Address;
-use helix_identity::PersonhoodStatus;
+use helix_crypto::{Address, PublicKey};
+use helix_identity::{GuardianSet, PersonhoodStatus, RecoveryRequest};
 use serde::{Deserialize, Serialize};
 
 /// Per-account ledger state
@@ -48,6 +48,13 @@ pub struct ChainState {
     pub names: HashMap<String, String>,
     /// Proof of Personhood status per address string. Absent entries are `Unverified`.
     pub personhood: HashMap<String, PersonhoodStatus>,
+    /// Registered social-recovery guardians per address string. Absent = no guardians.
+    pub guardians: HashMap<String, GuardianSet>,
+    /// In-progress guardian approval votes to rotate an address's controlling key.
+    pub recovery_requests: HashMap<String, RecoveryRequest>,
+    /// Active recovery override key per address string. Once set, this key (not the one
+    /// the address was originally derived from) must produce transaction signatures for it.
+    pub recovery_keys: HashMap<String, PublicKey>,
 }
 
 impl ChainState {
@@ -58,6 +65,9 @@ impl ChainState {
             total_burned: 0,
             names: HashMap::new(),
             personhood: HashMap::new(),
+            guardians: HashMap::new(),
+            recovery_requests: HashMap::new(),
+            recovery_keys: HashMap::new(),
         }
     }
 
@@ -139,6 +149,38 @@ impl ChainState {
 
     pub fn has_personhood(&self, address: &Address) -> bool {
         self.personhood_status(address).is_verified()
+    }
+
+    /// The social-recovery guardian set registered for `address`, if any.
+    pub fn guardians(&self, address: &Address) -> Option<&GuardianSet> {
+        self.guardians.get(&address.to_string())
+    }
+
+    pub fn set_guardians(&mut self, address: &Address, set: GuardianSet) {
+        self.guardians.insert(address.to_string(), set);
+    }
+
+    /// The in-progress guardian approval vote for recovering `address`, if any.
+    pub fn recovery_request(&self, address: &Address) -> Option<&RecoveryRequest> {
+        self.recovery_requests.get(&address.to_string())
+    }
+
+    pub fn set_recovery_request(&mut self, address: &Address, request: RecoveryRequest) {
+        self.recovery_requests.insert(address.to_string(), request);
+    }
+
+    pub fn clear_recovery_request(&mut self, address: &Address) {
+        self.recovery_requests.remove(&address.to_string());
+    }
+
+    /// The active guardian-recovered public key for `address`, if its control was ever
+    /// socially recovered. `None` means the address is still controlled by its original key.
+    pub fn recovery_key(&self, address: &Address) -> Option<&PublicKey> {
+        self.recovery_keys.get(&address.to_string())
+    }
+
+    pub fn set_recovery_key(&mut self, address: &Address, key: PublicKey) {
+        self.recovery_keys.insert(address.to_string(), key);
     }
 
     /// Addresses with a nonzero staked amount — candidates for the next validator epoch.

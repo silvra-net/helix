@@ -53,6 +53,23 @@ pub struct PersonhoodResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardianResponse {
+    pub address: String,
+    pub guardians: Vec<String>,
+    pub threshold: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryStatusResponse {
+    pub address: String,
+    /// Currently controlling public key fingerprint, if control was ever socially recovered.
+    pub recovered_key_fingerprint: Option<String>,
+    /// Guardian approvals collected so far for a pending recovery vote, if any.
+    pub pending_approvals: Option<usize>,
+    pub threshold: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub version: String,
     pub height: u64,

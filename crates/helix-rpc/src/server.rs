@@ -18,7 +18,10 @@ use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use crate::{AccountResponse, BlockResponse, NameResponse, NodeStatus, PersonhoodResponse};
+use crate::{
+    AccountResponse, BlockResponse, GuardianResponse, NameResponse, NodeStatus,
+    PersonhoodResponse, RecoveryStatusResponse,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -39,6 +42,8 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/accounts/:address", get(get_account))
         .route("/accounts/:address/name", get(get_account_name))
         .route("/accounts/:address/personhood", get(get_account_personhood))
+        .route("/accounts/:address/guardians", get(get_account_guardians))
+        .route("/accounts/:address/recovery", get(get_account_recovery))
         .route("/names/:name", get(resolve_name))
         .route("/mempool", get(get_mempool_info))
         .route("/transactions", post(submit_transaction))
@@ -64,6 +69,8 @@ async fn root() -> Json<Value> {
             "GET  /accounts/{address}",
             "GET  /accounts/{address}/name",
             "GET  /accounts/{address}/personhood",
+            "GET  /accounts/{address}/guardians",
+            "GET  /accounts/{address}/recovery",
             "GET  /names/{name}",
             "GET  /mempool",
             "POST /transactions"
@@ -220,6 +227,69 @@ async fn get_account_personhood(
         Json(json!(PersonhoodResponse {
             address: address_str,
             status,
+        })),
+    )
+}
+
+async fn get_account_guardians(
+    State(state): State<AppState>,
+    Path(address_str): Path<String>,
+) -> impl IntoResponse {
+    let address = match Address::from_str(&address_str) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid address format" })),
+            )
+        }
+    };
+    let chain = state.chain_state.read().await;
+    match chain.guardians(&address) {
+        Some(set) => (
+            StatusCode::OK,
+            Json(json!(GuardianResponse {
+                address: address_str,
+                guardians: set.guardians.iter().map(|g| g.to_string()).collect(),
+                threshold: set.threshold(),
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no guardians registered for {}", address_str) })),
+        ),
+    }
+}
+
+async fn get_account_recovery(
+    State(state): State<AppState>,
+    Path(address_str): Path<String>,
+) -> impl IntoResponse {
+    let address = match Address::from_str(&address_str) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid address format" })),
+            )
+        }
+    };
+    let chain = state.chain_state.read().await;
+    let recovered_key_fingerprint = chain.recovery_key(&address).map(|k| k.fingerprint());
+    let (pending_approvals, threshold) = match chain.recovery_request(&address) {
+        Some(req) => (
+            Some(req.approvals.len()),
+            chain.guardians(&address).map(|g| g.threshold()),
+        ),
+        None => (None, None),
+    };
+    (
+        StatusCode::OK,
+        Json(json!(RecoveryStatusResponse {
+            address: address_str,
+            recovered_key_fingerprint,
+            pending_approvals,
+            threshold,
         })),
     )
 }
