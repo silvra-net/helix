@@ -47,6 +47,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::name::NameCmd,
     },
+    /// Proof of Personhood identity attestation
+    Identity {
+        #[command(subcommand)]
+        action: commands::identity::IdentityCmd,
+    },
 }
 
 #[tokio::main]
@@ -60,5 +65,6 @@ async fn main() -> Result<()> {
         Commands::Account { address } => commands::chain::show_account(&address, &node).await,
         Commands::Tx { action } => commands::tx::run(action, &node).await,
         Commands::Name { action } => commands::name::run(action, &node).await,
+        Commands::Identity { action } => commands::identity::run(action, &node).await,
     }
 }

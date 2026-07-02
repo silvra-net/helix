@@ -145,6 +145,14 @@ hlx tx send <address> <amount_hlx>       # Send HLX
   --fee <nano_hlx>                       # Custom fee (default: 10000)
 hlx tx status <hash>                     # Transaction status
 
+# Names
+hlx name register <name> [--key wallet.json] [--fee <nano_hlx>]  # Register alice.hlx
+hlx name resolve <name>                  # Resolve a name to its address
+
+# Proof of Personhood
+hlx identity attest <address> [--key wallet.json] [--fee <nano_hlx>]  # Attest a human
+hlx identity status <address>            # Show personhood verification status
+
 # Options (global)
 --node http://127.0.0.1:8545             # Override RPC node
 ```
@@ -176,6 +184,9 @@ All endpoints return JSON. Base URL: `http://127.0.0.1:8545`
 | GET | `/blocks/height/:n` | Block by height |
 | GET | `/blocks/hash/:hash` | Block by hash |
 | GET | `/accounts/:address` | Account balance, nonce, stake |
+| GET | `/accounts/:address/name` | Registered name for an address |
+| GET | `/accounts/:address/personhood` | Proof of Personhood status for an address |
+| GET | `/names/:name` | Resolve a name to its owning address |
 | GET | `/mempool` | Pending transaction count |
 | POST | `/transactions` | Submit a signed transaction |
 
@@ -269,7 +280,7 @@ Example: hlxfd5oBCzmDnBJZSKFm3PHA4nyyTK6ueQo3
 - [x] Slashing on double-signing (evidence detection + stake burn)
 - [x] P2P vote propagation between peers
 - [x] Non-proposer validators join a round from a peer-broadcast proposal
-- [ ] Proof of Personhood (social attestation)
+- [x] Proof of Personhood (social attestation)
 - [x] Human-readable names (`alice.hlx`)
 - [ ] Social recovery wallets (3-of-5 guardians)
 

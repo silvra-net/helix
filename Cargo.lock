@@ -1215,6 +1215,7 @@ dependencies = [
  "helix-core",
  "helix-crypto",
  "helix-executor",
+ "helix-identity",
  "helix-mempool",
  "helix-storage",
  "serde",

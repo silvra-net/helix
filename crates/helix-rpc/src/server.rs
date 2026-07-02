@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use crate::{AccountResponse, BlockResponse, NameResponse, NodeStatus};
+use crate::{AccountResponse, BlockResponse, NameResponse, NodeStatus, PersonhoodResponse};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +38,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/blocks/hash/:hash", get(get_block_by_hash))
         .route("/accounts/:address", get(get_account))
         .route("/accounts/:address/name", get(get_account_name))
+        .route("/accounts/:address/personhood", get(get_account_personhood))
         .route("/names/:name", get(resolve_name))
         .route("/mempool", get(get_mempool_info))
         .route("/transactions", post(submit_transaction))
@@ -62,6 +63,7 @@ async fn root() -> Json<Value> {
             "GET  /blocks/hash/{hash}",
             "GET  /accounts/{address}",
             "GET  /accounts/{address}/name",
+            "GET  /accounts/{address}/personhood",
             "GET  /names/{name}",
             "GET  /mempool",
             "POST /transactions"
@@ -196,6 +198,30 @@ async fn get_account_name(
             Json(json!({ "error": format!("no name registered for {}", address_str) })),
         ),
     }
+}
+
+async fn get_account_personhood(
+    State(state): State<AppState>,
+    Path(address_str): Path<String>,
+) -> impl IntoResponse {
+    let address = match Address::from_str(&address_str) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid address format" })),
+            )
+        }
+    };
+    let chain = state.chain_state.read().await;
+    let status = chain.personhood_status(&address);
+    (
+        StatusCode::OK,
+        Json(json!(PersonhoodResponse {
+            address: address_str,
+            status,
+        })),
+    )
 }
 
 async fn get_mempool_info(State(state): State<AppState>) -> Json<Value> {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use helix_crypto::Address;
+use helix_identity::PersonhoodStatus;
 use serde::{Deserialize, Serialize};
 
 /// Per-account ledger state
@@ -45,6 +46,8 @@ pub struct ChainState {
     pub total_burned: u64,
     /// Registered human-readable names (without the `.hlx` suffix) → owning address string.
     pub names: HashMap<String, String>,
+    /// Proof of Personhood status per address string. Absent entries are `Unverified`.
+    pub personhood: HashMap<String, PersonhoodStatus>,
 }
 
 impl ChainState {
@@ -54,6 +57,7 @@ impl ChainState {
             total_supply,
             total_burned: 0,
             names: HashMap::new(),
+            personhood: HashMap::new(),
         }
     }
 
@@ -119,6 +123,22 @@ impl ChainState {
             .iter()
             .find(|(_, owner)| **owner == addr)
             .map(|(name, _)| name.as_str())
+    }
+
+    /// Proof of Personhood status for an address. Defaults to `Unverified` if unknown.
+    pub fn personhood_status(&self, address: &Address) -> PersonhoodStatus {
+        self.personhood
+            .get(&address.to_string())
+            .cloned()
+            .unwrap_or(PersonhoodStatus::Unverified)
+    }
+
+    pub fn set_personhood_status(&mut self, address: &Address, status: PersonhoodStatus) {
+        self.personhood.insert(address.to_string(), status);
+    }
+
+    pub fn has_personhood(&self, address: &Address) -> bool {
+        self.personhood_status(address).is_verified()
     }
 
     /// Addresses with a nonzero staked amount — candidates for the next validator epoch.

@@ -47,6 +47,12 @@ pub struct NameResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonhoodResponse {
+    pub address: String,
+    pub status: helix_identity::PersonhoodStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub version: String,
     pub height: u64,

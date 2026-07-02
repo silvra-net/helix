@@ -2,7 +2,7 @@ pub mod name;
 pub mod personhood;
 
 pub use name::{HelixName, NameError};
-pub use personhood::{PersonhoodProof, PersonhoodStatus};
+pub use personhood::{PersonhoodError, PersonhoodProof, PersonhoodStatus, ATTESTATION_THRESHOLD};
 
 use helix_crypto::Address;
 

@@ -11,6 +11,7 @@ const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks");
 const HEIGHT_IDX: TableDefinition<u64, &[u8]> = TableDefinition::new("height_index");
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
 const NAMES: TableDefinition<&str, &str> = TableDefinition::new("names");
+const PERSONHOOD: TableDefinition<&str, &[u8]> = TableDefinition::new("personhood");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const META_HEIGHT: &str = "latest_height";
@@ -30,6 +31,7 @@ impl HelixDb {
         tx.open_table(HEIGHT_IDX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(ACCOUNTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(NAMES).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(PERSONHOOD).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
         Ok(HelixDb { db })
@@ -42,6 +44,7 @@ impl HelixDb {
         {
             let mut accounts = tx.open_table(ACCOUNTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut names = tx.open_table(NAMES).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut personhood = tx.open_table(PERSONHOOD).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
             for (addr, account) in &state.accounts {
@@ -54,6 +57,12 @@ impl HelixDb {
                 names.insert(name.as_str(), owner.as_str())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            for (addr, status) in &state.personhood {
+                let encoded = bincode::serialize(status)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                personhood.insert(addr.as_str(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
             meta.insert(META_BURNED, &state.total_burned.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
         }
@@ -64,6 +73,7 @@ impl HelixDb {
         let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
         let accounts_table = tx.open_table(ACCOUNTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let names_table = tx.open_table(NAMES).map_err(|e| StorageError::Db(e.to_string()))?;
+        let personhood_table = tx.open_table(PERSONHOOD).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
         let mut accounts = std::collections::HashMap::new();
@@ -82,6 +92,15 @@ impl HelixDb {
             names.insert(k.value().to_string(), v.value().to_string());
         }
 
+        let mut personhood = std::collections::HashMap::new();
+        let mut personhood_iter = personhood_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = personhood_iter.next() {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let status = bincode::deserialize(v.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            personhood.insert(k.value().to_string(), status);
+        }
+
         let total_burned = meta_table
             .get(META_BURNED)
             .ok()
@@ -92,7 +111,7 @@ impl HelixDb {
             })
             .unwrap_or(0);
 
-        Ok(ChainState { accounts, total_supply, total_burned, names })
+        Ok(ChainState { accounts, total_supply, total_burned, names, personhood })
     }
 
     pub fn get_account(&self, address: &str) -> StorageResult<Option<AccountState>> {
