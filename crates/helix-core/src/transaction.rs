@@ -68,6 +68,14 @@ impl Transaction {
     }
 
     pub fn verify_signature(&self) -> CryptoResult<()> {
+        // The attached public key must actually derive the claimed sender address —
+        // otherwise anyone could sign with their own key while setting `from` to a
+        // victim's address, since the ML-DSA check alone only proves key possession.
+        if Address::from_public_key(&self.public_key) != self.from {
+            return Err(helix_crypto::CryptoError::InvalidAddress(
+                "public key does not match sender address".to_string(),
+            ));
+        }
         let hash = self.signing_hash();
         helix_crypto::verify(&self.public_key, hash.as_bytes(), &self.signature)
     }
@@ -84,4 +92,45 @@ struct TxPayload<'a> {
     fee: Amount,
     nonce: u64,
     data: &'a [u8],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_crypto::KeyPair;
+
+    fn build_tx(from: Address, keypair: &KeyPair) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from,
+            to: None,
+            amount: 100,
+            fee: 1,
+            nonce: 0,
+            data: vec![],
+            signature: Signature::from_bytes(vec![]),
+            public_key: keypair.public.clone(),
+        };
+        tx.signature = keypair.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn verify_signature_accepts_matching_key_and_address() {
+        let keypair = KeyPair::generate();
+        let address = Address::from_public_key(&keypair.public);
+        let tx = build_tx(address, &keypair);
+        assert!(tx.verify_signature().is_ok());
+    }
+
+    #[test]
+    fn verify_signature_rejects_spoofed_from_address() {
+        // Attacker signs with their own key but claims a victim's address as `from`.
+        let attacker = KeyPair::generate();
+        let victim = KeyPair::generate();
+        let victim_address = Address::from_public_key(&victim.public);
+        let tx = build_tx(victim_address, &attacker);
+        assert!(tx.verify_signature().is_err());
+    }
 }
