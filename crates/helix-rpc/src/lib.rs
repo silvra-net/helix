@@ -8,6 +8,17 @@ use helix_core::Block;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxResponse {
+    pub hash: String,
+    pub from: String,
+    pub to: Option<String>,
+    pub amount_hlx: f64,
+    pub fee_hlx: f64,
+    pub tx_type: String,
+    pub nonce: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockResponse {
     pub hash: String,
     pub height: u64,
@@ -16,10 +27,24 @@ pub struct BlockResponse {
     pub validator: String,
     pub prev_hash: String,
     pub merkle_root: String,
+    pub transactions: Vec<TxResponse>,
 }
 
 impl From<Block> for BlockResponse {
     fn from(block: Block) -> Self {
+        let transactions = block
+            .transactions
+            .iter()
+            .map(|tx| TxResponse {
+                hash: tx.hash().to_hex(),
+                from: tx.from.to_string(),
+                to: tx.to.as_ref().map(|a| a.to_string()),
+                amount_hlx: tx.amount as f64 / 1_000_000_000.0,
+                fee_hlx: tx.fee as f64 / 1_000_000_000.0,
+                tx_type: format!("{:?}", tx.tx_type),
+                nonce: tx.nonce,
+            })
+            .collect();
         BlockResponse {
             hash: block.hash().to_hex(),
             height: block.height(),
@@ -28,6 +53,7 @@ impl From<Block> for BlockResponse {
             validator: block.header.validator.to_string(),
             prev_hash: block.header.prev_hash.to_hex(),
             merkle_root: block.header.merkle_root.to_hex(),
+            transactions,
         }
     }
 }

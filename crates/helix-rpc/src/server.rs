@@ -139,6 +139,12 @@ async fn get_account(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
+    if Address::from_str(&address).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid address format: {}", address) })),
+        );
+    }
     let chain = state.chain_state.read().await;
     match chain.accounts.get(&address) {
         Some(acc) => (
