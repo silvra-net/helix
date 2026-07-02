@@ -98,6 +98,11 @@ impl ChainState {
         self.update_account(address, |acc| acc.balance = balance);
     }
 
+    /// Set staked amount directly — used only in genesis to pre-stake the validator.
+    pub fn set_validator_stake(&mut self, address: &Address, staked: u64) {
+        self.update_account(address, |acc| acc.staked = staked);
+    }
+
     pub fn circulating_supply(&self) -> u64 {
         self.total_supply.saturating_sub(self.total_burned)
     }
@@ -183,11 +188,12 @@ impl ChainState {
         self.recovery_keys.insert(address.to_string(), key);
     }
 
-    /// Addresses with a nonzero staked amount — candidates for the next validator epoch.
+    /// Addresses that meet the minimum stake threshold — candidates for the next validator epoch.
     pub fn stakers(&self) -> Vec<(Address, u64)> {
+        use crate::genesis::MIN_VALIDATOR_STAKE;
         self.accounts
             .values()
-            .filter(|acc| acc.staked > 0)
+            .filter(|acc| acc.staked >= MIN_VALIDATOR_STAKE)
             .filter_map(|acc| Address::from_str(&acc.address).ok().map(|addr| (addr, acc.staked)))
             .collect()
     }

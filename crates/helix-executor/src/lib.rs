@@ -32,15 +32,24 @@ pub type ExecutionResult<T> = Result<T, ExecutionError>;
 /// Execute all transactions in a block, updating chain state in place.
 /// Skips invalid transactions (records failure in receipt) rather than
 /// reverting the whole block — validators earn fees even on failed txs.
-pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
+/// Execute all transactions in a block and distribute fees.
+///
+/// `reward_address` — where the validator's 50 % fee share lands.
+/// Falls back to the block's validator address when `None`.
+pub fn execute_block(
+    state: &mut ChainState,
+    block: &Block,
+    reward_address: Option<&Address>,
+) -> BlockReceipt {
     let validator = block.header.validator.clone();
+    let fee_recipient = reward_address.unwrap_or(&validator);
     let mut receipts = Vec::with_capacity(block.transactions.len());
     let mut total_burned = 0u64;
     let mut total_validator_reward = 0u64;
 
     let height = block.height();
     for tx in &block.transactions {
-        let receipt = execute_transaction(state, tx, &validator, height);
+        let receipt = execute_transaction(state, tx, fee_recipient, height);
         total_burned += receipt.fee_burned;
         total_validator_reward += receipt.fee_to_validator;
         receipts.push(receipt);
@@ -445,8 +454,8 @@ fn distribute_fee(
     validator: &Address,
     fee: u64,
 ) -> ExecutionResult<(u64, u64)> {
-    let burned = fee * 70 / 100;
-    let reward = fee - burned;
+    let burned = fee / 2;      // 50% deflationary burn
+    let reward = fee - burned; // 50% to block validator
     state.update_account(validator, |acc| {
         acc.balance += reward;
     });
