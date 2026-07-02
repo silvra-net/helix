@@ -7,14 +7,18 @@ use anyhow::Result;
 use helix_consensus::{BftEngine, ConsensusError, Validator, ValidatorSet};
 use helix_core::{genesis_block, Block};
 use helix_crypto::{Address, KeyPair};
-use helix_executor::{execute_block, genesis::GenesisConfig, state::ChainState};
+use helix_executor::{
+    execute_block,
+    genesis::{GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX},
+    state::ChainState,
+};
 use helix_mempool::Mempool;
 use helix_p2p::{
     config::P2PConfig,
     service::{P2PCommand, P2PEvent, P2PService},
 };
 use helix_rpc::server::{start_rpc_server, AppState};
-use helix_storage::{mem::MemBlockStore, BlockStore};
+use helix_storage::{db::HelixDb, BlockStore};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -68,7 +72,7 @@ pub struct HelixNode {
     /// Where the validator's 50 % fee share lands.  Defaults to `address` when unset.
     /// Configure via HELIX_REWARD_ADDRESS env var.
     reward_address: Option<Address>,
-    store: Arc<RwLock<MemBlockStore>>,
+    store: Arc<RwLock<HelixDb>>,
     mempool: Arc<RwLock<Mempool>>,
     chain_state: Arc<RwLock<ChainState>>,
     p2p_command_tx: mpsc::Sender<P2PCommand>,
@@ -99,17 +103,25 @@ impl HelixNode {
         info!("Validator address : {}", address);
         info!("PK fingerprint    : {}", keypair.public.fingerprint());
 
-        // Genesis block
-        let mut store = MemBlockStore::new();
-        let sig = keypair.sign(b"helix-genesis-v1")?;
-        let genesis = genesis_block(address.clone(), sig);
-        store.put_block(genesis)?;
-        info!("Genesis block created (height 0)");
+        // Persistent redb-backed store — blocks + chain state survive restarts.
+        let db_path = PathBuf::from("helix-data.redb");
+        let mut store = HelixDb::open(&db_path)?;
 
-        // Genesis state
         let genesis_cfg = GenesisConfig::devnet(address.clone());
-        let chain_state = genesis_cfg.build_state();
-        info!("Genesis: no validator pre-mine — earnings via 50/50 fee split only");
+        let chain_state = if store.get_block_by_height(0).is_ok() {
+            info!("Loaded existing chain state from {}", db_path.display());
+            store.load_chain_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX)?
+        } else {
+            let sig = keypair.sign(b"helix-genesis-v1")?;
+            let genesis = genesis_block(address.clone(), sig);
+            store.put_block(genesis)?;
+            info!("Genesis block created (height 0)");
+
+            let state = genesis_cfg.build_state();
+            store.save_chain_state(&state)?;
+            info!("Genesis: no validator pre-mine — earnings via 50/50 fee split only");
+            state
+        };
 
         // P2P setup
         let p2p_config = P2PConfig::default();
@@ -224,7 +236,7 @@ async fn handle_p2p_event(
     event: P2PEvent,
     mempool: &Arc<RwLock<Mempool>>,
     peer_count: &Arc<std::sync::atomic::AtomicUsize>,
-    store: &Arc<RwLock<MemBlockStore>>,
+    store: &Arc<RwLock<HelixDb>>,
     chain_state: &Arc<RwLock<ChainState>>,
     engine: &Arc<RwLock<BftEngine>>,
     keypair: &KeyPair,
@@ -301,7 +313,7 @@ async fn handle_p2p_event(
 /// (`handle_p2p_event`). Both paths must apply identical side effects exactly once.
 async fn apply_finalized_block(
     block: Block,
-    store: &Arc<RwLock<MemBlockStore>>,
+    store: &Arc<RwLock<HelixDb>>,
     mempool: &Arc<RwLock<Mempool>>,
     chain_state: &Arc<RwLock<ChainState>>,
     engine: &Arc<RwLock<BftEngine>>,
@@ -362,12 +374,16 @@ async fn apply_finalized_block(
     // Broadcast to peers before storing (peers can validate against prev_hash)
     let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone()));
 
-    // Persist
+    // Persist block + chain state to the same redb file, under one write lock.
     {
         let mut s = store.write().await;
         if let Err(e) = s.put_block(block) {
             error!("Failed to store block {}: {}", height, e);
             return;
+        }
+        let state = chain_state.read().await;
+        if let Err(e) = s.save_chain_state(&state) {
+            error!("Failed to persist chain state at height {}: {}", height, e);
         }
     }
 
@@ -379,7 +395,7 @@ async fn apply_finalized_block(
 }
 
 async fn block_production_loop(
-    store: Arc<RwLock<MemBlockStore>>,
+    store: Arc<RwLock<HelixDb>>,
     mempool: Arc<RwLock<Mempool>>,
     chain_state: Arc<RwLock<ChainState>>,
     keypair: Arc<KeyPair>,

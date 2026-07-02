@@ -12,7 +12,7 @@ use helix_core::Transaction;
 use helix_crypto::{Address, Hash};
 use helix_executor::state::ChainState;
 use helix_mempool::Mempool;
-use helix_storage::{mem::MemBlockStore, BlockStore};
+use helix_storage::{db::HelixDb, BlockStore};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
@@ -25,7 +25,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Arc<RwLock<MemBlockStore>>,
+    pub store: Arc<RwLock<HelixDb>>,
     pub mempool: Arc<RwLock<Mempool>>,
     pub chain_state: Arc<RwLock<ChainState>>,
     pub node_address: String,

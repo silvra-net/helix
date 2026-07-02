@@ -280,3 +280,46 @@ impl BlockStore for HelixDb {
             .unwrap_or(Hash::ZERO)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_core::genesis_block;
+    use helix_crypto::{Address, KeyPair};
+
+    /// A block + chain state written by one `HelixDb` handle must be readable
+    /// back after the process (simulated here by dropping and reopening the
+    /// handle) restarts — the entire point of moving off the in-memory store.
+    #[test]
+    fn blocks_and_chain_state_survive_reopening_the_database() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("helix-db-test-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&kp.public);
+        let sig = kp.sign(b"test-genesis").unwrap();
+        let genesis = genesis_block(validator.clone(), sig);
+        let genesis_hash = genesis.hash();
+
+        {
+            let mut db = HelixDb::open(&path).unwrap();
+            db.put_block(genesis).unwrap();
+
+            let mut state = ChainState::new(1_000_000);
+            state.set_balance(&validator, 42);
+            db.save_chain_state(&state).unwrap();
+        }
+
+        // Reopen — nothing but the file on disk carries state across this point.
+        let db = HelixDb::open(&path).unwrap();
+        assert_eq!(db.latest_height(), 0);
+        assert_eq!(db.latest_hash(), genesis_hash);
+        assert_eq!(db.get_block_by_height(0).unwrap().hash(), genesis_hash);
+
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+        assert_eq!(loaded.get(&validator).unwrap().balance, 42);
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

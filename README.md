@@ -152,6 +152,16 @@ Use the start script for a consistent setup:
 ./scripts/start-node.sh
 ```
 
+### Persistent Chain Data
+
+Blocks and chain state (balances, names, personhood, guardians) are stored in
+`helix-data.redb` (in the working directory), a single-file [redb](https://github.com/cberner/redb)
+database:
+- Written on every finalized block — survives node restarts and crashes
+- On startup, the node loads existing state from this file if present, or
+  builds genesis state on first run
+- **Back this file up** alongside `validator-key.bin` — losing it loses chain history
+
 ---
 
 ## CLI Reference (`hlx`)
@@ -378,7 +388,7 @@ This makes HLX deflationary by design: every transaction reduces supply.
 - [ ] Formal verification tooling
 
 ### 📋 Phase 7 — Production Hardening
-- [ ] Persistent block storage (redb on disk)
+- [x] Persistent block storage (redb on disk)
 - [ ] ML-KEM transport encryption (quantum-secure P2P)
 - [ ] ZK-STARK integration (privacy + Proof of Personhood)
 - [ ] Quantum algorithm migration protocol
