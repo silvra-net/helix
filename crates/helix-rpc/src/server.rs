@@ -20,7 +20,7 @@ use tracing::info;
 
 use crate::{
     AccountResponse, BlockResponse, GuardianResponse, NameResponse, NodeStatus,
-    PersonhoodResponse, RecoveryStatusResponse,
+    PersonhoodResponse, RecoveryStatusResponse, TxHistoryEntry,
 };
 
 #[derive(Clone)]
@@ -44,6 +44,10 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/accounts/:address/personhood", get(get_account_personhood))
         .route("/accounts/:address/guardians", get(get_account_guardians))
         .route("/accounts/:address/recovery", get(get_account_recovery))
+        .route(
+            "/accounts/:address/transactions",
+            get(get_account_transactions),
+        )
         .route("/names/:name", get(resolve_name))
         .route("/mempool", get(get_mempool_info))
         .route("/transactions", post(submit_transaction))
@@ -71,6 +75,7 @@ async fn root() -> Json<Value> {
             "GET  /accounts/{address}/personhood",
             "GET  /accounts/{address}/guardians",
             "GET  /accounts/{address}/recovery",
+            "GET  /accounts/{address}/transactions",
             "GET  /names/{name}",
             "GET  /mempool",
             "POST /transactions"
@@ -300,6 +305,56 @@ async fn get_account_recovery(
     )
 }
 
+/// Extracts every transaction touching `address` (as sender or recipient) from `blocks`,
+/// newest first. Pure and store-agnostic so it can be unit-tested without a `HelixDb`.
+fn extract_tx_history(blocks: &[helix_core::Block], address: &str) -> Vec<TxHistoryEntry> {
+    let mut history = Vec::new();
+    for block in blocks {
+        for tx in &block.transactions {
+            let is_sender = tx.from.to_string() == address;
+            let is_recipient = tx.to.as_ref().map(|a| a.to_string()).as_deref() == Some(address);
+            if is_sender || is_recipient {
+                history.push(TxHistoryEntry {
+                    hash: tx.hash().to_hex(),
+                    from: tx.from.to_string(),
+                    to: tx.to.as_ref().map(|a| a.to_string()),
+                    amount_hlx: tx.amount as f64 / 1_000_000_000.0,
+                    fee_hlx: tx.fee as f64 / 1_000_000_000.0,
+                    tx_type: format!("{:?}", tx.tx_type),
+                    nonce: tx.nonce,
+                    block_height: block.height(),
+                    block_hash: block.hash().to_hex(),
+                    timestamp: block.header.timestamp,
+                });
+            }
+        }
+    }
+    history.reverse();
+    history
+}
+
+async fn get_account_transactions(
+    State(state): State<AppState>,
+    Path(address_str): Path<String>,
+) -> impl IntoResponse {
+    if Address::from_str(&address_str).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid address format: {}", address_str) })),
+        );
+    }
+    let store = state.store.read().await;
+    let latest = store.latest_height();
+    let blocks: Vec<_> = (0..=latest)
+        .filter_map(|h| store.get_block_by_height(h).ok())
+        .collect();
+    let history = extract_tx_history(&blocks, &address_str);
+    (
+        StatusCode::OK,
+        Json(json!({ "address": address_str, "transactions": history })),
+    )
+}
+
 async fn get_mempool_info(State(state): State<AppState>) -> Json<Value> {
     let mempool = state.mempool.read().await;
     Json(json!({
@@ -323,5 +378,79 @@ async fn submit_transaction(
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": e.to_string() })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_core::{Block, BlockHeader, CryptoVersion, TxType};
+    use helix_crypto::{Hash, PublicKey, Signature};
+
+    fn addr(seed: u8) -> Address {
+        Address::from_public_key(&PublicKey::from_bytes(vec![seed; 8]))
+    }
+
+    fn tx(from: &Address, to: &Address, amount: u64, nonce: u64) -> Transaction {
+        Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: from.clone(),
+            to: Some(to.clone()),
+            amount,
+            fee: 100,
+            nonce,
+            data: vec![],
+            signature: Signature::from_bytes(vec![]),
+            public_key: PublicKey::from_bytes(vec![]),
+        }
+    }
+
+    fn block(height: u64, validator: &Address, transactions: Vec<Transaction>) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                height,
+                timestamp: 1_000 + height,
+                prev_hash: Hash::ZERO,
+                merkle_root: Hash::ZERO,
+                validator: validator.clone(),
+                crypto_version: CryptoVersion::MlDsa,
+                signature: Signature::from_bytes(vec![]),
+            },
+            transactions,
+        }
+    }
+
+    #[test]
+    fn extract_tx_history_finds_sent_and_received_newest_first() {
+        let alice = addr(1);
+        let bob = addr(2);
+        let carol = addr(3);
+
+        let block0 = block(0, &alice, vec![tx(&alice, &bob, 10, 0)]);
+        let block1 = block(1, &alice, vec![tx(&bob, &alice, 5, 0), tx(&carol, &bob, 1, 0)]);
+
+        let history = extract_tx_history(&[block0, block1], alice.to_string().as_str());
+
+        assert_eq!(history.len(), 2);
+        // newest block first
+        assert_eq!(history[0].block_height, 1);
+        assert_eq!(history[0].from, bob.to_string());
+        assert_eq!(history[0].to.as_deref(), Some(alice.to_string().as_str()));
+        assert_eq!(history[1].block_height, 0);
+        assert_eq!(history[1].from, alice.to_string());
+    }
+
+    #[test]
+    fn extract_tx_history_ignores_unrelated_transactions() {
+        let alice = addr(1);
+        let bob = addr(2);
+        let carol = addr(3);
+
+        let block0 = block(0, &alice, vec![tx(&bob, &carol, 10, 0)]);
+
+        let history = extract_tx_history(&[block0], alice.to_string().as_str());
+        assert!(history.is_empty());
     }
 }

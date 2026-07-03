@@ -395,7 +395,7 @@ This makes HLX deflationary by design: every transaction reduces supply.
 - [ ] Quantum algorithm migration protocol
 - [ ] On-chain governance
 - [ ] Light client protocol
-- [ ] Tx-History endpoint (`GET /accounts/:address/transactions`)
+- [x] Tx-History endpoint (`GET /accounts/:address/transactions`)
 
 ---
 

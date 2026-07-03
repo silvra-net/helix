@@ -59,6 +59,20 @@ impl From<Block> for BlockResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxHistoryEntry {
+    pub hash: String,
+    pub from: String,
+    pub to: Option<String>,
+    pub amount_hlx: f64,
+    pub fee_hlx: f64,
+    pub tx_type: String,
+    pub nonce: u64,
+    pub block_height: u64,
+    pub block_hash: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountResponse {
     pub address: String,
     pub balance_hlx: f64,
