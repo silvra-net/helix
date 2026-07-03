@@ -19,9 +19,9 @@ const VALIDATOR_GENESIS_STAKE_HLX: u64 = 1_000_000; // 1 M HLX
 
 /// Pre-funded genesis wallets: (address, balance_HLX, staked_HLX).
 const GENESIS_PREFUND: &[(&str, u64, u64)] = &[
-    // Moris — admin wallet, remaining supply after validator stake
+    // Maurice — admin wallet, remaining supply after validator stake
     (
-        "hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z",
+        "hlxaivJrSHS8jsSpwcKwnEipPg5CjvNdiTVg",
         TOTAL_SUPPLY_HLX - VALIDATOR_GENESIS_STAKE_HLX, // 99 M HLX
         0,
     ),
