@@ -394,7 +394,7 @@ This makes HLX deflationary by design: every transaction reduces supply.
 - [ ] ZK-STARK integration (privacy + Proof of Personhood)
 - [ ] Quantum algorithm migration protocol
 - [x] On-chain governance (`CreateProposal`/`VoteProposal` txs; stake-weighted 2/3-plus-one supermajority adjusts `min_validator_stake` or `fuel_per_fee_unit`; 1000-block voting window)
-- [ ] Light client protocol
+- [x] Light client protocol (header-only sync via `GET /blocks/height/:n/header`; Merkle inclusion proofs via `GET /blocks/height/:n/proof/:tx_hash` + `helix_crypto::verify_merkle_proof` — a client that trusts a block's `merkle_root` can confirm a tx was included without downloading the full block; validator-signature verification of headers by a client without full state is still open)
 - [x] Tx-History endpoint (`GET /accounts/:address/transactions`)
 
 ---

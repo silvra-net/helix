@@ -58,6 +58,62 @@ impl From<Block> for BlockResponse {
     }
 }
 
+/// Block header only — no transaction bodies. Lets a light client sync the
+/// chain of headers (and their signatures) without the bandwidth cost of
+/// downloading every transaction in every block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeaderResponse {
+    pub hash: String,
+    pub height: u64,
+    pub timestamp: u64,
+    pub validator: String,
+    pub prev_hash: String,
+    pub merkle_root: String,
+}
+
+impl From<&Block> for HeaderResponse {
+    fn from(block: &Block) -> Self {
+        HeaderResponse {
+            hash: block.hash().to_hex(),
+            height: block.height(),
+            timestamp: block.header.timestamp,
+            validator: block.header.validator.to_string(),
+            prev_hash: block.header.prev_hash.to_hex(),
+            merkle_root: block.header.merkle_root.to_hex(),
+        }
+    }
+}
+
+/// One step of a Merkle inclusion proof, JSON-friendly (hex sibling hash).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofStepResponse {
+    pub sibling: String,
+    pub sibling_is_right: bool,
+}
+
+impl From<&helix_crypto::MerkleProofStep> for ProofStepResponse {
+    fn from(step: &helix_crypto::MerkleProofStep) -> Self {
+        ProofStepResponse {
+            sibling: step.sibling.to_hex(),
+            sibling_is_right: step.sibling_is_right,
+        }
+    }
+}
+
+/// A Merkle inclusion proof for one transaction in one block. A light client
+/// that already trusts `merkle_root` (e.g. from a `HeaderResponse` it
+/// verified) can replay this proof to confirm the transaction was included,
+/// without downloading the block's other transactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxProofResponse {
+    pub tx_hash: String,
+    pub block_height: u64,
+    pub block_hash: String,
+    pub merkle_root: String,
+    pub leaf_index: usize,
+    pub proof: Vec<ProofStepResponse>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxHistoryEntry {
     pub hash: String,

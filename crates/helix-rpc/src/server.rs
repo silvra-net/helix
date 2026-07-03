@@ -20,8 +20,8 @@ use tracing::info;
 
 use crate::{
     AccountResponse, BlockResponse, GovernanceParamsResponse, GovernanceProposalResponse,
-    GuardianResponse, NameResponse, NodeStatus, PersonhoodResponse, RecoveryStatusResponse,
-    TxHistoryEntry,
+    GuardianResponse, HeaderResponse, NameResponse, NodeStatus, PersonhoodResponse,
+    ProofStepResponse, RecoveryStatusResponse, TxHistoryEntry, TxProofResponse,
 };
 
 #[derive(Clone)]
@@ -39,6 +39,8 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/status", get(get_status))
         .route("/blocks/latest", get(get_latest_block))
         .route("/blocks/height/:n", get(get_block_by_height))
+        .route("/blocks/height/:n/header", get(get_block_header))
+        .route("/blocks/height/:n/proof/:tx_hash", get(get_tx_proof))
         .route("/blocks/hash/:hash", get(get_block_by_hash))
         .route("/accounts/:address", get(get_account))
         .route("/accounts/:address/name", get(get_account_name))
@@ -73,6 +75,8 @@ async fn root() -> Json<Value> {
             "GET  /status",
             "GET  /blocks/latest",
             "GET  /blocks/height/{n}",
+            "GET  /blocks/height/{n}/header",
+            "GET  /blocks/height/{n}/proof/{tx_hash}",
             "GET  /blocks/hash/{hash}",
             "GET  /accounts/{address}",
             "GET  /accounts/{address}/name",
@@ -145,6 +149,66 @@ async fn get_block_by_hash(
         Ok(block) => (StatusCode::OK, Json(json!(BlockResponse::from(block)))),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))),
     }
+}
+
+/// Header-only view of a block — for light clients that sync the chain of
+/// headers without paying the bandwidth cost of every block's full tx list.
+async fn get_block_header(
+    State(state): State<AppState>,
+    Path(n): Path<u64>,
+) -> impl IntoResponse {
+    let store = state.store.read().await;
+    match store.get_block_by_height(n) {
+        Ok(block) => (StatusCode::OK, Json(json!(HeaderResponse::from(&block)))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// Merkle inclusion proof for one transaction in a block. A light client that
+/// already trusts the block's `merkle_root` (e.g. from `/blocks/height/{n}/header`)
+/// can replay this proof to confirm the transaction was included, without
+/// downloading the block's other transactions.
+async fn get_tx_proof(
+    State(state): State<AppState>,
+    Path((height, tx_hash_hex)): Path<(u64, String)>,
+) -> impl IntoResponse {
+    let tx_hash = match Hash::from_hex(&tx_hash_hex) {
+        Ok(h) => h,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid tx hash format" })),
+            )
+        }
+    };
+    let store = state.store.read().await;
+    let block = match store.get_block_by_height(height) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))),
+    };
+    let index = match block.transactions.iter().position(|tx| tx.hash() == tx_hash) {
+        Some(i) => i,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("tx {} not found in block {}", tx_hash_hex, height) })),
+            )
+        }
+    };
+    let proof = block
+        .merkle_proof_for(index)
+        .expect("index came from position() over this block's own transactions, so it's in bounds");
+    (
+        StatusCode::OK,
+        Json(json!(TxProofResponse {
+            tx_hash: tx_hash_hex,
+            block_height: block.height(),
+            block_hash: block.hash().to_hex(),
+            merkle_root: block.header.merkle_root.to_hex(),
+            leaf_index: index,
+            proof: proof.iter().map(ProofStepResponse::from).collect(),
+        })),
+    )
 }
 
 async fn get_account(
