@@ -111,6 +111,39 @@ pub struct RecoveryStatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceParamsResponse {
+    pub min_validator_stake_hlx: f64,
+    pub fuel_per_fee_unit: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceProposalResponse {
+    pub id: u64,
+    pub proposer: String,
+    pub param: String,
+    pub new_value: u64,
+    pub created_at_height: u64,
+    pub yes_stake_hlx: f64,
+    pub yes_votes: usize,
+    pub executed: bool,
+}
+
+impl From<&helix_executor::GovernanceProposal> for GovernanceProposalResponse {
+    fn from(p: &helix_executor::GovernanceProposal) -> Self {
+        GovernanceProposalResponse {
+            id: p.id,
+            proposer: p.proposer.clone(),
+            param: format!("{:?}", p.param),
+            new_value: p.new_value,
+            created_at_height: p.created_at_height,
+            yes_stake_hlx: p.yes_stake as f64 / 1_000_000_000.0,
+            yes_votes: p.voters.len(),
+            executed: p.executed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub version: String,
     pub height: u64,

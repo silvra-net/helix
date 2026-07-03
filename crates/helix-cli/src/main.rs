@@ -62,6 +62,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::contract::ContractCmd,
     },
+    /// On-chain governance (stake-weighted proposals to change protocol parameters)
+    Governance {
+        #[command(subcommand)]
+        action: commands::governance::GovernanceCmd,
+    },
 }
 
 #[tokio::main]
@@ -78,5 +83,6 @@ async fn main() -> Result<()> {
         Commands::Identity { action } => commands::identity::run(action, &node).await,
         Commands::Recovery { action } => commands::recovery::run(action, &node).await,
         Commands::Contract { action } => commands::contract::run(action, &node).await,
+        Commands::Governance { action } => commands::governance::run(action, &node).await,
     }
 }

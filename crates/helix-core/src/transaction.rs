@@ -24,6 +24,10 @@ pub enum TxType {
     DeployContract,
     /// Call a deployed smart contract
     CallContract,
+    /// Propose a stake-weighted governance change to a protocol parameter
+    CreateProposal,
+    /// Vote yes on a pending governance proposal
+    VoteProposal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

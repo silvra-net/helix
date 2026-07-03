@@ -19,8 +19,9 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::{
-    AccountResponse, BlockResponse, GuardianResponse, NameResponse, NodeStatus,
-    PersonhoodResponse, RecoveryStatusResponse, TxHistoryEntry,
+    AccountResponse, BlockResponse, GovernanceParamsResponse, GovernanceProposalResponse,
+    GuardianResponse, NameResponse, NodeStatus, PersonhoodResponse, RecoveryStatusResponse,
+    TxHistoryEntry,
 };
 
 #[derive(Clone)]
@@ -49,6 +50,9 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
             get(get_account_transactions),
         )
         .route("/names/:name", get(resolve_name))
+        .route("/governance/params", get(get_governance_params))
+        .route("/governance/proposals", get(get_governance_proposals))
+        .route("/governance/proposals/:id", get(get_governance_proposal))
         .route("/mempool", get(get_mempool_info))
         .route("/transactions", post(submit_transaction))
         .layer(CorsLayer::permissive())
@@ -77,6 +81,9 @@ async fn root() -> Json<Value> {
             "GET  /accounts/{address}/recovery",
             "GET  /accounts/{address}/transactions",
             "GET  /names/{name}",
+            "GET  /governance/params",
+            "GET  /governance/proposals",
+            "GET  /governance/proposals/{id}",
             "GET  /mempool",
             "POST /transactions"
         ]
@@ -186,6 +193,36 @@ async fn resolve_name(
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("name {} not registered", name) })),
+        ),
+    }
+}
+
+async fn get_governance_params(State(state): State<AppState>) -> Json<Value> {
+    let chain = state.chain_state.read().await;
+    Json(json!(GovernanceParamsResponse {
+        min_validator_stake_hlx: chain.governance_params.min_validator_stake as f64 / 1_000_000_000.0,
+        fuel_per_fee_unit: chain.governance_params.fuel_per_fee_unit,
+    }))
+}
+
+async fn get_governance_proposals(State(state): State<AppState>) -> Json<Value> {
+    let chain = state.chain_state.read().await;
+    let mut proposals: Vec<GovernanceProposalResponse> =
+        chain.proposals.values().map(GovernanceProposalResponse::from).collect();
+    proposals.sort_by_key(|p| p.id);
+    Json(json!({ "proposals": proposals }))
+}
+
+async fn get_governance_proposal(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let chain = state.chain_state.read().await;
+    match chain.proposal(id) {
+        Some(p) => (StatusCode::OK, Json(json!(GovernanceProposalResponse::from(p)))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("proposal {} not found", id) })),
         ),
     }
 }

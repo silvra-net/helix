@@ -4,6 +4,8 @@ use helix_crypto::{Address, PublicKey};
 use helix_identity::{GuardianSet, PersonhoodStatus, RecoveryRequest};
 use serde::{Deserialize, Serialize};
 
+use crate::governance::{GovernanceParams, GovernanceProposal};
+
 /// Per-account ledger state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
@@ -60,6 +62,12 @@ pub struct ChainState {
     /// Active recovery override key per address string. Once set, this key (not the one
     /// the address was originally derived from) must produce transaction signatures for it.
     pub recovery_keys: HashMap<String, PublicKey>,
+    /// Runtime-adjustable protocol parameters — changed only via passed governance proposals.
+    pub governance_params: GovernanceParams,
+    /// Governance proposals by id, both pending and resolved.
+    pub proposals: HashMap<u64, GovernanceProposal>,
+    /// Next id to assign to a new proposal.
+    pub next_proposal_id: u64,
 }
 
 impl ChainState {
@@ -73,6 +81,9 @@ impl ChainState {
             guardians: HashMap::new(),
             recovery_requests: HashMap::new(),
             recovery_keys: HashMap::new(),
+            governance_params: GovernanceParams::default(),
+            proposals: HashMap::new(),
+            next_proposal_id: 0,
         }
     }
 
@@ -195,11 +206,24 @@ impl ChainState {
 
     /// Addresses that meet the minimum stake threshold — candidates for the next validator epoch.
     pub fn stakers(&self) -> Vec<(Address, u64)> {
-        use crate::genesis::MIN_VALIDATOR_STAKE;
+        let min_stake = self.governance_params.min_validator_stake;
         self.accounts
             .values()
-            .filter(|acc| acc.staked >= MIN_VALIDATOR_STAKE)
+            .filter(|acc| acc.staked >= min_stake)
             .filter_map(|acc| Address::from_str(&acc.address).ok().map(|addr| (addr, acc.staked)))
             .collect()
+    }
+
+    /// Total HLX staked across every account — the governance voting-power pool.
+    pub fn total_staked(&self) -> u64 {
+        self.accounts.values().map(|acc| acc.staked).sum()
+    }
+
+    pub fn proposal(&self, id: u64) -> Option<&GovernanceProposal> {
+        self.proposals.get(&id)
+    }
+
+    pub fn set_proposal(&mut self, proposal: GovernanceProposal) {
+        self.proposals.insert(proposal.id, proposal);
     }
 }

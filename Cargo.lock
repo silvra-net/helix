@@ -1096,6 +1096,7 @@ dependencies = [
  "clap",
  "helix-core",
  "helix-crypto",
+ "helix-executor",
  "hex",
  "rand 0.8.6",
  "reqwest",

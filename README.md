@@ -393,7 +393,7 @@ This makes HLX deflationary by design: every transaction reduces supply.
 - [ ] ML-KEM transport encryption (quantum-secure P2P)
 - [ ] ZK-STARK integration (privacy + Proof of Personhood)
 - [ ] Quantum algorithm migration protocol
-- [ ] On-chain governance
+- [x] On-chain governance (`CreateProposal`/`VoteProposal` txs; stake-weighted 2/3-plus-one supermajority adjusts `min_validator_stake` or `fuel_per_fee_unit`; 1000-block voting window)
 - [ ] Light client protocol
 - [x] Tx-History endpoint (`GET /accounts/:address/transactions`)
 

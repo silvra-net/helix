@@ -3,6 +3,7 @@ use std::path::Path;
 
 use helix_core::Block;
 use helix_crypto::Hash;
+use helix_executor::governance::{GovernanceParams, GovernanceProposal};
 use helix_executor::state::{AccountState, ChainState};
 
 use crate::{BlockStore, StorageError, StorageResult};
@@ -15,11 +16,15 @@ const PERSONHOOD: TableDefinition<&str, &[u8]> = TableDefinition::new("personhoo
 const GUARDIANS: TableDefinition<&str, &[u8]> = TableDefinition::new("guardians");
 const RECOVERY_REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("recovery_requests");
 const RECOVERY_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("recovery_keys");
+const PROPOSALS: TableDefinition<u64, &[u8]> = TableDefinition::new("proposals");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const META_HEIGHT: &str = "latest_height";
 const META_HASH: &str = "latest_hash";
 const META_BURNED: &str = "total_burned";
+const META_MIN_VALIDATOR_STAKE: &str = "gov_min_validator_stake";
+const META_FUEL_PER_FEE_UNIT: &str = "gov_fuel_per_fee_unit";
+const META_NEXT_PROPOSAL_ID: &str = "gov_next_proposal_id";
 
 pub struct HelixDb {
     db: Database,
@@ -38,6 +43,7 @@ impl HelixDb {
         tx.open_table(GUARDIANS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
         Ok(HelixDb { db })
@@ -54,6 +60,7 @@ impl HelixDb {
             let mut guardians = tx.open_table(GUARDIANS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut recovery_requests = tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut recovery_keys = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut proposals = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
             for (addr, account) in &state.accounts {
@@ -90,7 +97,25 @@ impl HelixDb {
                 recovery_keys.insert(addr.as_str(), encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            for (id, proposal) in &state.proposals {
+                let encoded = bincode::serialize(proposal)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                proposals.insert(*id, encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
             meta.insert(META_BURNED, &state.total_burned.to_le_bytes()[..])
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            meta.insert(
+                META_MIN_VALIDATOR_STAKE,
+                &state.governance_params.min_validator_stake.to_le_bytes()[..],
+            )
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+            meta.insert(
+                META_FUEL_PER_FEE_UNIT,
+                &state.governance_params.fuel_per_fee_unit.to_le_bytes()[..],
+            )
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+            meta.insert(META_NEXT_PROPOSAL_ID, &state.next_proposal_id.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
         }
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))
@@ -104,6 +129,7 @@ impl HelixDb {
         let guardians_table = tx.open_table(GUARDIANS).map_err(|e| StorageError::Db(e.to_string()))?;
         let recovery_requests_table = tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let recovery_keys_table = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let proposals_table = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
         let mut accounts = std::collections::HashMap::new();
@@ -158,15 +184,31 @@ impl HelixDb {
             recovery_keys.insert(k.value().to_string(), key);
         }
 
-        let total_burned = meta_table
-            .get(META_BURNED)
-            .ok()
-            .flatten()
-            .and_then(|v| {
+        let mut proposals = std::collections::HashMap::new();
+        let mut proposals_iter = proposals_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = proposals_iter.next() {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let proposal: GovernanceProposal = bincode::deserialize(v.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            proposals.insert(k.value(), proposal);
+        }
+
+        let read_meta_u64 = |key: &str| -> Option<u64> {
+            meta_table.get(key).ok().flatten().and_then(|v| {
                 let bytes: [u8; 8] = v.value().try_into().ok()?;
                 Some(u64::from_le_bytes(bytes))
             })
-            .unwrap_or(0);
+        };
+
+        let total_burned = read_meta_u64(META_BURNED).unwrap_or(0);
+        let default_params = GovernanceParams::default();
+        let governance_params = GovernanceParams {
+            min_validator_stake: read_meta_u64(META_MIN_VALIDATOR_STAKE)
+                .unwrap_or(default_params.min_validator_stake),
+            fuel_per_fee_unit: read_meta_u64(META_FUEL_PER_FEE_UNIT)
+                .unwrap_or(default_params.fuel_per_fee_unit),
+        };
+        let next_proposal_id = read_meta_u64(META_NEXT_PROPOSAL_ID).unwrap_or(0);
 
         Ok(ChainState {
             accounts,
@@ -177,6 +219,9 @@ impl HelixDb {
             guardians,
             recovery_requests,
             recovery_keys,
+            governance_params,
+            proposals,
+            next_proposal_id,
         })
     }
 

@@ -1,8 +1,10 @@
 pub mod genesis;
+pub mod governance;
 pub mod receipt;
 pub mod state;
 
 pub use genesis::GenesisConfig;
+pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal};
 pub use receipt::{BlockReceipt, Receipt};
 pub use state::{AccountState, ChainState};
 
@@ -90,6 +92,8 @@ pub fn execute_transaction(
         TxType::ApproveRecovery => execute_approve_recovery(state, tx, validator, tx_hash),
         TxType::DeployContract => execute_deploy_contract(state, tx, validator, tx_hash),
         TxType::CallContract => execute_call_contract(state, tx, validator, tx_hash),
+        TxType::CreateProposal => execute_create_proposal(state, tx, validator, tx_hash, height),
+        TxType::VoteProposal => execute_vote_proposal(state, tx, validator, tx_hash, height),
     }
 }
 
@@ -427,11 +431,6 @@ fn execute_approve_recovery(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
-/// Fuel units of WASM execution granted per nano-HLX of `tx.fee`. There is no
-/// separate gas-price market yet — the flat tx fee doubles as the execution
-/// budget until Phase 7 gains dedicated gas metering / pricing.
-const FUEL_PER_FEE_UNIT: u64 = 1;
-
 /// Deploy a WASM contract: `tx.data` is validated as a WASM module and stored as the
 /// deploying account's code. There's no separate contract-address derivation yet — the
 /// deployer's own address becomes the contract account, so only its key can redeploy.
@@ -503,7 +502,7 @@ fn execute_call_contract(
         return Receipt::failure(tx_hash, "target address has no deployed contract", 0, 0);
     };
 
-    let fuel_limit = tx.fee.saturating_mul(FUEL_PER_FEE_UNIT);
+    let fuel_limit = tx.fee.saturating_mul(state.governance_params.fuel_per_fee_unit);
     if let Err(e) = helix_vm::call(&code, fuel_limit) {
         return Receipt::failure(tx_hash, &format!("contract call failed: {e}"), 0, 0);
     }
@@ -514,6 +513,119 @@ fn execute_call_contract(
     });
     state.update_account(&target, |acc| {
         acc.balance += tx.amount;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// Create a stake-weighted governance proposal to change one protocol parameter. Only
+/// current stakers may propose — same skin-in-the-game requirement as voting.
+fn execute_create_proposal(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+    height: u64,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+    if sender.staked == 0 {
+        return Receipt::failure(tx_hash, "only stakers may create governance proposals", 0, 0);
+    }
+
+    let (param, new_value) = match governance::decode_proposal(&tx.data) {
+        Ok(p) => p,
+        Err(e) => return Receipt::failure(tx_hash, &format!("invalid proposal payload: {e}"), 0, 0),
+    };
+
+    let id = state.next_proposal_id;
+    state.next_proposal_id += 1;
+    state.set_proposal(GovernanceProposal {
+        id,
+        proposer: tx.from.to_string(),
+        param,
+        new_value,
+        created_at_height: height,
+        voters: Default::default(),
+        yes_stake: 0,
+        executed: false,
+    });
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// Cast a stake-weighted yes-vote on a pending proposal (`tx.data` = proposal id). Once
+/// accumulated yes-stake crosses the 2/3-plus-one supermajority of total staked HLX, the
+/// parameter change is applied immediately and the proposal is marked executed.
+fn execute_vote_proposal(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+    height: u64,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+    if sender.staked == 0 {
+        return Receipt::failure(tx_hash, "only stakers may vote", 0, 0);
+    }
+
+    let proposal_id = match governance::decode_vote(&tx.data) {
+        Ok(id) => id,
+        Err(e) => return Receipt::failure(tx_hash, &format!("invalid vote payload: {e}"), 0, 0),
+    };
+
+    let Some(mut proposal) = state.proposal(proposal_id).cloned() else {
+        return Receipt::failure(tx_hash, "proposal not found", 0, 0);
+    };
+    if proposal.executed {
+        return Receipt::failure(tx_hash, "proposal already executed", 0, 0);
+    }
+    if proposal.is_expired(height) {
+        return Receipt::failure(tx_hash, "voting period has expired", 0, 0);
+    }
+    if !proposal.voters.insert(tx.from.to_string()) {
+        return Receipt::failure(tx_hash, "address already voted on this proposal", 0, 0);
+    }
+    proposal.yes_stake = proposal.yes_stake.saturating_add(sender.staked);
+
+    if proposal.yes_stake >= governance::quorum_threshold(state.total_staked()) {
+        match proposal.param {
+            GovernanceParam::MinValidatorStake => {
+                state.governance_params.min_validator_stake = proposal.new_value;
+            }
+            GovernanceParam::FuelPerFeeUnit => {
+                state.governance_params.fuel_per_fee_unit = proposal.new_value;
+            }
+        }
+        proposal.executed = true;
+    }
+    state.set_proposal(proposal);
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
     });
 
     distribute_fee(state, validator, tx.fee)
@@ -1086,5 +1198,178 @@ mod tests {
         assert!(!receipt.success);
         assert_eq!(state.get(&caller).unwrap().balance, 1_000_000);
         assert_eq!(state.get(&caller).unwrap().nonce, 0);
+    }
+
+    fn signed_governance_tx(
+        kp: &KeyPair,
+        from: &Address,
+        tx_type: TxType,
+        data: Vec<u8>,
+        nonce: u64,
+        fee: u64,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type,
+            from: from.clone(),
+            to: None,
+            amount: 0,
+            fee,
+            nonce,
+            data,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn create_proposal_rejects_non_staker() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 5);
+        let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success);
+        assert!(state.proposals.is_empty());
+    }
+
+    #[test]
+    fn create_proposal_succeeds_for_staker_and_charges_fee() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+
+        let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 5);
+        let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 100);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        let proposal = state.proposal(0).expect("proposal 0 should exist");
+        assert_eq!(proposal.new_value, 5);
+        assert_eq!(proposal.created_at_height, 100);
+        assert!(!proposal.executed);
+        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000 - 10_000);
+    }
+
+    #[test]
+    fn vote_reaching_supermajority_applies_param_change_immediately() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let proposer_kp = KeyPair::generate();
+        let proposer = Address::from_public_key(&proposer_kp.public);
+        let voter_kp = KeyPair::generate();
+        let voter = Address::from_public_key(&voter_kp.public);
+
+        let mut state = ChainState::new(0);
+        // Two stakers, 50/50 split. Neither alone reaches 2/3, but together they do.
+        state.update_account(&proposer, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+        state.update_account(&voter, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+
+        let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 99);
+        let create_tx =
+            signed_governance_tx(&proposer_kp, &proposer, TxType::CreateProposal, data, 0, 10_000);
+        assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
+        assert_eq!(state.governance_params.fuel_per_fee_unit, governance::DEFAULT_FUEL_PER_FEE_UNIT);
+
+        // Proposer's own vote (50%) isn't enough for 2/3 quorum yet.
+        let self_vote = signed_governance_tx(
+            &proposer_kp,
+            &proposer,
+            TxType::VoteProposal,
+            governance::encode_vote(0),
+            1,
+            10_000,
+        );
+        assert!(execute_transaction(&mut state, &self_vote, &validator, 1).success);
+        assert!(!state.proposal(0).unwrap().executed);
+
+        // Second staker's vote pushes yes-stake to 100% — crosses the 2/3 threshold.
+        let second_vote = signed_governance_tx(
+            &voter_kp,
+            &voter,
+            TxType::VoteProposal,
+            governance::encode_vote(0),
+            0,
+            10_000,
+        );
+        let receipt = execute_transaction(&mut state, &second_vote, &validator, 2);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert!(state.proposal(0).unwrap().executed);
+        assert_eq!(state.governance_params.fuel_per_fee_unit, 99);
+    }
+
+    #[test]
+    fn vote_rejects_double_voting_from_same_address() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+
+        let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, 1);
+        let create_tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
+        assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
+
+        let vote_tx =
+            signed_governance_tx(&kp, &addr, TxType::VoteProposal, governance::encode_vote(0), 1, 10_000);
+        assert!(execute_transaction(&mut state, &vote_tx, &validator, 1).success);
+
+        let repeat_vote_tx =
+            signed_governance_tx(&kp, &addr, TxType::VoteProposal, governance::encode_vote(0), 2, 10_000);
+        let receipt = execute_transaction(&mut state, &repeat_vote_tx, &validator, 2);
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn vote_rejects_after_voting_period_expires() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let proposer_kp = KeyPair::generate();
+        let proposer = Address::from_public_key(&proposer_kp.public);
+        let voter_kp = KeyPair::generate();
+        let voter = Address::from_public_key(&voter_kp.public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&proposer, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+        state.update_account(&voter, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+
+        let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, 1);
+        let create_tx = signed_governance_tx(&proposer_kp, &proposer, TxType::CreateProposal, data, 0, 10_000);
+        assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
+
+        let expired_height = governance::VOTING_PERIOD_BLOCKS + 1;
+        let vote_tx =
+            signed_governance_tx(&voter_kp, &voter, TxType::VoteProposal, governance::encode_vote(0), 0, 10_000);
+        let receipt = execute_transaction(&mut state, &vote_tx, &validator, expired_height);
+        assert!(!receipt.success);
     }
 }
