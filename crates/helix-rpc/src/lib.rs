@@ -78,6 +78,7 @@ pub struct AccountResponse {
     pub balance_hlx: f64,
     pub staked_hlx: f64,
     pub nonce: u64,
+    pub has_code: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,7 +10,11 @@ description = "Transaction execution engine and account state machine for Helix"
 helix-crypto.workspace = true
 helix-core.workspace = true
 helix-identity.workspace = true
+helix-vm.workspace = true
 serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+wat = "1.0"

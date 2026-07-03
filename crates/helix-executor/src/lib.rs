@@ -88,10 +88,8 @@ pub fn execute_transaction(
         TxType::RegisterIdentity => execute_register_identity(state, tx, validator, tx_hash, height),
         TxType::RegisterGuardians => execute_register_guardians(state, tx, validator, tx_hash),
         TxType::ApproveRecovery => execute_approve_recovery(state, tx, validator, tx_hash),
-        TxType::DeployContract | TxType::CallContract => {
-            // WASM VM is Phase 4 — accept and charge fee, no state change yet
-            charge_fee_only(state, tx, validator, tx_hash)
-        }
+        TxType::DeployContract => execute_deploy_contract(state, tx, validator, tx_hash),
+        TxType::CallContract => execute_call_contract(state, tx, validator, tx_hash),
     }
 }
 
@@ -429,20 +427,95 @@ fn execute_approve_recovery(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
-fn charge_fee_only(
+/// Fuel units of WASM execution granted per nano-HLX of `tx.fee`. There is no
+/// separate gas-price market yet — the flat tx fee doubles as the execution
+/// budget until Phase 7 gains dedicated gas metering / pricing.
+const FUEL_PER_FEE_UNIT: u64 = 1;
+
+/// Deploy a WASM contract: `tx.data` is validated as a WASM module and stored as the
+/// deploying account's code. There's no separate contract-address derivation yet — the
+/// deployer's own address becomes the contract account, so only its key can redeploy.
+fn execute_deploy_contract(
     state: &mut ChainState,
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
     if sender.balance < tx.fee {
         return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
     }
+    if tx.to.is_some() {
+        return Receipt::failure(tx_hash, "deploy transactions must not set a recipient", 0, 0);
+    }
+    if tx.data.is_empty() {
+        return Receipt::failure(tx_hash, "deploy transaction is missing WASM bytecode", 0, 0);
+    }
+    if let Err(e) = helix_vm::validate(&tx.data) {
+        return Receipt::failure(tx_hash, &format!("invalid contract bytecode: {e}"), 0, 0);
+    }
+
     state.update_account(&tx.from, |acc| {
+        acc.code = Some(tx.data.clone());
         acc.balance -= tx.fee;
         acc.nonce += 1;
     });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// Call a deployed contract at `tx.to`, running its exported `call()` entry point with
+/// fuel metering. `tx.amount` (if any) is transferred to the contract's balance only on
+/// successful execution, matching normal transfer semantics.
+fn execute_call_contract(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+
+    let Some(target) = tx.to.clone() else {
+        return Receipt::failure(tx_hash, "call transactions require a target contract address", 0, 0);
+    };
+
+    let total_cost = tx.amount.saturating_add(tx.fee);
+    if sender.balance < total_cost {
+        return Receipt::failure(
+            tx_hash,
+            &format!("insufficient balance: need {}, have {}", total_cost, sender.balance),
+            0,
+            0,
+        );
+    }
+
+    let Some(code) = state.get(&target).and_then(|acc| acc.code.clone()) else {
+        return Receipt::failure(tx_hash, "target address has no deployed contract", 0, 0);
+    };
+
+    let fuel_limit = tx.fee.saturating_mul(FUEL_PER_FEE_UNIT);
+    if let Err(e) = helix_vm::call(&code, fuel_limit) {
+        return Receipt::failure(tx_hash, &format!("contract call failed: {e}"), 0, 0);
+    }
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= total_cost;
+        acc.nonce += 1;
+    });
+    state.update_account(&target, |acc| {
+        acc.balance += tx.amount;
+    });
+
     distribute_fee(state, validator, tx.fee)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
@@ -822,5 +895,196 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 1);
         assert!(!receipt.success);
         assert!(state.recovery_key(&owner).is_none());
+    }
+
+    fn valid_contract_wasm() -> Vec<u8> {
+        wat::parse_str(r#"(module (func (export "call")))"#).unwrap()
+    }
+
+    fn signed_contract_tx(
+        kp: &KeyPair,
+        from: &Address,
+        tx_type: TxType,
+        to: Option<Address>,
+        amount: u64,
+        data: Vec<u8>,
+        nonce: u64,
+        fee: u64,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type,
+            from: from.clone(),
+            to,
+            amount,
+            fee,
+            nonce,
+            data,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn deploy_contract_stores_code_and_charges_fee() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let tx = signed_contract_tx(
+            &kp,
+            &addr,
+            TxType::DeployContract,
+            None,
+            0,
+            valid_contract_wasm(),
+            0,
+            10_000,
+        );
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert!(state.get(&addr).unwrap().code.is_some());
+        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000 - 10_000);
+    }
+
+    #[test]
+    fn deploy_contract_rejects_invalid_bytecode() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let tx = signed_contract_tx(
+            &kp,
+            &addr,
+            TxType::DeployContract,
+            None,
+            0,
+            b"not wasm".to_vec(),
+            0,
+            10_000,
+        );
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success);
+        assert!(state.get(&addr).unwrap().code.is_none());
+    }
+
+    #[test]
+    fn call_contract_executes_and_transfers_value() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&deployer, |acc| acc.balance = 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000);
+
+        let deploy_tx = signed_contract_tx(
+            &deployer_kp,
+            &deployer,
+            TxType::DeployContract,
+            None,
+            0,
+            valid_contract_wasm(),
+            0,
+            10_000,
+        );
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+
+        let call_tx = signed_contract_tx(
+            &caller_kp,
+            &caller,
+            TxType::CallContract,
+            Some(deployer.clone()),
+            5_000,
+            vec![],
+            0,
+            10_000,
+        );
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.get(&caller).unwrap().balance, 1_000_000 - 5_000 - 10_000);
+        assert_eq!(
+            state.get(&deployer).unwrap().balance,
+            1_000_000 - 10_000 + 5_000
+        );
+    }
+
+    #[test]
+    fn call_contract_rejects_target_without_code() {
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000);
+
+        let tx = signed_contract_tx(
+            &caller_kp,
+            &caller,
+            TxType::CallContract,
+            Some(target),
+            0,
+            vec![],
+            0,
+            10_000,
+        );
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn call_contract_fails_out_of_gas_without_charging_fee() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&deployer, |acc| acc.balance = 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000);
+
+        let looping_wasm = wat::parse_str(r#"(module (func (export "call") (loop br 0)))"#).unwrap();
+        let deploy_tx = signed_contract_tx(
+            &deployer_kp,
+            &deployer,
+            TxType::DeployContract,
+            None,
+            0,
+            looping_wasm,
+            0,
+            10_000,
+        );
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+
+        let call_tx = signed_contract_tx(
+            &caller_kp,
+            &caller,
+            TxType::CallContract,
+            Some(deployer),
+            0,
+            vec![],
+            0,
+            1, // 1 fuel unit — nowhere near enough to complete the loop
+        );
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+
+        assert!(!receipt.success);
+        assert_eq!(state.get(&caller).unwrap().balance, 1_000_000);
+        assert_eq!(state.get(&caller).unwrap().nonce, 0);
     }
 }

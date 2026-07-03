@@ -159,6 +159,7 @@ async fn get_account(
                 balance_hlx: acc.balance_hlx(),
                 staked_hlx: acc.staked_hlx(),
                 nonce: acc.nonce,
+                has_code: acc.code.is_some(),
             })),
         ),
         None => (

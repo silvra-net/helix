@@ -14,6 +14,10 @@ pub struct AccountState {
     pub staked: u64,
     /// Next expected nonce — prevents replay attacks
     pub nonce: u64,
+    /// Deployed WASM contract bytecode, if this account is a contract.
+    /// `#[serde(default)]` keeps deserialization of pre-Phase-7 redb data working.
+    #[serde(default)]
+    pub code: Option<Vec<u8>>,
 }
 
 impl AccountState {
@@ -23,6 +27,7 @@ impl AccountState {
             balance: 0,
             staked: 0,
             nonce: 0,
+            code: None,
         }
     }
 

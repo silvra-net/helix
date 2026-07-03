@@ -11,6 +11,7 @@ members = [
     "crates/helix-rpc",
     "crates/helix-node",
     "crates/helix-cli",
+    "crates/helix-vm",
 ]
 resolver = "2"
 
@@ -65,6 +66,9 @@ argon2 = "0.5"
 # Persistence
 redb = "2.1"
 
+# WASM smart contract execution
+wasmi = "0.31"
+
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json", "blocking"] }
@@ -79,3 +83,4 @@ helix-identity = { path = "crates/helix-identity" }
 helix-executor = { path = "crates/helix-executor" }
 helix-mempool = { path = "crates/helix-mempool" }
 helix-rpc = { path = "crates/helix-rpc" }
+helix-vm = { path = "crates/helix-vm" }

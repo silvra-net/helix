@@ -381,10 +381,10 @@ This makes HLX deflationary by design: every transaction reduces supply.
 - [x] Human-readable names (`alice.hlx`)
 - [x] Social recovery wallets (3-of-5 guardians)
 
-### 📋 Phase 6 — Smart Contracts
-- [ ] WASM VM integration
-- [ ] Contract deployment and execution
-- [ ] Gas metering
+### 🔄 Phase 6 — Smart Contracts
+- [x] WASM VM integration (`helix-vm` crate, `wasmi` interpreter, fuel-metered, no host imports)
+- [x] Contract deployment and execution (`DeployContract`/`CallContract` txs; deployer address doubles as the contract account — no derived contract addresses yet)
+- [x] Gas metering (fuel-based; `tx.fee` currently doubles as the execution fuel budget — no separate gas-price market yet)
 - [ ] Formal verification tooling
 
 ### 📋 Phase 7 — Production Hardening

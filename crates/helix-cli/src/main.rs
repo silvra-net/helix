@@ -57,6 +57,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::recovery::RecoveryCmd,
     },
+    /// WASM smart contract deployment and calls
+    Contract {
+        #[command(subcommand)]
+        action: commands::contract::ContractCmd,
+    },
 }
 
 #[tokio::main]
@@ -72,5 +77,6 @@ async fn main() -> Result<()> {
         Commands::Name { action } => commands::name::run(action, &node).await,
         Commands::Identity { action } => commands::identity::run(action, &node).await,
         Commands::Recovery { action } => commands::recovery::run(action, &node).await,
+        Commands::Contract { action } => commands::contract::run(action, &node).await,
     }
 }
