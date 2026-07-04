@@ -25,6 +25,7 @@ license = "MIT"
 # Post-Quantum Cryptography (NIST standards)
 pqcrypto-dilithium = "0.5"
 pqcrypto-sphincsplus = "0.7"
+pqcrypto-kyber = "0.8"
 pqcrypto-traits = "0.3"
 blake3 = "1.5"
 zeroize = { version = "1.7", features = ["derive"] }

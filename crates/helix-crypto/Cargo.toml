@@ -9,6 +9,7 @@ description = "Quantum-secure cryptographic primitives for the Helix blockchain"
 [dependencies]
 pqcrypto-dilithium.workspace = true
 pqcrypto-sphincsplus.workspace = true
+pqcrypto-kyber.workspace = true
 pqcrypto-traits.workspace = true
 blake3.workspace = true
 zeroize.workspace = true

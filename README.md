@@ -390,11 +390,12 @@ This makes HLX deflationary by design: every transaction reduces supply.
 ### 📋 Phase 7 — Production Hardening
 - [x] Persistent block storage (redb on disk)
 - [x] BFT round-timeout — a stalled round (no quorum within 3 block-time ticks) auto-advances to the next round-robin proposer instead of halting the chain
-- [ ] ML-KEM transport encryption (quantum-secure P2P)
+- [x] ML-KEM transport encryption (quantum-secure P2P) — ML-KEM-768 (NIST FIPS 203) key encapsulation in `helix-crypto`; per-peer post-quantum session keys established via `helix/session/1.0.0` gossipsub handshake (Hello/KemCt); session keys derived with BLAKE3 and used for AES-256-GCM message encryption — layered on top of Noise (X25519) for defense-in-depth
 - [ ] ZK-STARK integration (privacy + Proof of Personhood)
-- [ ] Quantum algorithm migration protocol
+- [x] Quantum algorithm migration protocol — crypto-agility in key files (scheme-tagged `[tag][sk][pk]`), `CryptoScheme` dispatch for signing and verification, `Vote::crypto_version` and `BlockHeader::crypto_version` propagate the scheme through consensus; `HELIX_VALIDATOR_CRYPTO_SCHEME=sphincs-plus` env var for new keys; backward-compat with legacy untagged keys
+- [x] Block proposer signature verification — `BlockHeader::verify_signature()` checks public key → address derivation and ML-DSA/SPHINCS+ signature under `crypto_version`; `validate_block()` rejects forged blocks
 - [x] On-chain governance (`CreateProposal`/`VoteProposal` txs; stake-weighted 2/3-plus-one supermajority adjusts `min_validator_stake` or `fuel_per_fee_unit`; 1000-block voting window)
-- [x] Light client protocol (header-only sync via `GET /blocks/height/:n/header`; Merkle inclusion proofs via `GET /blocks/height/:n/proof/:tx_hash` + `helix_crypto::verify_merkle_proof` — a client that trusts a block's `merkle_root` can confirm a tx was included without downloading the full block; validator-signature verification of headers by a client without full state is still open)
+- [x] Light client protocol (header-only sync via `GET /blocks/height/:n/header`; Merkle inclusion proofs via `GET /blocks/height/:n/proof/:tx_hash` + `helix_crypto::verify_merkle_proof`; block proposer signature self-verifiable via `BlockHeader::verify_signature()` — `public_key` travels with the header so a light client without full state can verify)
 - [x] Tx-History endpoint (`GET /accounts/:address/transactions`)
 
 ---

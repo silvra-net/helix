@@ -1137,6 +1137,7 @@ dependencies = [
  "bs58",
  "hex",
  "pqcrypto-dilithium",
+ "pqcrypto-kyber",
  "pqcrypto-sphincsplus",
  "pqcrypto-traits",
  "rand 0.8.6",
@@ -1205,7 +1206,9 @@ dependencies = [
 name = "helix-p2p"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "bincode",
+ "blake3",
  "helix-consensus",
  "helix-core",
  "helix-crypto",
@@ -2682,6 +2685,19 @@ dependencies = [
  "dunce",
  "getrandom 0.3.4",
  "libc",
+]
+
+[[package]]
+name = "pqcrypto-kyber"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15c00293cf898859d0c771455388054fd69ab712263c73fdc7f287a39b1ba000"
+dependencies = [
+ "cc",
+ "glob",
+ "libc",
+ "pqcrypto-internals",
+ "pqcrypto-traits",
 ]
 
 [[package]]
