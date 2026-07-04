@@ -23,6 +23,9 @@ pub type P2PResult<T> = Result<T, P2PError>;
 pub const TOPIC_BLOCKS: &str = "helix/blocks/1.0.0";
 pub const TOPIC_TRANSACTIONS: &str = "helix/transactions/1.0.0";
 pub const TOPIC_VOTES: &str = "helix/votes/1.0.0";
+/// Finalized, committed blocks — broadcast after BFT quorum so lagging peers
+/// can apply them directly without replaying the vote round.
+pub const TOPIC_COMMITTED_BLOCKS: &str = "helix/committed-blocks/1.0.0";
 /// Per-peer ML-KEM-768 handshake messages (Hello / KemCt). Messages include
 /// explicit `from`/`to` fields so peers filter out messages not addressed to them.
 pub const TOPIC_SESSION: &str = "helix/session/1.0.0";

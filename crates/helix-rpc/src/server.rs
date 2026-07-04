@@ -2,13 +2,13 @@ use std::net::SocketAddr;
 use std::sync::{atomic::Ordering, Arc};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use helix_core::Transaction;
+use helix_core::{Block, Transaction};
 use helix_crypto::{Address, Hash};
 use helix_executor::state::ChainState;
 use helix_mempool::Mempool;
@@ -42,6 +42,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/blocks/height/:n/header", get(get_block_header))
         .route("/blocks/height/:n/proof/:tx_hash", get(get_tx_proof))
         .route("/blocks/hash/:hash", get(get_block_by_hash))
+        .route("/blocks/range", get(get_blocks_range))
         .route("/accounts/:address", get(get_account))
         .route("/accounts/:address/name", get(get_account_name))
         .route("/accounts/:address/personhood", get(get_account_personhood))
@@ -56,6 +57,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/governance/proposals", get(get_governance_proposals))
         .route("/governance/proposals/:id", get(get_governance_proposal))
         .route("/mempool", get(get_mempool_info))
+        .route("/sync/blocks", get(get_sync_blocks))
         .route("/transactions", post(submit_transaction))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -151,6 +153,50 @@ async fn get_block_by_hash(
     }
 }
 
+/// Batch block download for node sync.
+///
+/// `GET /blocks/range?from=<height>&count=<n>` — returns up to 500 full blocks
+/// starting at `from`.  Used by new nodes bootstrapping from a known peer.
+async fn get_blocks_range(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, u64>>,
+) -> impl IntoResponse {
+    let from = params.get("from").copied().unwrap_or(0);
+    let count = params.get("count").copied().unwrap_or(100).min(500);
+    let store = state.store.read().await;
+    let mut blocks = Vec::with_capacity(count as usize);
+    for h in from..from + count {
+        match store.get_block_by_height(h) {
+            Ok(block) => blocks.push(BlockResponse::from(block)),
+            Err(_) => break, // reached tip — stop silently
+        }
+    }
+    (StatusCode::OK, Json(json!(blocks)))
+}
+
+/// Full block download for node sync — returns raw `Block` structs as JSON.
+///
+/// `GET /sync/blocks?from=<height>&count=<n>` — up to 200 blocks per request.
+/// Unlike `/blocks/range` (which returns the lossy `BlockResponse` display view),
+/// this endpoint returns the full `Block` including signatures and public keys, so
+/// a syncing node can replay execution and store blocks in its local database.
+async fn get_sync_blocks(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, u64>>,
+) -> impl IntoResponse {
+    let from = params.get("from").copied().unwrap_or(1);
+    let count = params.get("count").copied().unwrap_or(200).min(200);
+    let store = state.store.read().await;
+    let mut blocks: Vec<Block> = Vec::with_capacity(count as usize);
+    for h in from..from + count {
+        match store.get_block_by_height(h) {
+            Ok(block) => blocks.push(block),
+            Err(_) => break,
+        }
+    }
+    (StatusCode::OK, Json(json!(blocks)))
+}
+
 /// Header-only view of a block — for light clients that sync the chain of
 /// headers without paying the bandwidth cost of every block's full tx list.
 async fn get_block_header(
@@ -229,6 +275,8 @@ async fn get_account(
                 address: acc.address.clone(),
                 balance_hlx: acc.balance_hlx(),
                 staked_hlx: acc.staked_hlx(),
+                unbonding_stake_hlx: acc.unbonding_stake as f64 / 1_000_000_000.0,
+                unbonding_unlock_height: acc.unbonding_unlock_height,
                 nonce: acc.nonce,
                 has_code: acc.code.is_some(),
             })),

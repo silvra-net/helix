@@ -12,11 +12,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use helix_consensus::{Proposal, Vote};
-use helix_core::Transaction;
+use helix_core::{Block, Transaction};
 
 use crate::config::P2PConfig;
 use crate::session::{HandshakeMsg, SessionManager};
-use crate::{P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_SESSION, TOPIC_TRANSACTIONS, TOPIC_VOTES};
+use crate::{P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_SESSION, TOPIC_TRANSACTIONS, TOPIC_VOTES};
 
 /// Events received FROM the P2P network → node
 #[derive(Debug)]
@@ -24,6 +24,9 @@ pub enum P2PEvent {
     NewProposal(Proposal),
     NewTransaction(Transaction),
     NewVote(Vote),
+    /// A peer broadcast a committed block (already past BFT quorum).
+    /// The receiving node can apply it directly after verifying the proposer signature.
+    NewCommittedBlock(Block),
     PeerConnected(String),
     PeerDisconnected(String),
 }
@@ -34,6 +37,8 @@ pub enum P2PCommand {
     BroadcastProposal(Proposal),
     BroadcastTransaction(Transaction),
     BroadcastVote(Vote),
+    /// Broadcast a committed block to help lagging peers catch up.
+    BroadcastBlock(Block),
     ConnectPeer(Multiaddr),
 }
 
@@ -115,6 +120,7 @@ impl P2PService {
         let block_topic = gossipsub::IdentTopic::new(TOPIC_BLOCKS);
         let tx_topic = gossipsub::IdentTopic::new(TOPIC_TRANSACTIONS);
         let vote_topic = gossipsub::IdentTopic::new(TOPIC_VOTES);
+        let committed_topic = gossipsub::IdentTopic::new(TOPIC_COMMITTED_BLOCKS);
         let session_topic = gossipsub::IdentTopic::new(TOPIC_SESSION);
 
         swarm.behaviour_mut().gossipsub.subscribe(&block_topic)
@@ -122,6 +128,8 @@ impl P2PService {
         swarm.behaviour_mut().gossipsub.subscribe(&tx_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
         swarm.behaviour_mut().gossipsub.subscribe(&vote_topic)
+            .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
+        swarm.behaviour_mut().gossipsub.subscribe(&committed_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
         swarm.behaviour_mut().gossipsub.subscribe(&session_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
@@ -250,6 +258,15 @@ impl P2PService {
                                 }
                             }
                         }
+                        P2PCommand::BroadcastBlock(block) => {
+                            if let Ok(data) = bincode::serialize(&block) {
+                                if let Err(e) = swarm.behaviour_mut().gossipsub
+                                    .publish(committed_topic.clone(), data)
+                                {
+                                    debug!("Committed block broadcast: {}", e);
+                                }
+                            }
+                        }
                         P2PCommand::ConnectPeer(addr) => {
                             let _ = swarm.dial(addr);
                         }
@@ -341,6 +358,14 @@ async fn handle_app_message(topic: &str, data: &[u8], event_tx: &mpsc::Sender<P2
                 let _ = event_tx.send(P2PEvent::NewVote(vote)).await;
             }
             Err(e) => warn!("Invalid vote from peer: {}", e),
+        }
+    } else if topic == TOPIC_COMMITTED_BLOCKS {
+        match bincode::deserialize::<Block>(data) {
+            Ok(block) => {
+                debug!(height = block.height(), "Committed block from peer");
+                let _ = event_tx.send(P2PEvent::NewCommittedBlock(block)).await;
+            }
+            Err(e) => warn!("Invalid committed block from peer: {}", e),
         }
     }
 }

@@ -67,8 +67,12 @@ pub async fn show_account(address: &str, node: &str) -> Result<()> {
 
     println!("Account: {}", address);
     println!("─────────────────────────────────────────");
-    println!("  Balance : {} HLX", res["balance_hlx"]);
-    println!("  Staked  : {} HLX", res["staked_hlx"]);
-    println!("  Nonce   : {}", res["nonce"]);
+    println!("  Balance  : {} HLX", res["balance_hlx"]);
+    println!("  Staked   : {} HLX", res["staked_hlx"]);
+    let unbonding = res["unbonding_stake_hlx"].as_f64().unwrap_or(0.0);
+    if unbonding > 0.0 {
+        println!("  Unbonding: {} HLX (unlocks at block #{})", unbonding, res["unbonding_unlock_height"]);
+    }
+    println!("  Nonce    : {}", res["nonce"]);
     Ok(())
 }

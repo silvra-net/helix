@@ -1196,6 +1196,7 @@ dependencies = [
  "helix-rpc",
  "helix-storage",
  "libp2p",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

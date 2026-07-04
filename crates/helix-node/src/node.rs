@@ -165,7 +165,7 @@ impl HelixNode {
         let mut store = HelixDb::open(&db_path)?;
 
         let genesis_cfg = GenesisConfig::devnet(address.clone());
-        let chain_state = if store.get_block_by_height(0).is_ok() {
+        let mut chain_state = if store.get_block_by_height(0).is_ok() {
             info!("Loaded existing chain state from {}", db_path.display());
             store.load_chain_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX)?
         } else {
@@ -179,6 +179,17 @@ impl HelixNode {
             info!("Genesis: no validator pre-mine — earnings via 50/50 fee split only");
             state
         };
+
+        // Block sync — download historical blocks from a trusted peer if configured.
+        // `HELIX_SYNC_PEER=http://seed:8545` — fetches all blocks this node is missing.
+        if let Ok(peer_url) = std::env::var("HELIX_SYNC_PEER") {
+            let local_tip = store.latest_height();
+            info!("Syncing blocks from {} (local tip: {})", peer_url, local_tip);
+            match sync_blocks_from_peer(&peer_url, local_tip, &mut store, &mut chain_state).await {
+                Ok(synced) => info!("Block sync complete — applied {} new blocks", synced),
+                Err(e) => warn!("Block sync failed (continuing anyway): {}", e),
+            }
+        }
 
         // P2P setup
         let p2p_config = P2PConfig::default();
@@ -322,7 +333,7 @@ async fn handle_p2p_event(
             match result {
                 Ok(Some(block)) => {
                     info!(height = block.height(), "Block finalized via peer proposal");
-                    apply_finalized_block(block, store, mempool, chain_state, engine, p2p_tx, reward_address.clone()).await;
+                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, reward_address.clone()).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::UnknownValidator(_)) => {
@@ -344,7 +355,7 @@ async fn handle_p2p_event(
             match result {
                 Ok(Some(block)) => {
                     info!(height = block.height(), "Block finalized via peer votes");
-                    apply_finalized_block(block, store, mempool, chain_state, engine, p2p_tx, reward_address.clone()).await;
+                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, reward_address.clone()).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::NoActiveRound) => {
@@ -353,6 +364,43 @@ async fn handle_p2p_event(
                     debug!("Vote received with no active round — ignored");
                 }
                 Err(e) => warn!("Rejected peer vote: {}", e),
+            }
+        }
+        P2PEvent::NewCommittedBlock(block) => {
+            let our_height = store.read().await.latest_height();
+            let block_height = block.height();
+
+            if block_height <= our_height {
+                // Already have it — duplicate from gossip, ignore.
+                return;
+            }
+
+            if block_height > our_height + 1 {
+                // Gap detected — we're missing blocks between our_height+1 and block_height-1.
+                // Attempt to fill the gap from the peer that announced this block (using the
+                // RPC sync endpoint on the same host). We look for HELIX_SYNC_PEER; if not
+                // set, we can't fill the gap and will stay behind until the next block arrives.
+                warn!(our_height, block_height, "Block gap detected — attempting catch-up sync");
+                if let Ok(peer_url) = std::env::var("HELIX_SYNC_PEER") {
+                    let mut s = store.write().await;
+                    let mut cs = chain_state.write().await;
+                    match sync_blocks_from_peer(&peer_url, our_height, &mut s, &mut cs).await {
+                        Ok(n) => info!("Gap filled: applied {} blocks", n),
+                        Err(e) => warn!("Gap sync failed: {}", e),
+                    }
+                }
+                return;
+            }
+
+            // block_height == our_height + 1: verify proposer sig, then apply.
+            match block.header.verify_signature() {
+                Ok(()) => {
+                    info!(height = block_height, "Applying committed block from peer");
+                    apply_finalized_block(block, false, store, mempool, chain_state, engine, p2p_tx, reward_address).await;
+                }
+                Err(e) => {
+                    warn!(height = block_height, err = %e, "Committed block from peer failed signature check — dropping");
+                }
             }
         }
         P2PEvent::PeerConnected(_) => {
@@ -368,8 +416,14 @@ async fn handle_p2p_event(
 /// finality — whether that happened locally (this node cast the deciding vote
 /// itself in `block_production_loop`) or via a peer's vote arriving through P2P
 /// (`handle_p2p_event`). Both paths must apply identical side effects exactly once.
+///
+/// `should_broadcast`: set to `true` when this node was part of the consensus round
+/// (it knows the correct committed round). Set to `false` when applying a block
+/// received via `NewCommittedBlock` — the block has already been broadcast by the
+/// proposer, and re-broadcasting with a wrong round tag would confuse other nodes.
 async fn apply_finalized_block(
     block: Block,
+    should_broadcast: bool,
     store: &Arc<RwLock<HelixDb>>,
     mempool: &Arc<RwLock<Mempool>>,
     chain_state: &Arc<RwLock<ChainState>>,
@@ -434,12 +488,14 @@ async fn apply_finalized_block(
         }
     }
 
-    // Broadcast to peers before storing (peers can validate against prev_hash).
-    // Tagged with the round it actually committed in, so a peer that's
-    // exactly one block behind can validate the proposer against the right
-    // round instead of assuming round 0.
-    let round = engine.read().await.last_committed_round().unwrap_or(0);
-    let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal { round, block: block.clone() }));
+    // Only the node that participated in consensus knows the correct committed round
+    // and can broadcast a semantically correct Proposal. Nodes that received the block
+    // via NewCommittedBlock skip re-broadcasting to avoid flooding with wrong round tags.
+    if should_broadcast {
+        let round = engine.read().await.last_committed_round().unwrap_or(0);
+        let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal { round, block: block.clone() }));
+        let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone()));
+    }
 
     // Persist block + chain state to the same redb file, under one write lock.
     {
@@ -502,7 +558,7 @@ async fn block_production_loop(
         };
         match produced {
             Ok(block) => {
-                apply_finalized_block(block, &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone())
+                apply_finalized_block(block, true, &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone())
                     .await;
             }
             Err(ConsensusError::AwaitingVotes { round, .. }) => {
@@ -536,4 +592,53 @@ async fn block_production_loop(
             let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(vote));
         }
     }
+}
+
+/// Download and apply all blocks from a peer node that this node is missing.
+///
+/// Fetches blocks in batches of 200 from `peer_url/sync/blocks?from=X&count=200`,
+/// applies each through `execute_block`, and persists them to `store`.
+///
+/// Skips genesis (height 0) — every node generates it locally.
+/// Returns the number of blocks successfully applied.
+async fn sync_blocks_from_peer(
+    peer_url: &str,
+    local_tip: u64,
+    store: &mut HelixDb,
+    chain_state: &mut ChainState,
+) -> Result<u64> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let mut from = local_tip + 1;
+    let mut total_applied = 0u64;
+
+    loop {
+        let url = format!("{}/sync/blocks?from={}&count=200", peer_url.trim_end_matches('/'), from);
+        let resp = client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("peer returned HTTP {}", resp.status());
+        }
+        let blocks: Vec<Block> = resp.json().await?;
+        if blocks.is_empty() {
+            break; // caught up
+        }
+        for block in &blocks {
+            let h = block.height();
+            execute_block(chain_state, block, None);
+            store.put_block(block.clone())?;
+            if h % 1000 == 0 {
+                info!("Synced block {}", h);
+            }
+        }
+        total_applied += blocks.len() as u64;
+        from += blocks.len() as u64;
+        if blocks.len() < 200 {
+            break; // last batch — we're at the peer tip
+        }
+    }
+
+    store.save_chain_state(chain_state)?;
+    Ok(total_applied)
 }

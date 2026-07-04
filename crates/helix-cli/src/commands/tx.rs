@@ -28,6 +28,40 @@ pub enum TxCmd {
         #[arg(long)]
         nonce: Option<u64>,
     },
+    /// Lock HLX as validator stake
+    Stake {
+        /// Amount in HLX to stake
+        amount: f64,
+        /// Wallet key file
+        #[arg(short, long, default_value = "wallet.json")]
+        key: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
+        fee: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
+    /// Begin unbonding staked HLX (7-day lock before claimable)
+    Unstake {
+        /// Amount in HLX to unstake
+        amount: f64,
+        /// Wallet key file
+        #[arg(short, long, default_value = "wallet.json")]
+        key: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
+        fee: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
+    /// Claim unbonded stake back to liquid balance (after 7-day unbonding period)
+    ClaimUnbonded {
+        /// Wallet key file
+        #[arg(short, long, default_value = "wallet.json")]
+        key: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
+        fee: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
     /// Check transaction status
     Status {
         /// Transaction hash
@@ -39,6 +73,15 @@ pub async fn run(cmd: TxCmd, node: &str) -> Result<()> {
     match cmd {
         TxCmd::Send { to, amount, key, fee, nonce } => {
             send(to, amount, key, fee, nonce, node).await
+        }
+        TxCmd::Stake { amount, key, fee, nonce } => {
+            simple_amount_tx(TxType::Stake, amount, key, fee, nonce, node).await
+        }
+        TxCmd::Unstake { amount, key, fee, nonce } => {
+            simple_amount_tx(TxType::Unstake, amount, key, fee, nonce, node).await
+        }
+        TxCmd::ClaimUnbonded { key, fee, nonce } => {
+            zero_amount_tx(TxType::ClaimUnbonded, key, fee, nonce, node).await
         }
         TxCmd::Status { hash } => tx_status(hash, node).await,
     }
@@ -96,10 +139,96 @@ async fn send(
     println!("  Fee   : {} nano-HLX", fee);
     println!("  Nonce : {}", nonce);
 
+    submit_tx(&tx, node).await
+}
+
+/// Stake / Unstake — sends `amount_hlx` to self (or zero `to`)
+async fn simple_amount_tx(
+    tx_type: TxType,
+    amount_hlx: f64,
+    key_path: PathBuf,
+    fee: u64,
+    nonce_override: Option<u64>,
+    node: &str,
+) -> Result<()> {
+    let kf = KeyFile::load(&key_path)?;
+    let kp = if kf.is_encrypted() {
+        let pass = rpassword_read("Wallet passphrase: ")?;
+        kf.to_keypair(Some(&pass))?
+    } else {
+        kf.to_keypair(None)?
+    };
+    let from = Address::from_str(&kf.address)
+        .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
+    let amount_nano = (amount_hlx * NANO_PER_HLX) as u64;
+    let nonce = match nonce_override {
+        Some(n) => n,
+        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+    };
+    let mut tx = Transaction {
+        version: 1,
+        tx_type,
+        from: from.clone(),
+        to: None,
+        amount: amount_nano,
+        fee,
+        nonce,
+        data: vec![],
+        crypto_version: kp.scheme,
+        signature: Signature::from_bytes(vec![]),
+        public_key: kp.public.clone(),
+    };
+    let signing_hash = tx.signing_hash();
+    tx.signature = kp.sign(signing_hash.as_bytes())?;
+
+    submit_tx(&tx, node).await
+}
+
+/// Transactions with no amount (ClaimUnbonded, etc.)
+async fn zero_amount_tx(
+    tx_type: TxType,
+    key_path: PathBuf,
+    fee: u64,
+    nonce_override: Option<u64>,
+    node: &str,
+) -> Result<()> {
+    let kf = KeyFile::load(&key_path)?;
+    let kp = if kf.is_encrypted() {
+        let pass = rpassword_read("Wallet passphrase: ")?;
+        kf.to_keypair(Some(&pass))?
+    } else {
+        kf.to_keypair(None)?
+    };
+    let from = Address::from_str(&kf.address)
+        .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
+    let nonce = match nonce_override {
+        Some(n) => n,
+        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+    };
+    let mut tx = Transaction {
+        version: 1,
+        tx_type,
+        from: from.clone(),
+        to: None,
+        amount: 0,
+        fee,
+        nonce,
+        data: vec![],
+        crypto_version: kp.scheme,
+        signature: Signature::from_bytes(vec![]),
+        public_key: kp.public.clone(),
+    };
+    let signing_hash = tx.signing_hash();
+    tx.signature = kp.sign(signing_hash.as_bytes())?;
+
+    submit_tx(&tx, node).await
+}
+
+async fn submit_tx(tx: &Transaction, node: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let res: serde_json::Value = client
         .post(format!("{}/transactions", node))
-        .json(&tx)
+        .json(tx)
         .send()
         .await?
         .json()
@@ -109,7 +238,6 @@ async fn send(
         bail!("Transaction rejected: {}", err);
     }
 
-    println!();
     println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
     println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
     Ok(())

@@ -133,6 +133,10 @@ pub struct AccountResponse {
     pub address: String,
     pub balance_hlx: f64,
     pub staked_hlx: f64,
+    /// Stake in unbonding period (still slashable, not yet liquid)
+    pub unbonding_stake_hlx: f64,
+    /// Block height at which `unbonding_stake` becomes claimable (0 = no active unbonding)
+    pub unbonding_unlock_height: u64,
     pub nonce: u64,
     pub has_code: bool,
 }
