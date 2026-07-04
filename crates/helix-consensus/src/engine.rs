@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use helix_core::{block::CryptoVersion, Block, BlockHeader, Transaction};
+use helix_core::{Block, BlockHeader, Transaction};
 use helix_crypto::{merkle_root, Address, Hash, KeyPair, Signature};
 use tracing::info;
 
@@ -416,7 +416,7 @@ impl BftEngine {
             prev_hash,
             merkle_root: merkle,
             validator: self.address.clone(),
-            crypto_version: CryptoVersion::MlDsa,
+            crypto_version: keypair.scheme,
             signature: Signature::from_bytes(vec![]),
         };
 
@@ -462,6 +462,7 @@ fn cast_vote(
         block_hash,
         validator: address.clone(),
         public_key: keypair.public.clone(),
+        crypto_version: keypair.scheme,
         signature: Signature::from_bytes(vec![]),
     };
     let signing_bytes = vote.signing_bytes();

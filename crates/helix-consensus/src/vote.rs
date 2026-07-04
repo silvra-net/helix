@@ -1,3 +1,4 @@
+use helix_core::block::CryptoVersion;
 use helix_crypto::{Address, Hash, PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 
@@ -22,12 +23,17 @@ pub struct Vote {
     /// Public key of the voting validator. `Address` is a one-way BLAKE3 hash of it,
     /// so the key must travel with the vote for `signature` to be verifiable.
     pub public_key: PublicKey,
-    /// ML-DSA signature over (vote_type, height, round, block_hash)
+    /// Which crypto scheme the validator signed with — supports migration, mirrors
+    /// `BlockHeader::crypto_version`.
+    pub crypto_version: CryptoVersion,
+    /// Signature over (vote_type, height, round, block_hash, crypto_version)
     pub signature: Signature,
 }
 
 impl Vote {
-    /// The bytes that get signed — deterministic canonical encoding
+    /// The bytes that get signed — deterministic canonical encoding. Includes
+    /// `crypto_version` so a vote can't be replayed under a different scheme tag
+    /// than the one it was actually signed with.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(match self.vote_type {
@@ -37,13 +43,15 @@ impl Vote {
         bytes.extend_from_slice(&self.height.to_le_bytes());
         bytes.extend_from_slice(&self.round.to_le_bytes());
         bytes.extend_from_slice(self.block_hash.as_bytes());
+        bytes.push(self.crypto_version as u8);
         bytes
     }
 
     /// Verify that `public_key` belongs to `validator` and that `signature` is a
-    /// valid ML-DSA signature over this vote's contents. A forged vote (right
-    /// address, no private key) fails here — this is what makes votes trustworthy
-    /// once they start arriving over the network instead of only from `self`.
+    /// valid signature (under this vote's declared `crypto_version`) over this
+    /// vote's contents. A forged vote (right address, no private key) fails here —
+    /// this is what makes votes trustworthy once they start arriving over the
+    /// network instead of only from `self`.
     pub fn verify_signature(&self) -> ConsensusResult<()> {
         if Address::from_public_key(&self.public_key) != self.validator {
             return Err(ConsensusError::InvalidVote {
@@ -53,7 +61,12 @@ impl Vote {
                 ),
             });
         }
-        helix_crypto::verify(&self.public_key, &self.signing_bytes(), &self.signature)
-            .map_err(ConsensusError::Crypto)
+        helix_crypto::verify_with_scheme(
+            self.crypto_version,
+            &self.public_key,
+            &self.signing_bytes(),
+            &self.signature,
+        )
+        .map_err(ConsensusError::Crypto)
     }
 }

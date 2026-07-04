@@ -6,8 +6,28 @@ use aes_gcm::{
 };
 use anyhow::{bail, Result};
 use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-use helix_crypto::{Address, KeyPair, PublicKey, SecretKey};
+use helix_crypto::{Address, CryptoScheme, KeyPair};
 use serde::{Deserialize, Serialize};
+
+/// Human-readable algo strings stored in `KeyFile::algo` — the on-disk name for
+/// each `CryptoScheme`, so a wallet file records which scheme to reconstruct on load.
+const ALGO_ML_DSA: &str = "ML-DSA-Dilithium3";
+const ALGO_SPHINCS_PLUS: &str = "SLH-DSA-SPHINCS+-SHA2-192s";
+
+fn algo_name(scheme: CryptoScheme) -> &'static str {
+    match scheme {
+        CryptoScheme::MlDsa => ALGO_ML_DSA,
+        CryptoScheme::SphincsPlus => ALGO_SPHINCS_PLUS,
+    }
+}
+
+fn scheme_from_algo(algo: &str) -> Result<CryptoScheme> {
+    match algo {
+        ALGO_ML_DSA => Ok(CryptoScheme::MlDsa),
+        ALGO_SPHINCS_PLUS => Ok(CryptoScheme::SphincsPlus),
+        other => bail!("Unknown key algorithm in wallet file: {}", other),
+    }
+}
 
 /// On-disk wallet format — supports both plaintext (devnet) and encrypted (mainnet)
 #[derive(Serialize, Deserialize)]
@@ -34,7 +54,7 @@ impl KeyFile {
         KeyFile {
             address: address.to_string(),
             public_key: kp.public.to_hex(),
-            algo: "ML-DSA-Dilithium3".to_string(),
+            algo: algo_name(kp.scheme).to_string(),
             encryption: "plaintext".to_string(),
             secret_key: hex::encode(kp.secret.as_bytes()),
             kdf_salt: None,
@@ -70,7 +90,7 @@ impl KeyFile {
         Ok(KeyFile {
             address: address.to_string(),
             public_key: kp.public.to_hex(),
-            algo: "ML-DSA-Dilithium3".to_string(),
+            algo: algo_name(kp.scheme).to_string(),
             encryption: "aes256gcm-argon2id".to_string(),
             secret_key: hex::encode(&ciphertext),
             kdf_salt: Some(salt.to_string()),
@@ -133,10 +153,8 @@ impl KeyFile {
         };
 
         let pk_bytes = hex::decode(&self.public_key)?;
-        Ok(KeyPair {
-            public: PublicKey::from_bytes(pk_bytes),
-            secret: SecretKey::from_bytes(sk_bytes),
-        })
+        let scheme = scheme_from_algo(&self.algo)?;
+        Ok(KeyPair::from_raw(scheme, sk_bytes, pk_bytes)?)
     }
 
     pub fn is_encrypted(&self) -> bool {

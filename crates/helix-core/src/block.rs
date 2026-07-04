@@ -3,19 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::transaction::Transaction;
 
-/// The signing algorithm version used by the block proposer.
-/// Bumped during quantum migration to a new PQC scheme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CryptoVersion {
-    /// ML-DSA (Dilithium3) — NIST PQC standard, initial version
-    MlDsa = 1,
-}
-
-impl Default for CryptoVersion {
-    fn default() -> Self {
-        CryptoVersion::MlDsa
-    }
-}
+/// The signing algorithm used by the block proposer for this header.
+/// Bumped during quantum migration to a new PQC scheme — see `helix_crypto::CryptoScheme`
+/// for the schemes themselves and how verification dispatches on this tag.
+pub use helix_crypto::CryptoScheme as CryptoVersion;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHeader {

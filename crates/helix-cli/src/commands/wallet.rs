@@ -1,20 +1,24 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Subcommand;
-use helix_crypto::KeyPair;
+use helix_crypto::{CryptoScheme, KeyPair};
 
 use crate::keyfile::KeyFile;
 
 #[derive(Subcommand)]
 pub enum WalletCmd {
-    /// Generate a new ML-DSA keypair
+    /// Generate a new keypair (ML-DSA by default)
     New {
         #[arg(short, long, default_value = "wallet.json")]
         output: PathBuf,
         /// Protect the key with a passphrase (AES-256-GCM + Argon2id)
         #[arg(long)]
         passphrase: Option<String>,
+        /// Signature scheme: "ml-dsa" (default) or "sphincs-plus" — pick the
+        /// latter to migrate a wallet to the hash-based PQC scheme
+        #[arg(long, default_value = "ml-dsa")]
+        scheme: String,
     },
     /// Show address and public key for a wallet file
     Info {
@@ -37,9 +41,14 @@ pub enum WalletCmd {
 
 pub async fn run(cmd: WalletCmd) -> Result<()> {
     match cmd {
-        WalletCmd::New { output, passphrase } => {
-            println!("Generating ML-DSA (Dilithium3) keypair...");
-            let kp = KeyPair::generate();
+        WalletCmd::New { output, passphrase, scheme } => {
+            let scheme = match scheme.as_str() {
+                "ml-dsa" => CryptoScheme::MlDsa,
+                "sphincs-plus" => CryptoScheme::SphincsPlus,
+                other => bail!("Unknown scheme '{}' — expected 'ml-dsa' or 'sphincs-plus'", other),
+            };
+            println!("Generating {:?} keypair...", scheme);
+            let kp = KeyPair::generate_for(scheme);
 
             let kf = match passphrase {
                 Some(ref pass) => {

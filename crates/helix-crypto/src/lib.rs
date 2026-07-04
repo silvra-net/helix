@@ -6,4 +6,4 @@ pub mod keys;
 pub use address::Address;
 pub use error::{CryptoError, CryptoResult};
 pub use hash::{merkle_proof, merkle_root, verify_merkle_proof, Hash, MerkleProofStep};
-pub use keys::{verify, KeyPair, PublicKey, SecretKey, Signature};
+pub use keys::{verify, verify_with_scheme, CryptoScheme, KeyPair, PublicKey, SecretKey, Signature};

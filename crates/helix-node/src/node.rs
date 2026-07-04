@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use helix_consensus::{BftEngine, ConsensusError, Proposal, Validator, ValidatorSet};
 use helix_core::{genesis_block, Block};
-use helix_crypto::{Address, KeyPair};
+use helix_crypto::{Address, CryptoScheme, KeyPair};
 use helix_executor::{
     execute_block,
     genesis::{GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX},
@@ -22,43 +22,96 @@ use helix_storage::{db::HelixDb, BlockStore};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
-/// Load the validator keypair from disk, or generate + persist a new one.
-/// Stored as raw secret-key bytes (4032 B for ML-DSA-65); public key is derived on load.
-fn load_or_create_keypair(path: &PathBuf) -> Result<KeyPair> {
-    use helix_crypto::{PublicKey, SecretKey};
-    use pqcrypto_dilithium::dilithium3;
-    use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+/// Load the validator keypair from disk, or generate + persist a new one for
+/// `scheme_for_new` (the scheme to use only if no key file exists yet).
+///
+/// File format is `[scheme tag: 1 byte][secret key][public key]`, which lets a
+/// validator migrate to a new PQC scheme (see `helix_crypto::CryptoScheme`) by
+/// setting `HELIX_VALIDATOR_CRYPTO_SCHEME=sphincs-plus` and regenerating the key —
+/// blocks/votes it already signed under the old scheme stay verifiable forever
+/// since each one carries its own `crypto_version` tag.
+///
+/// Pre-migration key files (raw ML-DSA `secret key || public key`, no tag byte)
+/// are still read correctly: their length exactly matches the untagged legacy
+/// size, which no valid tagged file can produce.
+fn load_or_create_keypair(path: &PathBuf, scheme_for_new: CryptoScheme) -> Result<KeyPair> {
+    let legacy_len = CryptoScheme::MlDsa.secret_key_len() + CryptoScheme::MlDsa.public_key_len();
 
     if path.exists() {
         let data = std::fs::read(path)?;
-        let sk_len = dilithium3::secret_key_bytes();
-        let pk_len = dilithium3::public_key_bytes();
-        if data.len() != sk_len + pk_len {
-            anyhow::bail!(
-                "Validator key file has unexpected size ({} bytes, expected {})",
-                data.len(), sk_len + pk_len
-            );
-        }
-        let sk_bytes = data[..sk_len].to_vec();
-        let pk_bytes = data[sk_len..].to_vec();
-        // Validate both keys parse correctly
-        dilithium3::SecretKey::from_bytes(&sk_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid secret key in validator key file: {e:?}"))?;
-        dilithium3::PublicKey::from_bytes(&pk_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid public key in validator key file: {e:?}"))?;
-        info!("Loaded persistent validator keypair from {}", path.display());
-        Ok(KeyPair {
-            public: PublicKey::from_bytes(pk_bytes),
-            secret: SecretKey::from_bytes(sk_bytes),
-        })
+
+        let (scheme, sk_bytes, pk_bytes) = if data.len() == legacy_len {
+            let sk_len = CryptoScheme::MlDsa.secret_key_len();
+            (CryptoScheme::MlDsa, data[..sk_len].to_vec(), data[sk_len..].to_vec())
+        } else {
+            if data.is_empty() {
+                anyhow::bail!("Validator key file is empty");
+            }
+            let scheme = CryptoScheme::from_tag(data[0])
+                .map_err(|e| anyhow::anyhow!("Validator key file: {e}"))?;
+            let sk_len = scheme.secret_key_len();
+            let pk_len = scheme.public_key_len();
+            if data.len() != 1 + sk_len + pk_len {
+                anyhow::bail!(
+                    "Validator key file has unexpected size ({} bytes, expected {})",
+                    data.len(), 1 + sk_len + pk_len
+                );
+            }
+            (scheme, data[1..1 + sk_len].to_vec(), data[1 + sk_len..].to_vec())
+        };
+
+        let kp = KeyPair::from_raw(scheme, sk_bytes, pk_bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid key in validator key file: {e}"))?;
+        info!("Loaded persistent validator keypair ({:?}) from {}", scheme, path.display());
+        Ok(kp)
     } else {
-        let kp = KeyPair::generate();
-        // Persist as sk_bytes || pk_bytes
-        let mut data = kp.secret.as_bytes().to_vec();
+        let kp = KeyPair::generate_for(scheme_for_new);
+        // Persist as scheme_tag || sk_bytes || pk_bytes
+        let mut data = vec![scheme_for_new as u8];
+        data.extend_from_slice(kp.secret.as_bytes());
         data.extend_from_slice(kp.public.as_bytes());
         std::fs::write(path, &data)?;
-        info!("Generated new validator keypair → saved to {}", path.display());
+        info!("Generated new validator keypair ({:?}) → saved to {}", scheme_for_new, path.display());
         Ok(kp)
+    }
+}
+
+#[cfg(test)]
+mod keypair_file_tests {
+    use super::*;
+
+    #[test]
+    fn generates_and_reloads_a_tagged_keypair() {
+        let path = std::env::temp_dir().join(format!("helix-test-key-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let generated = load_or_create_keypair(&path, CryptoScheme::SphincsPlus).unwrap();
+        assert_eq!(generated.scheme, CryptoScheme::SphincsPlus);
+
+        // Loading again must reconstruct the same key from the tagged file,
+        // regardless of what scheme_for_new is passed (the file already exists).
+        let reloaded = load_or_create_keypair(&path, CryptoScheme::MlDsa).unwrap();
+        assert_eq!(reloaded.scheme, CryptoScheme::SphincsPlus);
+        assert_eq!(reloaded.public.as_bytes(), generated.public.as_bytes());
+        assert_eq!(reloaded.secret.as_bytes(), generated.secret.as_bytes());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn reads_pre_migration_legacy_format_as_ml_dsa() {
+        let path = std::env::temp_dir().join(format!("helix-test-legacy-key-{}.bin", std::process::id()));
+        let kp = KeyPair::generate();
+        // Legacy format: no scheme tag byte, just sk || pk.
+        let mut data = kp.secret.as_bytes().to_vec();
+        data.extend_from_slice(kp.public.as_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let loaded = load_or_create_keypair(&path, CryptoScheme::SphincsPlus).unwrap();
+        assert_eq!(loaded.scheme, CryptoScheme::MlDsa);
+        assert_eq!(loaded.public.as_bytes(), kp.public.as_bytes());
+
+        std::fs::remove_file(&path).unwrap();
     }
 }
 
@@ -83,7 +136,11 @@ pub struct HelixNode {
 impl HelixNode {
     pub async fn new() -> Result<Self> {
         let key_path = PathBuf::from("validator-key.bin");
-        let keypair = load_or_create_keypair(&key_path)?;
+        let scheme_for_new = match std::env::var("HELIX_VALIDATOR_CRYPTO_SCHEME").as_deref() {
+            Ok("sphincs-plus") | Ok("sphincsplus") => CryptoScheme::SphincsPlus,
+            _ => CryptoScheme::MlDsa,
+        };
+        let keypair = load_or_create_keypair(&key_path, scheme_for_new)?;
         let address = Address::from_public_key(&keypair.public);
 
         // Optional reward address — fees land here instead of the validator address.

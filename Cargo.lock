@@ -1194,8 +1194,6 @@ dependencies = [
  "helix-rpc",
  "helix-storage",
  "libp2p",
- "pqcrypto-dilithium",
- "pqcrypto-traits",
  "serde",
  "serde_json",
  "tokio",

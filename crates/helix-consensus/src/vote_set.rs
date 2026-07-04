@@ -126,6 +126,7 @@ mod tests {
             block_hash,
             validator: Address::from_public_key(&keypair.public),
             public_key: keypair.public.clone(),
+            crypto_version: keypair.scheme,
             signature: Signature::from_bytes(vec![]),
         };
         vote.signature = keypair.sign(&vote.signing_bytes()).unwrap();
