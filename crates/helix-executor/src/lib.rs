@@ -128,6 +128,10 @@ fn execute_transfer(
     validator: &Address,
     tx_hash: Hash,
 ) -> Receipt {
+    if tx.amount == 0 {
+        return Receipt::failure(tx_hash, "transfer amount must be greater than zero", 0, 0);
+    }
+
     let sender = state.get_or_default(&tx.from);
 
     if tx.nonce != sender.nonce {

@@ -7,6 +7,8 @@ use thiserror::Error;
 pub enum MempoolError {
     #[error("Transaction {0} already in mempool")]
     AlreadyExists(String),
+    #[error("Nonce already pending: a transaction from {from} with nonce {nonce} is already in the mempool")]
+    NoncePending { from: String, nonce: u64 },
     #[error("Mempool full (max {0} transactions)")]
     Full(usize),
     #[error("Fee too low: got {got}, minimum {min}")]
@@ -27,6 +29,9 @@ pub struct Mempool {
     by_fee: BTreeMap<std::cmp::Reverse<Amount>, Vec<String>>,
     /// hash → transaction
     by_hash: HashMap<String, Transaction>,
+    /// (sender_address, nonce) → tx hash — prevents two txs with the same nonce
+    /// from the same sender clogging the pool (only one can ever succeed)
+    by_sender_nonce: HashMap<(String, u64), String>,
     max_size: usize,
     min_fee: Amount,
 }
@@ -36,6 +41,7 @@ impl Mempool {
         Mempool {
             by_fee: BTreeMap::new(),
             by_hash: HashMap::new(),
+            by_sender_nonce: HashMap::new(),
             max_size: DEFAULT_MAX_SIZE,
             min_fee: DEFAULT_MIN_FEE,
         }
@@ -55,6 +61,17 @@ impl Mempool {
             return Err(MempoolError::AlreadyExists(hash));
         }
 
+        // Reject if a different tx from the same sender at the same nonce is already pending.
+        // Two txs with the same (from, nonce) cannot both succeed; admitting both wastes
+        // block space and degrades UX.
+        let sender_nonce_key = (tx.from.to_string(), tx.nonce);
+        if self.by_sender_nonce.contains_key(&sender_nonce_key) {
+            return Err(MempoolError::NoncePending {
+                from: tx.from.to_string(),
+                nonce: tx.nonce,
+            });
+        }
+
         if self.by_hash.len() >= self.max_size {
             return Err(MempoolError::Full(self.max_size));
         }
@@ -68,6 +85,7 @@ impl Mempool {
             .or_default()
             .push(hash.clone());
 
+        self.by_sender_nonce.insert(sender_nonce_key, hash.clone());
         self.by_hash.insert(hash, tx);
         Ok(())
     }
@@ -109,6 +127,7 @@ impl Mempool {
                         self.by_fee.remove(&std::cmp::Reverse(tx.fee));
                     }
                 }
+                self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
             }
         }
     }
@@ -218,5 +237,39 @@ mod tests {
         assert_eq!(pool.len(), 1);
         pool.remove_committed(&[hash]);
         assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn test_double_nonce_rejected() {
+        // Two different txs (different fees → different hashes) from the same sender
+        // at the same nonce: the second must be rejected so block space is not wasted.
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        let tx1 = make_tx(&kp, 5_000, 0);
+        let tx2 = make_tx(&kp, 6_000, 0); // same sender, same nonce, higher fee
+
+        pool.add(tx1).unwrap();
+        assert!(matches!(
+            pool.add(tx2),
+            Err(MempoolError::NoncePending { .. })
+        ));
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn test_double_nonce_slot_freed_after_commit() {
+        // After the first tx is committed, a new tx at the same nonce should be accepted
+        // (edge case: a re-submission after a failed block inclusion).
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        let tx = make_tx(&kp, 5_000, 0);
+        let hash = tx.hash();
+        pool.add(tx).unwrap();
+        pool.remove_committed(&[hash]);
+
+        let tx2 = make_tx(&kp, 6_000, 0);
+        assert!(pool.add(tx2).is_ok(), "slot should be free after commit");
     }
 }
