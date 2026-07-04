@@ -34,6 +34,11 @@ pub enum TxType {
     ///   - `commitment: [u8; 16]`   — the public commitment C = secret^(2^63)
     ///   - `proof_bytes: Vec<u8>`   — the winterfell STARK proof bytes
     ProvePersonhood,
+    /// Release unbonded stake to the liquid balance after the unbonding period has elapsed.
+    ///
+    /// No payload (`data` is empty). The executor checks `unbonding_unlock_height` against
+    /// the current block height; fails if no unbonding is pending or the lock hasn't expired.
+    ClaimUnbonded,
 }
 
 /// Payload embedded in `Transaction::data` for `TxType::ProvePersonhood`.

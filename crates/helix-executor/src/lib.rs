@@ -6,7 +6,7 @@ pub mod state;
 pub use genesis::GenesisConfig;
 pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal};
 pub use receipt::{BlockReceipt, Receipt};
-pub use state::{AccountState, ChainState};
+pub use state::{AccountState, ChainState, UNBONDING_PERIOD};
 
 use helix_core::{
     transaction::{PersonhoodProofPayload, TxType},
@@ -88,7 +88,8 @@ pub fn execute_transaction(
     match tx.tx_type {
         TxType::Transfer => execute_transfer(state, tx, validator, tx_hash),
         TxType::Stake => execute_stake(state, tx, validator, tx_hash),
-        TxType::Unstake => execute_unstake(state, tx, validator, tx_hash),
+        TxType::Unstake => execute_unstake(state, tx, validator, tx_hash, height),
+
         TxType::RegisterName => execute_register_name(state, tx, validator, tx_hash),
         TxType::RegisterIdentity => execute_register_identity(state, tx, validator, tx_hash, height),
         TxType::RegisterGuardians => execute_register_guardians(state, tx, validator, tx_hash),
@@ -98,6 +99,7 @@ pub fn execute_transaction(
         TxType::CreateProposal => execute_create_proposal(state, tx, validator, tx_hash, height),
         TxType::VoteProposal => execute_vote_proposal(state, tx, validator, tx_hash, height),
         TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash),
+        TxType::ClaimUnbonded => execute_claim_unbonded(state, tx, validator, tx_hash, height),
     }
 }
 
@@ -207,6 +209,7 @@ fn execute_unstake(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    height: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -219,10 +222,65 @@ fn execute_unstake(
     if sender.balance < tx.fee {
         return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
     }
+    // Only one unbonding queue entry at a time — simplifies state and slash accounting.
+    if sender.unbonding_stake > 0 {
+        return Receipt::failure(
+            tx_hash,
+            "an unbonding is already in progress; claim it before unstaking more",
+            0,
+            0,
+        );
+    }
 
+    let unlock_height = height + state::UNBONDING_PERIOD;
     state.update_account(&tx.from, |acc| {
         acc.staked -= tx.amount;
-        acc.balance += tx.amount; // returned immediately (unbonding period: Phase 4)
+        // Stake moves to the unbonding queue — still slashable during this period.
+        acc.unbonding_stake = tx.amount;
+        acc.unbonding_unlock_height = unlock_height;
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+fn execute_claim_unbonded(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+    height: u64,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+    if sender.unbonding_stake == 0 {
+        return Receipt::failure(tx_hash, "no unbonding stake to claim", 0, 0);
+    }
+    if !sender.can_claim_unbonded(height) {
+        return Receipt::failure(
+            tx_hash,
+            &format!(
+                "unbonding period not over: unlocks at height {}, current {}",
+                sender.unbonding_unlock_height, height
+            ),
+            0,
+            0,
+        );
+    }
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance += acc.unbonding_stake;
+        acc.unbonding_stake = 0;
+        acc.unbonding_unlock_height = 0;
         acc.balance -= tx.fee;
         acc.nonce += 1;
     });
@@ -719,7 +777,6 @@ mod tests {
             data: name.as_bytes().to_vec(),
             crypto_version: kp.scheme,
 
-
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -793,7 +850,6 @@ mod tests {
             nonce,
             data: vec![],
             crypto_version: kp.scheme,
-
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -901,7 +957,6 @@ mod tests {
             data,
             crypto_version: kp.scheme,
 
-
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -927,7 +982,6 @@ mod tests {
             nonce,
             data: new_public_key.as_bytes().to_vec(),
             crypto_version: kp.scheme,
-
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -1101,7 +1155,6 @@ mod tests {
             nonce,
             data,
             crypto_version: kp.scheme,
-
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -1290,7 +1343,6 @@ mod tests {
             data,
             crypto_version: kp.scheme,
 
-
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -1445,5 +1497,148 @@ mod tests {
             signed_governance_tx(&voter_kp, &voter, TxType::VoteProposal, governance::encode_vote(0), 0, 10_000);
         let receipt = execute_transaction(&mut state, &vote_tx, &validator, expired_height);
         assert!(!receipt.success);
+    }
+
+    // ── Unbonding / ClaimUnbonded tests ──────────────────────────────────────
+
+    fn signed_tx_simple(kp: &KeyPair, from: &Address, tx_type: TxType, nonce: u64, fee: u64) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type,
+            from: from.clone(),
+            to: None,
+            amount: 0,
+            fee,
+            nonce,
+            data: vec![],
+            crypto_version: kp.scheme,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    fn signed_unstake_tx(kp: &KeyPair, from: &Address, amount: u64, nonce: u64, fee: u64) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::Unstake,
+            from: from.clone(),
+            to: None,
+            amount,
+            fee,
+            nonce,
+            data: vec![],
+            crypto_version: kp.scheme,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn unstake_moves_to_unbonding_not_balance() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 100_000;
+            acc.staked = 500_000;
+        });
+
+        let tx = signed_unstake_tx(&kp, &addr, 200_000, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+        assert!(receipt.success, "{:?}", receipt.error);
+
+        let acc = state.get(&addr).unwrap();
+        assert_eq!(acc.staked, 300_000, "active stake should be reduced");
+        assert_eq!(acc.unbonding_stake, 200_000, "unstaked amount should be in unbonding");
+        assert_eq!(acc.balance, 90_000, "only fee deducted from balance, unbonded not released");
+        assert_eq!(acc.unbonding_unlock_height, 1 + UNBONDING_PERIOD);
+    }
+
+    #[test]
+    fn claim_unbonded_before_period_fails() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 100_000;
+            acc.staked = 500_000;
+        });
+
+        let unstake_tx = signed_unstake_tx(&kp, &addr, 200_000, 0, 10_000);
+        execute_transaction(&mut state, &unstake_tx, &validator, 1);
+
+        // Try to claim one block before unlock
+        let claim_tx = signed_tx_simple(&kp, &addr, TxType::ClaimUnbonded, 1, 10_000);
+        let receipt = execute_transaction(&mut state, &claim_tx, &validator, UNBONDING_PERIOD);
+        assert!(!receipt.success, "should fail: unlock height is 1 + UNBONDING_PERIOD");
+    }
+
+    #[test]
+    fn claim_unbonded_after_period_succeeds() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 100_000;
+            acc.staked = 500_000;
+        });
+
+        let unstake_tx = signed_unstake_tx(&kp, &addr, 200_000, 0, 10_000);
+        execute_transaction(&mut state, &unstake_tx, &validator, 1);
+
+        // Claim exactly at unlock height
+        let unlock = 1 + UNBONDING_PERIOD;
+        let claim_tx = signed_tx_simple(&kp, &addr, TxType::ClaimUnbonded, 1, 10_000);
+        let receipt = execute_transaction(&mut state, &claim_tx, &validator, unlock);
+        assert!(receipt.success, "{:?}", receipt.error);
+
+        let acc = state.get(&addr).unwrap();
+        assert_eq!(acc.unbonding_stake, 0);
+        assert_eq!(acc.unbonding_unlock_height, 0);
+        // balance: 100_000 - 10_000 (unstake fee) + 200_000 (claimed) - 10_000 (claim fee) = 280_000
+        assert_eq!(acc.balance, 280_000);
+    }
+
+    #[test]
+    fn slash_hits_both_staked_and_unbonding() {
+        let addr = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.staked = 1_000_000;
+            acc.unbonding_stake = 500_000;
+        });
+
+        // 10% slash (1000 bps)
+        let slashed = state.slash(&addr, 1_000);
+        let acc = state.get(&addr).unwrap();
+        assert_eq!(acc.staked, 900_000);
+        assert_eq!(acc.unbonding_stake, 450_000);
+        assert_eq!(slashed, 150_000); // 100k + 50k
+    }
+
+    #[test]
+    fn double_unbonding_rejected() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 200_000;
+            acc.staked = 1_000_000;
+        });
+
+        let tx1 = signed_unstake_tx(&kp, &addr, 300_000, 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx1, &validator, 1).success);
+
+        let tx2 = signed_unstake_tx(&kp, &addr, 100_000, 1, 10_000);
+        let receipt = execute_transaction(&mut state, &tx2, &validator, 2);
+        assert!(!receipt.success, "second unstake while first is unbonding should fail");
     }
 }

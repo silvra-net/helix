@@ -412,14 +412,20 @@ async fn apply_finalized_block(
     }
 
     // Epoch boundary: rebuild the validator set from current stake.
-    // Personhood attestation isn't wired up yet (Phase 6), so rotated-in
-    // validators start uncapped-by-personhood (i.e. capped at 0.5%) until then.
+    // Personhood is read from chain state: ZK-STARK ProvePersonhood txs set
+    // PersonhoodStatus::Verified, which unlocks the 1% voting-power cap
+    // (instead of the 0.5% cap for unverified validators).
     if height % helix_consensus::EPOCH_LENGTH == 0 {
-        let stakers = chain_state.read().await.stakers();
+        let state_guard = chain_state.read().await;
+        let stakers = state_guard.stakers();
         let validators: Vec<Validator> = stakers
             .into_iter()
-            .map(|(addr, stake)| Validator::new(addr, stake, false))
+            .map(|(addr, stake)| {
+                let has_personhood = state_guard.has_personhood(&addr);
+                Validator::new(addr, stake, has_personhood)
+            })
             .collect();
+        drop(state_guard);
         let had = validators.len();
         let mut eng = engine.write().await;
         eng.rotate_validator_set(validators);

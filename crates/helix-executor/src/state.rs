@@ -6,18 +6,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::governance::{GovernanceParams, GovernanceProposal};
 
+/// Unbonding period in blocks — stake stays slashable for 7 days (≈ 12s/block).
+/// After this many blocks past the unstake tx, `ClaimUnbonded` releases the funds.
+pub const UNBONDING_PERIOD: u64 = 50_400;
+
 /// Per-account ledger state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
     pub address: String,
     /// Liquid balance in nano-HLX (1 HLX = 1_000_000_000 nano-HLX)
     pub balance: u64,
-    /// Locked in PoS stake
+    /// Locked in PoS stake (still earning rewards, still slashable)
     pub staked: u64,
+    /// Stake that has been queued for release but is still in the unbonding period.
+    /// This amount is slashable for past misbehavior discovered during unbonding.
+    #[serde(default)]
+    pub unbonding_stake: u64,
+    /// The block height at which `unbonding_stake` becomes claimable.
+    /// 0 means there is no active unbonding.
+    #[serde(default)]
+    pub unbonding_unlock_height: u64,
     /// Next expected nonce — prevents replay attacks
     pub nonce: u64,
     /// Deployed WASM contract bytecode, if this account is a contract.
-    /// `#[serde(default)]` keeps deserialization of pre-Phase-7 redb data working.
     #[serde(default)]
     pub code: Option<Vec<u8>>,
 }
@@ -28,9 +39,18 @@ impl AccountState {
             address: address.to_string(),
             balance: 0,
             staked: 0,
+            unbonding_stake: 0,
+            unbonding_unlock_height: 0,
             nonce: 0,
             code: None,
         }
+    }
+
+    /// Returns true if the unbonding period has passed and stake can be claimed.
+    pub fn can_claim_unbonded(&self, current_height: u64) -> bool {
+        self.unbonding_stake > 0
+            && self.unbonding_unlock_height > 0
+            && current_height >= self.unbonding_unlock_height
     }
 
     pub fn balance_hlx(&self) -> f64 {
@@ -136,10 +156,16 @@ impl ChainState {
         let Some(acc) = self.accounts.get_mut(&key) else {
             return 0;
         };
-        let amount = (acc.staked as u128 * fraction_bps as u128 / 10_000) as u64;
-        acc.staked -= amount;
-        self.total_burned += amount;
-        amount
+        // Slash from both active stake and unbonding stake — misbehavior during the
+        // unbonding period must still carry consequences, otherwise a validator could
+        // double-sign and immediately queue an unstake to escape punishment.
+        let slash_staked = (acc.staked as u128 * fraction_bps as u128 / 10_000) as u64;
+        let slash_unbonding = (acc.unbonding_stake as u128 * fraction_bps as u128 / 10_000) as u64;
+        acc.staked -= slash_staked;
+        acc.unbonding_stake -= slash_unbonding;
+        let total = slash_staked + slash_unbonding;
+        self.total_burned += total;
+        total
     }
 
     /// Resolve a registered name (without `.hlx`) to its owning address string.
