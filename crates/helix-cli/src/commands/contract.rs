@@ -88,6 +88,8 @@ async fn deploy(
         fee,
         nonce,
         data: bytecode,
+        crypto_version: kp.scheme,
+
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
@@ -141,6 +143,8 @@ async fn call(
         fee,
         nonce,
         data: vec![],
+        crypto_version: kp.scheme,
+
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };

@@ -503,6 +503,8 @@ mod tests {
             fee: 100,
             nonce,
             data: vec![],
+            crypto_version: Default::default(),
+
             signature: Signature::from_bytes(vec![]),
             public_key: PublicKey::from_bytes(vec![]),
         }

@@ -110,7 +110,13 @@ fn verify_tx_signature(state: &ChainState, tx: &Transaction) -> bool {
     match state.recovery_key(&tx.from) {
         Some(active_key) => {
             tx.public_key.as_bytes() == active_key.as_bytes()
-                && helix_crypto::verify(active_key, tx.signing_hash().as_bytes(), &tx.signature).is_ok()
+                && helix_crypto::verify_with_scheme(
+                    tx.crypto_version,
+                    active_key,
+                    tx.signing_hash().as_bytes(),
+                    &tx.signature,
+                )
+                .is_ok()
         }
         None => tx.verify_signature().is_ok(),
     }
@@ -707,6 +713,9 @@ mod tests {
             fee,
             nonce,
             data: name.as_bytes().to_vec(),
+            crypto_version: kp.scheme,
+
+
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -779,6 +788,9 @@ mod tests {
             fee,
             nonce,
             data: vec![],
+            crypto_version: kp.scheme,
+
+
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -883,6 +895,9 @@ mod tests {
             fee,
             nonce,
             data,
+            crypto_version: kp.scheme,
+
+
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -907,6 +922,9 @@ mod tests {
             fee,
             nonce,
             data: new_public_key.as_bytes().to_vec(),
+            crypto_version: kp.scheme,
+
+
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -1019,6 +1037,8 @@ mod tests {
             fee: 10_000,
             nonce: 1,
             data: vec![],
+            crypto_version: Default::default(),
+
             signature: Signature::from_bytes(vec![]),
             public_key: new_kp.public.clone(),
         };
@@ -1076,6 +1096,9 @@ mod tests {
             fee,
             nonce,
             data,
+            crypto_version: kp.scheme,
+
+
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -1261,6 +1284,9 @@ mod tests {
             fee,
             nonce,
             data,
+            crypto_version: kp.scheme,
+
+
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };

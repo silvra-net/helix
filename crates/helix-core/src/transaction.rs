@@ -1,4 +1,4 @@
-use helix_crypto::{Address, CryptoResult, Hash, PublicKey, Signature};
+use helix_crypto::{Address, CryptoResult, CryptoScheme, Hash, PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 
 /// HLX amounts are stored in nano-HLX (1 HLX = 1_000_000_000 nHLX)
@@ -60,7 +60,12 @@ pub struct Transaction {
     pub nonce: u64,
     /// Arbitrary payload: contract bytecode, call data, identity proof, etc.
     pub data: Vec<u8>,
-    /// ML-DSA detached signature over the canonical hash of this tx
+    /// Which PQC signature scheme was used to produce `signature`.
+    /// Included in the signing hash so this field cannot be flipped post-signing.
+    /// Defaults to `CryptoScheme::MlDsa` for backward-compatible deserialization.
+    #[serde(default)]
+    pub crypto_version: CryptoScheme,
+    /// Detached signature over the canonical hash of this tx
     pub signature: Signature,
     /// Full public key (needed for sig verification + address derivation)
     pub public_key: PublicKey,
@@ -79,6 +84,7 @@ impl Transaction {
             fee: self.fee,
             nonce: self.nonce,
             data: &self.data,
+            crypto_version: self.crypto_version,
         })
         .expect("serialization is infallible for fixed types");
         Hash::digest(&payload)
@@ -100,11 +106,17 @@ impl Transaction {
             ));
         }
         let hash = self.signing_hash();
-        helix_crypto::verify(&self.public_key, hash.as_bytes(), &self.signature)
+        helix_crypto::verify_with_scheme(
+            self.crypto_version,
+            &self.public_key,
+            hash.as_bytes(),
+            &self.signature,
+        )
     }
 }
 
-/// The signable subset of a transaction (excludes sig and pubkey)
+/// The signable subset of a transaction (excludes sig and pubkey).
+/// `crypto_version` is included so the scheme cannot be flipped post-signing.
 #[derive(Serialize)]
 struct TxPayload<'a> {
     version: u32,
@@ -115,6 +127,7 @@ struct TxPayload<'a> {
     fee: Amount,
     nonce: u64,
     data: &'a [u8],
+    crypto_version: CryptoScheme,
 }
 
 #[cfg(test)]
@@ -132,6 +145,7 @@ mod tests {
             fee: 1,
             nonce: 0,
             data: vec![],
+            crypto_version: keypair.scheme,
             signature: Signature::from_bytes(vec![]),
             public_key: keypair.public.clone(),
         };

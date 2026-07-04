@@ -60,6 +60,8 @@ async fn attest(address: String, key_path: PathBuf, fee: u64, node: &str) -> Res
         fee,
         nonce,
         data: vec![],
+        crypto_version: kp.scheme,
+
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };

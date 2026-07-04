@@ -58,6 +58,8 @@ async fn register(name: String, key_path: PathBuf, fee: u64, node: &str) -> Resu
         fee,
         nonce,
         data: name.as_bytes().to_vec(),
+        crypto_version: kp.scheme,
+
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };

@@ -149,6 +149,7 @@ mod tests {
             fee,
             nonce,
             data: vec![],
+            crypto_version: keypair.scheme,
             signature: Signature::from_bytes(vec![0u8; 32]),
             public_key: keypair.public.clone(),
         };

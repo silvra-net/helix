@@ -103,6 +103,8 @@ async fn propose(
         fee,
         nonce,
         data: encode_proposal(param.into(), new_value),
+        crypto_version: kp.scheme,
+
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
@@ -143,6 +145,8 @@ async fn vote(proposal_id: u64, key_path: PathBuf, fee: u64, node: &str) -> Resu
         fee,
         nonce,
         data: encode_vote(proposal_id),
+        crypto_version: kp.scheme,
+
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };

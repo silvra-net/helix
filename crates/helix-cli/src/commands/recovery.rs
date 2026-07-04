@@ -89,6 +89,8 @@ async fn register_guardians(
         fee,
         nonce,
         data: guardians.join("\n").into_bytes(),
+        crypto_version: kp.scheme,
+
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
@@ -151,6 +153,8 @@ async fn approve(
         fee,
         nonce,
         data: new_key_bytes,
+        crypto_version: kp.scheme,
+
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };

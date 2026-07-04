@@ -140,6 +140,7 @@ mod tests {
             fee: 1,
             nonce,
             data: vec![],
+            crypto_version: Default::default(),
             signature: Sig::from_bytes(vec![]),
             public_key: PublicKey::from_bytes(vec![]),
         }

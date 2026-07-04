@@ -82,6 +82,8 @@ async fn send(
         fee,
         nonce,
         data: vec![],
+        crypto_version: kp.scheme,
+
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
