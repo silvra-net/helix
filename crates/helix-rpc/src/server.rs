@@ -517,6 +517,7 @@ mod tests {
                 prev_hash: Hash::ZERO,
                 merkle_root: Hash::ZERO,
                 validator: validator.clone(),
+                public_key: helix_crypto::PublicKey::from_bytes(vec![]),
                 crypto_version: CryptoVersion::MlDsa,
                 signature: Signature::from_bytes(vec![]),
             },

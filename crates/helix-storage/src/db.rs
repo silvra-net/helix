@@ -344,7 +344,7 @@ mod tests {
         let kp = KeyPair::generate();
         let validator = Address::from_public_key(&kp.public);
         let sig = kp.sign(b"test-genesis").unwrap();
-        let genesis = genesis_block(validator.clone(), sig);
+        let genesis = genesis_block(validator.clone(), kp.public.clone(), sig);
         let genesis_hash = genesis.hash();
 
         {

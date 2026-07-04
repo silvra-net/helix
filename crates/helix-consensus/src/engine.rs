@@ -335,6 +335,14 @@ impl BftEngine {
             });
         }
 
+        block
+            .header
+            .verify_signature()
+            .map_err(|e| ConsensusError::InvalidBlock {
+                height: h,
+                reason: format!("invalid proposer signature: {e}"),
+            })?;
+
         if !block.verify_merkle_root() {
             return Err(ConsensusError::InvalidBlock {
                 height: h,
@@ -416,6 +424,7 @@ impl BftEngine {
             prev_hash,
             merkle_root: merkle,
             validator: self.address.clone(),
+            public_key: keypair.public.clone(),
             crypto_version: keypair.scheme,
             signature: Signature::from_bytes(vec![]),
         };

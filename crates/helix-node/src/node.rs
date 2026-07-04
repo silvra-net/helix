@@ -170,7 +170,7 @@ impl HelixNode {
             store.load_chain_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX)?
         } else {
             let sig = keypair.sign(b"helix-genesis-v1")?;
-            let genesis = genesis_block(address.clone(), sig);
+            let genesis = genesis_block(address.clone(), keypair.public.clone(), sig);
             store.put_block(genesis)?;
             info!("Genesis block created (height 0)");
 

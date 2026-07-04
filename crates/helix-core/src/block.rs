@@ -1,4 +1,4 @@
-use helix_crypto::{merkle_proof, merkle_root, Address, Hash, MerkleProofStep, Signature};
+use helix_crypto::{merkle_proof, merkle_root, Address, Hash, MerkleProofStep, PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 
 use crate::transaction::Transaction;
@@ -22,9 +22,13 @@ pub struct BlockHeader {
     pub merkle_root: Hash,
     /// Address of the validator that proposed this block
     pub validator: Address,
+    /// Public key of the proposing validator. `Address` is one-way so the key
+    /// must travel with the header for `signature` to be self-verifiable —
+    /// same pattern as `Vote::public_key`.
+    pub public_key: PublicKey,
     /// Which crypto scheme the validator used — supports migration
     pub crypto_version: CryptoVersion,
-    /// ML-DSA signature over the canonical header hash
+    /// Signature over the canonical signing hash (excludes `signature` itself)
     pub signature: Signature,
 }
 
@@ -40,6 +44,23 @@ impl BlockHeader {
             self.validator.as_str().as_bytes(),
             &[self.crypto_version as u8],
         ])
+    }
+
+    /// Verify that `public_key` derives `validator` and that `signature` is
+    /// valid under this header's declared `crypto_version`. Returns an error
+    /// if either check fails — callers should reject the block.
+    pub fn verify_signature(&self) -> helix_crypto::CryptoResult<()> {
+        if Address::from_public_key(&self.public_key) != self.validator {
+            return Err(helix_crypto::CryptoError::InvalidPublicKey(
+                "block proposer public key does not derive declared validator address".into(),
+            ));
+        }
+        helix_crypto::verify_with_scheme(
+            self.crypto_version,
+            &self.public_key,
+            self.signing_hash().as_bytes(),
+            &self.signature,
+        )
     }
 
     /// Full header hash including the signature — used as block ID
@@ -85,7 +106,7 @@ impl Block {
 }
 
 /// Genesis block — the first block, height 0, no parent
-pub fn genesis_block(validator: Address, signature: Signature) -> Block {
+pub fn genesis_block(validator: Address, public_key: PublicKey, signature: Signature) -> Block {
     let header = BlockHeader {
         version: 1,
         height: 0,
@@ -93,6 +114,7 @@ pub fn genesis_block(validator: Address, signature: Signature) -> Block {
         prev_hash: Hash::ZERO,
         merkle_root: Hash::ZERO,
         validator,
+        public_key,
         crypto_version: CryptoVersion::MlDsa,
         signature,
     };
@@ -140,6 +162,7 @@ mod tests {
                 prev_hash: Hash::ZERO,
                 merkle_root: root,
                 validator: Address::from_public_key(&PublicKey::from_bytes(vec![9])),
+                public_key: PublicKey::from_bytes(vec![9]),
                 crypto_version: CryptoVersion::MlDsa,
                 signature: Sig::from_bytes(vec![]),
             },
@@ -152,10 +175,49 @@ mod tests {
         }
     }
 
+    fn signed_test_block(kp: &helix_crypto::KeyPair) -> Block {
+        let addr = Address::from_public_key(&kp.public);
+        let mut block = genesis_block(addr, kp.public.clone(), Sig::from_bytes(vec![]));
+        let sig = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
+        block.header.signature = sig;
+        block
+    }
+
+    #[test]
+    fn verify_signature_accepts_valid_proposer_signature() {
+        use helix_crypto::KeyPair;
+        let kp = KeyPair::generate();
+        let block = signed_test_block(&kp);
+        assert!(block.header.verify_signature().is_ok());
+    }
+
+    #[test]
+    fn verify_signature_rejects_wrong_public_key() {
+        use helix_crypto::KeyPair;
+        let kp = KeyPair::generate();
+        let other = KeyPair::generate();
+        let mut block = signed_test_block(&kp);
+        // Swap in a different public key — address won't match
+        block.header.public_key = other.public.clone();
+        assert!(block.header.verify_signature().is_err());
+    }
+
+    #[test]
+    fn verify_signature_rejects_tampered_content() {
+        use helix_crypto::KeyPair;
+        let kp = KeyPair::generate();
+        let mut block = signed_test_block(&kp);
+        // Tamper with the block height after signing — signing_hash changes
+        block.header.height = 99;
+        assert!(block.header.verify_signature().is_err());
+    }
+
     #[test]
     fn merkle_proof_for_out_of_bounds_index_is_none() {
+        let pk = PublicKey::from_bytes(vec![1]);
         let block = genesis_block(
-            Address::from_public_key(&PublicKey::from_bytes(vec![1])),
+            Address::from_public_key(&pk),
+            pk,
             Sig::from_bytes(vec![]),
         );
         assert!(block.merkle_proof_for(0).is_none());
