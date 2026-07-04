@@ -12,6 +12,7 @@ members = [
     "crates/helix-node",
     "crates/helix-cli",
     "crates/helix-vm",
+    "crates/helix-zkp",
 ]
 resolver = "2"
 
@@ -64,6 +65,9 @@ libp2p = { version = "0.54", features = [
 aes-gcm = "0.10"
 argon2 = "0.5"
 
+# ZK-STARK proofs (NIST finalist — ZK Proof of Personhood)
+winterfell = "0.13"
+
 # Persistence
 redb = "2.1"
 
@@ -85,3 +89,4 @@ helix-executor = { path = "crates/helix-executor" }
 helix-mempool = { path = "crates/helix-mempool" }
 helix-rpc = { path = "crates/helix-rpc" }
 helix-vm = { path = "crates/helix-vm" }
+helix-zkp = { path = "crates/helix-zkp" }

@@ -11,6 +11,7 @@ helix-crypto.workspace = true
 helix-core.workspace = true
 helix-identity.workspace = true
 helix-vm.workspace = true
+helix-zkp.workspace = true
 serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true

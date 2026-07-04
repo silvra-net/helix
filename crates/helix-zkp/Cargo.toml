@@ -1,0 +1,13 @@
+[package]
+name = "helix-zkp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ZK-STARK Proof of Personhood for Helix validators — winterfell-based STARK proofs"
+
+[dependencies]
+winterfell.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true

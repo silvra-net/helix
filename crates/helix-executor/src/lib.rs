@@ -8,7 +8,10 @@ pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal};
 pub use receipt::{BlockReceipt, Receipt};
 pub use state::{AccountState, ChainState};
 
-use helix_core::{transaction::TxType, Block, Transaction};
+use helix_core::{
+    transaction::{PersonhoodProofPayload, TxType},
+    Block, Transaction,
+};
 use helix_crypto::{Address, Hash, PublicKey};
 use helix_identity::{GuardianSet, HelixName, RecoveryRequest};
 use thiserror::Error;
@@ -94,6 +97,7 @@ pub fn execute_transaction(
         TxType::CallContract => execute_call_contract(state, tx, validator, tx_hash),
         TxType::CreateProposal => execute_create_proposal(state, tx, validator, tx_hash, height),
         TxType::VoteProposal => execute_vote_proposal(state, tx, validator, tx_hash, height),
+        TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash),
     }
 }
 
@@ -623,6 +627,46 @@ fn execute_vote_proposal(
     }
     state.set_proposal(proposal);
 
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+fn execute_prove_personhood(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+
+    let payload: PersonhoodProofPayload = match bincode::deserialize(&tx.data) {
+        Ok(p) => p,
+        Err(_) => return Receipt::failure(tx_hash, "invalid personhood proof payload", 0, 0),
+    };
+
+    let proof = helix_zkp::PersonhoodProof::from_bytes(payload.proof_bytes);
+    if !helix_zkp::verify_personhood(&proof, payload.commitment) {
+        return Receipt::failure(tx_hash, "ZK personhood proof verification failed", 0, 0);
+    }
+
+    // Mark account as ZK-STARK personhood-verified in chain state
+    state.set_personhood_status(
+        &tx.from,
+        PersonhoodStatus::Verified { verified_at_height: 0 },
+    );
     state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
         acc.nonce += 1;

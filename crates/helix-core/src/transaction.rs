@@ -28,6 +28,21 @@ pub enum TxType {
     CreateProposal,
     /// Vote yes on a pending governance proposal
     VoteProposal,
+    /// Submit a ZK-STARK proof of personhood for a registered commitment.
+    ///
+    /// `data` field carries the bincode-serialized `PersonhoodProofPayload`:
+    ///   - `commitment: [u8; 16]`   — the public commitment C = secret^(2^63)
+    ///   - `proof_bytes: Vec<u8>`   — the winterfell STARK proof bytes
+    ProvePersonhood,
+}
+
+/// Payload embedded in `Transaction::data` for `TxType::ProvePersonhood`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonhoodProofPayload {
+    /// C = secret^(2^63) mod p, as 16-byte little-endian f128 field element.
+    pub commitment: [u8; 16],
+    /// Serialized winterfell STARK proof bytes.
+    pub proof_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
