@@ -4,6 +4,7 @@ use std::sync::{atomic::Ordering, Arc};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -18,6 +19,7 @@ use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+use crate::rate_limit::{rate_limit_middleware, RateLimiter};
 use crate::{
     AccountResponse, BlockResponse, GovernanceParamsResponse, GovernanceProposalResponse,
     GuardianResponse, HeaderResponse, NameResponse, NodeStatus, PersonhoodResponse,
@@ -34,6 +36,11 @@ pub struct AppState {
 }
 
 pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
+    // Burst of 30 requests per IP, sustained refill of 10/sec — generous enough
+    // for normal wallet/explorer use, tight enough to blunt a single-source flood
+    // against the publicly reachable RPC endpoint.
+    let limiter = Arc::new(RateLimiter::new(30.0, 10.0));
+
     let app = Router::new()
         .route("/", get(root))
         .route("/status", get(get_status))
@@ -60,11 +67,17 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/sync/blocks", get(get_sync_blocks))
         .route("/transactions", post(submit_transaction))
         .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
         .with_state(state);
 
     info!("RPC server listening on http://{}", bind);
     let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 async fn root() -> Json<Value> {

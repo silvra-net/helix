@@ -397,6 +397,7 @@ This makes HLX deflationary by design: every transaction reduces supply.
 - [x] On-chain governance (`CreateProposal`/`VoteProposal` txs; stake-weighted 2/3-plus-one supermajority adjusts `min_validator_stake` or `fuel_per_fee_unit`; 1000-block voting window)
 - [x] Light client protocol (header-only sync via `GET /blocks/height/:n/header`; Merkle inclusion proofs via `GET /blocks/height/:n/proof/:tx_hash` + `helix_crypto::verify_merkle_proof`; block proposer signature self-verifiable via `BlockHeader::verify_signature()` — `public_key` travels with the header so a light client without full state can verify)
 - [x] Tx-History endpoint (`GET /accounts/:address/transactions`)
+- [x] Per-IP rate limiting on the REST API (`helix-rpc::rate_limit`; token-bucket, 30 burst / 10 req/s sustained per IP; Cloudflare `CF-Connecting-IP`/`X-Forwarded-For`-aware so the public tunnel doesn't bucket every visitor under one IP)
 
 ---
 
