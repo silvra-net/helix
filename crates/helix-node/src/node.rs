@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use helix_consensus::{BftEngine, ConsensusError, Proposal, Validator, ValidatorSet};
 use helix_core::{genesis_block, Block};
-use helix_crypto::{Address, CryptoScheme, KeyPair};
+use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair};
 use helix_executor::{
     execute_block,
     genesis::{GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX},
@@ -35,11 +35,24 @@ use tracing::{debug, error, info, warn};
 /// are still read correctly: their length exactly matches the untagged legacy
 /// size, which no valid tagged file can produce.
 fn load_or_create_keypair(path: &PathBuf, scheme_for_new: CryptoScheme) -> Result<KeyPair> {
-    let legacy_len = CryptoScheme::MlDsa.secret_key_len() + CryptoScheme::MlDsa.public_key_len();
-
     if path.exists() {
         let data = std::fs::read(path)?;
 
+        // Bevorzugt: vereinheitlichtes KeyFile-JSON-Format (seit 2026-07-05, dasselbe
+        // Format wie `hlx wallet` — kein separates Node-Rohformat mehr nötig, siehe
+        // helix-crypto::keyfile). Fallback darunter: legacy Rohformat für bereits
+        // bestehende validator-key.bin-Dateien, die noch im alten Format sind.
+        if let Ok(text) = std::str::from_utf8(&data) {
+            if let Ok(kf) = KeyFile::from_json_str(text) {
+                let kp = kf
+                    .to_keypair(None)
+                    .map_err(|e| anyhow::anyhow!("Invalid key in {}: {}", path.display(), e))?;
+                info!("Loaded persistent validator keypair ({:?}) from {} (KeyFile format)", kp.scheme, path.display());
+                return Ok(kp);
+            }
+        }
+
+        let legacy_len = CryptoScheme::MlDsa.secret_key_len() + CryptoScheme::MlDsa.public_key_len();
         let (scheme, sk_bytes, pk_bytes) = if data.len() == legacy_len {
             let sk_len = CryptoScheme::MlDsa.secret_key_len();
             (CryptoScheme::MlDsa, data[..sk_len].to_vec(), data[sk_len..].to_vec())
@@ -62,16 +75,15 @@ fn load_or_create_keypair(path: &PathBuf, scheme_for_new: CryptoScheme) -> Resul
 
         let kp = KeyPair::from_raw(scheme, sk_bytes, pk_bytes)
             .map_err(|e| anyhow::anyhow!("Invalid key in validator key file: {e}"))?;
-        info!("Loaded persistent validator keypair ({:?}) from {}", scheme, path.display());
+        info!("Loaded persistent validator keypair ({:?}) from {} (legacy raw format)", scheme, path.display());
         Ok(kp)
     } else {
         let kp = KeyPair::generate_for(scheme_for_new);
-        // Persist as scheme_tag || sk_bytes || pk_bytes
-        let mut data = vec![scheme_for_new as u8];
-        data.extend_from_slice(kp.secret.as_bytes());
-        data.extend_from_slice(kp.public.as_bytes());
-        std::fs::write(path, &data)?;
-        info!("Generated new validator keypair ({:?}) → saved to {}", scheme_for_new, path.display());
+        // Neue Keys im vereinheitlichten KeyFile-JSON-Format speichern — Node und CLI
+        // teilen sich ab jetzt ein Format, kein Konvertierungsschritt mehr nötig.
+        let kf = KeyFile::from_keypair_plain(&kp);
+        kf.save(path)?;
+        info!("Generated new validator keypair ({:?}) → saved to {} (KeyFile format)", scheme_for_new, path.display());
         Ok(kp)
     }
 }

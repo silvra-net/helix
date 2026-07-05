@@ -5,6 +5,9 @@
 *.log
 # Validator secret key — never commit
 /validator-key.bin
+/validator-wallet.json
+# Chain-Datenbank — Laufzeitdaten, kein Quellcode
+/helix-data.redb
 # Scripts (Cron/Dev-Loop — nur lokal)
 /scripts/
 /CLAUDE.md

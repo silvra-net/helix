@@ -1133,6 +1133,9 @@ dependencies = [
 name = "helix-crypto"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "argon2",
  "blake3",
  "bs58",
  "hex",
@@ -1142,6 +1145,7 @@ dependencies = [
  "pqcrypto-traits",
  "rand 0.8.6",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "zeroize",
 ]

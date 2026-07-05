@@ -37,6 +37,22 @@ pub enum WalletCmd {
         /// New passphrase (leave empty to remove encryption)
         passphrase: String,
     },
+    /// Import a node's raw validator key file (e.g. validator-key.bin) into a
+    /// normal CLI wallet file, so `wallet info`/`tx send`/etc. can use it directly.
+    /// Node key files use a different on-disk format than CLI wallets (raw
+    /// [scheme-tag][secret][public] bytes, or legacy untagged ML-DSA) — this bridges
+    /// the two without hand-rolled conversion code.
+    ImportNodeKey {
+        /// Path to the raw node key file (e.g. validator-key.bin)
+        #[arg(short, long)]
+        from: PathBuf,
+        /// Output wallet file
+        #[arg(short, long, default_value = "wallet.json")]
+        output: PathBuf,
+        /// Protect the imported key with a passphrase (AES-256-GCM + Argon2id)
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
 }
 
 pub async fn run(cmd: WalletCmd) -> Result<()> {
@@ -85,6 +101,55 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
         WalletCmd::Address { key } => {
             let kf = KeyFile::load(&key)?;
             println!("{}", kf.address);
+        }
+
+        WalletCmd::ImportNodeKey { from, output, passphrase } => {
+            let data = std::fs::read(&from)
+                .map_err(|e| anyhow::anyhow!("Could not read {}: {}", from.display(), e))?;
+
+            // Gleiche Erkennung wie helix-node::load_or_create_keypair: legacy Format
+            // (kein Tag-Byte, immer ML-DSA) vs. neues getaggtes Format.
+            let legacy_len = CryptoScheme::MlDsa.secret_key_len() + CryptoScheme::MlDsa.public_key_len();
+            let (scheme, sk_bytes, pk_bytes) = if data.len() == legacy_len {
+                let sk_len = CryptoScheme::MlDsa.secret_key_len();
+                (CryptoScheme::MlDsa, data[..sk_len].to_vec(), data[sk_len..].to_vec())
+            } else {
+                if data.is_empty() {
+                    bail!("Node key file is empty");
+                }
+                let scheme = CryptoScheme::from_tag(data[0])
+                    .map_err(|e| anyhow::anyhow!("Node key file: {}", e))?;
+                let sk_len = scheme.secret_key_len();
+                let pk_len = scheme.public_key_len();
+                if data.len() != 1 + sk_len + pk_len {
+                    bail!(
+                        "Node key file has unexpected size ({} bytes, expected {})",
+                        data.len(), 1 + sk_len + pk_len
+                    );
+                }
+                (scheme, data[1..1 + sk_len].to_vec(), data[1 + sk_len..].to_vec())
+            };
+
+            let kp = KeyPair::from_raw(scheme, sk_bytes, pk_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid key in {}: {}", from.display(), e))?;
+
+            let kf = match passphrase {
+                Some(ref pass) => {
+                    println!("Encrypting with AES-256-GCM + Argon2id...");
+                    KeyFile::from_keypair_encrypted(&kp, pass)?
+                }
+                None => KeyFile::from_keypair_plain(&kp),
+            };
+
+            kf.save(&output)?;
+            println!();
+            println!("  Imported from : {}", from.display());
+            println!("  Address       : {}", kf.address);
+            println!("  Algorithm     : {}", kf.algo);
+            println!("  Encryption    : {}", kf.encryption);
+            println!("  Saved to      : {}", output.display());
+            println!();
+            println!("  Use it like any other wallet, e.g.: hlx tx send <to> <amount> --key {}", output.display());
         }
 
         WalletCmd::Encrypt { key, passphrase } => {
