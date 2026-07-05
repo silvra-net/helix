@@ -249,10 +249,32 @@ impl HelixNode {
         // BFT engine, shared between the block production loop (which drives
         // its own proposals) and the P2P event handler (which folds in votes
         // arriving from other validators against that same active round).
-        let total_stake = 1_000_000_000_000_000u64;
-        let validator = Validator::new(self.address.clone(), total_stake, true);
-        let validator_set = ValidatorSet::new(vec![validator], 0);
+        //
+        // Rebuilt from persisted chain state rather than hardcoded, so a restart
+        // resumes with the same validator set and epoch the chain already
+        // rotated to — not epoch 0 with only this node as validator.
         let genesis_height = self.store.read().await.latest_height();
+        let validator_set = {
+            let state_guard = self.chain_state.read().await;
+            let validators: Vec<Validator> = state_guard
+                .stakers()
+                .into_iter()
+                .map(|(addr, stake)| {
+                    let has_personhood = state_guard.has_personhood(&addr);
+                    Validator::new(addr, stake, has_personhood)
+                })
+                .collect();
+            drop(state_guard);
+            let epoch = genesis_height / helix_consensus::EPOCH_LENGTH;
+            if validators.is_empty() {
+                // No qualifying stakers recorded yet — fall back to self as sole
+                // validator so the chain can still produce blocks.
+                let total_stake = 1_000_000_000_000_000u64;
+                ValidatorSet::new(vec![Validator::new(self.address.clone(), total_stake, true)], epoch)
+            } else {
+                ValidatorSet::new(validators, epoch)
+            }
+        };
         let engine = Arc::new(RwLock::new(BftEngine::new(
             validator_set,
             self.address.clone(),
