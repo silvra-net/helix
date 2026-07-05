@@ -404,7 +404,7 @@ This makes HLX deflationary by design: every transaction reduces supply.
 ## Security
 
 - **Persistent validator key** is stored unencrypted in `validator-key.bin` — protect this file
-- The transport layer (Noise/X25519) is not yet post-quantum — on-chain data is
+- The base transport layer (Noise/X25519) is classical, but P2P messages are additionally encrypted with ML-KEM-768 (post-quantum) session keys — see Phase 7 above; Noise remains for defense-in-depth
 - Minimum fee (1,000 nano-HLX) prevents zero-cost spam
 - Report security issues privately before public disclosure
 
