@@ -1,8 +1,10 @@
 pub mod config;
+pub mod reputation;
 pub mod session;
 pub mod service;
 
 pub use config::P2PConfig;
+pub use reputation::PeerReputation;
 pub use service::{P2PCommand, P2PEvent, P2PService};
 
 use thiserror::Error;

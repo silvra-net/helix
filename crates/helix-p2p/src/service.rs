@@ -15,6 +15,7 @@ use helix_consensus::{Proposal, Vote};
 use helix_core::{Block, Transaction};
 
 use crate::config::P2PConfig;
+use crate::reputation::PeerReputation;
 use crate::session::{HandshakeMsg, SessionManager};
 use crate::{P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_SESSION, TOPIC_TRANSACTIONS, TOPIC_VOTES};
 
@@ -156,26 +157,40 @@ impl P2PService {
         // ML-KEM session manager — maintains per-peer post-quantum session keys
         let mut session = SessionManager::new();
 
+        // Misbehavior scoring — disconnects and refuses reconnection for peers
+        // that repeatedly send malformed protocol messages.
+        let mut reputation = PeerReputation::new();
+
         loop {
             tokio::select! {
                 event = swarm.next() => {
                     let Some(event) = event else { break };
                     match event {
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Gossipsub(
-                            gossipsub::Event::Message { message, .. }
+                            gossipsub::Event::Message { propagation_source, message, .. }
                         )) => {
+                            let peer_str = propagation_source.to_string();
+                            if reputation.is_banned(&peer_str) {
+                                continue;
+                            }
+
                             let topic = message.topic.as_str();
 
-                            if topic == TOPIC_SESSION {
+                            let malformed = if topic == TOPIC_SESSION {
                                 handle_session_message(
                                     &message.data,
                                     &local_peer_id,
                                     &mut session,
                                     &mut swarm,
                                     &session_topic,
-                                );
+                                )
                             } else {
-                                handle_app_message(topic, &message.data, &event_tx).await;
+                                handle_app_message(topic, &message.data, &event_tx).await
+                            };
+
+                            if malformed && reputation.record_infraction(&peer_str) {
+                                warn!(peer = %peer_str, "peer exceeded misbehavior threshold — disconnecting");
+                                let _ = swarm.disconnect_peer_id(propagation_source);
                             }
                         }
 
@@ -199,8 +214,14 @@ impl P2PService {
                             info!(addr = %address, "P2P listening");
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            info!(peer = %peer_id, "Peer connected — initiating ML-KEM handshake");
                             let peer_str = peer_id.to_string();
+                            if reputation.is_banned(&peer_str) {
+                                warn!(peer = %peer_str, "rejecting connection from banned peer");
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                continue;
+                            }
+
+                            info!(peer = %peer_id, "Peer connected — initiating ML-KEM handshake");
 
                             // Kick off the ML-KEM session handshake as initiator
                             let ek = session.initiate(&peer_str);
@@ -281,24 +302,26 @@ impl P2PService {
 
 // ─── Session handshake handler ───────────────────────────────────────────────
 
+/// Returns `true` if the message was malformed (i.e. the sender should be
+/// charged a misbehavior strike).
 fn handle_session_message(
     data: &[u8],
     local_peer_id: &str,
     session: &mut SessionManager,
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
     session_topic: &gossipsub::IdentTopic,
-) {
+) -> bool {
     let msg = match bincode::deserialize::<HandshakeMsg>(data) {
         Ok(m) => m,
         Err(e) => {
             warn!("Malformed session message: {}", e);
-            return;
+            return true;
         }
     };
 
     // Messages are broadcast; only process those addressed to us
     if msg.to_peer() != local_peer_id {
-        return;
+        return false;
     }
 
     match msg {
@@ -322,13 +345,16 @@ fn handle_session_message(
                     }
                 }
             }
+            false
         }
         HandshakeMsg::KemCt { from, ct, .. } => {
             // We are the initiator: complete the handshake
             if session.complete(&from, &ct) {
                 info!(peer = %from, "ML-KEM session established (initiator)");
+                false
             } else {
                 warn!(peer = %from, "ML-KEM KemCt completion failed");
+                true
             }
         }
     }
@@ -336,36 +362,56 @@ fn handle_session_message(
 
 // ─── Application message handler ─────────────────────────────────────────────
 
-async fn handle_app_message(topic: &str, data: &[u8], event_tx: &mpsc::Sender<P2PEvent>) {
+/// Returns `true` if the message was malformed (i.e. the sender should be
+/// charged a misbehavior strike).
+async fn handle_app_message(topic: &str, data: &[u8], event_tx: &mpsc::Sender<P2PEvent>) -> bool {
     if topic == TOPIC_BLOCKS {
         match bincode::deserialize::<Proposal>(data) {
             Ok(proposal) => {
                 debug!(height = proposal.block.height(), round = proposal.round, "Proposal from peer");
                 let _ = event_tx.send(P2PEvent::NewProposal(proposal)).await;
+                false
             }
-            Err(e) => warn!("Invalid proposal from peer: {}", e),
+            Err(e) => {
+                warn!("Invalid proposal from peer: {}", e);
+                true
+            }
         }
     } else if topic == TOPIC_TRANSACTIONS {
         match bincode::deserialize::<Transaction>(data) {
             Ok(tx) => {
                 let _ = event_tx.send(P2PEvent::NewTransaction(tx)).await;
+                false
             }
-            Err(e) => warn!("Invalid tx from peer: {}", e),
+            Err(e) => {
+                warn!("Invalid tx from peer: {}", e);
+                true
+            }
         }
     } else if topic == TOPIC_VOTES {
         match bincode::deserialize::<Vote>(data) {
             Ok(vote) => {
                 let _ = event_tx.send(P2PEvent::NewVote(vote)).await;
+                false
             }
-            Err(e) => warn!("Invalid vote from peer: {}", e),
+            Err(e) => {
+                warn!("Invalid vote from peer: {}", e);
+                true
+            }
         }
     } else if topic == TOPIC_COMMITTED_BLOCKS {
         match bincode::deserialize::<Block>(data) {
             Ok(block) => {
                 debug!(height = block.height(), "Committed block from peer");
                 let _ = event_tx.send(P2PEvent::NewCommittedBlock(block)).await;
+                false
             }
-            Err(e) => warn!("Invalid committed block from peer: {}", e),
+            Err(e) => {
+                warn!("Invalid committed block from peer: {}", e);
+                true
+            }
         }
+    } else {
+        false
     }
 }
