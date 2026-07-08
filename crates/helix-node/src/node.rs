@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use helix_consensus::{BftEngine, ConsensusError, Proposal, Validator, ValidatorSet};
 use helix_core::{genesis_block, Block};
 use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair};
@@ -129,7 +129,49 @@ mod keypair_file_tests {
 
 const BLOCK_TIME_MS: u64 = 2_000;
 const MAX_TXS_PER_BLOCK: usize = 1_000;
-const RPC_BIND: &str = "127.0.0.1:8545";
+const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
+
+/// RPC bind address — defaults to `RPC_BIND_DEFAULT`, overridable via `HELIX_RPC_BIND`
+/// (e.g. `HELIX_RPC_BIND=0.0.0.0:8545` for non-standard topologies where the node
+/// isn't reached through a local reverse proxy / tunnel).
+fn resolve_rpc_bind() -> Result<SocketAddr> {
+    resolve_rpc_bind_from(std::env::var("HELIX_RPC_BIND").ok())
+}
+
+fn resolve_rpc_bind_from(override_val: Option<String>) -> Result<SocketAddr> {
+    match override_val {
+        Some(s) => s
+            .parse()
+            .with_context(|| format!("HELIX_RPC_BIND is set but not a valid address: {}", s)),
+        None => Ok(RPC_BIND_DEFAULT.parse().expect("valid default RPC bind addr")),
+    }
+}
+
+#[cfg(test)]
+mod rpc_bind_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_when_unset() {
+        assert_eq!(
+            resolve_rpc_bind_from(None).unwrap(),
+            RPC_BIND_DEFAULT.parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn honors_valid_override() {
+        assert_eq!(
+            resolve_rpc_bind_from(Some("0.0.0.0:9999".to_string())).unwrap(),
+            "0.0.0.0:9999".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_override() {
+        assert!(resolve_rpc_bind_from(Some("not-an-address".to_string())).is_err());
+    }
+}
 
 pub struct HelixNode {
     keypair: Arc<KeyPair>,
@@ -233,7 +275,8 @@ impl HelixNode {
         };
 
         // Spawn RPC server
-        let rpc_bind: SocketAddr = RPC_BIND.parse()?;
+        let rpc_bind: SocketAddr = resolve_rpc_bind()?;
+        info!("RPC bind address  : {}", rpc_bind);
         tokio::spawn(async move {
             start_rpc_server(rpc_state, rpc_bind).await;
         });
