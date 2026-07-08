@@ -1,0 +1,13 @@
+target/
+builds/
+*.log
+.env
+
+# Secrets / runtime data — never bake these into an image layer.
+validator-key.bin
+validator-wallet.json
+helix-data.redb
+
+.git/
+.claude-session-state*.md
+CLAUDE.md

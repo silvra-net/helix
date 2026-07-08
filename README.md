@@ -134,6 +134,9 @@ On first start, the node:
 | Variable | Default | Description |
 |---|---|---|
 | `HELIX_REWARD_ADDRESS` | (validator address) | Address that receives the 50% validator fee reward. Set this to your app wallet address so fees land there instead of the signing key. |
+| `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). |
+| `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer to fetch missing historical blocks from on startup. |
+| `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.bin` exists. |
 
 ```bash
 HELIX_REWARD_ADDRESS=hlx... ./target/release/helix
@@ -161,6 +164,34 @@ database:
 - On startup, the node loads existing state from this file if present, or
   builds genesis state on first run
 - **Back this file up** alongside `validator-key.bin` — losing it loses chain history
+
+### Docker Deployment
+
+A `Dockerfile` is provided for running a validator node without a local Rust toolchain.
+It's a multi-stage build (Rust builder → `debian:bookworm-slim` runtime) that produces
+a small image containing only the `helix` node binary.
+
+```bash
+docker build -t helix-node .
+
+docker run -d --name helix \
+  -p 8545:8545 -p 8546:8546 \
+  -v helix-data:/data \
+  -e HELIX_RPC_BIND=0.0.0.0:8545 \
+  helix-node
+```
+
+Notes:
+- The container's working directory is `/data` — mount a named volume (or bind mount)
+  there so `validator-key.bin` and `helix-data.redb` survive container recreation/upgrades.
+  Losing that volume means losing the validator identity and chain history, same as a
+  bare-metal deployment (see the two sections above).
+- `HELIX_RPC_BIND=0.0.0.0:8545` is required for the REST API to be reachable from outside
+  the container — the compiled-in default only binds `127.0.0.1`.
+- To join an existing network instead of starting a fresh devnet genesis, set
+  `HELIX_SYNC_PEER=http://<seed-host>:8545` and expose peer `8546/tcp` to the outside
+  world (P2P is TCP-only, no UDP/QUIC in the current transport).
+- The image has not been pushed to a registry — build it locally or in your own CI.
 
 ---
 
