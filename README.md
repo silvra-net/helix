@@ -144,10 +144,14 @@ HELIX_REWARD_ADDRESS=hlx... ./target/release/helix
 
 ### Persistent Validator Key
 
-The node stores its ML-DSA keypair in `validator-key.bin` (in the working directory):
-- File format: `sk_bytes (4032 bytes) ‖ pk_bytes (1952 bytes)` = 5984 bytes total
-- Generated once on first start; reused on every subsequent restart
+The node stores its validator keypair in `validator-key.bin` (in the working directory):
+- File format: unified `KeyFile` JSON (the same format used by `hlx wallet`) — fields
+  `address`, `public_key`, `algo`, `encryption` (`plaintext` or `aes256gcm-argon2id`),
+  `secret_key`, plus `kdf_salt`/`nonce` when encrypted
+- Generated once on first start (plaintext); reused on every subsequent restart
 - Validator address stays the same across restarts
+- Older raw-bytes files (`sk_bytes ‖ pk_bytes`, no JSON) from before 2026-07-05 are
+  still read transparently, but new keys are always written in `KeyFile` format
 - **Back this file up** — losing it means losing your validator identity
 
 Use the start script for a consistent setup:
