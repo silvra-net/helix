@@ -34,7 +34,20 @@ use tracing::{debug, error, info, warn};
 /// Pre-migration key files (raw ML-DSA `secret key || public key`, no tag byte)
 /// are still read correctly: their length exactly matches the untagged legacy
 /// size, which no valid tagged file can produce.
+/// Passphrase used to decrypt an encrypted `validator-key.bin` (KeyFile format with
+/// `encryption = "aes256gcm-argon2id"`, e.g. produced by `hlx wallet encrypt`). There
+/// is no interactive prompt at node startup, so this is the only way to unlock one.
+const VALIDATOR_KEY_PASSPHRASE_ENV: &str = "HELIX_VALIDATOR_KEY_PASSPHRASE";
+
 fn load_or_create_keypair(path: &PathBuf, scheme_for_new: CryptoScheme) -> Result<KeyPair> {
+    load_or_create_keypair_with(path, scheme_for_new, std::env::var(VALIDATOR_KEY_PASSPHRASE_ENV).ok())
+}
+
+fn load_or_create_keypair_with(
+    path: &PathBuf,
+    scheme_for_new: CryptoScheme,
+    passphrase: Option<String>,
+) -> Result<KeyPair> {
     if path.exists() {
         let data = std::fs::read(path)?;
 
@@ -45,7 +58,7 @@ fn load_or_create_keypair(path: &PathBuf, scheme_for_new: CryptoScheme) -> Resul
         if let Ok(text) = std::str::from_utf8(&data) {
             if let Ok(kf) = KeyFile::from_json_str(text) {
                 let kp = kf
-                    .to_keypair(None)
+                    .to_keypair(passphrase.as_deref())
                     .map_err(|e| anyhow::anyhow!("Invalid key in {}: {}", path.display(), e))?;
                 info!("Loaded persistent validator keypair ({:?}) from {} (KeyFile format)", kp.scheme, path.display());
                 return Ok(kp);
@@ -122,6 +135,30 @@ mod keypair_file_tests {
         let loaded = load_or_create_keypair(&path, CryptoScheme::SphincsPlus).unwrap();
         assert_eq!(loaded.scheme, CryptoScheme::MlDsa);
         assert_eq!(loaded.public.as_bytes(), kp.public.as_bytes());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn loads_passphrase_encrypted_keyfile_when_passphrase_given() {
+        let path = std::env::temp_dir().join(format!("helix-test-encrypted-key-{}.bin", std::process::id()));
+        let kp = KeyPair::generate();
+        let kf = KeyFile::from_keypair_encrypted(&kp, "correct horse battery staple").unwrap();
+        kf.save(&path).unwrap();
+
+        match load_or_create_keypair_with(&path, CryptoScheme::MlDsa, None) {
+            Err(e) => assert!(e.to_string().contains("Passphrase required")),
+            Ok(_) => panic!("expected loading an encrypted key without a passphrase to fail"),
+        }
+
+        let loaded = load_or_create_keypair_with(
+            &path,
+            CryptoScheme::MlDsa,
+            Some("correct horse battery staple".to_string()),
+        )
+        .unwrap();
+        assert_eq!(loaded.public.as_bytes(), kp.public.as_bytes());
+        assert_eq!(loaded.secret.as_bytes(), kp.secret.as_bytes());
 
         std::fs::remove_file(&path).unwrap();
     }
