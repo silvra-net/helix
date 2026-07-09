@@ -137,6 +137,7 @@ On first start, the node:
 | `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). |
 | `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer to fetch missing historical blocks from on startup. |
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.bin` exists. |
+| `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.bin` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
 
 ```bash
 HELIX_REWARD_ADDRESS=hlx... ./target/release/helix
