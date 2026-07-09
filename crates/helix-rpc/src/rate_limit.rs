@@ -67,9 +67,17 @@ impl RateLimiter {
 /// localhost, so the TCP peer address alone would bucket every visitor
 /// together — Cloudflare's `CF-Connecting-IP` header (falling back to the
 /// more generic `X-Forwarded-For`) carries the original client IP instead.
-/// The raw socket address is only used as a last resort (e.g. direct/local
-/// access without the tunnel in front).
+///
+/// Both headers are attacker-controlled on any connection that didn't
+/// actually come through the local tunnel (e.g. `HELIX_RPC_BIND=0.0.0.0:8545`
+/// deployments reachable directly), so they're only trusted when the raw
+/// socket peer is loopback — otherwise a client could send a fresh spoofed
+/// value on every request and bypass the limiter entirely. In that case the
+/// real socket address is used, which is exactly what the limiter needs.
 fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    if !peer.ip().is_loopback() {
+        return peer.ip();
+    }
     if let Some(ip) = headers
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
@@ -165,6 +173,17 @@ mod tests {
     #[test]
     fn falls_back_to_socket_peer_without_headers() {
         let headers = HeaderMap::new();
+        let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        assert_eq!(client_ip(&headers, peer), "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn ignores_forwarded_headers_from_non_loopback_peer() {
+        // A direct (non-tunneled) connection can set any header value it likes,
+        // so it must not be trusted — otherwise a spoofed header would bypass
+        // the limiter on every request.
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
         let peer: SocketAddr = "198.51.100.4:9000".parse().unwrap();
         assert_eq!(client_ip(&headers, peer), "198.51.100.4".parse::<IpAddr>().unwrap());
     }
