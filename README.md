@@ -129,14 +129,35 @@ On first start, the node:
 - Exposes REST API on `http://127.0.0.1:8545`
 - Listens for P2P peers on `0.0.0.0:8546`
 
+### Config File
+
+Instead of setting env vars individually, the node reads an optional `helix.toml`
+in the working directory (a different path can be set via `HELIX_CONFIG`). Every
+field is optional; the matching env var (if set) always overrides the file, so
+existing env-var-only setups keep working unchanged:
+
+```toml
+# helix.toml
+rpc_bind = "0.0.0.0:8545"
+p2p_listen_addr = "0.0.0.0:8546"
+reward_address = "hlx..."
+sync_peer = "http://seed-host:8545"
+validator_crypto_scheme = "ml-dsa"
+```
+
+An absent file is not an error (all fields default to unset); a present but
+malformed file (bad TOML, or an unknown field) fails node startup.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `HELIX_REWARD_ADDRESS` | (validator address) | Address that receives the 50% validator fee reward. Set this to your app wallet address so fees land there instead of the signing key. |
-| `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). |
-| `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer to fetch missing historical blocks from on startup. |
-| `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.bin` exists. |
+| `HELIX_CONFIG` | `./helix.toml` | Path to the config file described above. |
+| `HELIX_REWARD_ADDRESS` | (validator address) | Address that receives the 50% validator fee reward. Set this to your app wallet address so fees land there instead of the signing key. Overrides `reward_address` in `helix.toml`. |
+| `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). Overrides `rpc_bind` in `helix.toml`. |
+| `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address. Overrides `p2p_listen_addr` in `helix.toml`. |
+| `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer to fetch missing historical blocks from on startup. Overrides `sync_peer` in `helix.toml`. Note: the one-off startup sync honors both the file and the env var, but the live mid-run gap-fill fallback (triggered when a gossiped block arrives ahead of our tip) only reads the env var. |
+| `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.bin` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.bin` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
 
 ```bash

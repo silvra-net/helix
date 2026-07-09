@@ -22,6 +22,8 @@ use helix_storage::{db::HelixDb, BlockStore};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
+use crate::config::{self, NodeConfig};
+
 /// Load the validator keypair from disk, or generate + persist a new one for
 /// `scheme_for_new` (the scheme to use only if no key file exists yet).
 ///
@@ -168,11 +170,12 @@ const BLOCK_TIME_MS: u64 = 2_000;
 const MAX_TXS_PER_BLOCK: usize = 1_000;
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
 
-/// RPC bind address — defaults to `RPC_BIND_DEFAULT`, overridable via `HELIX_RPC_BIND`
-/// (e.g. `HELIX_RPC_BIND=0.0.0.0:8545` for non-standard topologies where the node
-/// isn't reached through a local reverse proxy / tunnel).
-fn resolve_rpc_bind() -> Result<SocketAddr> {
-    resolve_rpc_bind_from(std::env::var("HELIX_RPC_BIND").ok())
+/// RPC bind address — defaults to `RPC_BIND_DEFAULT`, overridable via `helix.toml`'s
+/// `rpc_bind` field or (taking precedence) the `HELIX_RPC_BIND` env var (e.g.
+/// `HELIX_RPC_BIND=0.0.0.0:8545` for non-standard topologies where the node isn't
+/// reached through a local reverse proxy / tunnel).
+fn resolve_rpc_bind(cfg: &NodeConfig) -> Result<SocketAddr> {
+    resolve_rpc_bind_from(config::resolve("HELIX_RPC_BIND", &cfg.rpc_bind))
 }
 
 fn resolve_rpc_bind_from(override_val: Option<String>) -> Result<SocketAddr> {
@@ -214,7 +217,7 @@ pub struct HelixNode {
     keypair: Arc<KeyPair>,
     address: Address,
     /// Where the validator's 50 % fee share lands.  Defaults to `address` when unset.
-    /// Configure via HELIX_REWARD_ADDRESS env var.
+    /// Configure via `reward_address` in `helix.toml` or the HELIX_REWARD_ADDRESS env var.
     reward_address: Option<Address>,
     store: Arc<RwLock<HelixDb>>,
     mempool: Arc<RwLock<Mempool>>,
@@ -222,27 +225,33 @@ pub struct HelixNode {
     p2p_command_tx: mpsc::Sender<P2PCommand>,
     p2p_event_rx: mpsc::Receiver<P2PEvent>,
     p2p_service: Option<P2PService>,
+    rpc_bind: SocketAddr,
 }
 
 impl HelixNode {
     pub async fn new() -> Result<Self> {
+        // `helix.toml` (path overridable via HELIX_CONFIG) bundles the node
+        // params below; env vars still take precedence over the file, see
+        // `config::resolve`.
+        let cfg = config::load_node_config()?;
+
         let key_path = PathBuf::from("validator-key.bin");
-        let scheme_for_new = match std::env::var("HELIX_VALIDATOR_CRYPTO_SCHEME").as_deref() {
-            Ok("sphincs-plus") | Ok("sphincsplus") => CryptoScheme::SphincsPlus,
+        let scheme_for_new = match config::resolve("HELIX_VALIDATOR_CRYPTO_SCHEME", &cfg.validator_crypto_scheme).as_deref() {
+            Some("sphincs-plus") | Some("sphincsplus") => CryptoScheme::SphincsPlus,
             _ => CryptoScheme::MlDsa,
         };
         let keypair = load_or_create_keypair(&key_path, scheme_for_new)?;
         let address = Address::from_public_key(&keypair.public);
 
         // Optional reward address — fees land here instead of the validator address.
-        let reward_address = std::env::var("HELIX_REWARD_ADDRESS").ok().and_then(|s| {
+        let reward_address = config::resolve("HELIX_REWARD_ADDRESS", &cfg.reward_address).and_then(|s| {
             match Address::from_str(&s) {
                 Ok(addr) => {
-                    info!("Fee reward address : {} (HELIX_REWARD_ADDRESS)", addr);
+                    info!("Fee reward address : {} (HELIX_REWARD_ADDRESS / helix.toml)", addr);
                     Some(addr)
                 }
                 Err(_) => {
-                    warn!("HELIX_REWARD_ADDRESS is set but invalid — fees go to validator address");
+                    warn!("reward_address is set but invalid — fees go to validator address");
                     None
                 }
             }
@@ -272,8 +281,9 @@ impl HelixNode {
         };
 
         // Block sync — download historical blocks from a trusted peer if configured.
-        // `HELIX_SYNC_PEER=http://seed:8545` — fetches all blocks this node is missing.
-        if let Ok(peer_url) = std::env::var("HELIX_SYNC_PEER") {
+        // `sync_peer = "http://seed:8545"` in helix.toml, or HELIX_SYNC_PEER — fetches
+        // all blocks this node is missing.
+        if let Some(peer_url) = config::resolve("HELIX_SYNC_PEER", &cfg.sync_peer) {
             let local_tip = store.latest_height();
             info!("Syncing blocks from {} (local tip: {})", peer_url, local_tip);
             match sync_blocks_from_peer(&peer_url, local_tip, &mut store, &mut chain_state).await {
@@ -282,9 +292,17 @@ impl HelixNode {
             }
         }
 
-        // P2P setup
-        let p2p_config = P2PConfig::default();
+        // P2P setup — `p2p_listen_addr` in helix.toml (or HELIX_P2P_LISTEN) overrides
+        // the default listen address; unset means keep P2PConfig::default().
+        let mut p2p_config = P2PConfig::default();
+        if let Some(addr) = config::resolve("HELIX_P2P_LISTEN", &cfg.p2p_listen_addr) {
+            p2p_config.listen_addr = addr
+                .parse()
+                .with_context(|| format!("invalid P2P listen address: {}", addr))?;
+        }
         let (p2p_service, p2p_command_tx, p2p_event_rx) = P2PService::new(p2p_config);
+
+        let rpc_bind = resolve_rpc_bind(&cfg)?;
 
         Ok(HelixNode {
             keypair: Arc::new(keypair),
@@ -296,6 +314,7 @@ impl HelixNode {
             p2p_command_tx,
             p2p_event_rx,
             p2p_service: Some(p2p_service),
+            rpc_bind,
         })
     }
 
@@ -312,7 +331,7 @@ impl HelixNode {
         };
 
         // Spawn RPC server
-        let rpc_bind: SocketAddr = resolve_rpc_bind()?;
+        let rpc_bind: SocketAddr = self.rpc_bind;
         info!("RPC bind address  : {}", rpc_bind);
         tokio::spawn(async move {
             start_rpc_server(rpc_state, rpc_bind).await;
@@ -494,6 +513,8 @@ async fn handle_p2p_event(
                 // Attempt to fill the gap from the peer that announced this block (using the
                 // RPC sync endpoint on the same host). We look for HELIX_SYNC_PEER; if not
                 // set, we can't fill the gap and will stay behind until the next block arrives.
+                // (This runtime fallback path only reads the env var, not helix.toml's
+                // `sync_peer` — the startup sync in `HelixNode::new` already resolves both.)
                 warn!(our_height, block_height, "Block gap detected — attempting catch-up sync");
                 if let Ok(peer_url) = std::env::var("HELIX_SYNC_PEER") {
                     let mut s = store.write().await;

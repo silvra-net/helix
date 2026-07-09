@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tracing::info;
 
+mod config;
 mod node;
 
 #[tokio::main]
