@@ -186,7 +186,7 @@ async fn get_blocks_range(
     let count = params.get("count").copied().unwrap_or(100).min(500);
     let store = state.store.read().await;
     let mut blocks = Vec::with_capacity(count as usize);
-    for h in from..from + count {
+    for h in from..from.saturating_add(count) {
         match store.get_block_by_height(h) {
             Ok(block) => blocks.push(BlockResponse::from(block)),
             Err(_) => break, // reached tip — stop silently
@@ -209,7 +209,7 @@ async fn get_sync_blocks(
     let count = params.get("count").copied().unwrap_or(200).min(200);
     let store = state.store.read().await;
     let mut blocks: Vec<Block> = Vec::with_capacity(count as usize);
-    for h in from..from + count {
+    for h in from..from.saturating_add(count) {
         match store.get_block_by_height(h) {
             Ok(block) => blocks.push(block),
             Err(_) => break,
@@ -675,5 +675,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn fresh_test_state() -> AppState {
+        let path = std::env::temp_dir().join(format!(
+            "helix-rpc-test-store-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = HelixDb::open(&path).unwrap();
+        AppState {
+            store: Arc::new(RwLock::new(store)),
+            mempool: Arc::new(RwLock::new(Mempool::new())),
+            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+            node_address: "test-node".to_string(),
+            peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// `from` near `u64::MAX` used to be added directly to `count`, which overflows.
+    /// Regression test for CTO backlog item 14.
+    #[tokio::test]
+    async fn get_blocks_range_does_not_overflow_near_u64_max() {
+        let state = fresh_test_state();
+        let mut params = std::collections::HashMap::new();
+        params.insert("from".to_string(), u64::MAX - 1);
+        params.insert("count".to_string(), 10);
+
+        let response = get_blocks_range(State(state), Query(params)).await;
+        assert_eq!(response.into_response().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_sync_blocks_does_not_overflow_near_u64_max() {
+        let state = fresh_test_state();
+        let mut params = std::collections::HashMap::new();
+        params.insert("from".to_string(), u64::MAX - 1);
+        params.insert("count".to_string(), 10);
+
+        let response = get_sync_blocks(State(state), Query(params)).await;
+        assert_eq!(response.into_response().status(), StatusCode::OK);
     }
 }
