@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::{atomic::Ordering, Arc};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -35,6 +35,11 @@ pub struct AppState {
     pub peer_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// Explicit request-body cap for `POST /transactions`, well above any plausible signed
+/// transaction, chosen to bound memory pressure from oversized payloads on this
+/// publicly reachable endpoint rather than relying on axum's implicit 2 MB default.
+const TX_SUBMIT_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
 pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
     // Burst of 30 requests per IP, sustained refill of 10/sec — generous enough
     // for normal wallet/explorer use, tight enough to blunt a single-source flood
@@ -65,7 +70,10 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/governance/proposals/:id", get(get_governance_proposal))
         .route("/mempool", get(get_mempool_info))
         .route("/sync/blocks", get(get_sync_blocks))
-        .route("/transactions", post(submit_transaction))
+        .route(
+            "/transactions",
+            post(submit_transaction).layer(DefaultBodyLimit::max(TX_SUBMIT_BODY_LIMIT_BYTES)),
+        )
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
         .with_state(state);
@@ -618,5 +626,54 @@ mod tests {
 
         let history = extract_tx_history(&[block0], alice.to_string().as_str());
         assert!(history.is_empty());
+    }
+
+    /// Exercises the exact route + `DefaultBodyLimit` wiring used for `POST /transactions`
+    /// in `start_rpc_server`, without needing a full `AppState` (redb needs a filesystem
+    /// path, which isn't worth setting up just to test body-size enforcement).
+    fn body_limited_echo_router() -> Router {
+        Router::new().route(
+            "/transactions",
+            post(|body: axum::body::Bytes| async move { body.len().to_string() })
+                .layer(DefaultBodyLimit::max(TX_SUBMIT_BODY_LIMIT_BYTES)),
+        )
+    }
+
+    #[tokio::test]
+    async fn submit_transaction_route_accepts_body_within_limit() {
+        use tower::ServiceExt;
+
+        let body = vec![b'a'; TX_SUBMIT_BODY_LIMIT_BYTES];
+        let response = body_limited_echo_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/transactions")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn submit_transaction_route_rejects_body_over_limit() {
+        use tower::ServiceExt;
+
+        let body = vec![b'a'; TX_SUBMIT_BODY_LIMIT_BYTES + 1];
+        let response = body_limited_echo_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/transactions")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
