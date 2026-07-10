@@ -742,7 +742,17 @@ async fn block_production_loop(
 /// Download and apply all blocks from a peer node that this node is missing.
 ///
 /// Fetches blocks in batches of 200 from `peer_url/sync/blocks?from=X&count=200`,
-/// applies each through `execute_block`, and persists them to `store`.
+/// verifies each block's proposer signature (same check as the P2P committed-block
+/// path in `handle_p2p_event`), applies it through `execute_block`, and persists it
+/// to `store`.
+///
+/// `sync_peer` is operator-configured and generally trusted, but since Docker
+/// deployments let external validator operators point it at a peer outside their
+/// own trust domain, a compromised or misconfigured peer could otherwise feed in
+/// unsigned or forged blocks. On the first block that fails signature verification,
+/// sync stops immediately — blocks applied before it stay applied and persisted
+/// (chain state is saved before returning), nothing already-valid is rolled back,
+/// but nothing after the bad block is trusted either.
 ///
 /// Skips genesis (height 0) — every node generates it locally.
 /// Returns the number of blocks successfully applied.
@@ -771,6 +781,16 @@ async fn sync_blocks_from_peer(
         }
         for block in &blocks {
             let h = block.height();
+            if let Err(e) = block.header.verify_signature() {
+                store.save_chain_state(chain_state)?;
+                anyhow::bail!(
+                    "block {} from sync peer failed signature verification ({}) — \
+                     aborting sync, {} block(s) already applied",
+                    h,
+                    e,
+                    total_applied
+                );
+            }
             execute_block(chain_state, block, None);
             store.put_block(block.clone())?;
             if h % 1000 == 0 {
@@ -786,4 +806,98 @@ async fn sync_blocks_from_peer(
 
     store.save_chain_state(chain_state)?;
     Ok(total_applied)
+}
+
+#[cfg(test)]
+mod sync_blocks_from_peer_tests {
+    use super::*;
+    use axum::{extract::Query, routing::get, Json, Router};
+    use helix_core::genesis_block;
+    use helix_crypto::{KeyPair, Signature as Sig};
+    use std::collections::HashMap;
+
+    fn signed_block(kp: &KeyPair, height: u64) -> Block {
+        let mut block = genesis_block(
+            Address::from_public_key(&kp.public),
+            kp.public.clone(),
+            Sig::from_bytes(vec![]),
+        );
+        block.header.height = height;
+        let sig = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
+        block.header.signature = sig;
+        block
+    }
+
+    async fn serve_blocks(blocks: Vec<Block>) -> String {
+        let blocks = Arc::new(blocks);
+        let app = Router::new().route(
+            "/sync/blocks",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let blocks = blocks.clone();
+                async move {
+                    let from: u64 = params.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let count: usize = params.get("count").and_then(|s| s.parse().ok()).unwrap_or(200);
+                    let page: Vec<Block> = blocks
+                        .iter()
+                        .filter(|b| b.height() >= from)
+                        .take(count)
+                        .cloned()
+                        .collect();
+                    Json(page)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    fn fresh_store() -> HelixDb {
+        let path = std::env::temp_dir().join(format!(
+            "helix-test-sync-store-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        HelixDb::open(&path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn applies_all_validly_signed_blocks() {
+        let kp = KeyPair::generate();
+        let blocks = vec![signed_block(&kp, 1), signed_block(&kp, 2), signed_block(&kp, 3)];
+        let peer_url = serve_blocks(blocks).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        let applied = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await.unwrap();
+
+        assert_eq!(applied, 3);
+        assert_eq!(store.latest_height(), 3);
+    }
+
+    #[tokio::test]
+    async fn rejects_tampered_block_and_aborts_cleanly() {
+        let kp = KeyPair::generate();
+        let mut tampered = signed_block(&kp, 2);
+        tampered.header.height = 99; // invalidates the signature without re-signing
+        let blocks = vec![signed_block(&kp, 1), tampered, signed_block(&kp, 3)];
+        let peer_url = serve_blocks(blocks).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+
+        // Sync aborts with an error instead of panicking/crashing ...
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("signature verification"));
+        // ... but the one valid block seen before the bad one stays applied.
+        assert_eq!(store.latest_height(), 1);
+        // The forged/height-99 and any block after it must never be persisted.
+        assert!(store.get_block_by_height(99).is_err());
+        assert!(store.get_block_by_height(3).is_err());
+    }
 }

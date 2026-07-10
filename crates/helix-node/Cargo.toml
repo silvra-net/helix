@@ -29,3 +29,6 @@ toml.workspace = true
 anyhow.workspace = true
 reqwest.workspace = true
 libp2p.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
