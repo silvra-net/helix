@@ -219,6 +219,11 @@ pub struct HelixNode {
     /// Where the validator's 50 % fee share lands.  Defaults to `address` when unset.
     /// Configure via `reward_address` in `helix.toml` or the HELIX_REWARD_ADDRESS env var.
     reward_address: Option<Address>,
+    /// Resolved once at startup (env > `helix.toml` > unset) via `config::resolve`,
+    /// then reused for both the startup sync and the runtime gap-fill fallback in
+    /// `handle_p2p_event` — so a `sync_peer` set only in the config file also
+    /// covers the runtime path, not just startup.
+    sync_peer: Option<String>,
     store: Arc<RwLock<HelixDb>>,
     mempool: Arc<RwLock<Mempool>>,
     chain_state: Arc<RwLock<ChainState>>,
@@ -283,10 +288,11 @@ impl HelixNode {
         // Block sync — download historical blocks from a trusted peer if configured.
         // `sync_peer = "http://seed:8545"` in helix.toml, or HELIX_SYNC_PEER — fetches
         // all blocks this node is missing.
-        if let Some(peer_url) = config::resolve("HELIX_SYNC_PEER", &cfg.sync_peer) {
+        let sync_peer = config::resolve("HELIX_SYNC_PEER", &cfg.sync_peer);
+        if let Some(peer_url) = &sync_peer {
             let local_tip = store.latest_height();
             info!("Syncing blocks from {} (local tip: {})", peer_url, local_tip);
-            match sync_blocks_from_peer(&peer_url, local_tip, &mut store, &mut chain_state).await {
+            match sync_blocks_from_peer(peer_url, local_tip, &mut store, &mut chain_state).await {
                 Ok(synced) => info!("Block sync complete — applied {} new blocks", synced),
                 Err(e) => warn!("Block sync failed (continuing anyway): {}", e),
             }
@@ -308,6 +314,7 @@ impl HelixNode {
             keypair: Arc::new(keypair),
             address,
             reward_address,
+            sync_peer,
             store: Arc::new(RwLock::new(store)),
             mempool: Arc::new(RwLock::new(Mempool::new())),
             chain_state: Arc::new(RwLock::new(chain_state)),
@@ -389,6 +396,7 @@ impl HelixNode {
         let keypair_for_p2p = self.keypair.clone();
         let p2p_tx_for_p2p = self.p2p_command_tx.clone();
         let reward_for_p2p = self.reward_address.as_ref().map(|a| Arc::new(a.clone()));
+        let sync_peer_for_p2p = self.sync_peer.clone();
         let mut p2p_event_rx = self.p2p_event_rx;
         tokio::spawn(async move {
             while let Some(event) = p2p_event_rx.recv().await {
@@ -402,6 +410,7 @@ impl HelixNode {
                     &keypair_for_p2p,
                     &p2p_tx_for_p2p,
                     reward_for_p2p.clone(),
+                    &sync_peer_for_p2p,
                 )
                 .await;
             }
@@ -443,6 +452,7 @@ async fn handle_p2p_event(
     keypair: &KeyPair,
     p2p_tx: &mpsc::Sender<P2PCommand>,
     reward_address: Option<Arc<Address>>,
+    sync_peer: &Option<String>,
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
@@ -510,16 +520,16 @@ async fn handle_p2p_event(
 
             if block_height > our_height + 1 {
                 // Gap detected — we're missing blocks between our_height+1 and block_height-1.
-                // Attempt to fill the gap from the peer that announced this block (using the
-                // RPC sync endpoint on the same host). We look for HELIX_SYNC_PEER; if not
-                // set, we can't fill the gap and will stay behind until the next block arrives.
-                // (This runtime fallback path only reads the env var, not helix.toml's
-                // `sync_peer` — the startup sync in `HelixNode::new` already resolves both.)
+                // Attempt to fill the gap from the configured sync peer (using the RPC sync
+                // endpoint on the same host; resolved once at startup from HELIX_SYNC_PEER or
+                // helix.toml's `sync_peer` via `config::resolve`, same source as the startup
+                // sync in `HelixNode::new`). If unset, we can't fill the gap and will stay
+                // behind until the next block arrives.
                 warn!(our_height, block_height, "Block gap detected — attempting catch-up sync");
-                if let Ok(peer_url) = std::env::var("HELIX_SYNC_PEER") {
+                if let Some(peer_url) = sync_peer {
                     let mut s = store.write().await;
                     let mut cs = chain_state.write().await;
-                    match sync_blocks_from_peer(&peer_url, our_height, &mut s, &mut cs).await {
+                    match sync_blocks_from_peer(peer_url, our_height, &mut s, &mut cs).await {
                         Ok(n) => info!("Gap filled: applied {} blocks", n),
                         Err(e) => warn!("Gap sync failed: {}", e),
                     }
