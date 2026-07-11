@@ -1,6 +1,7 @@
 use helix_core::{transaction::Amount, Transaction};
 use helix_crypto::Hash;
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -21,6 +22,12 @@ pub type MempoolResult<T> = Result<T, MempoolError>;
 
 const DEFAULT_MAX_SIZE: usize = 10_000;
 const DEFAULT_MIN_FEE: Amount = 1_000; // 1000 nano-HLX
+/// A tx that sits in the pool longer than this without being committed is
+/// dropped, freeing its (sender, nonce) slot. Without this, a tx that can
+/// never be included (insufficient balance, unfillable nonce gap ahead of it)
+/// blocks that slot forever whenever the pool isn't full enough to trigger
+/// fee-based eviction.
+const DEFAULT_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Fee-prioritized transaction pool.
 /// Higher fee → included in next block first.
@@ -32,8 +39,11 @@ pub struct Mempool {
     /// (sender_address, nonce) → tx hash — prevents two txs with the same nonce
     /// from the same sender clogging the pool (only one can ever succeed)
     by_sender_nonce: HashMap<(String, u64), String>,
+    /// hash → time of admission, used for TTL-based expiry
+    entered_at: HashMap<String, Instant>,
     max_size: usize,
     min_fee: Amount,
+    ttl: Duration,
 }
 
 impl Mempool {
@@ -42,8 +52,10 @@ impl Mempool {
             by_fee: BTreeMap::new(),
             by_hash: HashMap::new(),
             by_sender_nonce: HashMap::new(),
+            entered_at: HashMap::new(),
             max_size: DEFAULT_MAX_SIZE,
             min_fee: DEFAULT_MIN_FEE,
+            ttl: DEFAULT_TTL,
         }
     }
 
@@ -54,12 +66,54 @@ impl Mempool {
             by_fee: BTreeMap::new(),
             by_hash: HashMap::new(),
             by_sender_nonce: HashMap::new(),
+            entered_at: HashMap::new(),
             max_size,
             min_fee,
+            ttl: DEFAULT_TTL,
+        }
+    }
+
+    /// Like `with_limits` but also overrides the TTL — used by tests that need
+    /// to exercise expiry without waiting `DEFAULT_TTL`.
+    pub fn with_limits_and_ttl(max_size: usize, min_fee: Amount, ttl: Duration) -> Self {
+        Mempool {
+            by_fee: BTreeMap::new(),
+            by_hash: HashMap::new(),
+            by_sender_nonce: HashMap::new(),
+            entered_at: HashMap::new(),
+            max_size,
+            min_fee,
+            ttl,
+        }
+    }
+
+    /// Drop all transactions that have been sitting in the pool longer than `ttl`.
+    /// Called lazily from `add()`/`take()` rather than on a background timer.
+    fn evict_expired(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<String> = self
+            .entered_at
+            .iter()
+            .filter(|(_, &t)| now.duration_since(t) >= self.ttl)
+            .map(|(h, _)| h.clone())
+            .collect();
+        for hash in expired {
+            self.entered_at.remove(&hash);
+            if let Some(tx) = self.by_hash.remove(&hash) {
+                if let Some(bucket) = self.by_fee.get_mut(&std::cmp::Reverse(tx.fee)) {
+                    bucket.retain(|h| h != &hash);
+                    if bucket.is_empty() {
+                        self.by_fee.remove(&std::cmp::Reverse(tx.fee));
+                    }
+                }
+                self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
+            }
         }
     }
 
     pub fn add(&mut self, tx: Transaction) -> MempoolResult<()> {
+        self.evict_expired();
+
         if tx.fee < self.min_fee {
             return Err(MempoolError::FeeTooLow {
                 got: tx.fee,
@@ -106,6 +160,7 @@ impl Mempool {
             .push(hash.clone());
 
         self.by_sender_nonce.insert(sender_nonce_key, hash.clone());
+        self.entered_at.insert(hash.clone(), Instant::now());
         self.by_hash.insert(hash, tx);
         Ok(())
     }
@@ -116,7 +171,8 @@ impl Mempool {
     /// TXs are sorted by (sender, nonce) after the fee-priority pass so that a
     /// sender's sequential nonces always land in the correct order in the block.
     /// Without this, nonce N+1 arriving before N would be dropped by the executor.
-    pub fn take(&self, max_count: usize) -> Vec<Transaction> {
+    pub fn take(&mut self, max_count: usize) -> Vec<Transaction> {
+        self.evict_expired();
         let mut result = Vec::with_capacity(max_count);
         'outer: for hashes in self.by_fee.values() {
             for hash in hashes {
@@ -149,6 +205,7 @@ impl Mempool {
                 }
                 self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
             }
+            self.entered_at.remove(&key);
         }
     }
 
@@ -169,6 +226,7 @@ impl Mempool {
         if let Some(tx) = self.by_hash.remove(&hash) {
             self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
         }
+        self.entered_at.remove(&hash);
     }
 
     pub fn len(&self) -> usize {
@@ -352,5 +410,37 @@ mod tests {
         let tx = make_tx(&kp3, 5_000, 0);
         assert!(matches!(pool.add(tx), Err(MempoolError::Full(2))));
         assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn test_expired_tx_evicted_and_nonce_slot_freed() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::with_limits_and_ttl(100, 1_000, Duration::from_millis(1));
+
+        let stuck = make_tx(&kp, 5_000, 0);
+        pool.add(stuck).unwrap();
+        assert_eq!(pool.len(), 1);
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        // A resubmission at the same (sender, nonce) would normally be rejected
+        // with NoncePending — but the stuck tx is past its TTL, so add() must
+        // evict it first and admit the new one.
+        let resubmit = make_tx(&kp, 6_000, 0);
+        pool.add(resubmit).unwrap();
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn test_take_also_evicts_expired() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::with_limits_and_ttl(100, 1_000, Duration::from_millis(1));
+        pool.add(make_tx(&kp, 5_000, 0)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let taken = pool.take(10);
+        assert!(taken.is_empty(), "expired tx must not be included in take()");
+        assert_eq!(pool.len(), 0);
     }
 }

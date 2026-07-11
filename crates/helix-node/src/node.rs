@@ -693,7 +693,7 @@ async fn block_production_loop(
             false
         };
 
-        let txs = { mempool.read().await.take(MAX_TXS_PER_BLOCK) };
+        let txs = { mempool.write().await.take(MAX_TXS_PER_BLOCK) };
         let prev_hash = store.read().await.latest_hash();
 
         let produced = if stalled {
