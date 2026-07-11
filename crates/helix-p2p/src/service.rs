@@ -213,10 +213,13 @@ impl P2PService {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             info!(addr = %address, "P2P listening");
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             let peer_str = peer_id.to_string();
+                            if let Some(ip) = multiaddr_ip(endpoint.get_remote_address()) {
+                                reputation.note_connection(&peer_str, &ip);
+                            }
                             if reputation.is_banned(&peer_str) {
-                                warn!(peer = %peer_str, "rejecting connection from banned peer");
+                                warn!(peer = %peer_str, "rejecting connection from banned peer/IP");
                                 let _ = swarm.disconnect_peer_id(peer_id);
                                 continue;
                             }
@@ -298,6 +301,17 @@ impl P2PService {
 
         Ok(())
     }
+}
+
+/// Extracts the bare IP address (if any) from a `Multiaddr`, ignoring the
+/// port/transport suffix, so the same address at different ports still maps
+/// to the same reputation entry.
+fn multiaddr_ip(addr: &Multiaddr) -> Option<String> {
+    addr.iter().find_map(|proto| match proto {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
+        _ => None,
+    })
 }
 
 // ─── Session handshake handler ───────────────────────────────────────────────
@@ -413,5 +427,29 @@ async fn handle_app_message(topic: &str, data: &[u8], event_tx: &mpsc::Sender<P2
         }
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod multiaddr_ip_tests {
+    use super::multiaddr_ip;
+    use libp2p::Multiaddr;
+
+    #[test]
+    fn extracts_ip4_ignoring_port() {
+        let addr: Multiaddr = "/ip4/203.0.113.7/tcp/8546".parse().unwrap();
+        assert_eq!(multiaddr_ip(&addr), Some("203.0.113.7".to_string()));
+    }
+
+    #[test]
+    fn extracts_ip6_ignoring_port() {
+        let addr: Multiaddr = "/ip6/::1/tcp/8546".parse().unwrap();
+        assert_eq!(multiaddr_ip(&addr), Some("::1".to_string()));
+    }
+
+    #[test]
+    fn returns_none_without_ip_component() {
+        let addr: Multiaddr = "/dns4/example.com/tcp/8546".parse().unwrap();
+        assert_eq!(multiaddr_ip(&addr), None);
     }
 }
