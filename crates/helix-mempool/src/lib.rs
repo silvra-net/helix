@@ -47,6 +47,18 @@ impl Mempool {
         }
     }
 
+    /// Like `new()` but with custom limits — mainly useful for tests that need
+    /// to exercise full-pool behavior without inserting thousands of transactions.
+    pub fn with_limits(max_size: usize, min_fee: Amount) -> Self {
+        Mempool {
+            by_fee: BTreeMap::new(),
+            by_hash: HashMap::new(),
+            by_sender_nonce: HashMap::new(),
+            max_size,
+            min_fee,
+        }
+    }
+
     pub fn add(&mut self, tx: Transaction) -> MempoolResult<()> {
         if tx.fee < self.min_fee {
             return Err(MempoolError::FeeTooLow {
@@ -73,7 +85,15 @@ impl Mempool {
         }
 
         if self.by_hash.len() >= self.max_size {
-            return Err(MempoolError::Full(self.max_size));
+            // Pool is full: only admit this tx if it strictly outbids the cheapest
+            // tx currently held, evicting that one to make room. Otherwise a
+            // sustained flood of just-above-min-fee spam could permanently lock
+            // out legitimate higher-fee transactions.
+            let lowest_fee = self.by_fee.keys().next_back().map(|r| r.0);
+            match lowest_fee {
+                Some(lowest) if tx.fee > lowest => self.evict_lowest_fee(),
+                _ => return Err(MempoolError::Full(self.max_size)),
+            }
         }
 
         // Verify signature before accepting
@@ -129,6 +149,25 @@ impl Mempool {
                 }
                 self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
             }
+        }
+    }
+
+    /// Remove the single cheapest transaction currently in the pool, making room
+    /// for one new admission. No-op if the pool is empty.
+    fn evict_lowest_fee(&mut self) {
+        let lowest_key = match self.by_fee.keys().next_back().copied() {
+            Some(k) => k,
+            None => return,
+        };
+        let hash = {
+            let bucket = self.by_fee.get_mut(&lowest_key).expect("key just observed to exist");
+            bucket.remove(0)
+        };
+        if self.by_fee.get(&lowest_key).is_some_and(|b| b.is_empty()) {
+            self.by_fee.remove(&lowest_key);
+        }
+        if let Some(tx) = self.by_hash.remove(&hash) {
+            self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
         }
     }
 
@@ -271,5 +310,47 @@ mod tests {
 
         let tx2 = make_tx(&kp, 6_000, 0);
         assert!(pool.add(tx2).is_ok(), "slot should be free after commit");
+    }
+
+    #[test]
+    fn test_full_pool_evicts_cheapest_tx_for_higher_fee() {
+        let kp1 = KeyPair::generate();
+        let kp2 = KeyPair::generate();
+        let kp3 = KeyPair::generate();
+        let mut pool = Mempool::with_limits(2, 1_000);
+
+        let cheap = make_tx(&kp1, 5_000, 0);
+        let cheap_hash = cheap.hash();
+        let mid = make_tx(&kp2, 6_000, 0);
+        pool.add(cheap).unwrap();
+        pool.add(mid).unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // Pool is full, but this tx outbids the cheapest (5_000) — must evict it.
+        let expensive = make_tx(&kp3, 7_000, 0);
+        pool.add(expensive).unwrap();
+
+        assert_eq!(pool.len(), 2);
+        assert!(!pool.contains(&cheap_hash), "cheapest tx should have been evicted");
+
+        // Evicted sender's nonce slot must be freed too.
+        let resubmit = make_tx(&kp1, 8_000, 0);
+        assert!(pool.add(resubmit).is_ok());
+    }
+
+    #[test]
+    fn test_full_pool_rejects_tx_that_does_not_outbid_cheapest() {
+        let kp1 = KeyPair::generate();
+        let kp2 = KeyPair::generate();
+        let kp3 = KeyPair::generate();
+        let mut pool = Mempool::with_limits(2, 1_000);
+
+        pool.add(make_tx(&kp1, 5_000, 0)).unwrap();
+        pool.add(make_tx(&kp2, 6_000, 0)).unwrap();
+
+        // Equal to the cheapest fee — must not evict, must reject as Full.
+        let tx = make_tx(&kp3, 5_000, 0);
+        assert!(matches!(pool.add(tx), Err(MempoolError::Full(2))));
+        assert_eq!(pool.len(), 2);
     }
 }
