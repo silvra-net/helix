@@ -143,6 +143,7 @@ p2p_listen_addr = "0.0.0.0:8546"
 reward_address = "hlx..."
 sync_peer = "http://seed-host:8545"
 validator_crypto_scheme = "ml-dsa"
+mempool_tx_ttl_secs = 1800
 ```
 
 An absent file is not an error (all fields default to unset); a present but
@@ -156,9 +157,10 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_REWARD_ADDRESS` | (validator address) | Address that receives the 50% validator fee reward. Set this to your app wallet address so fees land there instead of the signing key. Overrides `reward_address` in `helix.toml`. |
 | `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). Overrides `rpc_bind` in `helix.toml`. |
 | `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address. Overrides `p2p_listen_addr` in `helix.toml`. |
-| `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer to fetch missing historical blocks from on startup. Overrides `sync_peer` in `helix.toml`. Note: the one-off startup sync honors both the file and the env var, but the live mid-run gap-fill fallback (triggered when a gossiped block arrives ahead of our tip) only reads the env var. |
+| `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer to fetch missing historical blocks from on startup. Overrides `sync_peer` in `helix.toml`. Both the one-off startup sync and the live mid-run gap-fill fallback (triggered when a gossiped block arrives ahead of our tip) honor this — file or env var, either works. |
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.bin` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.bin` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
+| `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` (30 min) | How long an unconfirmed transaction may sit in the mempool before it's evicted, freeing its (sender, nonce) slot. Overrides `mempool_tx_ttl_secs` in `helix.toml`. |
 
 ```bash
 HELIX_REWARD_ADDRESS=hlx... ./target/release/helix

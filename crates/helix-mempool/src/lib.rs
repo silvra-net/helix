@@ -87,6 +87,13 @@ impl Mempool {
         }
     }
 
+    /// Like `new()` but with a custom TTL — lets deployments configure eviction
+    /// timing (e.g. via `helix.toml`/`HELIX_MEMPOOL_TX_TTL_SECS`) without touching
+    /// `max_size`/`min_fee`.
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self::with_limits_and_ttl(DEFAULT_MAX_SIZE, DEFAULT_MIN_FEE, ttl)
+    }
+
     /// Drop all transactions that have been sitting in the pool longer than `ttl`.
     /// Called lazily from `add()`/`take()` rather than on a background timer.
     fn evict_expired(&mut self) {

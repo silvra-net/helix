@@ -310,13 +310,20 @@ impl HelixNode {
 
         let rpc_bind = resolve_rpc_bind(&cfg)?;
 
+        // Mempool TTL — `mempool_tx_ttl_secs` in helix.toml, or HELIX_MEMPOOL_TX_TTL_SECS;
+        // unset means keep Mempool's built-in DEFAULT_TTL.
+        let mempool = match config::resolve_u64("HELIX_MEMPOOL_TX_TTL_SECS", cfg.mempool_tx_ttl_secs) {
+            Some(secs) => Mempool::with_ttl(std::time::Duration::from_secs(secs)),
+            None => Mempool::new(),
+        };
+
         Ok(HelixNode {
             keypair: Arc::new(keypair),
             address,
             reward_address,
             sync_peer,
             store: Arc::new(RwLock::new(store)),
-            mempool: Arc::new(RwLock::new(Mempool::new())),
+            mempool: Arc::new(RwLock::new(mempool)),
             chain_state: Arc::new(RwLock::new(chain_state)),
             p2p_command_tx,
             p2p_event_rx,

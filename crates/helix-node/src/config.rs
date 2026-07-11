@@ -16,6 +16,7 @@ pub struct NodeConfig {
     pub reward_address: Option<String>,
     pub sync_peer: Option<String>,
     pub validator_crypto_scheme: Option<String>,
+    pub mempool_tx_ttl_secs: Option<u64>,
 }
 
 const CONFIG_PATH_ENV: &str = "HELIX_CONFIG";
@@ -42,6 +43,17 @@ fn load_node_config_from(path: &Path) -> Result<NodeConfig> {
 /// file field, which takes precedence over the caller's default.
 pub fn resolve(env_var: &str, config_val: &Option<String>) -> Option<String> {
     std::env::var(env_var).ok().or_else(|| config_val.clone())
+}
+
+/// Same precedence as `resolve` (env var > config file > caller default), but for a
+/// `u64` setting. An env var present but not parseable as `u64` is ignored (falls
+/// through to the config file value) rather than erroring — keeps this consistent
+/// with `resolve`'s "never fail on optional settings" behavior.
+pub fn resolve_u64(env_var: &str, config_val: Option<u64>) -> Option<u64> {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or(config_val)
 }
 
 #[cfg(test)]
@@ -91,5 +103,28 @@ mod tests {
         let env_var = "HELIX_TEST_RESOLVE_FALLBACK";
         std::env::remove_var(env_var);
         assert_eq!(resolve(env_var, &Some("from-file".to_string())), Some("from-file".to_string()));
+    }
+
+    #[test]
+    fn resolve_u64_prefers_env_over_config_file() {
+        let env_var = "HELIX_TEST_RESOLVE_U64_PRECEDENCE";
+        std::env::set_var(env_var, "42");
+        assert_eq!(resolve_u64(env_var, Some(7)), Some(42));
+        std::env::remove_var(env_var);
+    }
+
+    #[test]
+    fn resolve_u64_falls_back_to_config_file_on_unparseable_env() {
+        let env_var = "HELIX_TEST_RESOLVE_U64_UNPARSEABLE";
+        std::env::set_var(env_var, "not-a-number");
+        assert_eq!(resolve_u64(env_var, Some(7)), Some(7));
+        std::env::remove_var(env_var);
+    }
+
+    #[test]
+    fn resolve_u64_falls_back_to_default_when_unset() {
+        let env_var = "HELIX_TEST_RESOLVE_U64_UNSET";
+        std::env::remove_var(env_var);
+        assert_eq!(resolve_u64(env_var, None), None);
     }
 }
