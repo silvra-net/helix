@@ -544,9 +544,27 @@ async fn handle_p2p_event(
                 return;
             }
 
-            // block_height == our_height + 1: verify proposer sig, then apply.
+            // block_height == our_height + 1: verify proposer sig, then that the
+            // signer is actually a member of the current validator set — a
+            // self-consistent signature alone only proves the embedded public key
+            // matches the declared `validator` address, not that this address holds
+            // any stake. Without this check, anyone can generate a free throwaway
+            // keypair, self-sign a block for our next height, and gossip it on the
+            // public TOPIC_COMMITTED_BLOCKS topic to have it applied here — bypassing
+            // BFT quorum entirely and forking us off the real chain.
             match block.header.verify_signature() {
                 Ok(()) => {
+                    let is_known_validator = {
+                        engine.read().await.validator_set().get(&block.header.validator).is_some()
+                    };
+                    if !is_known_validator {
+                        warn!(
+                            height = block_height,
+                            validator = %block.header.validator,
+                            "Committed block from peer signed by an address outside the current validator set — dropping"
+                        );
+                        return;
+                    }
                     info!(height = block_height, "Applying committed block from peer");
                     apply_finalized_block(block, false, store, mempool, chain_state, engine, p2p_tx, reward_address).await;
                 }
@@ -798,6 +816,26 @@ async fn sync_blocks_from_peer(
                     total_applied
                 );
             }
+            // A self-consistent signature only proves the embedded public key matches
+            // the declared `validator` address, not that this address held any stake
+            // at the time. Check it against the stakers recorded in `chain_state` as
+            // of the block directly before this one (i.e. right after the previous
+            // iteration's `execute_block` applied any staking txs) — same gap as the
+            // one just closed in `handle_p2p_event`'s `NewCommittedBlock` arm, but
+            // reachable via a compromised/MITM'd sync peer instead of public gossip.
+            let is_known_validator = chain_state
+                .stakers()
+                .iter()
+                .any(|(addr, _)| addr == &block.header.validator);
+            if !is_known_validator {
+                store.save_chain_state(chain_state)?;
+                anyhow::bail!(
+                    "block {} from sync peer signed by an address outside the current \
+                     validator set — aborting sync, {} block(s) already applied",
+                    h,
+                    total_applied
+                );
+            }
             execute_block(chain_state, block, None);
             store.put_block(block.clone())?;
             if h % 1000 == 0 {
@@ -872,6 +910,16 @@ mod sync_blocks_from_peer_tests {
         HelixDb::open(&path).unwrap()
     }
 
+    /// Registers `kp`'s address as a staked validator in `chain_state`, so blocks
+    /// it signs pass the validator-set membership check in `sync_blocks_from_peer`.
+    fn stake_validator(chain_state: &mut ChainState, kp: &KeyPair) {
+        let addr = Address::from_public_key(&kp.public);
+        let min_stake = chain_state.governance_params.min_validator_stake;
+        let mut acc = helix_executor::AccountState::new(&addr);
+        acc.staked = min_stake;
+        chain_state.accounts.insert(addr.to_string(), acc);
+    }
+
     #[tokio::test]
     async fn applies_all_validly_signed_blocks() {
         let kp = KeyPair::generate();
@@ -880,6 +928,7 @@ mod sync_blocks_from_peer_tests {
 
         let mut store = fresh_store();
         let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &kp);
         let applied = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await.unwrap();
 
         assert_eq!(applied, 3);
@@ -896,6 +945,7 @@ mod sync_blocks_from_peer_tests {
 
         let mut store = fresh_store();
         let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &kp);
         let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
 
         // Sync aborts with an error instead of panicking/crashing ...
@@ -906,5 +956,94 @@ mod sync_blocks_from_peer_tests {
         // The forged/height-99 and any block after it must never be persisted.
         assert!(store.get_block_by_height(99).is_err());
         assert!(store.get_block_by_height(3).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_validly_signed_block_from_unstaked_address() {
+        // Signature is perfectly valid, but `kp` was never registered as a staker —
+        // simulates an attacker with a free, throwaway keypair and no stake.
+        let kp = KeyPair::generate();
+        let blocks = vec![signed_block(&kp, 1)];
+        let peer_url = serve_blocks(blocks).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0); // no stakers registered
+        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("outside the current validator set"));
+        assert_eq!(store.latest_height(), 0);
+        assert!(store.get_block_by_height(1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod handle_p2p_event_tests {
+    use super::*;
+    use helix_core::genesis_block;
+    use helix_crypto::{KeyPair, Signature as Sig};
+    use std::sync::atomic::AtomicUsize;
+
+    fn fresh_store() -> HelixDb {
+        let path = std::env::temp_dir().join(format!(
+            "helix-test-p2p-event-store-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        HelixDb::open(&path).unwrap()
+    }
+
+    fn signed_block(kp: &KeyPair, height: u64) -> Block {
+        let mut block = genesis_block(
+            Address::from_public_key(&kp.public),
+            kp.public.clone(),
+            Sig::from_bytes(vec![]),
+        );
+        block.header.height = height;
+        let sig = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
+        block.header.signature = sig;
+        block
+    }
+
+    /// The free-throwaway-keypair attack this fix closes: a validly self-signed
+    /// block from an address that holds no stake and isn't in the validator set
+    /// must be dropped by the `NewCommittedBlock` P2P event handler, not applied.
+    #[tokio::test]
+    async fn new_committed_block_from_unstaked_signer_is_dropped() {
+        let attacker_kp = KeyPair::generate();
+        let block = signed_block(&attacker_kp, 1);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let peer_count = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+
+        // Validator set contains only a legitimate, unrelated validator — not the attacker.
+        let real_kp = KeyPair::generate();
+        let real_addr = Address::from_public_key(&real_kp.public);
+        let validator_set = ValidatorSet::new(vec![Validator::new(real_addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, real_addr, 0)));
+
+        let own_kp = KeyPair::generate();
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
+
+        handle_p2p_event(
+            P2PEvent::NewCommittedBlock(block),
+            &mempool,
+            &peer_count,
+            &store,
+            &chain_state,
+            &engine,
+            &own_kp,
+            &p2p_tx,
+            None,
+            &None,
+        )
+        .await;
+
+        // Dropped: never applied (height unchanged), nothing broadcast.
+        assert_eq!(store.read().await.latest_height(), 0);
+        assert!(p2p_rx.try_recv().is_err());
     }
 }
