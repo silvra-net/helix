@@ -750,6 +750,14 @@ fn execute_prove_personhood(
         return Receipt::failure(tx_hash, "ZK personhood proof verification failed", 0, 0);
     }
 
+    // The STARK circuit only proves knowledge of a secret matching `commitment` —
+    // it isn't bound to `tx.from`. Once submitted, `commitment`+`proof_bytes` are
+    // public on-chain, so without this check anyone could copy them into a
+    // ProvePersonhood tx from a different address and get the same free pass.
+    if !state.used_personhood_commitments.insert(payload.commitment) {
+        return Receipt::failure(tx_hash, "personhood commitment already claimed", 0, 0);
+    }
+
     // Mark account as ZK-STARK personhood-verified in chain state
     state.set_personhood_status(
         &tx.from,
@@ -1747,5 +1755,81 @@ mod tests {
         let tx2 = signed_unstake_tx(&kp, &addr, 100_000, 1, 10_000);
         let receipt = execute_transaction(&mut state, &tx2, &validator, 2);
         assert!(!receipt.success, "second unstake while first is unbonding should fail");
+    }
+
+    fn signed_personhood_tx(
+        kp: &KeyPair,
+        from: &Address,
+        payload: &PersonhoodProofPayload,
+        nonce: u64,
+        fee: u64,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::ProvePersonhood,
+            from: from.clone(),
+            to: None,
+            amount: 0,
+            fee,
+            nonce,
+            data: bincode::serialize(payload).unwrap(),
+            crypto_version: kp.scheme,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn prove_personhood_succeeds_and_sets_verified_status() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
+        let payload = PersonhoodProofPayload { commitment, proof_bytes: proof.as_bytes().to_vec() };
+        let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
+
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert!(state.has_personhood(&addr));
+    }
+
+    #[test]
+    fn prove_personhood_rejects_replayed_commitment_from_different_address() {
+        // `commitment`+`proof_bytes` become public the moment the first tx lands
+        // on-chain. The STARK circuit never binds them to `tx.from`, so without
+        // the commitment-reuse check, a second address copying the exact same
+        // payload would get personhood-verified for free — no secret knowledge of
+        // their own, defeating Sybil resistance entirely.
+        let kp1 = KeyPair::generate();
+        let addr1 = Address::from_public_key(&kp1.public);
+        let kp2 = KeyPair::generate();
+        let addr2 = Address::from_public_key(&kp2.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr1, |acc| acc.balance = 1_000_000);
+        state.update_account(&addr2, |acc| acc.balance = 1_000_000);
+
+        let (proof, commitment) = helix_zkp::prove_personhood([9u8; 16]);
+        let payload = PersonhoodProofPayload { commitment, proof_bytes: proof.as_bytes().to_vec() };
+
+        let tx1 = signed_personhood_tx(&kp1, &addr1, &payload, 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx1, &validator, 0).success);
+        assert!(state.has_personhood(&addr1));
+
+        // Same exact payload (commitment + proof_bytes), different address/signature.
+        let tx2 = signed_personhood_tx(&kp2, &addr2, &payload, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx2, &validator, 1);
+
+        assert!(!receipt.success, "replayed commitment must be rejected");
+        assert!(!state.has_personhood(&addr2), "copying address must not gain personhood");
+        // Original claimant is unaffected.
+        assert!(state.has_personhood(&addr1));
     }
 }

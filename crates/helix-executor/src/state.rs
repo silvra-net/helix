@@ -88,6 +88,15 @@ pub struct ChainState {
     pub proposals: HashMap<u64, GovernanceProposal>,
     /// Next id to assign to a new proposal.
     pub next_proposal_id: u64,
+    /// ZK personhood commitments that have already been claimed by some address.
+    /// A `commitment`+`proof_bytes` pair becomes public the moment it's included in
+    /// a block, and the STARK circuit only proves knowledge of a secret matching
+    /// `commitment` — it never binds the proof to the claiming address. Without this
+    /// set, anyone could copy a already-submitted proof verbatim into a
+    /// `ProvePersonhood` tx from a different address and be granted the same
+    /// `Verified` status for free, defeating Sybil resistance entirely.
+    #[serde(default)]
+    pub used_personhood_commitments: std::collections::HashSet<[u8; 16]>,
 }
 
 impl ChainState {
@@ -104,6 +113,7 @@ impl ChainState {
             governance_params: GovernanceParams::default(),
             proposals: HashMap::new(),
             next_proposal_id: 0,
+            used_personhood_commitments: std::collections::HashSet::new(),
         }
     }
 

@@ -17,6 +17,7 @@ const GUARDIANS: TableDefinition<&str, &[u8]> = TableDefinition::new("guardians"
 const RECOVERY_REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("recovery_requests");
 const RECOVERY_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("recovery_keys");
 const PROPOSALS: TableDefinition<u64, &[u8]> = TableDefinition::new("proposals");
+const PERSONHOOD_COMMITMENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("personhood_commitments");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const META_HEIGHT: &str = "latest_height";
@@ -44,6 +45,7 @@ impl HelixDb {
         tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
         Ok(HelixDb { db })
@@ -61,6 +63,7 @@ impl HelixDb {
             let mut recovery_requests = tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut recovery_keys = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut proposals = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut personhood_commitments = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
             for (addr, account) in &state.accounts {
@@ -103,6 +106,10 @@ impl HelixDb {
                 proposals.insert(*id, encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            for commitment in &state.used_personhood_commitments {
+                personhood_commitments.insert(commitment.as_slice(), &[][..])
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
             meta.insert(META_BURNED, &state.total_burned.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
             meta.insert(
@@ -130,6 +137,7 @@ impl HelixDb {
         let recovery_requests_table = tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let recovery_keys_table = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         let proposals_table = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let personhood_commitments_table = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
         let mut accounts = std::collections::HashMap::new();
@@ -193,6 +201,16 @@ impl HelixDb {
             proposals.insert(k.value(), proposal);
         }
 
+        let mut used_personhood_commitments = std::collections::HashSet::new();
+        let mut personhood_commitments_iter = personhood_commitments_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = personhood_commitments_iter.next() {
+            let (k, _v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let commitment: [u8; 16] = k.value().try_into().map_err(|_| {
+                StorageError::Serialization("personhood commitment key must be 16 bytes".to_string())
+            })?;
+            used_personhood_commitments.insert(commitment);
+        }
+
         let read_meta_u64 = |key: &str| -> Option<u64> {
             meta_table.get(key).ok().flatten().and_then(|v| {
                 let bytes: [u8; 8] = v.value().try_into().ok()?;
@@ -222,6 +240,7 @@ impl HelixDb {
             governance_params,
             proposals,
             next_proposal_id,
+            used_personhood_commitments,
         })
     }
 
@@ -353,6 +372,7 @@ mod tests {
 
             let mut state = ChainState::new(1_000_000);
             state.set_balance(&validator, 42);
+            state.used_personhood_commitments.insert([7u8; 16]);
             db.save_chain_state(&state).unwrap();
         }
 
@@ -364,6 +384,9 @@ mod tests {
 
         let loaded = db.load_chain_state(1_000_000).unwrap();
         assert_eq!(loaded.get(&validator).unwrap().balance, 42);
+        // A used personhood commitment must also survive a restart — otherwise a
+        // replayed proof would be accepted again right after the node restarts.
+        assert!(loaded.used_personhood_commitments.contains(&[7u8; 16]));
 
         let _ = std::fs::remove_file(&path);
     }
