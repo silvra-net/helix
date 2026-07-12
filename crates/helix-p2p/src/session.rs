@@ -112,6 +112,15 @@ impl SessionManager {
         self.sessions.contains_key(peer)
     }
 
+    /// Drops all handshake/session state for `peer` — call this when the underlying
+    /// connection closes. Without it, `pending`/`sessions` only ever grow: nothing else
+    /// ever removes an entry, so a node that's been up for a while accumulates state for
+    /// every peer it has ever handshaked with, connected or not.
+    pub fn remove(&mut self, peer: &str) {
+        self.pending.remove(peer);
+        self.sessions.remove(peer);
+    }
+
     /// Encrypt `plaintext` for `peer`. Returns `[nonce(8) || aes-gcm-ciphertext]`.
     /// Returns `None` if no session is established for this peer.
     pub fn encrypt(&mut self, peer: &str, plaintext: &[u8]) -> Option<Vec<u8>> {
@@ -204,5 +213,27 @@ mod tests {
         let ciphertext = alice.encrypt("bob", b"secret").unwrap();
         // Charlie cannot decrypt Alice's message intended for Bob
         assert!(charlie.decrypt("alice", &ciphertext).is_none());
+    }
+
+    #[test]
+    fn remove_drops_both_established_and_pending_state() {
+        let mut alice = SessionManager::new();
+        let mut bob = SessionManager::new();
+
+        // An established session with bob...
+        let ek = alice.initiate("bob");
+        let ct = bob.respond("alice", ek.as_bytes()).unwrap();
+        alice.complete("bob", ct.as_bytes());
+        assert!(alice.has_session("bob"));
+
+        // ...and a still-pending handshake with charlie (never completed).
+        alice.initiate("charlie");
+        assert!(alice.pending.contains_key("charlie"));
+
+        alice.remove("bob");
+        assert!(!alice.has_session("bob"), "established session must be dropped");
+
+        alice.remove("charlie");
+        assert!(!alice.pending.contains_key("charlie"), "pending handshake must be dropped too");
     }
 }

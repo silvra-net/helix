@@ -180,6 +180,7 @@ impl P2PService {
                                 handle_session_message(
                                     &message.data,
                                     &local_peer_id,
+                                    &peer_str,
                                     &mut session,
                                     &mut swarm,
                                     &session_topic,
@@ -247,6 +248,7 @@ impl P2PService {
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             debug!(peer = %peer_id, "Peer disconnected");
                             reputation.on_disconnect(&peer_id.to_string());
+                            session.remove(&peer_id.to_string());
                             let _ = event_tx
                                 .send(P2PEvent::PeerDisconnected(peer_id.to_string()))
                                 .await;
@@ -318,11 +320,23 @@ fn multiaddr_ip(addr: &Multiaddr) -> Option<String> {
 
 // ─── Session handshake handler ───────────────────────────────────────────────
 
+/// Whether a handshake message's self-reported `from` field can be trusted — i.e. it
+/// matches who actually sent it over the gossipsub connection. `from` lives inside the
+/// (otherwise unauthenticated) message payload, so without this check a single connected
+/// peer could broadcast Hello messages under arbitrarily many fabricated `from` values,
+/// each one making `SessionManager::respond` allocate a brand-new session entry for free —
+/// unbounded memory growth against consensus-critical P2P infrastructure. Requiring
+/// `from == actual_sender` caps it at one handshake-driven entry per real connection.
+fn message_sender_is_authentic(msg: &HandshakeMsg, actual_sender: &str) -> bool {
+    msg.from_peer() == actual_sender
+}
+
 /// Returns `true` if the message was malformed (i.e. the sender should be
 /// charged a misbehavior strike).
 fn handle_session_message(
     data: &[u8],
     local_peer_id: &str,
+    actual_sender: &str,
     session: &mut SessionManager,
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
     session_topic: &gossipsub::IdentTopic,
@@ -338,6 +352,15 @@ fn handle_session_message(
     // Messages are broadcast; only process those addressed to us
     if msg.to_peer() != local_peer_id {
         return false;
+    }
+
+    if !message_sender_is_authentic(&msg, actual_sender) {
+        warn!(
+            claimed = msg.from_peer(),
+            actual = actual_sender,
+            "Session handshake message's `from` doesn't match the real sender — dropping"
+        );
+        return true;
     }
 
     match msg {
@@ -453,5 +476,42 @@ mod multiaddr_ip_tests {
     fn returns_none_without_ip_component() {
         let addr: Multiaddr = "/dns4/example.com/tcp/8546".parse().unwrap();
         assert_eq!(multiaddr_ip(&addr), None);
+    }
+}
+
+#[cfg(test)]
+mod session_auth_tests {
+    use super::{message_sender_is_authentic, HandshakeMsg};
+
+    #[test]
+    fn accepts_a_hello_whose_from_matches_the_real_sender() {
+        let msg = HandshakeMsg::Hello {
+            from: "peer-a".to_string(),
+            to: "peer-b".to_string(),
+            ek: vec![],
+        };
+        assert!(message_sender_is_authentic(&msg, "peer-a"));
+    }
+
+    #[test]
+    fn rejects_a_hello_claiming_to_be_from_someone_else() {
+        // This is the exact free-fabricated-identity attack the check closes: a real,
+        // connected peer ("peer-attacker") broadcasts a Hello claiming to be "peer-victim".
+        let msg = HandshakeMsg::Hello {
+            from: "peer-victim".to_string(),
+            to: "peer-b".to_string(),
+            ek: vec![],
+        };
+        assert!(!message_sender_is_authentic(&msg, "peer-attacker"));
+    }
+
+    #[test]
+    fn rejects_a_kem_ct_claiming_to_be_from_someone_else() {
+        let msg = HandshakeMsg::KemCt {
+            from: "peer-victim".to_string(),
+            to: "peer-b".to_string(),
+            ct: vec![],
+        };
+        assert!(!message_sender_is_authentic(&msg, "peer-attacker"));
     }
 }
