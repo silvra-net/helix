@@ -235,6 +235,29 @@ fn execute_unstake(
         );
     }
 
+    // If this unstake would drop the sender below the validator minimum, and they're
+    // currently the ONLY account that meets it, reject: allowing it would leave
+    // ChainState::stakers() empty. rotate_validator_set() can't safely rotate into an empty
+    // set (it deliberately no-ops rather than halt block production — see CTO Backlog item
+    // 34), so the current validator set's voting power would stay frozen forever even
+    // though nobody backing it holds any stake anymore. This only guards voluntary exits;
+    // it doesn't (and shouldn't) protect a validator's stake from a deserved slash.
+    let min_stake = state.governance_params.min_validator_stake;
+    let was_staker = sender.staked >= min_stake;
+    let remains_staker = sender.staked.saturating_sub(tx.amount) >= min_stake;
+    if was_staker && !remains_staker {
+        let other_staker_remains = state.stakers().iter().any(|(addr, _)| addr != &tx.from);
+        if !other_staker_remains {
+            return Receipt::failure(
+                tx_hash,
+                "cannot unstake below the validator minimum: you are the last eligible \
+                 validator and the network would be left with none",
+                0,
+                0,
+            );
+        }
+    }
+
     let unlock_height = height + state::UNBONDING_PERIOD;
     state.update_account(&tx.from, |acc| {
         acc.staked -= tx.amount;
@@ -2059,6 +2082,83 @@ mod tests {
         let tx2 = signed_unstake_tx(&kp, &addr, 100_000, 1, 10_000);
         let receipt = execute_transaction(&mut state, &tx2, &validator, 2);
         assert!(!receipt.success, "second unstake while first is unbonding should fail");
+    }
+
+    #[test]
+    fn unstake_rejects_last_validator_dropping_below_minimum() {
+        // The sole account meeting min_validator_stake tries to unstake enough to drop
+        // below it. Allowing this would leave ChainState::stakers() empty, which
+        // rotate_validator_set() can't safely rotate into (see CTO Backlog item 34) — it
+        // would freeze the current validator set's voting power forever with nobody behind
+        // it holding any real stake.
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let min_stake = crate::genesis::MIN_VALIDATOR_STAKE;
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = min_stake;
+        });
+
+        // Would drop staked to min_stake - 1, below the threshold.
+        let tx = signed_unstake_tx(&kp, &addr, 1, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+
+        assert!(!receipt.success, "last validator must not be able to unstake below the minimum");
+        assert_eq!(state.get(&addr).unwrap().staked, min_stake, "stake must be untouched");
+        assert_eq!(state.get(&addr).unwrap().unbonding_stake, 0);
+    }
+
+    #[test]
+    fn unstake_allows_dropping_below_minimum_when_another_validator_remains() {
+        let kp1 = KeyPair::generate();
+        let addr1 = Address::from_public_key(&kp1.public);
+        let kp2 = KeyPair::generate();
+        let addr2 = Address::from_public_key(&kp2.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let min_stake = crate::genesis::MIN_VALIDATOR_STAKE;
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr1, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = min_stake;
+        });
+        state.update_account(&addr2, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = min_stake;
+        });
+
+        // addr1 can fully exit — addr2 still meets the minimum afterward.
+        let tx = signed_unstake_tx(&kp1, &addr1, min_stake, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.get(&addr1).unwrap().staked, 0);
+        assert_eq!(state.get(&addr1).unwrap().unbonding_stake, min_stake);
+    }
+
+    #[test]
+    fn unstake_allows_partial_reduction_that_stays_above_minimum() {
+        // Sole validator, but the unstake amount doesn't drop them below the threshold —
+        // no risk to the validator set, must be allowed.
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let min_stake = crate::genesis::MIN_VALIDATOR_STAKE;
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = min_stake * 2;
+        });
+
+        let tx = signed_unstake_tx(&kp, &addr, min_stake, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.get(&addr).unwrap().staked, min_stake);
     }
 
     fn signed_personhood_tx(
