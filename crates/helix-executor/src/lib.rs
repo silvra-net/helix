@@ -726,6 +726,9 @@ fn execute_create_proposal(
         Ok(p) => p,
         Err(e) => return Receipt::failure(tx_hash, &format!("invalid proposal payload: {e}"), 0, 0),
     };
+    if let Err(e) = param.validate(new_value) {
+        return Receipt::failure(tx_hash, &e.to_string(), 0, 0);
+    }
 
     let id = state.next_proposal_id;
     state.next_proposal_id += 1;
@@ -1606,6 +1609,53 @@ mod tests {
         assert_eq!(proposal.created_at_height, 100);
         assert!(!proposal.executed);
         assert_eq!(state.get(&addr).unwrap().balance, 1_000_000 - 10_000);
+    }
+
+    #[test]
+    fn create_proposal_rejects_zero_min_validator_stake() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+
+        // A min_validator_stake of 0 would let every zero-stake account pass the
+        // `stakers()` filter, exploding the validator set / stalling BFT quorum.
+        let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, 0);
+        let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success);
+        assert!(state.proposals.is_empty());
+        // Rejected before any balance/nonce mutation — the tx is simply invalid.
+        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000);
+        assert_eq!(state.get(&addr).unwrap().nonce, 0);
+    }
+
+    #[test]
+    fn create_proposal_rejects_zero_fuel_per_fee_unit() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+
+        // A fuel_per_fee_unit of 0 would give every contract call a fuel limit of 0,
+        // bricking all contract calls network-wide.
+        let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 0);
+        let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success);
+        assert!(state.proposals.is_empty());
     }
 
     #[test]

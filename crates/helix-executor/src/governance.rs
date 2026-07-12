@@ -34,6 +34,21 @@ impl GovernanceParam {
             GovernanceParam::FuelPerFeeUnit => 1,
         }
     }
+
+    /// Both governance-adjustable parameters must stay strictly positive: a
+    /// `min_validator_stake` of 0 would let every zero-stake account pass
+    /// `ChainState::stakers()`'s filter, exploding the validator set and (since
+    /// unverified-personhood voting power is `stake / 2`, so an all-zero-stake set
+    /// collapses total voting power to 0 as well) permanently stalling BFT quorum. A
+    /// `fuel_per_fee_unit` of 0 would give every contract call a fuel limit of 0,
+    /// bricking all contract calls network-wide.
+    pub fn validate(self, new_value: u64) -> Result<(), GovernanceError> {
+        if new_value == 0 {
+            Err(GovernanceError::ZeroParamValue(self))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -44,6 +59,8 @@ pub enum GovernanceError {
     UnknownParam(u8),
     #[error("vote payload must be exactly 8 bytes (proposal id)")]
     MalformedVote,
+    #[error("proposed value 0 for {0:?} would break protocol invariants")]
+    ZeroParamValue(GovernanceParam),
 }
 
 /// Encode a `CreateProposal` tx payload: 1 byte param discriminant + 8 bytes new value (LE).
