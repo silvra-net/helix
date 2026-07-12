@@ -39,6 +39,16 @@ pub enum TxType {
     /// No payload (`data` is empty). The executor checks `unbonding_unlock_height` against
     /// the current block height; fails if no unbonding is pending or the lock hasn't expired.
     ClaimUnbonded,
+    /// Owner-initiated cancellation of `tx.from`'s own pending (not-yet-finalized)
+    /// `RecoveryRequest`. No payload (`data` is empty). Without this, a single guardian
+    /// approving a bogus key (and never reaching threshold) permanently blocks the owner
+    /// from ever changing their guardian set again, since `RegisterGuardians` refuses to run
+    /// while any recovery request is pending and there was previously no way to clear one
+    /// short of reaching quorum. Signed normally by the owner's current key — this only ever
+    /// applies to sub-threshold requests, and `recovery_key` (the post-recovery signing
+    /// override) is only set once a request finalizes, so the account's original key is
+    /// still the sole valid signer here.
+    CancelRecoveryRequest,
 }
 
 /// Payload embedded in `Transaction::data` for `TxType::ProvePersonhood`.

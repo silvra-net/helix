@@ -100,6 +100,7 @@ pub fn execute_transaction(
         TxType::VoteProposal => execute_vote_proposal(state, tx, validator, tx_hash, height),
         TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash),
         TxType::ClaimUnbonded => execute_claim_unbonded(state, tx, validator, tx_hash, height),
+        TxType::CancelRecoveryRequest => execute_cancel_recovery_request(state, tx, validator, tx_hash),
     }
 }
 
@@ -492,6 +493,41 @@ fn execute_approve_recovery(
     } else {
         state.set_recovery_request(&target, request);
     }
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// `tx.from` clears their own pending (sub-threshold) `RecoveryRequest`. Without this, a
+/// single guardian who approves a bogus key — and never reaches the threshold, whether by
+/// mistake, going offline, or acting maliciously — permanently locks the owner out of
+/// `RegisterGuardians` (which refuses to run while any recovery request is pending), since
+/// there was previously no way to clear a sub-threshold request short of reaching quorum.
+fn execute_cancel_recovery_request(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+    if state.recovery_request(&tx.from).is_none() {
+        return Receipt::failure(tx_hash, "no pending recovery request to cancel", 0, 0);
+    }
+
+    state.clear_recovery_request(&tx.from);
 
     state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
@@ -1157,6 +1193,94 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 1);
         assert!(!receipt.success);
         assert!(state.recovery_key(&owner).is_none());
+    }
+
+    fn signed_cancel_recovery_request_tx(kp: &KeyPair, from: &Address, nonce: u64, fee: u64) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::CancelRecoveryRequest,
+            from: from.clone(),
+            to: None,
+            amount: 0,
+            fee,
+            nonce,
+            data: vec![],
+            crypto_version: kp.scheme,
+
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn cancel_recovery_request_unblocks_guardian_changes() {
+        // A single guardian's sub-threshold approval must not be able to permanently
+        // lock the owner out of ever changing their guardian set again.
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let owner_kp = KeyPair::generate();
+        let owner = Address::from_public_key(&owner_kp.public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&owner, |acc| acc.balance = 1_000_000);
+
+        let guardian_kps: Vec<KeyPair> = (0..5).map(|_| KeyPair::generate()).collect();
+        let guardian_addrs: Vec<Address> = guardian_kps
+            .iter()
+            .map(|kp| Address::from_public_key(&kp.public))
+            .collect();
+        for addr in &guardian_addrs {
+            state.update_account(addr, |acc| acc.balance = 1_000_000);
+        }
+
+        let reg_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 0, 10_000);
+        assert!(execute_transaction(&mut state, &reg_tx, &validator, 0).success);
+
+        // One malicious/careless guardian approves a bogus key — 1 of 5, nowhere near
+        // the 3-of-5 threshold, and never will be (the other guardians simply never act).
+        let bogus_kp = KeyPair::generate();
+        let approve_tx = signed_approve_recovery_tx(
+            &guardian_kps[0],
+            &guardian_addrs[0],
+            &owner,
+            &bogus_kp.public,
+            0,
+            10_000,
+        );
+        assert!(execute_transaction(&mut state, &approve_tx, &validator, 1).success);
+        assert!(state.recovery_request(&owner).is_some());
+
+        // Owner is now locked out of changing guardians...
+        let blocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 1, 10_000);
+        let receipt = execute_transaction(&mut state, &blocked_tx, &validator, 2);
+        assert!(!receipt.success, "guardian changes should be blocked while a request is pending");
+
+        // ...until they cancel the stuck request themselves, still with their original key
+        // (recovery never finalized, so no override key was ever set).
+        let cancel_tx = signed_cancel_recovery_request_tx(&owner_kp, &owner, 1, 10_000);
+        let receipt = execute_transaction(&mut state, &cancel_tx, &validator, 2);
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert!(state.recovery_request(&owner).is_none());
+
+        // Guardian changes work again.
+        let unblocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 2, 10_000);
+        let receipt = execute_transaction(&mut state, &unblocked_tx, &validator, 3);
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+    }
+
+    #[test]
+    fn cancel_recovery_request_rejects_when_none_pending() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let owner_kp = KeyPair::generate();
+        let owner = Address::from_public_key(&owner_kp.public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&owner, |acc| acc.balance = 1_000_000);
+
+        let tx = signed_cancel_recovery_request_tx(&owner_kp, &owner, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        assert!(!receipt.success);
     }
 
     fn valid_contract_wasm() -> Vec<u8> {
