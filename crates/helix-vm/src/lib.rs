@@ -5,7 +5,19 @@
 //! `call`. Execution is fuel-metered so a contract can never run unbounded.
 
 use thiserror::Error;
-use wasmi::{core::TrapCode, Config, Engine, Linker, Module, Store};
+use wasmi::{core::TrapCode, Config, Engine, Linker, Module, Store, StoreLimitsBuilder};
+
+/// Per-instance cap on linear memory, enforced by a `wasmi::ResourceLimiter`. Without one
+/// configured, wasmi eagerly allocates a module's *declared minimum* memory at instantiation
+/// time — before a single fuel unit is consumed — so a ~40-byte module declaring
+/// `(memory 65536 65536)` (the maximum a 32-bit Wasm memory type allows) could force every
+/// validator to attempt a 4 GiB allocation per call, completely unmetered by fuel/fees.
+/// Generous for realistic contracts, firm enough to bound worst-case damage per call.
+const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Per-table cap on element count, same rationale as `MAX_MEMORY_BYTES` — tables aren't
+/// fuel-metered at allocation time either.
+const MAX_TABLE_ELEMENTS: u32 = 10_000;
 
 #[derive(Debug, Error)]
 pub enum VmError {
@@ -49,7 +61,13 @@ pub fn call(code: &[u8], fuel_limit: u64) -> VmResult<CallOutcome> {
     let engine = engine();
     let module = Module::new(&engine, code).map_err(|e| VmError::InvalidModule(e.to_string()))?;
 
-    let mut store = Store::new(&engine, ());
+    let limits = StoreLimitsBuilder::new()
+        .memory_size(MAX_MEMORY_BYTES)
+        .table_elements(MAX_TABLE_ELEMENTS)
+        .trap_on_grow_failure(true)
+        .build();
+    let mut store = Store::new(&engine, limits);
+    store.limiter(|limits| limits);
     store
         .add_fuel(fuel_limit)
         .map_err(|e| VmError::Instantiation(e.to_string()))?;
@@ -118,6 +136,29 @@ mod tests {
         );
         let err = call(&wasm, 10_000).unwrap_err();
         assert!(matches!(err, VmError::OutOfGas));
+    }
+
+    #[test]
+    fn call_rejects_declared_memory_over_the_limit_instead_of_allocating_it() {
+        // 65536 pages * 64 KiB/page = 4 GiB — the maximum a 32-bit Wasm memory type
+        // allows, and comfortably declarable in a tiny module. Without a configured
+        // ResourceLimiter, wasmi allocates the *declared minimum* eagerly at
+        // instantiation, before a single fuel unit is spent — this must be rejected
+        // instead of attempting the allocation.
+        let wasm = wat_to_wasm(
+            r#"(module (memory 65536 65536) (func (export "call")))"#,
+        );
+        let err = call(&wasm, 1_000_000).unwrap_err();
+        assert!(
+            matches!(err, VmError::Instantiation(_)),
+            "expected instantiation to fail cleanly, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_accepts_memory_within_the_limit() {
+        let wasm = wat_to_wasm(r#"(module (memory 1 1) (func (export "call")))"#);
+        assert!(call(&wasm, 1_000_000).is_ok());
     }
 
     #[test]
