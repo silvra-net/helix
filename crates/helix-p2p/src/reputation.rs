@@ -56,10 +56,31 @@ impl PeerReputation {
         Self::default()
     }
 
-    /// Record which IP address `peer` last connected from. Call this on every
-    /// new connection so a later ban can also be applied to the IP.
-    pub fn note_connection(&mut self, peer: &str, ip: &str) {
+    /// Record which IP address `peer` last connected from, and report whether
+    /// the connection should be rejected (`peer` or `ip` already banned).
+    ///
+    /// If `ip` is already banned, the `peer_ip` entry is deliberately NOT
+    /// recorded. Without this short-circuit, an attacker connecting from an
+    /// already-banned IP with an endless supply of free, freshly generated
+    /// `PeerId`s could grow `peer_ip` without bound — no `BAN_THRESHOLD`
+    /// infractions needed, just one connection attempt per identity. This
+    /// case can't reuse the `insert_bounded` cap used for `banned`/
+    /// `banned_ips`: those are rarely-added, high-cost entries (5
+    /// infractions each) where losing the oldest ban under sustained attack
+    /// is an acceptable tradeoff, whereas here every entry is free for the
+    /// attacker to produce, so a bounded cap would just get evicted
+    /// continuously by attack traffic and could push out legitimate peers'
+    /// entries instead. Skipping the insert also doesn't need `on_disconnect`
+    /// to change: it already exempts banned peers from cleanup so the IP
+    /// ban stays resolvable after a legitimately-banned peer disconnects
+    /// (see its docs) — this path simply never creates the entry to begin
+    /// with, for identities that were never legitimate.
+    pub fn note_connection(&mut self, peer: &str, ip: &str) -> bool {
+        if self.banned.contains(peer) || self.banned_ips.contains(ip) {
+            return true;
+        }
         self.peer_ip.insert(peer.to_string(), ip.to_string());
+        false
     }
 
     /// Record a protocol violation from `peer`. Returns `true` if this
@@ -159,9 +180,10 @@ mod tests {
             rep.record_infraction("peer-a");
         }
 
-        // A brand new PeerId connecting from the same banned IP is rejected.
-        rep.note_connection("peer-a-fresh-identity", "1.2.3.4");
-        assert!(rep.is_banned("peer-a-fresh-identity"));
+        // A brand new PeerId connecting from the same banned IP is rejected
+        // — the caller learns this from `note_connection`'s return value,
+        // since (by design) no `peer_ip` entry is recorded for it.
+        assert!(rep.note_connection("peer-a-fresh-identity", "1.2.3.4"));
     }
 
     #[test]
@@ -228,9 +250,46 @@ mod tests {
         rep.on_disconnect("peer-a");
 
         // Still banned directly, and the IP ban still applies to a fresh
-        // PeerId connecting from the same address.
+        // PeerId connecting from the same address (reported via
+        // `note_connection`'s return value, not `is_banned`, since no
+        // `peer_ip` entry is recorded for it).
         assert!(rep.is_banned("peer-a"));
-        rep.note_connection("peer-a-fresh-identity", "1.2.3.4");
-        assert!(rep.is_banned("peer-a-fresh-identity"));
+        assert!(rep.note_connection("peer-a-fresh-identity", "1.2.3.4"));
+    }
+
+    #[test]
+    fn note_connection_reports_not_banned_and_records_ip_for_new_peer() {
+        let mut rep = PeerReputation::new();
+        assert!(!rep.note_connection("peer-a", "1.2.3.4"));
+        assert_eq!(rep.peer_ip.get("peer-a"), Some(&"1.2.3.4".to_string()));
+    }
+
+    #[test]
+    fn note_connection_reports_banned_for_directly_banned_peer() {
+        let mut rep = PeerReputation::new();
+        for _ in 0..BAN_THRESHOLD {
+            rep.record_infraction("peer-a");
+        }
+        assert!(rep.note_connection("peer-a", "1.1.1.1"));
+    }
+
+    #[test]
+    fn note_connection_skips_recording_peer_ip_when_ip_already_banned() {
+        let mut rep = PeerReputation::new();
+        rep.note_connection("peer-a", "9.9.9.9");
+        for _ in 0..BAN_THRESHOLD {
+            rep.record_infraction("peer-a");
+        }
+        assert!(rep.is_banned("peer-a"));
+
+        // Many fresh PeerIds connecting from the same now-banned IP are all
+        // reported as banned...
+        for i in 0..1000 {
+            let fresh_peer = format!("peer-fresh-{i}");
+            assert!(rep.note_connection(&fresh_peer, "9.9.9.9"));
+        }
+        // ...without growing `peer_ip`: only the original `peer-a` entry
+        // (recorded before the ban) is present.
+        assert_eq!(rep.peer_ip.len(), 1);
     }
 }

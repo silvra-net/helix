@@ -215,10 +215,11 @@ impl P2PService {
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             let peer_str = peer_id.to_string();
-                            if let Some(ip) = multiaddr_ip(endpoint.get_remote_address()) {
-                                reputation.note_connection(&peer_str, &ip);
-                            }
-                            if reputation.is_banned(&peer_str) {
+                            let banned = match multiaddr_ip(endpoint.get_remote_address()) {
+                                Some(ip) => reputation.note_connection(&peer_str, &ip),
+                                None => reputation.is_banned(&peer_str),
+                            };
+                            if banned {
                                 warn!(peer = %peer_str, "rejecting connection from banned peer/IP");
                                 let _ = swarm.disconnect_peer_id(peer_id);
                                 continue;
