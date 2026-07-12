@@ -73,6 +73,24 @@ impl ValidatorSet {
         self.validators.iter().find(|v| &v.address == address)
     }
 
+    /// Immediately removes `address` from the set — e.g. right after a proven double-sign
+    /// slash, so the validator loses BFT voting power starting from the very next round
+    /// instead of continuing at full, stale power until the next epoch's
+    /// `ValidatorSet::new()` rebuild (which could be up to `EPOCH_LENGTH` blocks away).
+    ///
+    /// Deliberately does NOT bump `epoch` or recompute the 1%-cap for the remaining
+    /// validators against the new (smaller) total stake — this is a fast jailing
+    /// mechanism, not a rotation. The remaining validators' `voting_power` stays as it was
+    /// until the next real rotation recomputes it properly; that's an acceptable, temporary
+    /// imprecision in exchange for removing the jailed validator's power immediately.
+    ///
+    /// Returns `true` if `address` was present and removed.
+    pub fn remove(&mut self, address: &Address) -> bool {
+        let before = self.validators.len();
+        self.validators.retain(|v| &v.address != address);
+        self.validators.len() != before
+    }
+
     pub fn len(&self) -> usize {
         self.validators.len()
     }
@@ -96,5 +114,53 @@ impl ValidatorSet {
         self.proposer_for_round(height, round)
             .map(|v| &v.address == address)
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_crypto::KeyPair;
+
+    fn rand_address() -> Address {
+        Address::from_public_key(&KeyPair::generate().public)
+    }
+
+    #[test]
+    fn remove_drops_the_validator_and_reports_it_was_present() {
+        let a = rand_address();
+        let b = rand_address();
+        let mut set = ValidatorSet::new(
+            vec![Validator::new(a.clone(), 100, true), Validator::new(b.clone(), 100, true)],
+            0,
+        );
+
+        assert!(set.remove(&a));
+        assert!(set.get(&a).is_none());
+        assert!(set.get(&b).is_some(), "unrelated validator must be unaffected");
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn remove_reports_false_for_an_address_not_in_the_set() {
+        let a = rand_address();
+        let stranger = rand_address();
+        let mut set = ValidatorSet::new(vec![Validator::new(a, 100, true)], 0);
+
+        assert!(!set.remove(&stranger));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn remove_does_not_bump_the_epoch() {
+        let a = rand_address();
+        let b = rand_address();
+        let mut set = ValidatorSet::new(
+            vec![Validator::new(a.clone(), 100, true), Validator::new(b, 100, true)],
+            7,
+        );
+
+        set.remove(&a);
+        assert_eq!(set.epoch, 7, "jailing is not a rotation — epoch must stay unchanged");
     }
 }

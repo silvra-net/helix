@@ -729,6 +729,36 @@ async fn apply_finalized_block(
     // called wherever the engine can produce evidence) and slashed inside `execute_block` above,
     // through the same transaction-execution path every node already runs identically.
 
+    // Immediately jail any validator whose double-sign slash just landed in this block,
+    // instead of leaving them at full, stale voting power until the next epoch rotation
+    // (up to EPOCH_LENGTH blocks / ~20 min away). Scans the block's own transactions —
+    // rather than engine.take_evidence(), which is per-node/asymmetric — so every node
+    // reaches the identical jailing decision, matching the deterministic slash itself:
+    // membership in `slashed_double_sign_incidents` is only ever true after the incident
+    // was independently signature-verified inside execute_submit_double_sign_evidence, so
+    // a forged evidence tx naming an innocent validator can't trigger a jail here either.
+    {
+        let state = chain_state.read().await;
+        for tx in &block.transactions {
+            if tx.tx_type != TxType::SubmitDoubleSignEvidence {
+                continue;
+            }
+            let Ok(evidence) = bincode::deserialize::<DoubleSignEvidence>(&tx.data) else {
+                continue;
+            };
+            let incident_key = format!("{}:{}:{}", evidence.validator, evidence.height, evidence.round);
+            if state.slashed_double_sign_incidents.contains(&incident_key)
+                && engine.write().await.validator_set.remove(&evidence.validator)
+            {
+                warn!(
+                    validator = %evidence.validator,
+                    height,
+                    "Validator jailed immediately after double-sign slash — excluded from BFT rounds from here on, not just at the next epoch rotation"
+                );
+            }
+        }
+    }
+
     // Epoch boundary: rebuild the validator set from current stake.
     // Personhood is read from chain state: ZK-STARK ProvePersonhood txs set
     // PersonhoodStatus::Verified, which unlocks the 1% voting-power cap
@@ -1256,5 +1286,107 @@ mod handle_p2p_event_tests {
 
         assert_eq!(store.read().await.latest_height(), 0);
         assert!(p2p_rx.try_recv().is_err());
+    }
+
+    fn signed_vote(
+        kp: &KeyPair,
+        validator: &Address,
+        vote_type: helix_consensus::VoteType,
+        height: u64,
+        round: u32,
+        block_hash: Hash,
+    ) -> helix_consensus::Vote {
+        let mut vote = helix_consensus::Vote {
+            vote_type,
+            height,
+            round,
+            block_hash,
+            validator: validator.clone(),
+            public_key: kp.public.clone(),
+            crypto_version: kp.scheme,
+            signature: Sig::from_bytes(vec![]),
+        };
+        vote.signature = kp.sign(&vote.signing_bytes()).unwrap();
+        vote
+    }
+
+    /// A block that includes a valid `SubmitDoubleSignEvidence` transaction must not just
+    /// apply the slash (already covered at the executor level) but also immediately remove
+    /// the slashed validator from the live `BftEngine`'s validator set — not wait for the
+    /// next epoch rotation, which could be `EPOCH_LENGTH` blocks away.
+    #[tokio::test]
+    async fn apply_finalized_block_jails_validator_immediately_after_slash() {
+        let bad_validator_kp = KeyPair::generate();
+        let bad_validator_addr = Address::from_public_key(&bad_validator_kp.public);
+        let reporter_kp = KeyPair::generate();
+        let reporter_addr = Address::from_public_key(&reporter_kp.public);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        {
+            let mut state = chain_state.write().await;
+            state.update_account(&bad_validator_addr, |acc| acc.staked = 1_000_000);
+            state.update_account(&reporter_addr, |acc| acc.balance = 1_000_000);
+        }
+
+        let validator_set =
+            ValidatorSet::new(vec![Validator::new(bad_validator_addr.clone(), 1_000_000, true)], 0);
+        let engine =
+            Arc::new(RwLock::new(BftEngine::new(validator_set, bad_validator_addr.clone(), 0)));
+
+        let vote_a = signed_vote(
+            &bad_validator_kp,
+            &bad_validator_addr,
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-a"),
+        );
+        let vote_b = signed_vote(
+            &bad_validator_kp,
+            &bad_validator_addr,
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-b"),
+        );
+        let evidence = DoubleSignEvidence {
+            validator: bad_validator_addr.clone(),
+            height: 10,
+            round: 0,
+            vote_a,
+            vote_b,
+        };
+
+        let mut evidence_tx = Transaction {
+            version: 1,
+            tx_type: TxType::SubmitDoubleSignEvidence,
+            from: reporter_addr.clone(),
+            to: None,
+            amount: 0,
+            fee: 0,
+            nonce: 0,
+            data: bincode::serialize(&evidence).unwrap(),
+            crypto_version: reporter_kp.scheme,
+            signature: Sig::from_bytes(vec![]),
+            public_key: reporter_kp.public.clone(),
+        };
+        evidence_tx.signature = reporter_kp.sign(evidence_tx.signing_hash().as_bytes()).unwrap();
+
+        let mut block = signed_block(&bad_validator_kp, 1, Hash::ZERO);
+        block.transactions = vec![evidence_tx];
+
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        apply_finalized_block(block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None).await;
+
+        assert!(
+            engine.read().await.validator_set.get(&bad_validator_addr).is_none(),
+            "slashed validator must be jailed immediately, not just at the next epoch rotation"
+        );
+        assert!(
+            chain_state.read().await.get(&bad_validator_addr).unwrap().staked < 1_000_000,
+            "slash itself must still have applied"
+        );
     }
 }
