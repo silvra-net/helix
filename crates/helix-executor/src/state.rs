@@ -271,6 +271,14 @@ impl ChainState {
         self.accounts.values().map(|acc| acc.staked).sum()
     }
 
+    /// The largest `staked` amount held by any single account. Used to bound how high
+    /// governance can push `min_validator_stake`: a proposed value above this would
+    /// disqualify every current staker at once, leaving `stakers()` empty — see the
+    /// ceiling check in `execute_create_proposal`.
+    pub fn max_single_stake(&self) -> u64 {
+        self.accounts.values().map(|acc| acc.staked).max().unwrap_or(0)
+    }
+
     pub fn proposal(&self, id: u64) -> Option<&GovernanceProposal> {
         self.proposals.get(&id)
     }

@@ -752,6 +752,29 @@ fn execute_create_proposal(
     if let Err(e) = param.validate(new_value) {
         return Receipt::failure(tx_hash, &e.to_string(), 0, 0);
     }
+    // MinValidatorStake additionally needs a *dynamic* ceiling, not just the static floor
+    // above: a value higher than every current staker's own stake would disqualify all of
+    // them at once, leaving ChainState::stakers() empty. rotate_validator_set() can't
+    // safely rotate into an empty set (it no-ops rather than halt block production), so
+    // this would freeze the validator set exactly as if the last validator had voluntarily
+    // unstaked below the minimum (execute_unstake already guards that path directly) —
+    // just reached through a governance proposal instead. Capping the proposed value at
+    // the current largest single stake guarantees at least that one account stays
+    // eligible, so this specific proposal can never be the cause of an empty set.
+    if let GovernanceParam::MinValidatorStake = param {
+        let ceiling = state.max_single_stake();
+        if new_value > ceiling {
+            return Receipt::failure(
+                tx_hash,
+                &format!(
+                    "proposed min_validator_stake {new_value} exceeds the current largest \
+                     single stake {ceiling} — would disqualify every validator at once"
+                ),
+                0,
+                0,
+            );
+        }
+    }
 
     let id = state.next_proposal_id;
     state.next_proposal_id += 1;
@@ -1730,13 +1753,15 @@ mod tests {
         let addr = Address::from_public_key(&kp.public);
         let validator = Address::from_public_key(&KeyPair::generate().public);
 
+        let floor = crate::genesis::MIN_VALIDATOR_STAKE / 100;
         let mut state = ChainState::new(0);
         state.update_account(&addr, |acc| {
             acc.balance = 1_000_000;
-            acc.staked = 500_000;
+            // Must be >= floor: the new dynamic ceiling on MinValidatorStake proposals caps
+            // the proposed value at the largest current single stake, so a tiny stake here
+            // would (correctly) block the floor-boundary proposal this test wants to check.
+            acc.staked = floor;
         });
-
-        let floor = crate::genesis::MIN_VALIDATOR_STAKE / 100;
         let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, floor);
         let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
         let receipt = execute_transaction(&mut state, &tx, &validator, 0);
@@ -1748,6 +1773,63 @@ mod tests {
         let data2 = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, floor - 1);
         let tx2 = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data2, 1, 10_000);
         assert!(!execute_transaction(&mut state, &tx2, &validator, 1).success);
+    }
+
+    #[test]
+    fn create_proposal_rejects_min_validator_stake_above_every_current_stake() {
+        // The scenario this closes: a proposal that would set min_validator_stake above
+        // what ANY current account has staked would disqualify every validator at once,
+        // leaving ChainState::stakers() empty and freezing the validator set exactly like
+        // an unguarded last-validator unstake would (see the guard in execute_unstake).
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        // Must clear the static floor (MIN_VALIDATOR_STAKE / 100) so this test actually
+        // exercises the dynamic ceiling check, not the unrelated floor check.
+        let floor = crate::genesis::MIN_VALIDATOR_STAKE / 100;
+        let largest_stake = floor + 1_000_000_000;
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = largest_stake;
+        });
+
+        let data = governance::encode_proposal(
+            governance::GovernanceParam::MinValidatorStake,
+            largest_stake + 1,
+        );
+        let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success, "proposal exceeding every current stake must be rejected");
+        assert!(state.proposals.is_empty());
+    }
+
+    #[test]
+    fn create_proposal_accepts_min_validator_stake_up_to_the_largest_current_stake() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let floor = crate::genesis::MIN_VALIDATOR_STAKE / 100;
+        let largest_stake = floor + 1_000_000_000;
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = largest_stake;
+        });
+
+        // Exactly at the current largest stake — the proposer themselves would still
+        // qualify afterward, so this must be allowed.
+        let data =
+            governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, largest_stake);
+        let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
     }
 
     #[test]
