@@ -103,6 +103,14 @@ pub struct ChainState {
     /// (by the same or a different reporter) to slash the validator repeatedly.
     #[serde(default)]
     pub slashed_double_sign_incidents: std::collections::HashSet<String>,
+    /// The network's configured personhood-issuing authority — set once at genesis (see
+    /// `GenesisConfig`), never overridden afterward. `ProvePersonhood` transactions require
+    /// this authority's signature over the claimed commitment; without one configured,
+    /// `ProvePersonhood` is rejected outright rather than falling back to trusting the ZK
+    /// proof alone (which anyone can self-issue for free — see
+    /// `PersonhoodProofPayload`'s doc comment).
+    #[serde(default)]
+    pub personhood_authority: Option<PublicKey>,
 }
 
 impl ChainState {
@@ -121,6 +129,7 @@ impl ChainState {
             next_proposal_id: 0,
             used_personhood_commitments: std::collections::HashSet::new(),
             slashed_double_sign_incidents: std::collections::HashSet::new(),
+            personhood_authority: None,
         }
     }
 

@@ -2,7 +2,7 @@ use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition};
 use std::path::Path;
 
 use helix_core::Block;
-use helix_crypto::Hash;
+use helix_crypto::{Hash, PublicKey};
 use helix_executor::governance::{GovernanceParams, GovernanceProposal};
 use helix_executor::state::{AccountState, ChainState};
 
@@ -33,6 +33,7 @@ const META_BURNED: &str = "total_burned";
 const META_MIN_VALIDATOR_STAKE: &str = "gov_min_validator_stake";
 const META_FUEL_PER_FEE_UNIT: &str = "gov_fuel_per_fee_unit";
 const META_NEXT_PROPOSAL_ID: &str = "gov_next_proposal_id";
+const META_PERSONHOOD_AUTHORITY: &str = "personhood_authority";
 
 pub struct HelixDb {
     db: Database,
@@ -138,6 +139,10 @@ impl HelixDb {
             .map_err(|e| StorageError::Db(e.to_string()))?;
             meta.insert(META_NEXT_PROPOSAL_ID, &state.next_proposal_id.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
+            if let Some(authority) = &state.personhood_authority {
+                meta.insert(META_PERSONHOOD_AUTHORITY, authority.as_bytes())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
         }
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))
     }
@@ -249,6 +254,8 @@ impl HelixDb {
                 .unwrap_or(default_params.fuel_per_fee_unit),
         };
         let next_proposal_id = read_meta_u64(META_NEXT_PROPOSAL_ID).unwrap_or(0);
+        let personhood_authority = meta_table.get(META_PERSONHOOD_AUTHORITY).ok().flatten()
+            .map(|v| PublicKey::from_bytes(v.value().to_vec()));
 
         Ok(ChainState {
             accounts,
@@ -264,6 +271,7 @@ impl HelixDb {
             next_proposal_id,
             used_personhood_commitments,
             slashed_double_sign_incidents,
+            personhood_authority,
         })
     }
 
@@ -477,6 +485,7 @@ mod tests {
             state.set_balance(&validator, 42);
             state.used_personhood_commitments.insert([7u8; 16]);
             state.slashed_double_sign_incidents.insert("validator1:10:0".to_string());
+            state.personhood_authority = Some(kp.public.clone());
             db.save_chain_state(&state).unwrap();
         }
 
@@ -495,6 +504,9 @@ mod tests {
         // (or a node that missed the original slash could apply it a second time)
         // right after a restart.
         assert!(loaded.slashed_double_sign_incidents.contains("validator1:10:0"));
+        // The personhood authority must also survive a restart — it's genesis-time-only
+        // configuration, never re-read from env/config on subsequent starts.
+        assert_eq!(loaded.personhood_authority, Some(kp.public.clone()));
 
         let _ = std::fs::remove_file(&path);
     }

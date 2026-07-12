@@ -33,6 +33,9 @@ pub enum TxType {
     /// `data` field carries the bincode-serialized `PersonhoodProofPayload`:
     ///   - `commitment: [u8; 16]`   — the public commitment C = secret^(2^63)
     ///   - `proof_bytes: Vec<u8>`   — the winterfell STARK proof bytes
+    ///   - `authority_signature`    — the network's personhood authority's signature over
+    ///     `commitment`, proving it was issued to a verified unique human (see
+    ///     `PersonhoodProofPayload`'s doc comment for why the ZK proof alone isn't enough)
     ProvePersonhood,
     /// Release unbonded stake to the liquid balance after the unbonding period has elapsed.
     ///
@@ -69,12 +72,23 @@ pub enum TxType {
 }
 
 /// Payload embedded in `Transaction::data` for `TxType::ProvePersonhood`.
+/// The STARK proof alone only shows knowledge of *some* secret matching `commitment` —
+/// `helix_zkp::prove_personhood` will happily generate one for any secret the caller picks,
+/// so without `authority_signature` anyone could self-issue unlimited "verified" identities
+/// for free. `authority_signature` is the network's configured personhood authority (see
+/// `ChainState::personhood_authority`) vouching that `commitment` was actually issued to a
+/// real, uniquely-verified human by whatever off-chain process that authority runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonhoodProofPayload {
     /// C = secret^(2^63) mod p, as 16-byte little-endian f128 field element.
     pub commitment: [u8; 16],
     /// Serialized winterfell STARK proof bytes.
     pub proof_bytes: Vec<u8>,
+    /// The personhood authority's signature over `commitment` (its raw 16 bytes).
+    pub authority_signature: Signature,
+    /// Which scheme the authority signed with — mirrors `BlockHeader::crypto_version`/
+    /// `Vote::crypto_version`, supports migration.
+    pub authority_crypto_version: CryptoScheme,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

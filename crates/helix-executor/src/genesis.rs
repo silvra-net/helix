@@ -1,4 +1,4 @@
-use helix_crypto::Address;
+use helix_crypto::{Address, PublicKey};
 
 use crate::state::ChainState;
 
@@ -28,10 +28,23 @@ const GENESIS_PREFUND: &[(&str, u64)] = &[];
 pub struct GenesisConfig {
     pub validator: Address,
     pub allocations: Vec<(Address, u64)>, // (address, nano-HLX balance)
+    /// The network's personhood-issuing authority, if configured — see
+    /// `ChainState::personhood_authority`'s doc comment. `None` means `ProvePersonhood` stays
+    /// disabled until an operator explicitly sets one; there is deliberately no default here
+    /// (auto-generating a keypair would produce an authority nobody actually holds the
+    /// private key for, which would just brick the feature a different way).
+    pub personhood_authority: Option<PublicKey>,
 }
 
 impl GenesisConfig {
     pub fn devnet(validator: Address) -> Self {
+        Self::devnet_with_personhood_authority(validator, None)
+    }
+
+    pub fn devnet_with_personhood_authority(
+        validator: Address,
+        personhood_authority: Option<PublicKey>,
+    ) -> Self {
         let mut allocations = Vec::new();
         for (addr_str, hlx) in GENESIS_PREFUND {
             if let Ok(addr) = Address::from_str(addr_str) {
@@ -42,7 +55,7 @@ impl GenesisConfig {
         // Balance auf der eigenen Adresse — kein separater externer Admin-Wallet-Fluss
         // mehr (Entscheidung Moris 2026-07-05).
         allocations.push((validator.clone(), (TOTAL_SUPPLY_HLX - VALIDATOR_GENESIS_STAKE_HLX) * NANO_PER_HLX));
-        GenesisConfig { allocations, validator }
+        GenesisConfig { allocations, validator, personhood_authority }
     }
 
     /// Build the initial ChainState.
@@ -60,6 +73,8 @@ impl GenesisConfig {
 
         // Validator genesis stake — staked directly so it survives epoch 1 rotation
         state.set_validator_stake(&self.validator, VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX);
+
+        state.personhood_authority = self.personhood_authority.clone();
 
         state
     }

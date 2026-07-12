@@ -269,7 +269,20 @@ impl HelixNode {
         let db_path = PathBuf::from("helix-data.redb");
         let mut store = HelixDb::open(&db_path)?;
 
-        let genesis_cfg = GenesisConfig::devnet(address.clone());
+        // Personhood authority — only takes effect for a fresh chain (see below); an
+        // existing chain's authority (if any) was already persisted at its own genesis.
+        let personhood_authority = config::resolve("HELIX_PERSONHOOD_AUTHORITY", &cfg.personhood_authority)
+            .and_then(|hex| match helix_crypto::PublicKey::from_hex(&hex) {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    warn!(err = %e, "HELIX_PERSONHOOD_AUTHORITY / helix.toml is set but not a valid public key — ProvePersonhood will stay disabled");
+                    None
+                }
+            });
+        if personhood_authority.is_none() {
+            info!("No personhood authority configured — ProvePersonhood transactions will be rejected");
+        }
+        let genesis_cfg = GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authority);
         let mut chain_state = if store.get_block_by_height(0).is_ok() {
             info!("Loaded existing chain state from {}", db_path.display());
             store.load_chain_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX)?

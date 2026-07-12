@@ -850,6 +850,26 @@ fn execute_prove_personhood(
         return Receipt::failure(tx_hash, "ZK personhood proof verification failed", 0, 0);
     }
 
+    // The ZK proof alone only shows knowledge of *some* secret matching `commitment` —
+    // helix_zkp::prove_personhood will generate a valid proof for any secret the caller
+    // picks, with no external gatekeeping. Without the authority's signature, anyone could
+    // self-issue unlimited "verified" identities for free (see `PersonhoodProofPayload`'s
+    // doc comment). No authority configured at all means personhood is disabled outright —
+    // failing closed rather than silently trusting the ZK proof alone.
+    let Some(authority) = &state.personhood_authority else {
+        return Receipt::failure(tx_hash, "no personhood authority configured", 0, 0);
+    };
+    let authority_sig_valid = helix_crypto::verify_with_scheme(
+        payload.authority_crypto_version,
+        authority,
+        &payload.commitment,
+        &payload.authority_signature,
+    )
+    .is_ok();
+    if !authority_sig_valid {
+        return Receipt::failure(tx_hash, "personhood authority signature verification failed", 0, 0);
+    }
+
     // The STARK circuit only proves knowledge of a secret matching `commitment` —
     // it isn't bound to `tx.from`. Once submitted, `commitment`+`proof_bytes` are
     // public on-chain, so without this check anyone could copy them into a
@@ -2016,22 +2036,81 @@ mod tests {
         tx
     }
 
+    fn personhood_payload(
+        authority_kp: &KeyPair,
+        commitment: [u8; 16],
+        proof_bytes: Vec<u8>,
+    ) -> PersonhoodProofPayload {
+        PersonhoodProofPayload {
+            commitment,
+            proof_bytes,
+            authority_signature: authority_kp.sign(&commitment).unwrap(),
+            authority_crypto_version: authority_kp.scheme,
+        }
+    }
+
     #[test]
     fn prove_personhood_succeeds_and_sets_verified_status() {
         let kp = KeyPair::generate();
         let addr = Address::from_public_key(&kp.public);
         let validator = Address::from_public_key(&KeyPair::generate().public);
+        let authority_kp = KeyPair::generate();
 
         let mut state = ChainState::new(0);
         state.update_account(&addr, |acc| acc.balance = 1_000_000);
+        state.personhood_authority = Some(authority_kp.public.clone());
 
         let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
-        let payload = PersonhoodProofPayload { commitment, proof_bytes: proof.as_bytes().to_vec() };
+        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());
         let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
 
         let receipt = execute_transaction(&mut state, &tx, &validator, 0);
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert!(state.has_personhood(&addr));
+    }
+
+    #[test]
+    fn prove_personhood_rejects_when_no_authority_configured() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let authority_kp = KeyPair::generate(); // exists, but never registered with the chain
+
+        let mut state = ChainState::new(0); // personhood_authority left as None
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
+        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());
+        let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
+
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        assert!(!receipt.success, "must fail closed with no authority configured");
+        assert!(!state.has_personhood(&addr));
+    }
+
+    #[test]
+    fn prove_personhood_rejects_self_issued_commitment_without_authority_signature() {
+        // The core of the fix: the ZK proof alone (a self-chosen secret, no external
+        // gatekeeping) must not be enough — it needs the configured authority's signature
+        // over the commitment too. Here the "attacker" signs with their own key instead of
+        // the real authority's.
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let real_authority_kp = KeyPair::generate();
+        let attacker_pretending_to_be_authority = KeyPair::generate();
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+        state.personhood_authority = Some(real_authority_kp.public.clone());
+
+        let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
+        let payload = personhood_payload(&attacker_pretending_to_be_authority, commitment, proof.as_bytes().to_vec());
+        let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
+
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        assert!(!receipt.success, "self-issued commitment without the real authority's signature must be rejected");
+        assert!(!state.has_personhood(&addr));
     }
 
     #[test]
@@ -2046,13 +2125,15 @@ mod tests {
         let kp2 = KeyPair::generate();
         let addr2 = Address::from_public_key(&kp2.public);
         let validator = Address::from_public_key(&KeyPair::generate().public);
+        let authority_kp = KeyPair::generate();
 
         let mut state = ChainState::new(0);
         state.update_account(&addr1, |acc| acc.balance = 1_000_000);
         state.update_account(&addr2, |acc| acc.balance = 1_000_000);
+        state.personhood_authority = Some(authority_kp.public.clone());
 
         let (proof, commitment) = helix_zkp::prove_personhood([9u8; 16]);
-        let payload = PersonhoodProofPayload { commitment, proof_bytes: proof.as_bytes().to_vec() };
+        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());
 
         let tx1 = signed_personhood_tx(&kp1, &addr1, &payload, 0, 10_000);
         assert!(execute_transaction(&mut state, &tx1, &validator, 0).success);
