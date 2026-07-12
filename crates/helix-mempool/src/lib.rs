@@ -145,6 +145,17 @@ impl Mempool {
             });
         }
 
+        // Verify signature before accepting — and, crucially, before the full-pool
+        // eviction check below. A tx with an invalid signature is rejected outright
+        // and must never be allowed to trigger eviction of a real, already-admitted
+        // tx: `fee` is a self-declared, unverified field at this point, so without
+        // this ordering an attacker could submit unsigned/garbage-signature txs with
+        // an inflated fee to have `evict_lowest_fee()` discard a legitimate tx, then
+        // have their own (never-admitted) tx rejected here — a free way to grind
+        // down other users' pending transactions.
+        tx.verify_signature()
+            .map_err(|e| MempoolError::Invalid(e.to_string()))?;
+
         if self.by_hash.len() >= self.max_size {
             // Pool is full: only admit this tx if it strictly outbids the cheapest
             // tx currently held, evicting that one to make room. Otherwise a
@@ -156,10 +167,6 @@ impl Mempool {
                 _ => return Err(MempoolError::Full(self.max_size)),
             }
         }
-
-        // Verify signature before accepting
-        tx.verify_signature()
-            .map_err(|e| MempoolError::Invalid(e.to_string()))?;
 
         self.by_fee
             .entry(std::cmp::Reverse(tx.fee))
@@ -417,6 +424,29 @@ mod tests {
         let tx = make_tx(&kp3, 5_000, 0);
         assert!(matches!(pool.add(tx), Err(MempoolError::Full(2))));
         assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn test_full_pool_invalid_signature_does_not_evict_existing_tx() {
+        let kp1 = KeyPair::generate();
+        let kp2 = KeyPair::generate();
+        let attacker_kp = KeyPair::generate();
+        let mut pool = Mempool::with_limits(2, 1_000);
+
+        let cheap = make_tx(&kp1, 5_000, 0);
+        let cheap_hash = cheap.hash();
+        pool.add(cheap).unwrap();
+        pool.add(make_tx(&kp2, 6_000, 0)).unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // Would outbid the cheapest tx (5_000) on fee alone, but the signature is
+        // garbage — must be rejected as Invalid without evicting anything.
+        let mut forged = make_tx(&attacker_kp, 100_000, 0);
+        forged.signature = Signature::from_bytes(vec![0u8; 32]);
+        assert!(matches!(pool.add(forged), Err(MempoolError::Invalid(_))));
+
+        assert_eq!(pool.len(), 2);
+        assert!(pool.contains(&cheap_hash), "cheapest tx must survive a forged eviction attempt");
     }
 
     #[test]
