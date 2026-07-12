@@ -245,6 +245,7 @@ impl P2PService {
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             debug!(peer = %peer_id, "Peer disconnected");
+                            reputation.on_disconnect(&peer_id.to_string());
                             let _ = event_tx
                                 .send(P2PEvent::PeerDisconnected(peer_id.to_string()))
                                 .await;

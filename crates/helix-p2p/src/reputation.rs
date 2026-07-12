@@ -70,6 +70,22 @@ impl PeerReputation {
             .map(|ip| self.banned_ips.contains(ip))
             .unwrap_or(false)
     }
+
+    /// Drop tracking state for `peer` once its connection closes, so that
+    /// many short-lived connections (each below the ban threshold) don't
+    /// grow `strikes`/`peer_ip` without bound.
+    ///
+    /// Banned peers (directly, or via a banned IP) are exempt: their
+    /// `peer_ip` entry must survive the disconnect, otherwise a banned
+    /// `PeerId` reconnecting from the same IP would no longer resolve to
+    /// that IP for the `is_banned` check.
+    pub fn on_disconnect(&mut self, peer: &str) {
+        if self.is_banned(peer) {
+            return;
+        }
+        self.strikes.remove(peer);
+        self.peer_ip.remove(peer);
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +150,39 @@ mod tests {
 
         rep.note_connection("peer-b", "5.6.7.8");
         assert!(!rep.is_banned("peer-b"));
+    }
+
+    #[test]
+    fn disconnect_clears_state_for_non_banned_peer() {
+        let mut rep = PeerReputation::new();
+        rep.note_connection("peer-a", "1.2.3.4");
+        rep.record_infraction("peer-a");
+
+        rep.on_disconnect("peer-a");
+
+        // Strikes reset: a fresh threshold's worth of infractions is needed
+        // again before this peer is banned.
+        for _ in 0..BAN_THRESHOLD - 1 {
+            assert!(!rep.record_infraction("peer-a"));
+        }
+        assert!(!rep.is_banned("peer-a"));
+    }
+
+    #[test]
+    fn disconnect_preserves_state_for_banned_peer_and_its_ip() {
+        let mut rep = PeerReputation::new();
+        rep.note_connection("peer-a", "1.2.3.4");
+        for _ in 0..BAN_THRESHOLD {
+            rep.record_infraction("peer-a");
+        }
+        assert!(rep.is_banned("peer-a"));
+
+        rep.on_disconnect("peer-a");
+
+        // Still banned directly, and the IP ban still applies to a fresh
+        // PeerId connecting from the same address.
+        assert!(rep.is_banned("peer-a"));
+        rep.note_connection("peer-a-fresh-identity", "1.2.3.4");
+        assert!(rep.is_banned("peer-a-fresh-identity"));
     }
 }
