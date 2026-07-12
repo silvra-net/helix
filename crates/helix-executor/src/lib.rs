@@ -576,7 +576,19 @@ fn execute_call_contract(
 
     let fuel_limit = tx.fee.saturating_mul(state.governance_params.fuel_per_fee_unit);
     if let Err(e) = helix_vm::call(&code, fuel_limit) {
-        return Receipt::failure(tx_hash, &format!("contract call failed: {e}"), 0, 0);
+        // Charge the fee and advance the nonce even though the call failed — fuel-
+        // metered execution was actually attempted and consumed real validator CPU.
+        // Without this, the identical tx (nonce never moved, balance never touched)
+        // can be resubmitted and re-executed by every validator forever at zero
+        // cost — e.g. a deliberately fuel-exhausting loop makes this a free,
+        // repeatable DoS instead of a one-time failed call.
+        state.update_account(&tx.from, |acc| {
+            acc.balance -= tx.fee;
+            acc.nonce += 1;
+        });
+        return distribute_fee(state, validator, tx.fee)
+            .map(|_| Receipt::failure(tx_hash, &format!("contract call failed: {e}"), 0, 0))
+            .unwrap_or_else(|de| Receipt::failure(tx_hash, &de.to_string(), 0, 0));
     }
 
     state.update_account(&tx.from, |acc| {
@@ -1283,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn call_contract_fails_out_of_gas_without_charging_fee() {
+    fn call_contract_charges_fee_and_advances_nonce_on_out_of_gas_failure() {
         let deployer_kp = KeyPair::generate();
         let deployer = Address::from_public_key(&deployer_kp.public);
         let caller_kp = KeyPair::generate();
@@ -1319,9 +1331,13 @@ mod tests {
         );
         let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
 
+        // The call itself still fails (ran out of fuel) ...
         assert!(!receipt.success);
-        assert_eq!(state.get(&caller).unwrap().balance, 1_000_000);
-        assert_eq!(state.get(&caller).unwrap().nonce, 0);
+        // ... but the fee was charged and the nonce advanced anyway, since
+        // execution actually ran and consumed real (fuel-metered) CPU — otherwise
+        // this exact tx could be resubmitted and re-executed forever for free.
+        assert_eq!(state.get(&caller).unwrap().balance, 1_000_000 - 1);
+        assert_eq!(state.get(&caller).unwrap().nonce, 1);
     }
 
     fn signed_governance_tx(
