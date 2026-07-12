@@ -749,6 +749,20 @@ async fn apply_finalized_block(
         eng.rotate_validator_set(validators);
         if had > 0 {
             info!(height, epoch = eng.validator_set().epoch, validators = had, "Validator set rotated");
+        } else {
+            // rotate_validator_set() is a deliberate no-op on an empty candidate list —
+            // switching to zero validators would halt block production entirely, so the
+            // previous (stale) validator set stays active instead. That keeps the chain
+            // alive but means every validator that fully unstaked and claimed still holds
+            // their pre-exit voting power indefinitely, with nothing else in the system
+            // ever surfacing that fact. This is the only place that can detect it, so warn
+            // loudly instead of the previous silence.
+            warn!(
+                height,
+                epoch = eng.validator_set().epoch,
+                "Epoch rotation skipped — no accounts meet min_validator_stake; \
+                 the previous validator set (and its now-stale voting power) remains active"
+            );
         }
     }
 
