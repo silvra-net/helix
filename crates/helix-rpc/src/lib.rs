@@ -215,4 +215,10 @@ pub struct NodeStatus {
     pub total_accounts: usize,
     pub circulating_supply_hlx: f64,
     pub total_burned_hlx: f64,
+    /// Deterministic hash of this node's full chain state at `height`
+    /// (`ChainState::state_hash`) — a diagnostic tool, not a protocol-level state root.
+    /// Compare this across nodes at the same `height` to notice execution divergence; it
+    /// isn't committed to a block or checked as part of consensus. See `state_hash`'s doc
+    /// comment for what it does and doesn't guarantee.
+    pub state_hash: String,
 }

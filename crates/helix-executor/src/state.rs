@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use helix_crypto::{Address, PublicKey};
+use helix_crypto::{Address, Hash, PublicKey};
 use helix_identity::{GuardianSet, PersonhoodStatus, RecoveryRequest};
 use serde::{Deserialize, Serialize};
 
@@ -279,11 +279,215 @@ impl ChainState {
         self.accounts.values().map(|acc| acc.staked).max().unwrap_or(0)
     }
 
+    /// A deterministic hash of the entire chain state — a diagnostic tool for noticing
+    /// when two nodes have (for whatever reason) computed different results from the same
+    /// block history. This is deliberately NOT a protocol-level state root: it isn't in
+    /// `BlockHeader`, isn't signed, isn't checked as part of block validity, and doesn't
+    /// gate consensus in any way. A real state root — committed in the header, verified by
+    /// every node as part of applying a block — is a materially bigger change (wire format,
+    /// full state-commitment scheme) and remains a separate, unstarted piece of work. What
+    /// this DOES give operators today: call it after applying the same block on two nodes
+    /// and compare. If they differ, something has diverged; if they match, nothing has (for
+    /// everything covered by this hash).
+    ///
+    /// `HashMap`/`HashSet` iteration order is not stable across processes — Rust's default
+    /// hasher (SipHash) uses a random per-process seed — so bincode-serializing one
+    /// directly would make this hash different on every node even when their *contents*
+    /// are identical, producing constant false positives. Every such collection is
+    /// therefore rewritten into a sorted `BTreeMap`/`BTreeSet`/sorted `Vec` first,
+    /// including ones nested inside stored values — `GovernanceProposal::voters` is a
+    /// `HashSet<String>`, so proposals get the same treatment via `CanonicalProposal`
+    /// rather than being hashed as-is.
+    pub fn state_hash(&self) -> Hash {
+        #[derive(Serialize)]
+        struct CanonicalProposal<'a> {
+            id: u64,
+            proposer: &'a str,
+            param: &'a crate::governance::GovernanceParam,
+            new_value: u64,
+            created_at_height: u64,
+            voters: Vec<&'a str>,
+            yes_stake: u64,
+            total_staked_at_creation: u64,
+            executed: bool,
+        }
+
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            accounts: BTreeMap<&'a str, &'a AccountState>,
+            total_supply: u64,
+            total_burned: u64,
+            names: BTreeMap<&'a str, &'a str>,
+            personhood: BTreeMap<&'a str, &'a PersonhoodStatus>,
+            guardians: BTreeMap<&'a str, &'a GuardianSet>,
+            recovery_requests: BTreeMap<&'a str, &'a RecoveryRequest>,
+            recovery_keys: BTreeMap<&'a str, &'a PublicKey>,
+            governance_params: &'a GovernanceParams,
+            proposals: BTreeMap<u64, CanonicalProposal<'a>>,
+            next_proposal_id: u64,
+            used_personhood_commitments: std::collections::BTreeSet<[u8; 16]>,
+            slashed_double_sign_incidents: std::collections::BTreeSet<&'a str>,
+            personhood_authority: &'a Option<PublicKey>,
+        }
+
+        let canonical = Canonical {
+            accounts: self.accounts.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            total_supply: self.total_supply,
+            total_burned: self.total_burned,
+            names: self.names.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
+            personhood: self.personhood.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            guardians: self.guardians.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            recovery_requests: self.recovery_requests.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            recovery_keys: self.recovery_keys.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            governance_params: &self.governance_params,
+            proposals: self
+                .proposals
+                .iter()
+                .map(|(id, p)| {
+                    let mut voters: Vec<&str> = p.voters.iter().map(|v| v.as_str()).collect();
+                    voters.sort_unstable();
+                    (
+                        *id,
+                        CanonicalProposal {
+                            id: p.id,
+                            proposer: &p.proposer,
+                            param: &p.param,
+                            new_value: p.new_value,
+                            created_at_height: p.created_at_height,
+                            voters,
+                            yes_stake: p.yes_stake,
+                            total_staked_at_creation: p.total_staked_at_creation,
+                            executed: p.executed,
+                        },
+                    )
+                })
+                .collect(),
+            next_proposal_id: self.next_proposal_id,
+            used_personhood_commitments: self.used_personhood_commitments.iter().copied().collect(),
+            slashed_double_sign_incidents: self.slashed_double_sign_incidents.iter().map(|s| s.as_str()).collect(),
+            personhood_authority: &self.personhood_authority,
+        };
+
+        let bytes = bincode::serialize(&canonical).expect("canonical chain state serialization is infallible");
+        Hash::digest(&bytes)
+    }
+
     pub fn proposal(&self, id: u64) -> Option<&GovernanceProposal> {
         self.proposals.get(&id)
     }
 
     pub fn set_proposal(&mut self, proposal: GovernanceProposal) {
         self.proposals.insert(proposal.id, proposal);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::governance::GovernanceParam;
+    use helix_crypto::KeyPair;
+
+    fn addr(seed: u8) -> Address {
+        Address::from_public_key(&helix_crypto::PublicKey::from_bytes(vec![seed; 8]))
+    }
+
+    #[test]
+    fn state_hash_is_stable_regardless_of_account_insertion_order() {
+        let mut forward = ChainState::new(1_000_000);
+        for i in 0..20u8 {
+            forward.update_account(&addr(i), |acc| {
+                acc.balance = i as u64 * 1000;
+                acc.staked = i as u64;
+            });
+        }
+
+        let mut backward = ChainState::new(1_000_000);
+        for i in (0..20u8).rev() {
+            backward.update_account(&addr(i), |acc| {
+                acc.balance = i as u64 * 1000;
+                acc.staked = i as u64;
+            });
+        }
+
+        assert_eq!(
+            forward.state_hash(),
+            backward.state_hash(),
+            "identical accounts inserted in different order must hash the same"
+        );
+    }
+
+    #[test]
+    fn state_hash_changes_when_a_balance_changes() {
+        let mut state = ChainState::new(0);
+        state.set_balance(&addr(1), 100);
+        let before = state.state_hash();
+
+        state.set_balance(&addr(1), 101);
+        let after = state.state_hash();
+
+        assert_ne!(before, after, "a real state change must change the hash");
+    }
+
+    #[test]
+    fn state_hash_is_stable_regardless_of_proposal_voter_order() {
+        // GovernanceProposal::voters is a HashSet<String> — the one nested non-deterministic
+        // collection in ChainState. This is the case CanonicalProposal exists to fix.
+        let voters_a: std::collections::HashSet<String> =
+            ["alice", "bob", "carol", "dave"].iter().map(|s| s.to_string()).collect();
+        let voters_b: std::collections::HashSet<String> =
+            ["dave", "carol", "bob", "alice"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(voters_a, voters_b, "sanity: these really are the same set");
+
+        let base_proposal = GovernanceProposal {
+            id: 0,
+            proposer: "alice".to_string(),
+            param: GovernanceParam::FuelPerFeeUnit,
+            new_value: 42,
+            created_at_height: 10,
+            voters: voters_a,
+            yes_stake: 400,
+            total_staked_at_creation: 1000,
+            executed: false,
+        };
+
+        let mut state_a = ChainState::new(0);
+        state_a.set_proposal(base_proposal.clone());
+
+        let mut state_b = ChainState::new(0);
+        state_b.set_proposal(GovernanceProposal { voters: voters_b, ..base_proposal });
+
+        assert_eq!(
+            state_a.state_hash(),
+            state_b.state_hash(),
+            "same voters inserted in different order must hash the same"
+        );
+    }
+
+    #[test]
+    fn state_hash_is_stable_regardless_of_set_insertion_order() {
+        let mut forward = ChainState::new(0);
+        forward.used_personhood_commitments.insert([1u8; 16]);
+        forward.used_personhood_commitments.insert([2u8; 16]);
+        forward.slashed_double_sign_incidents.insert("v1:10:0".to_string());
+        forward.slashed_double_sign_incidents.insert("v2:20:1".to_string());
+
+        let mut backward = ChainState::new(0);
+        backward.slashed_double_sign_incidents.insert("v2:20:1".to_string());
+        backward.slashed_double_sign_incidents.insert("v1:10:0".to_string());
+        backward.used_personhood_commitments.insert([2u8; 16]);
+        backward.used_personhood_commitments.insert([1u8; 16]);
+
+        assert_eq!(forward.state_hash(), backward.state_hash());
+    }
+
+    #[test]
+    fn state_hash_reflects_personhood_authority() {
+        let mut state = ChainState::new(0);
+        let before = state.state_hash();
+
+        state.personhood_authority = Some(KeyPair::generate().public);
+        let after = state.state_hash();
+
+        assert_ne!(before, after);
     }
 }

@@ -131,6 +131,7 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
         total_accounts: chain.account_count(),
         circulating_supply_hlx: chain.circulating_supply() as f64 / 1_000_000_000.0,
         total_burned_hlx: chain.total_burned as f64 / 1_000_000_000.0,
+        state_hash: chain.state_hash().to_hex(),
     })
 }
 

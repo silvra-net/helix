@@ -717,6 +717,13 @@ async fn apply_finalized_block(
         if receipt.failed_txs() > 0 {
             warn!(height, failed = receipt.failed_txs(), "Tx execution failures");
         }
+        // Not a protocol-level state root (not in BlockHeader, not signed, doesn't gate
+        // consensus) — a diagnostic escape hatch. If two nodes' logs ever show different
+        // state_hash values at the same height, something has silently diverged; grep for
+        // it. Also served live via GET /status (NodeStatus::state_hash) for tooling that
+        // wants to compare running nodes without trawling logs. See ChainState::state_hash's
+        // doc comment for exactly what this is and isn't.
+        debug!(height, state_hash = %state.state_hash().to_hex(), "Block applied");
     }
 
     // Double-sign slashing does NOT happen here. It used to: this function unconditionally
@@ -724,10 +731,12 @@ async fn apply_finalized_block(
     // local, live-BFT-vote-processing state — a node that only received this block passively
     // (P2P gossip or sync, see the NewCommittedBlock arm below and sync_blocks_from_peer) never
     // accumulates it, so some validators slashed while others silently didn't: a state fork,
-    // permanently undetectable since BlockHeader carries no state_root. Evidence is now
-    // reported via a `SubmitDoubleSignEvidence` transaction (see `report_double_sign_evidence`,
-    // called wherever the engine can produce evidence) and slashed inside `execute_block` above,
-    // through the same transaction-execution path every node already runs identically.
+    // undetectable by anything CONSENSUS-LEVEL, since BlockHeader still carries no state_root
+    // (ChainState::state_hash above is an operator-facing diagnostic, not a protocol check).
+    // Evidence is now reported via a `SubmitDoubleSignEvidence` transaction (see
+    // `report_double_sign_evidence`, called wherever the engine can produce evidence) and
+    // slashed inside `execute_block` above, through the same transaction-execution path
+    // every node already runs identically.
 
     // Immediately jail any validator whose double-sign slash just landed in this block,
     // instead of leaving them at full, stale voting power until the next epoch rotation
