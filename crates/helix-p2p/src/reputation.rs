@@ -1,10 +1,19 @@
 use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 /// Number of protocol infractions (malformed gossipsub payloads, failed session
 /// handshakes, etc.) a peer may commit before it is disconnected and refused
 /// reconnection for the lifetime of this process.
 const BAN_THRESHOLD: u32 = 5;
+
+/// Upper bound on how many distinct identities/IPs we hold a permanent ban
+/// for. Each ban costs an attacker `BAN_THRESHOLD` infractions, so this is
+/// deliberately generous — it exists only to cap memory under a sustained
+/// attack from many identities/IPs, not to limit normal operation. Once the
+/// cap is hit, the oldest ban is evicted (and its subject un-banned) to make
+/// room for the newest one.
+const MAX_BANNED_ENTRIES: usize = 100_000;
 
 /// Tracks per-peer misbehavior strikes and bans peers that cross the threshold.
 ///
@@ -23,8 +32,23 @@ const BAN_THRESHOLD: u32 = 5;
 pub struct PeerReputation {
     strikes: HashMap<String, u32>,
     banned: HashSet<String>,
+    banned_order: VecDeque<String>,
     peer_ip: HashMap<String, String>,
     banned_ips: HashSet<String>,
+    banned_ips_order: VecDeque<String>,
+}
+
+/// Insert `value` into `set`/`order` (a lookup set paired with its insertion
+/// order), evicting the oldest entry once `max` is exceeded.
+fn insert_bounded(set: &mut HashSet<String>, order: &mut VecDeque<String>, value: String, max: usize) {
+    if set.insert(value.clone()) {
+        order.push_back(value);
+        if order.len() > max {
+            if let Some(oldest) = order.pop_front() {
+                set.remove(&oldest);
+            }
+        }
+    }
 }
 
 impl PeerReputation {
@@ -48,9 +72,9 @@ impl PeerReputation {
         let strikes = self.strikes.entry(peer.to_string()).or_insert(0);
         *strikes += 1;
         if *strikes >= BAN_THRESHOLD {
-            self.banned.insert(peer.to_string());
+            insert_bounded(&mut self.banned, &mut self.banned_order, peer.to_string(), MAX_BANNED_ENTRIES);
             if let Some(ip) = self.peer_ip.get(peer) {
-                self.banned_ips.insert(ip.clone());
+                insert_bounded(&mut self.banned_ips, &mut self.banned_ips_order, ip.clone(), MAX_BANNED_ENTRIES);
             }
             true
         } else {
@@ -166,6 +190,30 @@ mod tests {
             assert!(!rep.record_infraction("peer-a"));
         }
         assert!(!rep.is_banned("peer-a"));
+    }
+
+    #[test]
+    fn banned_set_evicts_oldest_entry_once_cap_is_reached() {
+        let mut rep = PeerReputation::new();
+        // Fill the cap with distinct banned peers (no IPs, to isolate the
+        // `banned`/`banned_order` eviction path).
+        for i in 0..MAX_BANNED_ENTRIES {
+            let peer = format!("peer-{i}");
+            for _ in 0..BAN_THRESHOLD {
+                rep.record_infraction(&peer);
+            }
+        }
+        assert!(rep.is_banned("peer-0"));
+
+        // One more ban past the cap evicts the oldest (peer-0).
+        let overflow_peer = "peer-overflow";
+        for _ in 0..BAN_THRESHOLD {
+            rep.record_infraction(overflow_peer);
+        }
+
+        assert!(!rep.is_banned("peer-0"));
+        assert!(rep.is_banned(overflow_peer));
+        assert!(rep.is_banned("peer-1"));
     }
 
     #[test]
