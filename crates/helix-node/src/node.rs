@@ -565,6 +565,20 @@ async fn handle_p2p_event(
                         );
                         return;
                     }
+                    // Chain continuity: a validly-signed block from a real validator can
+                    // still fail to build on our actual tip (stale round, a validator
+                    // building on a different branch, etc.) — applying it anyway would
+                    // silently corrupt our chain state instead of just missing a block.
+                    let our_tip_hash = store.read().await.latest_hash();
+                    if block.header.prev_hash != our_tip_hash {
+                        warn!(
+                            height = block_height,
+                            expected_prev = %our_tip_hash,
+                            got_prev = %block.header.prev_hash,
+                            "Committed block from peer does not chain from our tip — dropping"
+                        );
+                        return;
+                    }
                     info!(height = block_height, "Applying committed block from peer");
                     apply_finalized_block(block, false, store, mempool, chain_state, engine, p2p_tx, reward_address).await;
                 }
@@ -793,6 +807,9 @@ async fn sync_blocks_from_peer(
 
     let mut from = local_tip + 1;
     let mut total_applied = 0u64;
+    // Tracks the hash each next block must chain from — starts at our current tip
+    // and advances to the just-applied block's own hash after each iteration.
+    let mut expected_prev_hash = store.latest_hash();
 
     loop {
         let url = format!("{}/sync/blocks?from={}&count=200", peer_url.trim_end_matches('/'), from);
@@ -836,8 +853,24 @@ async fn sync_blocks_from_peer(
                     total_applied
                 );
             }
+            // Chain continuity: a validly-signed block from a real validator can still
+            // fail to build on the block we just applied (peer serving a different
+            // branch, a stale/reordered batch, etc.) — applying it anyway would splice
+            // an unrelated block into our chain instead of just failing the sync.
+            if block.header.prev_hash != expected_prev_hash {
+                store.save_chain_state(chain_state)?;
+                anyhow::bail!(
+                    "block {} from sync peer does not chain from the previous block \
+                     (expected prev_hash {}, got {}) — aborting sync, {} block(s) already applied",
+                    h,
+                    expected_prev_hash,
+                    block.header.prev_hash,
+                    total_applied
+                );
+            }
             execute_block(chain_state, block, None);
             store.put_block(block.clone())?;
+            expected_prev_hash = block.hash();
             if h % 1000 == 0 {
                 info!("Synced block {}", h);
             }
@@ -858,19 +891,34 @@ mod sync_blocks_from_peer_tests {
     use super::*;
     use axum::{extract::Query, routing::get, Json, Router};
     use helix_core::genesis_block;
-    use helix_crypto::{KeyPair, Signature as Sig};
+    use helix_crypto::{Hash, KeyPair, Signature as Sig};
     use std::collections::HashMap;
 
-    fn signed_block(kp: &KeyPair, height: u64) -> Block {
+    fn signed_block(kp: &KeyPair, height: u64, prev_hash: Hash) -> Block {
         let mut block = genesis_block(
             Address::from_public_key(&kp.public),
             kp.public.clone(),
             Sig::from_bytes(vec![]),
         );
         block.header.height = height;
+        block.header.prev_hash = prev_hash;
         let sig = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
         block.header.signature = sig;
         block
+    }
+
+    /// Builds `heights.len()` blocks that properly chain from `Hash::ZERO` (a
+    /// fresh store's initial tip) through each other in order.
+    fn chained_blocks(kp: &KeyPair, heights: &[u64]) -> Vec<Block> {
+        let mut prev_hash = Hash::ZERO;
+        heights
+            .iter()
+            .map(|&h| {
+                let block = signed_block(kp, h, prev_hash);
+                prev_hash = block.hash();
+                block
+            })
+            .collect()
     }
 
     async fn serve_blocks(blocks: Vec<Block>) -> String {
@@ -923,7 +971,7 @@ mod sync_blocks_from_peer_tests {
     #[tokio::test]
     async fn applies_all_validly_signed_blocks() {
         let kp = KeyPair::generate();
-        let blocks = vec![signed_block(&kp, 1), signed_block(&kp, 2), signed_block(&kp, 3)];
+        let blocks = chained_blocks(&kp, &[1, 2, 3]);
         let peer_url = serve_blocks(blocks).await;
 
         let mut store = fresh_store();
@@ -938,9 +986,8 @@ mod sync_blocks_from_peer_tests {
     #[tokio::test]
     async fn rejects_tampered_block_and_aborts_cleanly() {
         let kp = KeyPair::generate();
-        let mut tampered = signed_block(&kp, 2);
-        tampered.header.height = 99; // invalidates the signature without re-signing
-        let blocks = vec![signed_block(&kp, 1), tampered, signed_block(&kp, 3)];
+        let mut blocks = chained_blocks(&kp, &[1, 2, 3]);
+        blocks[1].header.height = 99; // invalidates the signature without re-signing
         let peer_url = serve_blocks(blocks).await;
 
         let mut store = fresh_store();
@@ -963,7 +1010,7 @@ mod sync_blocks_from_peer_tests {
         // Signature is perfectly valid, but `kp` was never registered as a staker —
         // simulates an attacker with a free, throwaway keypair and no stake.
         let kp = KeyPair::generate();
-        let blocks = vec![signed_block(&kp, 1)];
+        let blocks = vec![signed_block(&kp, 1, Hash::ZERO)];
         let peer_url = serve_blocks(blocks).await;
 
         let mut store = fresh_store();
@@ -975,13 +1022,35 @@ mod sync_blocks_from_peer_tests {
         assert_eq!(store.latest_height(), 0);
         assert!(store.get_block_by_height(1).is_err());
     }
+
+    #[tokio::test]
+    async fn rejects_block_that_does_not_chain_from_previous_block() {
+        // Both blocks are validly signed by a real staker, but block 2's prev_hash
+        // doesn't match block 1's actual hash (e.g. peer serving a different branch).
+        let kp = KeyPair::generate();
+        let block1 = signed_block(&kp, 1, Hash::ZERO);
+        let non_chaining_block2 = signed_block(&kp, 2, Hash::ZERO); // should be block1.hash()
+        let blocks = vec![block1, non_chaining_block2];
+        let peer_url = serve_blocks(blocks).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &kp);
+        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not chain"));
+        // Block 1 stays applied, block 2 (the non-chaining one) is never persisted.
+        assert_eq!(store.latest_height(), 1);
+        assert!(store.get_block_by_height(2).is_err());
+    }
 }
 
 #[cfg(test)]
 mod handle_p2p_event_tests {
     use super::*;
     use helix_core::genesis_block;
-    use helix_crypto::{KeyPair, Signature as Sig};
+    use helix_crypto::{Hash, KeyPair, Signature as Sig};
     use std::sync::atomic::AtomicUsize;
 
     fn fresh_store() -> HelixDb {
@@ -994,13 +1063,14 @@ mod handle_p2p_event_tests {
         HelixDb::open(&path).unwrap()
     }
 
-    fn signed_block(kp: &KeyPair, height: u64) -> Block {
+    fn signed_block(kp: &KeyPair, height: u64, prev_hash: Hash) -> Block {
         let mut block = genesis_block(
             Address::from_public_key(&kp.public),
             kp.public.clone(),
             Sig::from_bytes(vec![]),
         );
         block.header.height = height;
+        block.header.prev_hash = prev_hash;
         let sig = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
         block.header.signature = sig;
         block
@@ -1012,7 +1082,7 @@ mod handle_p2p_event_tests {
     #[tokio::test]
     async fn new_committed_block_from_unstaked_signer_is_dropped() {
         let attacker_kp = KeyPair::generate();
-        let block = signed_block(&attacker_kp, 1);
+        let block = signed_block(&attacker_kp, 1, Hash::ZERO);
 
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let peer_count = Arc::new(AtomicUsize::new(0));
@@ -1043,6 +1113,47 @@ mod handle_p2p_event_tests {
         .await;
 
         // Dropped: never applied (height unchanged), nothing broadcast.
+        assert_eq!(store.read().await.latest_height(), 0);
+        assert!(p2p_rx.try_recv().is_err());
+    }
+
+    /// A block from a real, staked validator with a signature that checks out is
+    /// still dropped if it doesn't build on our actual tip — otherwise applying it
+    /// would silently splice an unrelated block into our chain state.
+    #[tokio::test]
+    async fn new_committed_block_with_wrong_prev_hash_is_dropped() {
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        // Fresh store's tip hash is Hash::ZERO — deliberately build the block on a
+        // different, non-zero "previous" hash so it doesn't chain.
+        let wrong_prev_hash = Hash::digest(b"not our actual tip");
+        let block = signed_block(&validator_kp, 1, wrong_prev_hash);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let peer_count = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+
+        let validator_set = ValidatorSet::new(vec![Validator::new(validator_addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, validator_addr, 0)));
+
+        let own_kp = KeyPair::generate();
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
+
+        handle_p2p_event(
+            P2PEvent::NewCommittedBlock(block),
+            &mempool,
+            &peer_count,
+            &store,
+            &chain_state,
+            &engine,
+            &own_kp,
+            &p2p_tx,
+            None,
+            &None,
+        )
+        .await;
+
         assert_eq!(store.read().await.latest_height(), 0);
         assert!(p2p_rx.try_recv().is_err());
     }
