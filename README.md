@@ -30,7 +30,7 @@ Helix is a Layer-1 blockchain built from the ground up for the post-quantum era.
 │ REST API     │ libp2p       │ PoS + BFT    │ State machine  │
 ├──────────────┴──────────────┴──────────────┴────────────────┤
 │                       helix-storage                         │
-│                    In-memory (MemBlockStore)                 │
+│              Persistent (redb-backed HelixDb)               │
 ├─────────────────────────────────────────────────────────────┤
 │  helix-core    │  helix-crypto   │  helix-identity          │
 │  Block, Tx     │  ML-DSA, BLAKE3 │  Names, Personhood       │
@@ -50,9 +50,9 @@ CLI: hlx (helix-cli)   ←→   REST API :8545   ←→   P2P :8546
 | Backup Signatures | SLH-DSA (SPHINCS+) | NIST FIPS 205 | ✅ |
 | Hashing | BLAKE3 | — | ✅ (2× security margin vs Grover) |
 | Zero-Knowledge | ZK-STARKs | — | ✅ (hash-based) |
-| Transport | Noise (X25519) | — | ⚠️ Phase 7: ML-KEM upgrade |
+| Transport | Noise (X25519) + ML-KEM-768 session layer | NIST FIPS 203 | ✅ |
 
-> **Note:** The transport layer (P2P) currently uses X25519 via the Noise protocol — not yet post-quantum. Consensus signatures and all on-chain data are fully quantum-secure.
+> **Note:** The base P2P transport (Noise/X25519) is classical, but every peer session is additionally wrapped in ML-KEM-768 (post-quantum) encryption negotiated via a `helix/session/1.0.0` handshake — Noise remains only for defense-in-depth underneath it. Consensus signatures and all on-chain data are fully quantum-secure.
 
 ---
 
