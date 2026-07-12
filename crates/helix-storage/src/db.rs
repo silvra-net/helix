@@ -1,4 +1,4 @@
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition};
 use std::path::Path;
 
 use helix_core::Block;
@@ -19,6 +19,11 @@ const RECOVERY_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("recove
 const PROPOSALS: TableDefinition<u64, &[u8]> = TableDefinition::new("proposals");
 const PERSONHOOD_COMMITMENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("personhood_commitments");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// address string → (block height, tx index within block), both big-endian so a
+/// key's values sort in ascending chain order for free. Lets `address_transactions`
+/// look up only the transactions touching one address instead of scanning every
+/// block in the chain on every request.
+const ADDRESS_TX_INDEX: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::new("address_tx_index");
 
 const META_HEIGHT: &str = "latest_height";
 const META_HASH: &str = "latest_hash";
@@ -47,6 +52,7 @@ impl HelixDb {
         tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
         Ok(HelixDb { db })
     }
@@ -255,6 +261,33 @@ impl HelixDb {
             None => Ok(None),
         }
     }
+
+    /// Returns `(block_height, tx_index_within_block)` for every transaction that
+    /// touched `address` (as sender or recipient), newest first, after applying
+    /// `offset`/`limit` — backed by `ADDRESS_TX_INDEX` instead of scanning every
+    /// block in the chain on every call.
+    pub fn address_transactions(
+        &self,
+        address: &str,
+        limit: usize,
+        offset: usize,
+    ) -> StorageResult<Vec<(u64, u32)>> {
+        let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
+        let table = tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut entries = Vec::new();
+        let mut iter = table.get(address).map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(v) = iter.next() {
+            let v = v.map_err(|e| StorageError::Db(e.to_string()))?;
+            let bytes = v.value();
+            let height = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+            let tx_index = u32::from_be_bytes(bytes[8..].try_into().unwrap());
+            entries.push((height, tx_index));
+        }
+        // Stored ascending (big-endian height sorts numerically) — reverse for
+        // newest-first before paginating.
+        entries.reverse();
+        Ok(entries.into_iter().skip(offset).take(limit).collect())
+    }
 }
 
 impl BlockStore for HelixDb {
@@ -292,11 +325,27 @@ impl BlockStore for HelixDb {
             let mut blocks = tx.open_table(BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut heights = tx.open_table(HEIGHT_IDX).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut address_tx_index = tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
 
             blocks.insert(hash.as_bytes().as_slice(), encoded.as_slice())
                 .map_err(|e| StorageError::Db(e.to_string()))?;
             heights.insert(height, hash.as_bytes().as_slice())
                 .map_err(|e| StorageError::Db(e.to_string()))?;
+
+            for (tx_index, txn) in block.transactions.iter().enumerate() {
+                let mut value = [0u8; 12];
+                value[..8].copy_from_slice(&height.to_be_bytes());
+                value[8..].copy_from_slice(&(tx_index as u32).to_be_bytes());
+
+                address_tx_index.insert(txn.from.as_str(), value.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+                if let Some(to) = &txn.to {
+                    if to != &txn.from {
+                        address_tx_index.insert(to.as_str(), value.as_slice())
+                            .map_err(|e| StorageError::Db(e.to_string()))?;
+                    }
+                }
+            }
 
             // Update latest only if this block is newer
             let current = meta.get(META_HEIGHT).ok().flatten()
@@ -348,8 +397,45 @@ impl BlockStore for HelixDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helix_core::genesis_block;
-    use helix_crypto::{Address, KeyPair};
+    use helix_core::{genesis_block, BlockHeader, CryptoVersion, TxType};
+    use helix_crypto::{Address, KeyPair, PublicKey, Signature};
+
+    fn addr(seed: u8) -> Address {
+        Address::from_public_key(&PublicKey::from_bytes(vec![seed; 8]))
+    }
+
+    fn transfer(from: &Address, to: &Address, nonce: u64) -> helix_core::Transaction {
+        helix_core::Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: from.clone(),
+            to: Some(to.clone()),
+            amount: 10,
+            fee: 1,
+            nonce,
+            data: vec![],
+            crypto_version: Default::default(),
+            signature: Signature::from_bytes(vec![]),
+            public_key: PublicKey::from_bytes(vec![]),
+        }
+    }
+
+    fn block_with_txs(height: u64, validator: &Address, transactions: Vec<helix_core::Transaction>) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                height,
+                timestamp: 1_000 + height,
+                prev_hash: Hash::ZERO,
+                merkle_root: Hash::ZERO,
+                validator: validator.clone(),
+                public_key: PublicKey::from_bytes(vec![]),
+                crypto_version: CryptoVersion::MlDsa,
+                signature: Signature::from_bytes(vec![]),
+            },
+            transactions,
+        }
+    }
 
     /// A block + chain state written by one `HelixDb` handle must be readable
     /// back after the process (simulated here by dropping and reopening the
@@ -387,6 +473,88 @@ mod tests {
         // A used personhood commitment must also survive a restart — otherwise a
         // replayed proof would be accepted again right after the node restarts.
         assert!(loaded.used_personhood_commitments.contains(&[7u8; 16]));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn fresh_db() -> (HelixDb, std::path::PathBuf) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "helix-db-address-index-test-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        (HelixDb::open(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn address_transactions_finds_sent_and_received_newest_first() {
+        let (mut db, path) = fresh_db();
+        let alice = addr(1);
+        let bob = addr(2);
+        let carol = addr(3);
+
+        db.put_block(block_with_txs(0, &alice, vec![transfer(&alice, &bob, 0)])).unwrap();
+        db.put_block(block_with_txs(
+            1,
+            &alice,
+            vec![transfer(&bob, &alice, 0), transfer(&carol, &bob, 0)],
+        ))
+        .unwrap();
+
+        let refs = db.address_transactions(alice.to_string().as_str(), 10, 0).unwrap();
+        assert_eq!(refs.len(), 2);
+        // Newest block first.
+        assert_eq!(refs[0].0, 1);
+        assert_eq!(refs[1].0, 0);
+
+        // Carol only appears once, in block 1.
+        let carol_refs = db.address_transactions(carol.to_string().as_str(), 10, 0).unwrap();
+        assert_eq!(carol_refs, vec![(1, 1)]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn address_transactions_honors_limit_and_offset() {
+        let (mut db, path) = fresh_db();
+        let alice = addr(1);
+        let bob = addr(2);
+
+        for h in 0..5u64 {
+            db.put_block(block_with_txs(h, &alice, vec![transfer(&alice, &bob, h)])).unwrap();
+        }
+
+        let page1 = db.address_transactions(alice.to_string().as_str(), 2, 0).unwrap();
+        assert_eq!(page1.iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![4, 3]);
+
+        let page2 = db.address_transactions(alice.to_string().as_str(), 2, 2).unwrap();
+        assert_eq!(page2.iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![2, 1]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn address_transactions_survives_reopening_the_database() {
+        let alice = addr(1);
+        let bob = addr(2);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "helix-db-address-index-persist-test-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut db = HelixDb::open(&path).unwrap();
+            db.put_block(block_with_txs(0, &alice, vec![transfer(&alice, &bob, 0)])).unwrap();
+        }
+
+        let db = HelixDb::open(&path).unwrap();
+        let refs = db.address_transactions(alice.to_string().as_str(), 10, 0).unwrap();
+        assert_eq!(refs, vec![(0, 0)]);
 
         let _ = std::fs::remove_file(&path);
     }

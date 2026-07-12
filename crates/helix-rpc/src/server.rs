@@ -476,8 +476,27 @@ async fn get_account_recovery(
     )
 }
 
+/// Builds the RPC-facing history entry for one transaction from the block it's in.
+fn tx_history_entry(block: &helix_core::Block, tx: &Transaction) -> TxHistoryEntry {
+    TxHistoryEntry {
+        hash: tx.hash().to_hex(),
+        from: tx.from.to_string(),
+        to: tx.to.as_ref().map(|a| a.to_string()),
+        amount_hlx: tx.amount as f64 / 1_000_000_000.0,
+        fee_hlx: tx.fee as f64 / 1_000_000_000.0,
+        tx_type: format!("{:?}", tx.tx_type),
+        nonce: tx.nonce,
+        block_height: block.height(),
+        block_hash: block.hash().to_hex(),
+        timestamp: block.header.timestamp,
+    }
+}
+
 /// Extracts every transaction touching `address` (as sender or recipient) from `blocks`,
 /// newest first. Pure and store-agnostic so it can be unit-tested without a `HelixDb`.
+/// Full-scan reference implementation — kept for tests as a ground truth to check the
+/// indexed lookup in `get_account_transactions` against; not used on the live request path.
+#[cfg(test)]
 fn extract_tx_history(blocks: &[helix_core::Block], address: &str) -> Vec<TxHistoryEntry> {
     let mut history = Vec::new();
     for block in blocks {
@@ -485,18 +504,7 @@ fn extract_tx_history(blocks: &[helix_core::Block], address: &str) -> Vec<TxHist
             let is_sender = tx.from.to_string() == address;
             let is_recipient = tx.to.as_ref().map(|a| a.to_string()).as_deref() == Some(address);
             if is_sender || is_recipient {
-                history.push(TxHistoryEntry {
-                    hash: tx.hash().to_hex(),
-                    from: tx.from.to_string(),
-                    to: tx.to.as_ref().map(|a| a.to_string()),
-                    amount_hlx: tx.amount as f64 / 1_000_000_000.0,
-                    fee_hlx: tx.fee as f64 / 1_000_000_000.0,
-                    tx_type: format!("{:?}", tx.tx_type),
-                    nonce: tx.nonce,
-                    block_height: block.height(),
-                    block_hash: block.hash().to_hex(),
-                    timestamp: block.header.timestamp,
-                });
+                history.push(tx_history_entry(block, tx));
             }
         }
     }
@@ -504,9 +512,19 @@ fn extract_tx_history(blocks: &[helix_core::Block], address: &str) -> Vec<TxHist
     history
 }
 
+const DEFAULT_ACCOUNT_TX_LIMIT: u64 = 50;
+const MAX_ACCOUNT_TX_LIMIT: u64 = 200;
+
+/// `GET /accounts/:address/transactions?limit=<n>&offset=<m>` — newest first.
+///
+/// Backed by `HelixDb::address_transactions`, an index maintained incrementally on
+/// every `put_block` rather than a scan of every block in the chain: cost is
+/// proportional to how many transactions actually touched this address, not to
+/// chain height, and stays bounded per request via `limit`/`offset`.
 async fn get_account_transactions(
     State(state): State<AppState>,
     Path(address_str): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, u64>>,
 ) -> impl IntoResponse {
     if Address::from_str(&address_str).is_err() {
         return (
@@ -514,12 +532,27 @@ async fn get_account_transactions(
             Json(json!({ "error": format!("invalid address format: {}", address_str) })),
         );
     }
+    let limit = params.get("limit").copied().unwrap_or(DEFAULT_ACCOUNT_TX_LIMIT).min(MAX_ACCOUNT_TX_LIMIT);
+    let offset = params.get("offset").copied().unwrap_or(0);
+
     let store = state.store.read().await;
-    let latest = store.latest_height();
-    let blocks: Vec<_> = (0..=latest)
-        .filter_map(|h| store.get_block_by_height(h).ok())
-        .collect();
-    let history = extract_tx_history(&blocks, &address_str);
+    let refs = match store.address_transactions(&address_str, limit as usize, offset as usize) {
+        Ok(refs) => refs,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to read transaction index: {e}") })),
+            );
+        }
+    };
+
+    let mut history = Vec::with_capacity(refs.len());
+    for (height, tx_index) in refs {
+        let Ok(block) = store.get_block_by_height(height) else { continue };
+        let Some(tx) = block.transactions.get(tx_index as usize) else { continue };
+        history.push(tx_history_entry(&block, tx));
+    }
+
     (
         StatusCode::OK,
         Json(json!({ "address": address_str, "transactions": history })),
@@ -626,6 +659,100 @@ mod tests {
 
         let history = extract_tx_history(&[block0], alice.to_string().as_str());
         assert!(history.is_empty());
+    }
+
+    fn fresh_app_state() -> (AppState, std::path::PathBuf) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "helix-rpc-account-tx-test-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = HelixDb::open(&path).unwrap();
+        let state = AppState {
+            store: Arc::new(RwLock::new(store)),
+            mempool: Arc::new(RwLock::new(Mempool::new())),
+            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+            node_address: String::new(),
+            peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        (state, path)
+    }
+
+    /// The indexed lookup behind `get_account_transactions` must return exactly the
+    /// same transactions (content and order) as the full-chain-scan reference
+    /// implementation (`extract_tx_history`) it replaced.
+    #[tokio::test]
+    async fn get_account_transactions_matches_full_scan_reference() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let bob = addr(2);
+        let carol = addr(3);
+
+        let blocks = vec![
+            block(0, &alice, vec![tx(&alice, &bob, 10, 0)]),
+            block(1, &alice, vec![tx(&bob, &alice, 5, 0), tx(&carol, &bob, 1, 0)]),
+            block(2, &alice, vec![tx(&alice, &carol, 2, 1)]),
+        ];
+        for b in &blocks {
+            state.store.write().await.put_block(b.clone()).unwrap();
+        }
+
+        let expected = extract_tx_history(&blocks, alice.to_string().as_str());
+
+        let response = get_account_transactions(
+            State(state),
+            Path(alice.to_string()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let got = parsed["transactions"].as_array().unwrap();
+
+        assert_eq!(got.len(), expected.len());
+        for (entry, want) in got.iter().zip(expected.iter()) {
+            assert_eq!(entry["hash"], want.hash);
+            assert_eq!(entry["block_height"], want.block_height);
+            assert_eq!(entry["from"], want.from);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn get_account_transactions_honors_limit_query_param() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let bob = addr(2);
+
+        for h in 0..5u64 {
+            state
+                .store
+                .write()
+                .await
+                .put_block(block(h, &alice, vec![tx(&alice, &bob, 1, h)]))
+                .unwrap();
+        }
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("limit".to_string(), 2u64);
+        let response = get_account_transactions(State(state), Path(alice.to_string()), Query(params))
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let got = parsed["transactions"].as_array().unwrap();
+
+        assert_eq!(got.len(), 2);
+        // Newest first: heights 4 then 3.
+        assert_eq!(got[0]["block_height"], 4);
+        assert_eq!(got[1]["block_height"], 3);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Exercises the exact route + `DefaultBodyLimit` wiring used for `POST /transactions`
