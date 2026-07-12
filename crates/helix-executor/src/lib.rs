@@ -92,7 +92,7 @@ pub fn execute_transaction(
         TxType::Unstake => execute_unstake(state, tx, validator, tx_hash, height),
 
         TxType::RegisterName => execute_register_name(state, tx, validator, tx_hash),
-        TxType::RegisterIdentity => execute_register_identity(state, tx, validator, tx_hash, height),
+        TxType::RegisterIdentity => execute_register_identity(state, tx, tx_hash),
         TxType::RegisterGuardians => execute_register_guardians(state, tx, validator, tx_hash),
         TxType::ApproveRecovery => execute_approve_recovery(state, tx, validator, tx_hash),
         TxType::DeployContract => execute_deploy_contract(state, tx, validator, tx_hash),
@@ -355,47 +355,24 @@ fn execute_register_name(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
-/// Proof of Personhood: `tx.from` attests that `tx.to` is a unique human.
-/// Phase 1 sybil resistance is social-graph only (any address may attest);
-/// ZK-STARK-based verification replaces this in a later phase.
-fn execute_register_identity(
-    state: &mut ChainState,
-    tx: &Transaction,
-    validator: &Address,
-    tx_hash: Hash,
-    height: u64,
-) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
-
-    let Some(attestee) = tx.to.clone() else {
-        return Receipt::failure(tx_hash, "attestation requires a target address (tx.to)", 0, 0);
-    };
-    if attestee == tx.from {
-        return Receipt::failure(tx_hash, "cannot attest your own identity", 0, 0);
-    }
-
-    let current = state.personhood_status(&attestee);
-    let updated = match current.attest(tx.from.clone(), height) {
-        Ok(status) => status,
-        Err(e) => return Receipt::failure(tx_hash, &e.to_string(), 0, 0),
-    };
-    state.set_personhood_status(&attestee, updated);
-
-    state.update_account(&tx.from, |acc| {
-        acc.balance -= tx.fee;
-        acc.nonce += 1;
-    });
-
-    distribute_fee(state, validator, tx.fee)
-        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
-        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+/// `RegisterIdentity` was Phase 1's social-graph personhood attestation: any address could
+/// attest any other, and `ATTESTATION_THRESHOLD` (3) distinct attesters flipped the target to
+/// `PersonhoodStatus::Verified`. That path has been fully superseded by the authority-gated
+/// ZK proof in `execute_prove_personhood` (backlog points 27/28) — but was left live and
+/// completely undermined that fix: an attacker only needs 3 freely-generated addresses (cost:
+/// three tx fees) to attest a target and reach `Verified`, with no ZK proof and no authority
+/// signature at all, bypassing Sybil resistance entirely and unlocking the 1% (instead of
+/// 0.5%) validator voting-power cap for a fully self-issued identity. Disabled outright,
+/// failing closed like the no-authority-configured branch of `execute_prove_personhood` — the
+/// only sanctioned path to `Verified` is now the authority-gated ZK proof.
+fn execute_register_identity(_state: &mut ChainState, _tx: &Transaction, tx_hash: Hash) -> Receipt {
+    Receipt::failure(
+        tx_hash,
+        "RegisterIdentity (social-graph attestation) is disabled; personhood verification \
+         requires an authority-signed ZK proof via ProvePersonhood",
+        0,
+        0,
+    )
 }
 
 /// Owner registers (or replaces) their social-recovery guardian set. `tx.data` is a
@@ -1053,13 +1030,18 @@ mod tests {
     }
 
     #[test]
-    fn attestation_reaches_verified_after_threshold() {
+    fn register_identity_social_attestation_is_disabled() {
+        // Regression for the bypass this closes: previously, ATTESTATION_THRESHOLD (3)
+        // freely-generated, attacker-controlled addresses attesting a target were enough to
+        // reach PersonhoodStatus::Verified with no ZK proof and no authority signature at
+        // all — completely undermining the Sybil-resistance fix in
+        // execute_prove_personhood (backlog points 27/28). RegisterIdentity must now be
+        // rejected unconditionally and never grant personhood, no matter how many distinct
+        // attesters submit it.
         let validator = Address::from_public_key(&KeyPair::generate().public);
-        let attestee_kp = KeyPair::generate();
-        let attestee = Address::from_public_key(&attestee_kp.public);
+        let attestee = Address::from_public_key(&KeyPair::generate().public);
 
         let mut state = ChainState::new(0);
-        state.update_account(&attestee, |acc| acc.balance = 1_000_000);
 
         for i in 0..helix_identity::ATTESTATION_THRESHOLD {
             let attester_kp = KeyPair::generate();
@@ -1068,63 +1050,10 @@ mod tests {
 
             let tx = signed_attest_tx(&attester_kp, &attester, &attestee, 0, 10_000);
             let receipt = execute_transaction(&mut state, &tx, &validator, 50 + i as u64);
-            assert!(receipt.success, "attestation {i} failed: {:?}", receipt.error);
+            assert!(!receipt.success, "attestation {i} unexpectedly succeeded");
         }
 
-        assert!(state.has_personhood(&attestee));
-    }
-
-    #[test]
-    fn attestation_rejects_self_attestation() {
-        let validator = Address::from_public_key(&KeyPair::generate().public);
-        let kp = KeyPair::generate();
-        let addr = Address::from_public_key(&kp.public);
-
-        let mut state = ChainState::new(0);
-        state.update_account(&addr, |acc| acc.balance = 1_000_000);
-
-        let tx = signed_attest_tx(&kp, &addr, &addr, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
-        assert!(!receipt.success);
-        assert!(!state.has_personhood(&addr));
-    }
-
-    #[test]
-    fn attestation_rejects_duplicate_from_same_attester() {
-        let validator = Address::from_public_key(&KeyPair::generate().public);
-        let attester_kp = KeyPair::generate();
-        let attester = Address::from_public_key(&attester_kp.public);
-        let attestee = Address::from_public_key(&KeyPair::generate().public);
-
-        let mut state = ChainState::new(0);
-        state.update_account(&attester, |acc| acc.balance = 1_000_000);
-
-        let tx1 = signed_attest_tx(&attester_kp, &attester, &attestee, 0, 10_000);
-        assert!(execute_transaction(&mut state, &tx1, &validator, 1).success);
-
-        let tx2 = signed_attest_tx(&attester_kp, &attester, &attestee, 1, 10_000);
-        let receipt = execute_transaction(&mut state, &tx2, &validator, 2);
-        assert!(!receipt.success);
-    }
-
-    #[test]
-    fn attestation_rejects_once_already_verified() {
-        let validator = Address::from_public_key(&KeyPair::generate().public);
-        let attestee = Address::from_public_key(&KeyPair::generate().public);
-
-        let mut state = ChainState::new(0);
-        state.set_personhood_status(
-            &attestee,
-            PersonhoodStatus::Verified { verified_at_height: 5 },
-        );
-
-        let attester_kp = KeyPair::generate();
-        let attester = Address::from_public_key(&attester_kp.public);
-        state.update_account(&attester, |acc| acc.balance = 1_000_000);
-
-        let tx = signed_attest_tx(&attester_kp, &attester, &attestee, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 10);
-        assert!(!receipt.success);
+        assert!(!state.has_personhood(&attestee));
     }
 
     fn signed_register_guardians_tx(
