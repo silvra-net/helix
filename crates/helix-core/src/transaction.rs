@@ -75,9 +75,9 @@ pub enum TxType {
 /// The STARK proof alone only shows knowledge of *some* secret matching `commitment` —
 /// `helix_zkp::prove_personhood` will happily generate one for any secret the caller picks,
 /// so without `authority_signature` anyone could self-issue unlimited "verified" identities
-/// for free. `authority_signature` is the network's configured personhood authority (see
-/// `ChainState::personhood_authority`) vouching that `commitment` was actually issued to a
-/// real, uniquely-verified human by whatever off-chain process that authority runs.
+/// for free. `authority_signature` is one of the network's configured personhood authorities
+/// (see `ChainState::personhood_authorities`) vouching that `commitment` was actually issued
+/// to a real, uniquely-verified human by whatever off-chain process that authority runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonhoodProofPayload {
     /// C = secret^(2^63) mod p, as 16-byte little-endian f128 field element.

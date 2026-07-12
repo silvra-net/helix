@@ -103,14 +103,26 @@ pub struct ChainState {
     /// (by the same or a different reporter) to slash the validator repeatedly.
     #[serde(default)]
     pub slashed_double_sign_incidents: std::collections::HashSet<String>,
-    /// The network's configured personhood-issuing authority — set once at genesis (see
+    /// The network's configured personhood-issuing authorities — set once at genesis (see
     /// `GenesisConfig`), never overridden afterward. `ProvePersonhood` transactions require
-    /// this authority's signature over the claimed commitment; without one configured,
-    /// `ProvePersonhood` is rejected outright rather than falling back to trusting the ZK
-    /// proof alone (which anyone can self-issue for free — see
-    /// `PersonhoodProofPayload`'s doc comment).
+    /// a signature over the claimed commitment from ANY ONE of these keys; an empty list
+    /// means no authority is configured, and `ProvePersonhood` is rejected outright rather
+    /// than falling back to trusting the ZK proof alone (which anyone can self-issue for
+    /// free — see `PersonhoodProofPayload`'s doc comment).
+    ///
+    /// Deliberately a list, not a single key: a single authority is a single point of
+    /// failure and censorship — if that one key is lost, compromised, or its operator goes
+    /// offline, personhood issuance for the entire network stops (or worse, a compromised
+    /// key can mint fraudulent verifications). "Any one of N" doesn't make issuance
+    /// decentralized in the Byzantine-fault-tolerant sense (a single compromised authority
+    /// can still mint fraudulent verifications on its own — this isn't M-of-N threshold
+    /// signing), but it does remove the single-operator availability risk, and lets a
+    /// compromised key be retired without an outage as long as at least one other remains
+    /// trustworthy. `Vec` rather than `HashSet`: `PublicKey` doesn't implement `Hash`, and
+    /// this list is expected to stay small (a handful of authorities at most), so linear
+    /// lookup is fine.
     #[serde(default)]
-    pub personhood_authority: Option<PublicKey>,
+    pub personhood_authorities: Vec<PublicKey>,
 }
 
 impl ChainState {
@@ -129,7 +141,7 @@ impl ChainState {
             next_proposal_id: 0,
             used_personhood_commitments: std::collections::HashSet::new(),
             slashed_double_sign_incidents: std::collections::HashSet::new(),
-            personhood_authority: None,
+            personhood_authorities: Vec::new(),
         }
     }
 
@@ -327,7 +339,10 @@ impl ChainState {
             next_proposal_id: u64,
             used_personhood_commitments: std::collections::BTreeSet<[u8; 16]>,
             slashed_double_sign_incidents: std::collections::BTreeSet<&'a str>,
-            personhood_authority: &'a Option<PublicKey>,
+            // Sorted by raw bytes (PublicKey has no Ord impl) — treated as a set for
+            // hashing purposes even though it's stored as an insertion-ordered Vec, so two
+            // configs listing the same authorities in a different order still hash equal.
+            personhood_authorities: std::collections::BTreeSet<&'a [u8]>,
         }
 
         let canonical = Canonical {
@@ -365,7 +380,7 @@ impl ChainState {
             next_proposal_id: self.next_proposal_id,
             used_personhood_commitments: self.used_personhood_commitments.iter().copied().collect(),
             slashed_double_sign_incidents: self.slashed_double_sign_incidents.iter().map(|s| s.as_str()).collect(),
-            personhood_authority: &self.personhood_authority,
+            personhood_authorities: self.personhood_authorities.iter().map(|k| k.as_bytes()).collect(),
         };
 
         let bytes = bincode::serialize(&canonical).expect("canonical chain state serialization is infallible");
@@ -485,7 +500,7 @@ mod tests {
         let mut state = ChainState::new(0);
         let before = state.state_hash();
 
-        state.personhood_authority = Some(KeyPair::generate().public);
+        state.personhood_authorities.push(KeyPair::generate().public);
         let after = state.state_hash();
 
         assert_ne!(before, after);

@@ -875,20 +875,24 @@ fn execute_prove_personhood(
 
     // The ZK proof alone only shows knowledge of *some* secret matching `commitment` —
     // helix_zkp::prove_personhood will generate a valid proof for any secret the caller
-    // picks, with no external gatekeeping. Without the authority's signature, anyone could
+    // picks, with no external gatekeeping. Without an authority's signature, anyone could
     // self-issue unlimited "verified" identities for free (see `PersonhoodProofPayload`'s
     // doc comment). No authority configured at all means personhood is disabled outright —
-    // failing closed rather than silently trusting the ZK proof alone.
-    let Some(authority) = &state.personhood_authority else {
+    // failing closed rather than silently trusting the ZK proof alone. Any ONE of the
+    // configured authorities may issue — see `ChainState::personhood_authorities`'s doc
+    // comment for why this is a list rather than a single key.
+    if state.personhood_authorities.is_empty() {
         return Receipt::failure(tx_hash, "no personhood authority configured", 0, 0);
-    };
-    let authority_sig_valid = helix_crypto::verify_with_scheme(
-        payload.authority_crypto_version,
-        authority,
-        &payload.commitment,
-        &payload.authority_signature,
-    )
-    .is_ok();
+    }
+    let authority_sig_valid = state.personhood_authorities.iter().any(|authority| {
+        helix_crypto::verify_with_scheme(
+            payload.authority_crypto_version,
+            authority,
+            &payload.commitment,
+            &payload.authority_signature,
+        )
+        .is_ok()
+    });
     if !authority_sig_valid {
         return Receipt::failure(tx_hash, "personhood authority signature verification failed", 0, 0);
     }
@@ -2218,7 +2222,7 @@ mod tests {
 
         let mut state = ChainState::new(0);
         state.update_account(&addr, |acc| acc.balance = 1_000_000);
-        state.personhood_authority = Some(authority_kp.public.clone());
+        state.personhood_authorities.push(authority_kp.public.clone());
 
         let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
         let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());
@@ -2230,13 +2234,35 @@ mod tests {
     }
 
     #[test]
+    fn prove_personhood_succeeds_with_second_of_multiple_authorities() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let other_authority_kp = KeyPair::generate();
+        let authority_kp = KeyPair::generate();
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+        state.personhood_authorities.push(other_authority_kp.public.clone());
+        state.personhood_authorities.push(authority_kp.public.clone());
+
+        let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
+        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());
+        let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
+
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        assert!(receipt.success, "signature from any configured authority must be accepted, got: {:?}", receipt.error);
+        assert!(state.has_personhood(&addr));
+    }
+
+    #[test]
     fn prove_personhood_rejects_when_no_authority_configured() {
         let kp = KeyPair::generate();
         let addr = Address::from_public_key(&kp.public);
         let validator = Address::from_public_key(&KeyPair::generate().public);
         let authority_kp = KeyPair::generate(); // exists, but never registered with the chain
 
-        let mut state = ChainState::new(0); // personhood_authority left as None
+        let mut state = ChainState::new(0); // personhood_authorities left empty
         state.update_account(&addr, |acc| acc.balance = 1_000_000);
 
         let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
@@ -2262,7 +2288,7 @@ mod tests {
 
         let mut state = ChainState::new(0);
         state.update_account(&addr, |acc| acc.balance = 1_000_000);
-        state.personhood_authority = Some(real_authority_kp.public.clone());
+        state.personhood_authorities.push(real_authority_kp.public.clone());
 
         let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
         let payload = personhood_payload(&attacker_pretending_to_be_authority, commitment, proof.as_bytes().to_vec());
@@ -2290,7 +2316,7 @@ mod tests {
         let mut state = ChainState::new(0);
         state.update_account(&addr1, |acc| acc.balance = 1_000_000);
         state.update_account(&addr2, |acc| acc.balance = 1_000_000);
-        state.personhood_authority = Some(authority_kp.public.clone());
+        state.personhood_authorities.push(authority_kp.public.clone());
 
         let (proof, commitment) = helix_zkp::prove_personhood([9u8; 16]);
         let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());

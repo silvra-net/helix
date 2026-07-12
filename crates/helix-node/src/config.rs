@@ -17,12 +17,13 @@ pub struct NodeConfig {
     pub sync_peer: Option<String>,
     pub validator_crypto_scheme: Option<String>,
     pub mempool_tx_ttl_secs: Option<u64>,
-    /// Hex-encoded public key of the network's personhood-issuing authority — see
-    /// `ChainState::personhood_authority`. Only read at genesis (fresh chain, no block 0
-    /// yet); once persisted, changing this has no effect without a chain reset. Every node
-    /// must be configured with the same value, since it becomes part of consensus-checked
-    /// state — this is an operator convention, not cryptographically enforced.
-    pub personhood_authority: Option<String>,
+    /// Comma-separated hex-encoded public keys of the network's personhood-issuing
+    /// authorities — see `ChainState::personhood_authorities`. `ProvePersonhood` accepts a
+    /// signature from any ONE of these. Only read at genesis (fresh chain, no block 0 yet);
+    /// once persisted, changing this has no effect without a chain reset. Every node must be
+    /// configured with the same value, since it becomes part of consensus-checked state —
+    /// this is an operator convention, not cryptographically enforced.
+    pub personhood_authorities: Option<String>,
 }
 
 const CONFIG_PATH_ENV: &str = "HELIX_CONFIG";

@@ -20,6 +20,10 @@ const PROPOSALS: TableDefinition<u64, &[u8]> = TableDefinition::new("proposals")
 const PERSONHOOD_COMMITMENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("personhood_commitments");
 /// "{validator}:{height}:{round}" → already-slashed double-sign incidents.
 const SLASHED_DOUBLE_SIGN_INCIDENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("slashed_double_sign_incidents");
+/// Key = authority public key bytes, value unused — same set-as-table pattern as
+/// `PERSONHOOD_COMMITMENTS`. A node accepts a `ProvePersonhood` signature from any one
+/// entry in this table (see `ChainState::personhood_authorities`'s doc comment).
+const PERSONHOOD_AUTHORITIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("personhood_authorities");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// address string → (block height, tx index within block), both big-endian so a
 /// key's values sort in ascending chain order for free. Lets `address_transactions`
@@ -33,7 +37,6 @@ const META_BURNED: &str = "total_burned";
 const META_MIN_VALIDATOR_STAKE: &str = "gov_min_validator_stake";
 const META_FUEL_PER_FEE_UNIT: &str = "gov_fuel_per_fee_unit";
 const META_NEXT_PROPOSAL_ID: &str = "gov_next_proposal_id";
-const META_PERSONHOOD_AUTHORITY: &str = "personhood_authority";
 
 pub struct HelixDb {
     db: Database,
@@ -55,6 +58,7 @@ impl HelixDb {
         tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
@@ -75,6 +79,7 @@ impl HelixDb {
             let mut proposals = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut personhood_commitments = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut slashed_double_sign_incidents = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut personhood_authorities = tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
             for (addr, account) in &state.accounts {
@@ -139,8 +144,8 @@ impl HelixDb {
             .map_err(|e| StorageError::Db(e.to_string()))?;
             meta.insert(META_NEXT_PROPOSAL_ID, &state.next_proposal_id.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
-            if let Some(authority) = &state.personhood_authority {
-                meta.insert(META_PERSONHOOD_AUTHORITY, authority.as_bytes())
+            for authority in &state.personhood_authorities {
+                personhood_authorities.insert(authority.as_bytes(), &[][..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
         }
@@ -158,6 +163,7 @@ impl HelixDb {
         let proposals_table = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         let personhood_commitments_table = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let slashed_double_sign_incidents_table = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let personhood_authorities_table = tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
         let mut accounts = std::collections::HashMap::new();
@@ -238,6 +244,13 @@ impl HelixDb {
             slashed_double_sign_incidents.insert(k.value().to_string());
         }
 
+        let mut personhood_authorities = Vec::new();
+        let mut personhood_authorities_iter = personhood_authorities_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = personhood_authorities_iter.next() {
+            let (k, _v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            personhood_authorities.push(PublicKey::from_bytes(k.value().to_vec()));
+        }
+
         let read_meta_u64 = |key: &str| -> Option<u64> {
             meta_table.get(key).ok().flatten().and_then(|v| {
                 let bytes: [u8; 8] = v.value().try_into().ok()?;
@@ -254,8 +267,6 @@ impl HelixDb {
                 .unwrap_or(default_params.fuel_per_fee_unit),
         };
         let next_proposal_id = read_meta_u64(META_NEXT_PROPOSAL_ID).unwrap_or(0);
-        let personhood_authority = meta_table.get(META_PERSONHOOD_AUTHORITY).ok().flatten()
-            .map(|v| PublicKey::from_bytes(v.value().to_vec()));
 
         Ok(ChainState {
             accounts,
@@ -271,7 +282,7 @@ impl HelixDb {
             next_proposal_id,
             used_personhood_commitments,
             slashed_double_sign_incidents,
-            personhood_authority,
+            personhood_authorities,
         })
     }
 
@@ -485,7 +496,7 @@ mod tests {
             state.set_balance(&validator, 42);
             state.used_personhood_commitments.insert([7u8; 16]);
             state.slashed_double_sign_incidents.insert("validator1:10:0".to_string());
-            state.personhood_authority = Some(kp.public.clone());
+            state.personhood_authorities.push(kp.public.clone());
             db.save_chain_state(&state).unwrap();
         }
 
@@ -506,7 +517,7 @@ mod tests {
         assert!(loaded.slashed_double_sign_incidents.contains("validator1:10:0"));
         // The personhood authority must also survive a restart — it's genesis-time-only
         // configuration, never re-read from env/config on subsequent starts.
-        assert_eq!(loaded.personhood_authority, Some(kp.public.clone()));
+        assert_eq!(loaded.personhood_authorities, vec![kp.public.clone()]);
 
         let _ = std::fs::remove_file(&path);
     }

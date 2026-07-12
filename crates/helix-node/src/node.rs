@@ -269,20 +269,28 @@ impl HelixNode {
         let db_path = PathBuf::from("helix-data.redb");
         let mut store = HelixDb::open(&db_path)?;
 
-        // Personhood authority — only takes effect for a fresh chain (see below); an
-        // existing chain's authority (if any) was already persisted at its own genesis.
-        let personhood_authority = config::resolve("HELIX_PERSONHOOD_AUTHORITY", &cfg.personhood_authority)
-            .and_then(|hex| match helix_crypto::PublicKey::from_hex(&hex) {
-                Ok(pk) => Some(pk),
-                Err(e) => {
-                    warn!(err = %e, "HELIX_PERSONHOOD_AUTHORITY / helix.toml is set but not a valid public key — ProvePersonhood will stay disabled");
-                    None
-                }
-            });
-        if personhood_authority.is_none() {
-            info!("No personhood authority configured — ProvePersonhood transactions will be rejected");
+        // Personhood authorities — only takes effect for a fresh chain (see below); an
+        // existing chain's authorities (if any) were already persisted at its own genesis.
+        let personhood_authorities: Vec<helix_crypto::PublicKey> =
+            config::resolve("HELIX_PERSONHOOD_AUTHORITIES", &cfg.personhood_authorities)
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|hex| match helix_crypto::PublicKey::from_hex(hex) {
+                            Ok(pk) => Some(pk),
+                            Err(e) => {
+                                warn!(err = %e, key = hex, "HELIX_PERSONHOOD_AUTHORITIES / helix.toml contains an invalid public key — skipping it");
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        if personhood_authorities.is_empty() {
+            info!("No personhood authorities configured — ProvePersonhood transactions will be rejected");
         }
-        let genesis_cfg = GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authority);
+        let genesis_cfg = GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authorities);
         let mut chain_state = if store.get_block_by_height(0).is_ok() {
             info!("Loaded existing chain state from {}", db_path.display());
             store.load_chain_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX)?
