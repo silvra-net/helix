@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use helix_consensus::{BftEngine, ConsensusError, Proposal, Validator, ValidatorSet};
-use helix_core::{genesis_block, Block};
-use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair};
+use helix_consensus::{BftEngine, ConsensusError, DoubleSignEvidence, Proposal, Validator, ValidatorSet};
+use helix_core::{genesis_block, Block, Transaction, TxType};
+use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair, Signature};
 use helix_executor::{
     execute_block,
     genesis::{GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX},
@@ -479,6 +479,13 @@ async fn handle_p2p_event(
             for v in outbound {
                 let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(v));
             }
+            // Report any double-sign evidence this vote processing turned up — see
+            // report_double_sign_evidence's doc comment for why this can't just slash
+            // directly here.
+            let evidence = { engine.write().await.take_evidence() };
+            for ev in evidence {
+                report_double_sign_evidence(ev, keypair, chain_state, mempool, p2p_tx).await;
+            }
 
             match result {
                 Ok(Some(block)) => {
@@ -500,6 +507,10 @@ async fn handle_p2p_event(
             let outbound = { engine.write().await.take_outbound_votes() };
             for v in outbound {
                 let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(v));
+            }
+            let evidence = { engine.write().await.take_evidence() };
+            for ev in evidence {
+                report_double_sign_evidence(ev, keypair, chain_state, mempool, p2p_tx).await;
             }
 
             match result {
@@ -596,9 +607,76 @@ async fn handle_p2p_event(
     }
 }
 
-/// Execute, slash, rotate, broadcast, and persist a block that just reached BFT
-/// finality — whether that happened locally (this node cast the deciding vote
-/// itself in `block_production_loop`) or via a peer's vote arriving through P2P
+/// Turns locally-detected double-sign evidence into a signed `SubmitDoubleSignEvidence`
+/// transaction, adds it to our own mempool, and broadcasts it — so the slash it carries gets
+/// applied deterministically once included in a block, through the same transaction-execution
+/// path every node already runs identically for every other tx. See that `TxType` variant's
+/// doc comment for why detection (node-local, asymmetric — fine) must stay separate from
+/// slashing (must be deterministic across all nodes).
+///
+/// Evidence is self-verifying (both votes carry their own signatures), so submitting it as our
+/// own transaction — rather than, say, relaying it verbatim — is just the simplest way to get
+/// it into the mempool; any node could equally report evidence anyone else produced.
+async fn report_double_sign_evidence(
+    evidence: DoubleSignEvidence,
+    keypair: &KeyPair,
+    chain_state: &Arc<RwLock<ChainState>>,
+    mempool: &Arc<RwLock<Mempool>>,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
+) {
+    let self_address = Address::from_public_key(&keypair.public);
+    let nonce = {
+        let state = chain_state.read().await;
+        state.get(&self_address).map(|acc| acc.nonce).unwrap_or(0)
+    };
+
+    let data = match bincode::serialize(&evidence) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(err = %e, "Failed to serialize double-sign evidence — dropping");
+            return;
+        }
+    };
+
+    let mut tx = Transaction {
+        version: 1,
+        tx_type: TxType::SubmitDoubleSignEvidence,
+        from: self_address,
+        to: None,
+        amount: 0,
+        fee: 0,
+        nonce,
+        data,
+        crypto_version: keypair.scheme,
+        signature: Signature::from_bytes(vec![]),
+        public_key: keypair.public.clone(),
+    };
+    tx.signature = match keypair.sign(tx.signing_hash().as_bytes()) {
+        Ok(sig) => sig,
+        Err(e) => {
+            warn!(err = %e, "Failed to sign double-sign evidence tx — dropping");
+            return;
+        }
+    };
+
+    warn!(
+        validator = %evidence.validator,
+        height = evidence.height,
+        round = evidence.round,
+        "Double-sign evidence detected — reporting on-chain"
+    );
+
+    if let Err(e) = mempool.write().await.add(tx.clone()) {
+        // Most likely a peer's report of the same incident already made it into our
+        // mempool first (same evidence, different reporter) — not an error.
+        debug!(err = %e, "Local mempool rejected our own evidence tx");
+    }
+    let _ = p2p_tx.try_send(P2PCommand::BroadcastTransaction(tx));
+}
+
+/// Execute, rotate, broadcast, and persist a block that just reached BFT finality —
+/// whether that happened locally (this node cast the deciding vote itself in
+/// `block_production_loop`) or via a peer's vote arriving through P2P
 /// (`handle_p2p_event`). Both paths must apply identical side effects exactly once.
 ///
 /// `should_broadcast`: set to `true` when this node was part of the consensus round
@@ -628,26 +706,15 @@ async fn apply_finalized_block(
         }
     }
 
-    // Slash any validator caught double-signing during this round. Detected
-    // in helix-consensus::VoteSet (conflicting votes, same validator/height/
-    // round/type, different block hash) — the signature on both votes is
-    // already verified there, so this evidence is trustworthy.
-    for ev in engine.write().await.take_evidence() {
-        if !ev.is_valid() {
-            continue;
-        }
-        let slashed = {
-            let mut state = chain_state.write().await;
-            state.slash(&ev.validator, helix_consensus::SLASH_FRACTION_BPS)
-        };
-        warn!(
-            validator = %ev.validator,
-            height = ev.height,
-            round = ev.round,
-            slashed_nano = slashed,
-            "Double-sign evidence confirmed — validator slashed"
-        );
-    }
+    // Double-sign slashing does NOT happen here. It used to: this function unconditionally
+    // drained engine.take_evidence() and slashed directly. But pending_evidence is per-node,
+    // local, live-BFT-vote-processing state — a node that only received this block passively
+    // (P2P gossip or sync, see the NewCommittedBlock arm below and sync_blocks_from_peer) never
+    // accumulates it, so some validators slashed while others silently didn't: a state fork,
+    // permanently undetectable since BlockHeader carries no state_root. Evidence is now
+    // reported via a `SubmitDoubleSignEvidence` transaction (see `report_double_sign_evidence`,
+    // called wherever the engine can produce evidence) and slashed inside `execute_block` above,
+    // through the same transaction-execution path every node already runs identically.
 
     // Epoch boundary: rebuild the validator set from current stake.
     // Personhood is read from chain state: ZK-STARK ProvePersonhood txs set
@@ -774,6 +841,12 @@ async fn block_production_loop(
         let outbound = { engine.write().await.take_outbound_votes() };
         for vote in outbound {
             let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(vote));
+        }
+        // Report any double-sign evidence this tick's produce_block/advance_round
+        // turned up (e.g. a stalled round's accumulated evidence).
+        let evidence = { engine.write().await.take_evidence() };
+        for ev in evidence {
+            report_double_sign_evidence(ev, &keypair, &chain_state, &mempool, &p2p_tx).await;
         }
     }
 }

@@ -49,6 +49,23 @@ pub enum TxType {
     /// override) is only set once a request finalizes, so the account's original key is
     /// still the sole valid signer here.
     CancelRecoveryRequest,
+    /// Reports a validator's proven double-sign: two conflicting BFT votes (same
+    /// validator/height/round/vote-type, different block hashes). `tx.data` carries the
+    /// bincode-serialized `helix_consensus::DoubleSignEvidence`. Anyone may submit this —
+    /// both votes carry their own independently-verifiable signatures, so the evidence
+    /// proves itself regardless of who reports it or whether `tx.from` witnessed the
+    /// original double-sign firsthand.
+    ///
+    /// This is deliberately a transaction (applied identically by every node through the
+    /// normal, already-deterministic `execute_transaction` path) rather than validator-local
+    /// state: the double-sign is still *detected* locally (each node's live BFT vote
+    /// processing notices a conflict independently), but turning that local detection
+    /// directly into a slash — instead of reporting it on-chain and letting execution decide
+    /// — meant a node that only received a block passively (P2P gossip or sync, never
+    /// processing the live votes itself) never accumulated that evidence and silently skipped
+    /// the slash that active participants applied: the same validator set diverging on
+    /// `staked` amounts between nodes, with no `state_root` anywhere to ever detect it.
+    SubmitDoubleSignEvidence,
 }
 
 /// Payload embedded in `Transaction::data` for `TxType::ProvePersonhood`.

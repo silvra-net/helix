@@ -18,6 +18,8 @@ const RECOVERY_REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("re
 const RECOVERY_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("recovery_keys");
 const PROPOSALS: TableDefinition<u64, &[u8]> = TableDefinition::new("proposals");
 const PERSONHOOD_COMMITMENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("personhood_commitments");
+/// "{validator}:{height}:{round}" → already-slashed double-sign incidents.
+const SLASHED_DOUBLE_SIGN_INCIDENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("slashed_double_sign_incidents");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// address string → (block height, tx index within block), both big-endian so a
 /// key's values sort in ascending chain order for free. Lets `address_transactions`
@@ -51,6 +53,7 @@ impl HelixDb {
         tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
@@ -70,6 +73,7 @@ impl HelixDb {
             let mut recovery_keys = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut proposals = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut personhood_commitments = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut slashed_double_sign_incidents = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
             for (addr, account) in &state.accounts {
@@ -116,6 +120,10 @@ impl HelixDb {
                 personhood_commitments.insert(commitment.as_slice(), &[][..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            for incident in &state.slashed_double_sign_incidents {
+                slashed_double_sign_incidents.insert(incident.as_str(), &[][..])
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
             meta.insert(META_BURNED, &state.total_burned.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
             meta.insert(
@@ -144,6 +152,7 @@ impl HelixDb {
         let recovery_keys_table = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         let proposals_table = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         let personhood_commitments_table = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let slashed_double_sign_incidents_table = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
         let mut accounts = std::collections::HashMap::new();
@@ -217,6 +226,13 @@ impl HelixDb {
             used_personhood_commitments.insert(commitment);
         }
 
+        let mut slashed_double_sign_incidents = std::collections::HashSet::new();
+        let mut slashed_double_sign_incidents_iter = slashed_double_sign_incidents_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = slashed_double_sign_incidents_iter.next() {
+            let (k, _v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            slashed_double_sign_incidents.insert(k.value().to_string());
+        }
+
         let read_meta_u64 = |key: &str| -> Option<u64> {
             meta_table.get(key).ok().flatten().and_then(|v| {
                 let bytes: [u8; 8] = v.value().try_into().ok()?;
@@ -247,6 +263,7 @@ impl HelixDb {
             proposals,
             next_proposal_id,
             used_personhood_commitments,
+            slashed_double_sign_incidents,
         })
     }
 
@@ -459,6 +476,7 @@ mod tests {
             let mut state = ChainState::new(1_000_000);
             state.set_balance(&validator, 42);
             state.used_personhood_commitments.insert([7u8; 16]);
+            state.slashed_double_sign_incidents.insert("validator1:10:0".to_string());
             db.save_chain_state(&state).unwrap();
         }
 
@@ -473,6 +491,10 @@ mod tests {
         // A used personhood commitment must also survive a restart — otherwise a
         // replayed proof would be accepted again right after the node restarts.
         assert!(loaded.used_personhood_commitments.contains(&[7u8; 16]));
+        // Same for a slashed double-sign incident — otherwise it could be re-slashed
+        // (or a node that missed the original slash could apply it a second time)
+        // right after a restart.
+        assert!(loaded.slashed_double_sign_incidents.contains("validator1:10:0"));
 
         let _ = std::fs::remove_file(&path);
     }

@@ -97,6 +97,12 @@ pub struct ChainState {
     /// `Verified` status for free, defeating Sybil resistance entirely.
     #[serde(default)]
     pub used_personhood_commitments: std::collections::HashSet<[u8; 16]>,
+    /// Double-sign incidents (`"{validator}:{height}:{round}"`) already slashed via
+    /// `SubmitDoubleSignEvidence`. A validator can only meaningfully double-sign once per
+    /// (height, round); without this, the same proven incident could be resubmitted
+    /// (by the same or a different reporter) to slash the validator repeatedly.
+    #[serde(default)]
+    pub slashed_double_sign_incidents: std::collections::HashSet<String>,
 }
 
 impl ChainState {
@@ -114,6 +120,7 @@ impl ChainState {
             proposals: HashMap::new(),
             next_proposal_id: 0,
             used_personhood_commitments: std::collections::HashSet::new(),
+            slashed_double_sign_incidents: std::collections::HashSet::new(),
         }
     }
 

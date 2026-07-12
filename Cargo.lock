@@ -1155,6 +1155,7 @@ name = "helix-executor"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "helix-consensus",
  "helix-core",
  "helix-crypto",
  "helix-identity",
@@ -1191,6 +1192,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bincode",
  "helix-consensus",
  "helix-core",
  "helix-crypto",

@@ -8,6 +8,7 @@ pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal};
 pub use receipt::{BlockReceipt, Receipt};
 pub use state::{AccountState, ChainState, UNBONDING_PERIOD};
 
+use helix_consensus::DoubleSignEvidence;
 use helix_core::{
     transaction::{PersonhoodProofPayload, TxType},
     Block, Transaction,
@@ -101,6 +102,7 @@ pub fn execute_transaction(
         TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash),
         TxType::ClaimUnbonded => execute_claim_unbonded(state, tx, validator, tx_hash, height),
         TxType::CancelRecoveryRequest => execute_cancel_recovery_request(state, tx, validator, tx_hash),
+        TxType::SubmitDoubleSignEvidence => execute_submit_double_sign_evidence(state, tx, validator, tx_hash),
     }
 }
 
@@ -528,6 +530,65 @@ fn execute_cancel_recovery_request(
     }
 
     state.clear_recovery_request(&tx.from);
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// Applies a slash for a proven double-sign. `tx.from` is just the reporter — anyone may
+/// submit this, since both votes carry their own independently-verifiable signatures and the
+/// evidence proves itself. Executed identically by every node through the normal transaction
+/// pipeline, unlike the validator-local BFT evidence detection that triggers a report (see
+/// `TxType::SubmitDoubleSignEvidence`'s doc comment for why that distinction matters).
+fn execute_submit_double_sign_evidence(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+
+    let evidence: DoubleSignEvidence = match bincode::deserialize(&tx.data) {
+        Ok(e) => e,
+        Err(_) => return Receipt::failure(tx_hash, "invalid double-sign evidence payload", 0, 0),
+    };
+
+    if !evidence.is_valid() {
+        return Receipt::failure(
+            tx_hash,
+            "evidence is not structurally valid (validator/height/round mismatch or identical block hashes)",
+            0,
+            0,
+        );
+    }
+    if evidence.vote_a.verify_signature().is_err() {
+        return Receipt::failure(tx_hash, "vote_a signature verification failed", 0, 0);
+    }
+    if evidence.vote_b.verify_signature().is_err() {
+        return Receipt::failure(tx_hash, "vote_b signature verification failed", 0, 0);
+    }
+
+    // A validator can only meaningfully double-sign once per (height, round) — reject a
+    // resubmission of an incident already slashed, whether by this reporter or another.
+    let incident_key = format!("{}:{}:{}", evidence.validator, evidence.height, evidence.round);
+    if !state.slashed_double_sign_incidents.insert(incident_key) {
+        return Receipt::failure(tx_hash, "this double-sign incident was already slashed", 0, 0);
+    }
+
+    state.slash(&evidence.validator, helix_consensus::SLASH_FRACTION_BPS);
 
     state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
@@ -1955,5 +2016,218 @@ mod tests {
         assert!(!state.has_personhood(&addr2), "copying address must not gain personhood");
         // Original claimant is unaffected.
         assert!(state.has_personhood(&addr1));
+    }
+
+    fn signed_vote(
+        kp: &KeyPair,
+        validator: &Address,
+        vote_type: helix_consensus::VoteType,
+        height: u64,
+        round: u32,
+        block_hash: Hash,
+    ) -> helix_consensus::Vote {
+        let mut vote = helix_consensus::Vote {
+            vote_type,
+            height,
+            round,
+            block_hash,
+            validator: validator.clone(),
+            public_key: kp.public.clone(),
+            crypto_version: kp.scheme,
+            signature: Signature::from_bytes(vec![]),
+        };
+        vote.signature = kp.sign(&vote.signing_bytes()).unwrap();
+        vote
+    }
+
+    fn signed_evidence_tx(
+        reporter_kp: &KeyPair,
+        reporter: &Address,
+        evidence: &DoubleSignEvidence,
+        nonce: u64,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::SubmitDoubleSignEvidence,
+            from: reporter.clone(),
+            to: None,
+            amount: 0,
+            fee: 0,
+            nonce,
+            data: bincode::serialize(evidence).unwrap(),
+            crypto_version: reporter_kp.scheme,
+            signature: Signature::from_bytes(vec![]),
+            public_key: reporter_kp.public.clone(),
+        };
+        tx.signature = reporter_kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn submit_double_sign_evidence_slashes_the_validator() {
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        let reporter_kp = KeyPair::generate();
+        let reporter = Address::from_public_key(&reporter_kp.public);
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&validator_addr, |acc| acc.staked = 1_000_000);
+        state.update_account(&reporter, |acc| acc.balance = 1_000_000);
+
+        let vote_a = signed_vote(
+            &validator_kp,
+            &validator_addr,
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-a"),
+        );
+        let vote_b = signed_vote(
+            &validator_kp,
+            &validator_addr,
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-b"),
+        );
+        let evidence = DoubleSignEvidence {
+            validator: validator_addr.clone(),
+            height: 10,
+            round: 0,
+            vote_a,
+            vote_b,
+        };
+
+        let tx = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 0);
+        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        let expected_slash = 1_000_000 * helix_consensus::SLASH_FRACTION_BPS / 10_000;
+        assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000 - expected_slash);
+        assert_eq!(state.total_burned, expected_slash);
+    }
+
+    #[test]
+    fn submit_double_sign_evidence_rejects_duplicate_incident() {
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        let reporter_kp = KeyPair::generate();
+        let reporter = Address::from_public_key(&reporter_kp.public);
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&validator_addr, |acc| acc.staked = 1_000_000);
+        state.update_account(&reporter, |acc| acc.balance = 1_000_000);
+
+        let vote_a = signed_vote(
+            &validator_kp,
+            &validator_addr,
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-a"),
+        );
+        let vote_b = signed_vote(
+            &validator_kp,
+            &validator_addr,
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-b"),
+        );
+        let evidence = DoubleSignEvidence {
+            validator: validator_addr.clone(),
+            height: 10,
+            round: 0,
+            vote_a,
+            vote_b,
+        };
+
+        let tx1 = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 0);
+        assert!(execute_transaction(&mut state, &tx1, &block_validator, 0).success);
+        let staked_after_first_slash = state.get(&validator_addr).unwrap().staked;
+
+        // Same incident reported again (could be a different reporter in practice) — must
+        // not slash a second time for the same (validator, height, round).
+        let tx2 = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 1);
+        let receipt = execute_transaction(&mut state, &tx2, &block_validator, 1);
+        assert!(!receipt.success);
+        assert_eq!(state.get(&validator_addr).unwrap().staked, staked_after_first_slash);
+    }
+
+    #[test]
+    fn submit_double_sign_evidence_rejects_non_conflicting_votes() {
+        // Same block_hash on both votes — not a double-sign, just the same vote twice.
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        let reporter_kp = KeyPair::generate();
+        let reporter = Address::from_public_key(&reporter_kp.public);
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&validator_addr, |acc| acc.staked = 1_000_000);
+        state.update_account(&reporter, |acc| acc.balance = 1_000_000);
+
+        let same_hash = Hash::digest(b"block-a");
+        let vote_a = signed_vote(&validator_kp, &validator_addr, helix_consensus::VoteType::Precommit, 10, 0, same_hash);
+        let vote_b = signed_vote(&validator_kp, &validator_addr, helix_consensus::VoteType::Precommit, 10, 0, same_hash);
+        let evidence = DoubleSignEvidence {
+            validator: validator_addr.clone(),
+            height: 10,
+            round: 0,
+            vote_a,
+            vote_b,
+        };
+
+        let tx = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 0);
+        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0);
+        assert!(!receipt.success);
+        assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000);
+    }
+
+    #[test]
+    fn submit_double_sign_evidence_rejects_forged_vote_signature() {
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        let attacker_kp = KeyPair::generate(); // does NOT hold validator_kp's key
+        let reporter = Address::from_public_key(&attacker_kp.public);
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&validator_addr, |acc| acc.staked = 1_000_000);
+        state.update_account(&reporter, |acc| acc.balance = 1_000_000);
+
+        // A real vote_a from the validator...
+        let vote_a = signed_vote(
+            &validator_kp,
+            &validator_addr,
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-a"),
+        );
+        // ...but vote_b is forged: claims to be from validator_addr, signed by someone else.
+        let mut vote_b = signed_vote(
+            &attacker_kp,
+            &validator_addr, // claimed validator (doesn't match attacker_kp's real address)
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-b"),
+        );
+        vote_b.public_key = validator_kp.public.clone(); // impersonate the pubkey too
+        let evidence = DoubleSignEvidence {
+            validator: validator_addr.clone(),
+            height: 10,
+            round: 0,
+            vote_a,
+            vote_b,
+        };
+
+        let tx = signed_evidence_tx(&attacker_kp, &reporter, &evidence, 0);
+        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0);
+        assert!(!receipt.success, "forged vote signature must be rejected");
+        assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000);
     }
 }
