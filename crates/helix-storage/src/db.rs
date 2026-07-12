@@ -34,6 +34,7 @@ const ADDRESS_TX_INDEX: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefi
 const META_HEIGHT: &str = "latest_height";
 const META_HASH: &str = "latest_hash";
 const META_BURNED: &str = "total_burned";
+const META_ISSUED: &str = "total_issued";
 const META_MIN_VALIDATOR_STAKE: &str = "gov_min_validator_stake";
 const META_FUEL_PER_FEE_UNIT: &str = "gov_fuel_per_fee_unit";
 const META_NEXT_PROPOSAL_ID: &str = "gov_next_proposal_id";
@@ -131,6 +132,8 @@ impl HelixDb {
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
             meta.insert(META_BURNED, &state.total_burned.to_le_bytes()[..])
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            meta.insert(META_ISSUED, &state.total_issued.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
             meta.insert(
                 META_MIN_VALIDATOR_STAKE,
@@ -259,6 +262,7 @@ impl HelixDb {
         };
 
         let total_burned = read_meta_u64(META_BURNED).unwrap_or(0);
+        let total_issued = read_meta_u64(META_ISSUED).unwrap_or(0);
         let default_params = GovernanceParams::default();
         let governance_params = GovernanceParams {
             min_validator_stake: read_meta_u64(META_MIN_VALIDATOR_STAKE)
@@ -271,6 +275,7 @@ impl HelixDb {
         Ok(ChainState {
             accounts,
             total_supply,
+            total_issued,
             total_burned,
             names,
             personhood,
@@ -494,6 +499,7 @@ mod tests {
 
             let mut state = ChainState::new(1_000_000);
             state.set_balance(&validator, 42);
+            state.total_issued = 123_456;
             state.used_personhood_commitments.insert([7u8; 16]);
             state.slashed_double_sign_incidents.insert("validator1:10:0".to_string());
             state.personhood_authorities.push(kp.public.clone());
@@ -508,6 +514,10 @@ mod tests {
 
         let loaded = db.load_chain_state(1_000_000).unwrap();
         assert_eq!(loaded.get(&validator).unwrap().balance, 42);
+        // Cumulative issuance (genesis allocation + minted block rewards) must survive a
+        // restart too — otherwise a node restart would silently reset the mint counter and
+        // let the halving schedule effectively start over, breaking the supply cap.
+        assert_eq!(loaded.total_issued, 123_456);
         // A used personhood commitment must also survive a restart — otherwise a
         // replayed proof would be accepted again right after the node restarts.
         assert!(loaded.used_personhood_commitments.contains(&[7u8; 16]));

@@ -38,9 +38,10 @@ pub type ExecutionResult<T> = Result<T, ExecutionError>;
 /// Execute all transactions in a block, updating chain state in place.
 /// Skips invalid transactions (records failure in receipt) rather than
 /// reverting the whole block — validators earn fees even on failed txs.
-/// Execute all transactions in a block and distribute fees.
+/// Execute all transactions in a block, distribute fees, and mint this
+/// block's scheduled issuance (see `genesis::scheduled_block_reward`).
 ///
-/// `reward_address` — where the validator's 50 % fee share lands.
+/// `reward_address` — where the validator's 50 % fee share *and* the block reward land.
 /// Falls back to the block's validator address when `None`.
 pub fn execute_block(
     state: &mut ChainState,
@@ -63,12 +64,24 @@ pub fn execute_block(
 
     state.total_burned = state.total_burned.saturating_add(total_burned);
 
+    // Block reward: minted independently of transaction volume, capped so `total_issued`
+    // never crosses the `total_supply` hard cap regardless of what the schedule says.
+    let scheduled = genesis::scheduled_block_reward(height);
+    let block_reward_minted = scheduled.min(state.mintable_headroom());
+    if block_reward_minted > 0 {
+        state.update_account(fee_recipient, |acc| {
+            acc.balance = acc.balance.saturating_add(block_reward_minted);
+        });
+        state.total_issued = state.total_issued.saturating_add(block_reward_minted);
+    }
+
     BlockReceipt {
         block_hash: block.hash().to_hex(),
         height: block.height(),
         tx_receipts: receipts,
         total_burned,
         validator_reward: total_validator_reward,
+        block_reward_minted,
     }
 }
 
@@ -920,7 +933,7 @@ fn execute_prove_personhood(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
-/// 70% of fee is burned (deflationary), 30% goes to the block validator
+/// 50% of fee is burned (deflationary), 50% goes to the block validator
 fn distribute_fee(
     state: &mut ChainState,
     validator: &Address,
@@ -937,7 +950,7 @@ fn distribute_fee(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helix_core::TxType;
+    use helix_core::{BlockHeader, CryptoVersion, TxType};
     use helix_crypto::{KeyPair, Signature};
 
     fn signed_register_name_tx(kp: &KeyPair, from: &Address, name: &str, nonce: u64, fee: u64) -> Transaction {
@@ -2546,5 +2559,87 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &block_validator, 0);
         assert!(!receipt.success, "forged vote signature must be rejected");
         assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000);
+    }
+
+    fn empty_block(validator: &Address, height: u64) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                height,
+                timestamp: 0,
+                prev_hash: Hash::ZERO,
+                merkle_root: Hash::ZERO,
+                validator: validator.clone(),
+                public_key: KeyPair::generate().public,
+                crypto_version: CryptoVersion::MlDsa,
+                signature: Signature::from_bytes(vec![]),
+            },
+            transactions: vec![],
+        }
+    }
+
+    #[test]
+    fn execute_block_mints_the_scheduled_block_reward_to_the_validator() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+
+        let block = empty_block(&validator, 1);
+        let receipt = execute_block(&mut state, &block, None);
+
+        let expected = crate::genesis::scheduled_block_reward(1);
+        assert_eq!(receipt.block_reward_minted, expected);
+        assert_eq!(state.get(&validator).unwrap().balance, expected);
+        assert_eq!(state.total_issued, expected);
+    }
+
+    #[test]
+    fn execute_block_mints_to_reward_address_override_not_the_block_validator() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let reward_addr = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+
+        let block = empty_block(&validator, 1);
+        execute_block(&mut state, &block, Some(&reward_addr));
+
+        assert!(state.get(&validator).is_none(), "reward must not land on the block validator when an override is set");
+        assert!(state.get(&reward_addr).unwrap().balance > 0);
+    }
+
+    #[test]
+    fn execute_block_never_mints_past_the_total_supply_cap() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let cap = crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX;
+        let mut state = ChainState::new(cap);
+        // Leave only a sliver of headroom under the cap — less than a full scheduled reward.
+        let sliver = 100u64;
+        state.total_issued = cap - sliver;
+
+        let block = empty_block(&validator, 1);
+        let receipt = execute_block(&mut state, &block, None);
+
+        assert_eq!(receipt.block_reward_minted, sliver, "must clamp to remaining headroom, not mint the full schedule");
+        assert_eq!(state.total_issued, cap);
+        assert_eq!(state.mintable_headroom(), 0);
+
+        // A second block at a fully exhausted cap must mint nothing at all.
+        let block2 = empty_block(&validator, 2);
+        let receipt2 = execute_block(&mut state, &block2, None);
+        assert_eq!(receipt2.block_reward_minted, 0);
+        assert_eq!(state.total_issued, cap);
+    }
+
+    #[test]
+    fn execute_block_reward_decays_across_halving_eras() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+
+        let first_era_block = empty_block(&validator, 1);
+        let r1 = execute_block(&mut state, &first_era_block, None).block_reward_minted;
+
+        let second_era_block = empty_block(&validator, crate::genesis::HALVING_INTERVAL_BLOCKS);
+        let r2 = execute_block(&mut state, &second_era_block, None).block_reward_minted;
+
+        assert_eq!(r1, crate::genesis::INITIAL_BLOCK_REWARD_HLX * crate::genesis::NANO_PER_HLX);
+        assert_eq!(r2, r1 / 2, "reward must halve once height crosses a halving interval boundary");
     }
 }

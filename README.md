@@ -58,19 +58,31 @@ CLI: hlx (helix-cli)   ←→   REST API :8545   ←→   P2P :8546
 
 ## Token Economics
 
-- **Hard cap:** 100,000,000 HLX — never more, forever
-- **No inflation:** No new tokens are ever minted after genesis
+- **Hard cap:** 100,000,000 HLX — never more, forever. This is an asymptotic ceiling the
+  emission schedule approaches, not an amount handed out at genesis (see below) — the same
+  shape as Bitcoin's 21M cap.
 - **Denomination:** 1 HLX = 1,000,000,000 nano-HLX
 - **Fee split:** 50% burned (deflationary) / 50% to block validator
+- **Block reward:** a halving issuance schedule mints new HLX every block (independent of
+  transaction volume), so validator income doesn't depend on fee revenue alone. Starts at
+  1 HLX/block, halves every 15,768,000 blocks (~1 year at the 2s block time) — the same
+  geometric-decay shape as Bitcoin's coinbase subsidy, always clamped so cumulative issuance
+  never crosses the 100M cap regardless of what the schedule alone would pay out.
 - **Minimum validator stake:** 100,000 HLX (0.1% of supply)
 - **Slashing:** 5% of staked HLX burned on confirmed double-sign
-- **Circulating supply** = total supply − total burned (starts at 100M, only decreases)
+- **Circulating supply** = total issued − total burned. Total issued starts small (just the
+  genesis validator stake) and grows block by block via the emission schedule above — it
+  does not start at the 100M cap.
 
 ### Genesis allocation (devnet)
 | Account | Amount | Purpose |
 |---|---|---|
-| Admin wallet | 99,000,000 HLX | Liquid, spendable |
-| Validator | 1,000,000 HLX staked | Genesis stake — earns fees, cannot spend |
+| Validator | 1,000,000 HLX staked | Genesis stake — earns fees + block rewards, cannot spend |
+
+No liquid HLX is pre-mined to any wallet at genesis (decision 2026-07-15, superseding an
+earlier design that liquid-dumped the remaining ~99M HLX to the validator's spendable balance
+on day one). The validator earns everything beyond its bootstrap stake the same way any future
+validator would: by producing blocks.
 
 ---
 
@@ -321,8 +333,9 @@ Base URL: `http://127.0.0.1:8545` (proxied via nginx to `https://helix.silvra.ne
   "is_syncing": false,
   "mempool_size": 0,
   "total_accounts": 2,
-  "circulating_supply_hlx": 99999999.9995,
-  "total_burned_hlx": 0.0005
+  "circulating_supply_hlx": 1000141.9995,
+  "total_burned_hlx": 0.0005,
+  "state_hash": "b3f1a9..."
 }
 ```
 
@@ -422,7 +435,9 @@ This makes HLX deflationary by design: every transaction reduces supply.
 ### ✅ Phase 3 — State Machine
 - [x] Transaction execution (Transfer, Stake, Unstake)
 - [x] 50/50 fee burn / validator split
-- [x] 100M HLX hard cap — no inflation ever
+- [x] 100M HLX hard cap — an asymptotic ceiling total issuance can never cross, not a
+  genesis pre-mine; see "Token Economics" above for the halving block-reward schedule that
+  replaced the original "dump the remaining supply to the validator at genesis" design
 - [x] Configurable fee reward address (`HELIX_REWARD_ADDRESS`)
 - [x] Genesis state with pre-staked validator
 - [x] `hlx` CLI tool

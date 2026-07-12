@@ -302,7 +302,7 @@ impl HelixNode {
 
             let state = genesis_cfg.build_state();
             store.save_chain_state(&state)?;
-            info!("Genesis: no validator pre-mine — earnings via 50/50 fee split only");
+            info!("Genesis: no liquid pre-mine — validator earns via 50/50 fee split plus the halving block reward");
             state
         };
 

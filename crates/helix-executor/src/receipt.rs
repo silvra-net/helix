@@ -39,6 +39,10 @@ pub struct BlockReceipt {
     pub tx_receipts: Vec<Receipt>,
     pub total_burned: u64,
     pub validator_reward: u64,
+    /// New HLX minted for this block via the halving block-reward schedule (see
+    /// `genesis::scheduled_block_reward`), on top of `validator_reward`'s fee share. 0 once
+    /// the schedule has decayed to nothing or the `TOTAL_SUPPLY_HLX` cap is reached.
+    pub block_reward_minted: u64,
 }
 
 impl BlockReceipt {

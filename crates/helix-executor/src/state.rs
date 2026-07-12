@@ -67,8 +67,18 @@ impl AccountState {
 pub struct ChainState {
     /// address string → account state
     pub accounts: HashMap<String, AccountState>,
-    /// Total HLX supply in nano-HLX (fixed at genesis)
+    /// Absolute HLX supply ceiling in nano-HLX (`genesis::TOTAL_SUPPLY_HLX`, fixed at
+    /// genesis) — the hard cap that `total_issued` may asymptotically approach but never
+    /// exceed. Distinct from `total_issued`: this never changes after genesis.
     pub total_supply: u64,
+    /// Cumulative nano-HLX actually minted so far — the genesis allocation plus every
+    /// block reward minted since (see `genesis::scheduled_block_reward`). Unlike
+    /// `total_supply`, this grows over time; `circulating_supply()` is derived from this,
+    /// not from `total_supply` directly, since most of the cap is unminted at any given
+    /// height under the halving schedule (exactly like Bitcoin: the 21 M cap is a ceiling
+    /// the emission schedule approaches, not an amount handed out at genesis).
+    #[serde(default)]
+    pub total_issued: u64,
     /// Cumulative burned fees — reduces circulating supply
     pub total_burned: u64,
     /// Registered human-readable names (without the `.hlx` suffix) → owning address string.
@@ -130,6 +140,7 @@ impl ChainState {
         ChainState {
             accounts: HashMap::new(),
             total_supply,
+            total_issued: 0,
             total_burned: 0,
             names: HashMap::new(),
             personhood: HashMap::new(),
@@ -178,7 +189,13 @@ impl ChainState {
     }
 
     pub fn circulating_supply(&self) -> u64 {
-        self.total_supply.saturating_sub(self.total_burned)
+        self.total_issued.saturating_sub(self.total_burned)
+    }
+
+    /// Nano-HLX still available to be minted under `TOTAL_SUPPLY_HLX` before the block-reward
+    /// schedule must stop regardless of what `scheduled_block_reward` would otherwise pay out.
+    pub fn mintable_headroom(&self) -> u64 {
+        self.total_supply.saturating_sub(self.total_issued)
     }
 
     pub fn account_count(&self) -> usize {
@@ -328,6 +345,7 @@ impl ChainState {
         struct Canonical<'a> {
             accounts: BTreeMap<&'a str, &'a AccountState>,
             total_supply: u64,
+            total_issued: u64,
             total_burned: u64,
             names: BTreeMap<&'a str, &'a str>,
             personhood: BTreeMap<&'a str, &'a PersonhoodStatus>,
@@ -348,6 +366,7 @@ impl ChainState {
         let canonical = Canonical {
             accounts: self.accounts.iter().map(|(k, v)| (k.as_str(), v)).collect(),
             total_supply: self.total_supply,
+            total_issued: self.total_issued,
             total_burned: self.total_burned,
             names: self.names.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
             personhood: self.personhood.iter().map(|(k, v)| (k.as_str(), v)).collect(),
