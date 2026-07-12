@@ -1679,6 +1679,55 @@ mod tests {
     }
 
     #[test]
+    fn create_proposal_rejects_near_zero_min_validator_stake() {
+        // 1 nano-HLX is nonzero, so the plain zero-check alone wouldn't catch this — but
+        // it's economically indistinguishable from 0 (every account trivially clears it),
+        // so it must still be rejected by the floor.
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+
+        let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, 1);
+        let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success);
+        assert!(state.proposals.is_empty());
+    }
+
+    #[test]
+    fn create_proposal_accepts_min_validator_stake_exactly_at_floor() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 500_000;
+        });
+
+        let floor = crate::genesis::MIN_VALIDATOR_STAKE / 100;
+        let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, floor);
+        let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.proposal(0).unwrap().new_value, floor);
+
+        // One nano below the floor must still fail — confirms the boundary is exact.
+        let data2 = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, floor - 1);
+        let tx2 = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data2, 1, 10_000);
+        assert!(!execute_transaction(&mut state, &tx2, &validator, 1).success);
+    }
+
+    #[test]
     fn vote_reaching_supermajority_applies_param_change_immediately() {
         let validator = Address::from_public_key(&KeyPair::generate().public);
         let proposer_kp = KeyPair::generate();
@@ -1743,7 +1792,7 @@ mod tests {
             acc.staked = 500_000;
         });
 
-        let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, 1);
+        let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 1);
         let create_tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
         assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
 
@@ -1858,7 +1907,7 @@ mod tests {
             acc.staked = 500_000;
         });
 
-        let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, 1);
+        let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 1);
         let create_tx = signed_governance_tx(&proposer_kp, &proposer, TxType::CreateProposal, data, 0, 10_000);
         assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
 

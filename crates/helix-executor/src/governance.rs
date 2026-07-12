@@ -35,16 +35,43 @@ impl GovernanceParam {
         }
     }
 
-    /// Both governance-adjustable parameters must stay strictly positive: a
-    /// `min_validator_stake` of 0 would let every zero-stake account pass
-    /// `ChainState::stakers()`'s filter, exploding the validator set and (since
-    /// unverified-personhood voting power is `stake / 2`, so an all-zero-stake set
-    /// collapses total voting power to 0 as well) permanently stalling BFT quorum. A
-    /// `fuel_per_fee_unit` of 0 would give every contract call a fuel limit of 0,
-    /// bricking all contract calls network-wide.
+    /// Minimum safe value for this parameter — below this, the parameter is close enough
+    /// to zero to cause (or contribute to) the same failure a value of exactly zero would.
+    ///
+    /// `MinValidatorStake`: `MIN_VALIDATOR_STAKE / 100` (1,000 HLX vs. the genesis default
+    /// of 100,000 HLX). A value near zero (even a nonzero one, e.g. 1 nano-HLX) would let
+    /// almost every account pass `ChainState::stakers()`'s filter, exploding the validator
+    /// set and — since unverified-personhood voting power is `stake / 2` — collapsing total
+    /// voting power toward 0, stalling BFT quorum. The floor is expressed relative to the
+    /// genesis constant (rather than a fresh magic number) so it scales automatically if
+    /// that constant is ever revisited. Two orders of magnitude below genesis still allows
+    /// real downward adjustment while keeping "dust stake" accounts out of the validator set.
+    ///
+    /// `FuelPerFeeUnit`: `1` — unlike `MinValidatorStake`, this parameter has no meaningful
+    /// near-zero danger zone once it's nonzero: `fuel_limit = tx.fee * fuel_per_fee_unit`,
+    /// so a low value just means callers pay more fee for the same fuel (an economic
+    /// inconvenience), not the "every call gets 0 fuel" catastrophe a true zero causes. `1`
+    /// is also the genesis default (`DEFAULT_FUEL_PER_FEE_UNIT`), so this floor is really
+    /// just the existing zero-check restated — kept as an explicit case here (rather than a
+    /// wildcard `_ => 1`) so a future new `GovernanceParam` variant must deliberately pick a
+    /// floor instead of silently inheriting one meant for a different parameter.
+    ///
+    /// Deliberately NOT implemented: a relative per-proposal change cap (e.g. "at most 10x
+    /// up/down per proposal"). That would guard against a single catastrophic jump but not
+    /// against a sequence of smaller proposals walking the value down over time — the
+    /// absolute floor here is the actual backstop no sequence of proposals can cross,
+    /// regardless of how many steps they take.
+    fn min_allowed(self) -> u64 {
+        match self {
+            GovernanceParam::MinValidatorStake => MIN_VALIDATOR_STAKE / 100,
+            GovernanceParam::FuelPerFeeUnit => 1,
+        }
+    }
+
     pub fn validate(self, new_value: u64) -> Result<(), GovernanceError> {
-        if new_value == 0 {
-            Err(GovernanceError::ZeroParamValue(self))
+        let floor = self.min_allowed();
+        if new_value < floor {
+            Err(GovernanceError::ParamBelowFloor { param: self, value: new_value, floor })
         } else {
             Ok(())
         }
@@ -59,8 +86,8 @@ pub enum GovernanceError {
     UnknownParam(u8),
     #[error("vote payload must be exactly 8 bytes (proposal id)")]
     MalformedVote,
-    #[error("proposed value 0 for {0:?} would break protocol invariants")]
-    ZeroParamValue(GovernanceParam),
+    #[error("proposed value {value} for {param:?} is below the minimum safe floor {floor}")]
+    ParamBelowFloor { param: GovernanceParam, value: u64, floor: u64 },
 }
 
 /// Encode a `CreateProposal` tx payload: 1 byte param discriminant + 8 bytes new value (LE).
