@@ -640,6 +640,9 @@ fn execute_create_proposal(
         created_at_height: height,
         voters: Default::default(),
         yes_stake: 0,
+        // Frozen quorum denominator for this proposal's lifetime — see the field's
+        // doc comment on why this must not be recomputed live at vote time.
+        total_staked_at_creation: state.total_staked(),
         executed: false,
     });
 
@@ -694,7 +697,12 @@ fn execute_vote_proposal(
     }
     proposal.yes_stake = proposal.yes_stake.saturating_add(sender.staked);
 
-    if proposal.yes_stake >= governance::quorum_threshold(state.total_staked()) {
+    // Quorum is checked against the total stake frozen at proposal creation, not a
+    // live recomputation — otherwise a voter could vote yes then immediately
+    // unstake, shrinking the denominator while their already-counted yes_stake
+    // stays put, letting a trivial follow-up vote cross a quorum that no longer
+    // reflects real backing.
+    if proposal.yes_stake >= governance::quorum_threshold(proposal.total_staked_at_creation) {
         match proposal.param {
             GovernanceParam::MinValidatorStake => {
                 state.governance_params.min_validator_stake = proposal.new_value;
@@ -1484,6 +1492,89 @@ mod tests {
             signed_governance_tx(&kp, &addr, TxType::VoteProposal, governance::encode_vote(0), 2, 10_000);
         let receipt = execute_transaction(&mut state, &repeat_vote_tx, &validator, 2);
         assert!(!receipt.success);
+    }
+
+    #[test]
+    fn quorum_survives_voter_unstaking_after_voting() {
+        // Reproduces the vote-then-unstake manipulation: an attacker votes yes with a
+        // large stake (short of quorum alone), then immediately unstakes that same
+        // stake. Under the old bug (quorum checked against a live-recomputed total),
+        // the shrunk total's quorum threshold could later be crossed by a trivial
+        // extra vote using the attacker's already-unstaked, phantom contribution.
+        // With quorum frozen at proposal creation, that same trivial vote must still
+        // fall short.
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let attacker_kp = KeyPair::generate();
+        let attacker = Address::from_public_key(&attacker_kp.public);
+        let honest_kp = KeyPair::generate();
+        let honest = Address::from_public_key(&honest_kp.public);
+        let tiny_kp = KeyPair::generate();
+        let tiny = Address::from_public_key(&tiny_kp.public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&attacker, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 200;
+        });
+        state.update_account(&honest, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 150;
+        });
+        // `tiny` isn't staked yet — added only after proposal creation, so it never
+        // contributes to the frozen quorum denominator, only to `yes_stake`.
+        state.update_account(&tiny, |acc| acc.balance = 1_000_000);
+
+        let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 42);
+        let create_tx =
+            signed_governance_tx(&attacker_kp, &attacker, TxType::CreateProposal, data, 0, 1);
+        assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
+        // Frozen denominator: 200 (attacker) + 150 (honest) = 350 -> quorum 234.
+        assert_eq!(state.proposal(0).unwrap().total_staked_at_creation, 350);
+        assert_eq!(governance::quorum_threshold(350), 234);
+
+        let attacker_vote = signed_governance_tx(
+            &attacker_kp,
+            &attacker,
+            TxType::VoteProposal,
+            governance::encode_vote(0),
+            1,
+            1,
+        );
+        assert!(execute_transaction(&mut state, &attacker_vote, &validator, 1).success);
+        // 200 alone is comfortably short of the 234 quorum — not a boundary fluke.
+        assert!(!state.proposal(0).unwrap().executed);
+        assert_eq!(state.proposal(0).unwrap().yes_stake, 200);
+
+        // Attacker fully unstakes right after voting — their already-counted
+        // yes_stake contribution is now backed by nothing.
+        let unstake_tx = signed_unstake_tx(&attacker_kp, &attacker, 200, 2, 1);
+        assert!(execute_transaction(&mut state, &unstake_tx, &validator, 2).success);
+        assert_eq!(state.get(&attacker).unwrap().staked, 0);
+        // Live total shrank to 150 (honest only) -- the old bug's quorum_threshold(150) is 101.
+        assert_eq!(state.total_staked(), 150);
+        assert_eq!(governance::quorum_threshold(state.total_staked()), 101);
+
+        // `tiny` stakes a token amount and votes yes purely to trigger a fresh
+        // quorum check. 200 (attacker's stale vote) + 1 (tiny) = 201, which would
+        // have crossed the OLD buggy live quorum (101) but must still fall short of
+        // the frozen quorum (234).
+        state.update_account(&tiny, |acc| acc.staked = 1);
+        let tiny_vote = signed_governance_tx(
+            &tiny_kp,
+            &tiny,
+            TxType::VoteProposal,
+            governance::encode_vote(0),
+            0,
+            1,
+        );
+        let receipt = execute_transaction(&mut state, &tiny_vote, &validator, 3);
+        assert!(receipt.success, "vote tx itself should still succeed: {:?}", receipt.error);
+        assert_eq!(state.proposal(0).unwrap().yes_stake, 201);
+        assert!(
+            !state.proposal(0).unwrap().executed,
+            "quorum must stay frozen at proposal creation, not shrink with a voter's later unstake"
+        );
+        assert_eq!(state.governance_params.fuel_per_fee_unit, governance::DEFAULT_FUEL_PER_FEE_UNIT);
     }
 
     #[test]

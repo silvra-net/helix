@@ -107,6 +107,13 @@ pub struct GovernanceProposal {
     pub voters: HashSet<String>,
     /// Cumulative staked HLX (recorded at time of vote) of everyone who voted yes.
     pub yes_stake: u64,
+    /// Total staked HLX network-wide at proposal creation — the fixed quorum
+    /// denominator for this proposal's entire voting period. Frozen here instead of
+    /// recomputed live at each vote: `yes_stake` only ever grows (a voter's stake
+    /// contribution is never revisited), so if the denominator could shrink — e.g.
+    /// a voter immediately unstaking after voting yes — a proposal could cross
+    /// quorum against a total that no longer includes the stake that got it there.
+    pub total_staked_at_creation: u64,
     pub executed: bool,
 }
 
@@ -169,6 +176,7 @@ mod tests {
             created_at_height: 10,
             voters: Default::default(),
             yes_stake: 0,
+            total_staked_at_creation: 0,
             executed: false,
         };
         assert!(!proposal.is_expired(10 + VOTING_PERIOD_BLOCKS));
