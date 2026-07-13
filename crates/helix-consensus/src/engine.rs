@@ -446,6 +446,37 @@ impl BftEngine {
         self.round_ticks = 0;
     }
 
+    /// Sync bookkeeping to a block that was finalized *without* going through this
+    /// engine's own `receive_proposal`/`add_vote` — i.e. one that arrived already
+    /// fully committed (the `NewCommittedBlock` P2P gossip topic, or catch-up sync),
+    /// rather than as a proposal/votes this engine itself processed to quorum.
+    ///
+    /// Without this, `current_height` only ever advances via `finalize()`, called
+    /// from `receive_proposal`/`add_vote` — a node whose next block happens to
+    /// arrive via the committed-block fast path instead (a real, common race once
+    /// more than one validator is proposing) silently stops advancing its own
+    /// height tracking even though `ChainState`/the block store move on correctly.
+    /// The next locally-driven proposal or vote is then compared against that
+    /// stale height and rejected — found by running a multi-node local testnet:
+    /// a node stuck this way rejects every subsequent proposal and vote with
+    /// "expected height N, got N+1", and since this can happen to more than one
+    /// validator at once, it can silently halt the whole chain.
+    ///
+    /// The committing round isn't known here (the gossiped block carries no round
+    /// number), so `last_committed_round` is cleared to `None` rather than guessed
+    /// — callers already treat "unknown" as round 0 (see `last_committed_round()`'s
+    /// doc comment).
+    pub fn sync_to_externally_finalized_block(&mut self, height: u64, block_hash: Hash) {
+        if height <= self.current_height {
+            return;
+        }
+        self.current_height = height;
+        self.last_committed = Some(block_hash);
+        self.last_committed_round = None;
+        self.round = None;
+        self.round_ticks = 0;
+    }
+
     fn assert_is_validator(&self) -> ConsensusResult<()> {
         self.validator_set
             .get(&self.address)
@@ -493,6 +524,8 @@ mod tests {
         self_addr: Address,
         a_kp: KeyPair,
         b_kp: KeyPair,
+        c_kp: KeyPair,
+        c_addr: Address,
         validator_set: ValidatorSet,
     }
 
@@ -513,12 +546,12 @@ mod tests {
                 Validator::new(a_addr.clone(), 1_000, true),
                 Validator::new(self_addr.clone(), 1_000, true),
                 Validator::new(b_addr.clone(), 1_000, true),
-                Validator::new(c_addr, 1_000, true),
+                Validator::new(c_addr.clone(), 1_000, true),
             ],
             0,
         );
 
-        FourValidators { self_kp, self_addr, a_kp, b_kp, validator_set }
+        FourValidators { self_kp, self_addr, a_kp, b_kp, c_kp, c_addr, validator_set }
     }
 
     fn peer_vote(kp: &KeyPair, vote_type: VoteType, height: u64, round: u32, hash: Hash) -> Vote {
@@ -667,6 +700,36 @@ mod tests {
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
         assert_eq!(engine.receive_proposal(&v.self_kp, 0, block).unwrap(), None);
         assert!(!engine.has_active_round());
+    }
+
+    /// Regression test for a chain-halting bug found by actually running a
+    /// multi-node local testnet: a block that arrives already fully committed
+    /// (the `NewCommittedBlock` gossip topic, modeled here by
+    /// `sync_to_externally_finalized_block` instead of driving the block through
+    /// `receive_proposal`/`add_vote`) must still leave the engine able to accept
+    /// the *next* real proposal. Before the fix, only `receive_proposal`/`add_vote`
+    /// advanced `current_height` (via the private `finalize()`) — a block applied
+    /// through the committed-block fast path left it stale, so the very next
+    /// proposal was rejected with an "expected height" error even though the
+    /// chain had legitimately moved on.
+    #[test]
+    fn sync_to_externally_finalized_block_lets_the_next_real_proposal_through() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 1);
+
+        // Height 2 arrived already committed — no receive_proposal/add_vote call.
+        engine.sync_to_externally_finalized_block(2, Hash::digest(b"block-2"));
+        assert_eq!(engine.current_height(), 2);
+        assert!(!engine.has_active_round(), "any stale round for height 2 must be cleared");
+
+        // c is the proposer for height 3, round 0 ((3 + 0) % 4 == 3, c's index).
+        let mut proposer_engine = BftEngine::new(v.validator_set.clone(), v.c_addr.clone(), 2);
+        let _ = proposer_engine.produce_block(&v.c_kp, Hash::digest(b"block-2"), vec![]);
+        let block = proposer_engine.pending_proposal().unwrap().clone();
+
+        // Before the fix this failed with InvalidBlock { reason: "expected height 2, got 3" }.
+        let result = engine.receive_proposal(&v.self_kp, 0, block);
+        assert!(result.is_ok(), "the next real proposal must not be rejected: {result:?}");
     }
 
     /// A block claiming to be proposed by a validator other than the one

@@ -705,6 +705,17 @@ async fn apply_finalized_block(
     let height = block.height();
     let tx_count = block.tx_count();
 
+    // `should_broadcast == false` means this block arrived already fully committed
+    // (the NewCommittedBlock gossip topic) rather than through this node's own
+    // receive_proposal/add_vote — those already advanced the engine's current_height
+    // internally via finalize() before returning Ok(Some(block)), so only the
+    // committed-block fast path needs this explicit sync. See
+    // sync_to_externally_finalized_block's doc comment for why skipping this
+    // silently desyncs the engine from the actual chain tip.
+    if !should_broadcast {
+        engine.write().await.sync_to_externally_finalized_block(height, block.hash());
+    }
+
     // Execute transactions
     {
         let mut state = chain_state.write().await;
