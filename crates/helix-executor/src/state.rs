@@ -79,6 +79,27 @@ pub const DEFAULT_COMMISSION_BPS: u16 = 1_000;
 /// earn.
 pub const MAX_COMMISSION_BPS: u16 = 5_000;
 
+/// Minimum fraction of a validator's effective stake (self + delegated, see
+/// `ChainState::effective_stake`) that must be backed by the validator's own capital, in basis
+/// points. Below this ratio a validator collects the full block-production/voting-power benefit
+/// of `effective_stake()` while running almost entirely on delegators' capital — a moral-hazard
+/// gap real chains (e.g. Cosmos) guard against, since slashing then falls mostly on the
+/// delegators who trusted the validator rather than the validator itself. 1000 bps = 10%, i.e.
+/// delegated stake is capped at 9x self-stake: generous enough not to bottleneck a well-run
+/// validator's growth, but enough that a validator always keeps meaningful skin in the game.
+pub const MIN_SELF_BOND_RATIO_BPS: u64 = 1_000;
+
+/// Whether `self_staked` alone satisfies `MIN_SELF_BOND_RATIO_BPS` against an effective stake of
+/// `self_staked + delegated`. An empty pool (`delegated == 0`) always passes trivially — the
+/// ratio only bites once a validator actually has delegators to be under-collateralized against.
+pub fn self_bond_ratio_ok(self_staked: u64, delegated: u64) -> bool {
+    let effective = self_staked as u128 + delegated as u128;
+    if effective == 0 {
+        return true;
+    }
+    self_staked as u128 * 10_000 >= effective * MIN_SELF_BOND_RATIO_BPS as u128
+}
+
 /// A validator's delegation pool: the collective stake backing it from delegators (kept
 /// separate from the validator's own `AccountState::staked`, which is untouched by
 /// delegation). Uses a shares-based accounting scheme (the same one Cosmos SDK's F1

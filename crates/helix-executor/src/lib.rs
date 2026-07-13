@@ -7,8 +7,8 @@ pub use genesis::GenesisConfig;
 pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal};
 pub use receipt::{BlockReceipt, Receipt};
 pub use state::{
-    AccountState, ChainState, DelegationPool, DEFAULT_COMMISSION_BPS, MAX_COMMISSION_BPS,
-    UNBONDING_PERIOD,
+    self_bond_ratio_ok, AccountState, ChainState, DelegationPool, DEFAULT_COMMISSION_BPS,
+    MAX_COMMISSION_BPS, MIN_SELF_BOND_RATIO_BPS, UNBONDING_PERIOD,
 };
 
 use helix_consensus::DoubleSignEvidence;
@@ -275,6 +275,23 @@ fn execute_unstake(
         }
     }
 
+    // Guards against a validator with delegators shedding its own stake down to (or toward)
+    // nothing while keeping `effective_stake()` (and so voting power/block production) intact
+    // on the back of delegators' capital alone — see `MIN_SELF_BOND_RATIO_BPS`'s doc comment.
+    let delegated = state.validator_pools.get(&tx.from.to_string()).map(|p| p.total_delegated_stake).unwrap_or(0);
+    if delegated > 0 {
+        let remaining_self = sender.staked - tx.amount;
+        if !state::self_bond_ratio_ok(remaining_self, delegated) {
+            return Receipt::failure(
+                tx_hash,
+                "cannot unstake: would drop your self-bond ratio below the required minimum \
+                 while delegators are still backing this validator",
+                0,
+                0,
+            );
+        }
+    }
+
     let unlock_height = height + state::UNBONDING_PERIOD;
     state.update_account(&tx.from, |acc| {
         acc.staked -= tx.amount;
@@ -370,6 +387,19 @@ fn execute_delegate(
         return Receipt::failure(
             tx_hash,
             "target address has never self-staked — not a recognized validator identity",
+            0,
+            0,
+        );
+    }
+
+    let existing_delegated =
+        state.validator_pools.get(&target_key).map(|p| p.total_delegated_stake).unwrap_or(0);
+    let prospective_delegated = existing_delegated.saturating_add(tx.amount);
+    if !state::self_bond_ratio_ok(target_self_staked, prospective_delegated) {
+        return Receipt::failure(
+            tx_hash,
+            "delegation rejected: this validator's self-bond ratio is already at its maximum \
+             leverage for its current self-stake",
             0,
             0,
         );
@@ -2463,6 +2493,65 @@ mod tests {
         assert_eq!(state.get(&addr).unwrap().staked, min_stake);
     }
 
+    #[test]
+    fn unstake_rejects_dropping_self_bond_ratio_below_minimum() {
+        // Validator has 100_000 self-staked and 900_000 delegated (exactly the 10% floor:
+        // 100_000 / 1_000_000 effective = 10%). Unstaking even a small amount would push self
+        // stake below what MIN_SELF_BOND_RATIO_BPS requires against the existing delegated
+        // pool — must be rejected even though this validator isn't the last one in the
+        // network (a separate, already-covered guard).
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let other_validator_kp = KeyPair::generate();
+        let other_validator = Address::from_public_key(&other_validator_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let min_stake = crate::genesis::MIN_VALIDATOR_STAKE;
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 100_000;
+        });
+        // A second validator so the "last staker" guard never fires here.
+        state.update_account(&other_validator, |acc| acc.staked = min_stake);
+        state.validator_pools.insert(
+            addr.to_string(),
+            DelegationPool { total_shares: 900_000, total_delegated_stake: 900_000, commission_bps: DEFAULT_COMMISSION_BPS },
+        );
+
+        let tx = signed_unstake_tx(&kp, &addr, 1, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+
+        assert!(!receipt.success, "unstake must be rejected: self-bond ratio would drop below the minimum");
+        assert_eq!(state.get(&addr).unwrap().staked, 100_000, "stake must be untouched");
+        let _ = other_validator_kp;
+    }
+
+    #[test]
+    fn unstake_allows_dropping_self_bond_ratio_when_no_delegators() {
+        // Same starting self-stake as above, but with no delegation pool — the self-bond
+        // ratio guard must not fire for a validator nobody has delegated to.
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let other_validator_kp = KeyPair::generate();
+        let other_validator = Address::from_public_key(&other_validator_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let min_stake = crate::genesis::MIN_VALIDATOR_STAKE;
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 100_000;
+        });
+        state.update_account(&other_validator, |acc| acc.staked = min_stake);
+
+        let tx = signed_unstake_tx(&kp, &addr, 1, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        let _ = other_validator_kp;
+    }
+
     fn signed_personhood_tx(
         kp: &KeyPair,
         from: &Address,
@@ -3018,6 +3107,52 @@ mod tests {
     }
 
     #[test]
+    fn delegate_rejects_when_it_would_breach_self_bond_ratio() {
+        // Target has 100_000 self-staked and already 900_000 delegated — exactly at the 10%
+        // floor. Any further delegation would push it under, so it must be rejected even
+        // though the target is otherwise a perfectly valid, self-staked validator.
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
+        state.update_account(&target, |acc| acc.staked = 100_000);
+        state.validator_pools.insert(
+            target.to_string(),
+            DelegationPool { total_shares: 900_000, total_delegated_stake: 900_000, commission_bps: DEFAULT_COMMISSION_BPS },
+        );
+
+        let tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 1, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success, "delegation must be rejected: would push self-bond ratio below the minimum");
+        assert_eq!(state.validator_pools.get(&target.to_string()).unwrap().total_delegated_stake, 900_000, "pool must be untouched");
+    }
+
+    #[test]
+    fn delegate_allows_up_to_exactly_the_self_bond_ratio_floor() {
+        // Same setup, but the delegation lands exactly at the 10% floor (100_000 self vs
+        // 900_000 delegated = 1_000_000 effective) rather than over it — must succeed, this
+        // is the boundary case for `self_bond_ratio_ok`.
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
+        state.update_account(&target, |acc| acc.staked = 100_000);
+
+        let tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 900_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.validator_pools.get(&target.to_string()).unwrap().total_delegated_stake, 900_000);
+    }
+
+    #[test]
     fn undelegate_redeems_value_and_moves_to_own_unbonding_queue() {
         let delegator_kp = KeyPair::generate();
         let delegator = Address::from_public_key(&delegator_kp.public);
@@ -3206,15 +3341,16 @@ mod tests {
         let fee_validator = Address::from_public_key(&KeyPair::generate().public);
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100_000 * 1_000_000_000;
-        // Below the minimum on self-stake alone.
-        state.update_account(&target, |acc| acc.staked = 10 * 1_000_000_000);
+        // Below the minimum on self-stake alone, but within the self-bond ratio floor
+        // (15_000 self-staked clears MIN_SELF_BOND_RATIO_BPS against up to 135_000 delegated).
+        state.update_account(&target, |acc| acc.staked = 15_000 * 1_000_000_000);
         state.update_account(&delegator, |acc| acc.balance = 200_000 * 1_000_000_000_000);
 
         assert!(state.stakers().is_empty(), "self-stake alone is below the minimum");
 
         let delegate_tx = signed_tx(
             &delegator_kp, &delegator, TxType::Delegate, Some(target.clone()),
-            200_000 * 1_000_000_000, vec![], 0, 10_000,
+            90_000 * 1_000_000_000, vec![], 0, 10_000,
         );
         assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0).success);
 
