@@ -221,4 +221,10 @@ pub struct NodeStatus {
     /// isn't committed to a block or checked as part of consensus. See `state_hash`'s doc
     /// comment for what it does and doesn't guarantee.
     pub state_hash: String,
+    /// This node's own libp2p listen port. Lets a joining node derive a dialable seed
+    /// address from a `sync_peer` URL (same host, this port) instead of relying solely on
+    /// mDNS — which only works within one local multicast segment and never finds a peer
+    /// reachable only over the open internet. See `resolve_seed_peer_multiaddr` in
+    /// `helix-node` for the client side of this.
+    pub p2p_port: u16,
 }

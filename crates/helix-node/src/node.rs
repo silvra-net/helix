@@ -220,6 +220,10 @@ pub struct HelixNode {
     p2p_command_tx: mpsc::Sender<P2PCommand>,
     p2p_event_rx: mpsc::Receiver<P2PEvent>,
     p2p_service: Option<P2PService>,
+    /// This node's own libp2p listen port — surfaced to RPC (`GET /status`) so a peer that
+    /// syncs from this node can derive a dialable seed address, see
+    /// `resolve_seed_peer_multiaddr`.
+    p2p_port: u16,
     rpc_bind: SocketAddr,
 }
 
@@ -350,6 +354,27 @@ impl HelixNode {
                 .parse()
                 .with_context(|| format!("invalid P2P listen address: {}", addr))?;
         }
+
+        // Explicit seed peer — `sync_peer` gets this node its historical blocks over plain
+        // HTTP, but on its own it left gossipsub with nothing but mDNS for live connectivity.
+        // mDNS only ever finds peers in the same local multicast segment, so a `sync_peer`
+        // reachable only over a real network (the exact "join an existing network" case the
+        // README documents) would sync its history once at startup and then never receive a
+        // single new block again — found by this same failure mode reproducing in CI, where
+        // mDNS doesn't work at all inside the runner's network sandbox, not just on the open
+        // internet. Resolves the peer's own P2P port via `GET /status` (added for this) and
+        // dials it directly; best-effort, mDNS remains a second, independent discovery path.
+        if let Some(peer_url) = &sync_peer {
+            match resolve_seed_peer_multiaddr(peer_url).await {
+                Ok(addr) => {
+                    info!(peer = %peer_url, multiaddr = %addr, "Resolved sync peer's P2P address — will dial directly");
+                    p2p_config.seed_peers.push(addr);
+                }
+                Err(e) => warn!(peer = %peer_url, error = %e, "Could not resolve sync peer's P2P address — falling back to mDNS-only discovery"),
+            }
+        }
+
+        let p2p_port = p2p_config.listen_addr.port();
         let (p2p_service, p2p_command_tx, p2p_event_rx) = P2PService::new(p2p_config);
 
         let rpc_bind = resolve_rpc_bind(&cfg)?;
@@ -372,6 +397,7 @@ impl HelixNode {
             p2p_command_tx,
             p2p_event_rx,
             p2p_service: Some(p2p_service),
+            p2p_port,
             rpc_bind,
         })
     }
@@ -386,6 +412,7 @@ impl HelixNode {
             chain_state: self.chain_state.clone(),
             node_address: self.address.to_string(),
             peer_count: peer_count.clone(),
+            p2p_port: self.p2p_port,
             p2p_command_tx: self.p2p_command_tx.clone(),
         };
 
@@ -1084,6 +1111,49 @@ async fn fetch_genesis_from_peer(peer_url: &str) -> Result<(Block, Vec<PublicKey
     Ok((block, personhood_authorities, governance_params))
 }
 
+/// Resolves a `sync_peer` HTTP URL (e.g. `http://seed:8545`) to a dialable libp2p multiaddr
+/// for that same peer, by asking it (via `GET /status`) which port it listens on for P2P —
+/// see the call site in `HelixNode::new` for why this exists instead of relying on mDNS
+/// alone. Best-effort by design: every caller treats a failure here as "fall back to
+/// mDNS-only", never as fatal, since a peer running an older build without `p2p_port` in its
+/// `/status` response should still be syncable, just without this extra connectivity path.
+async fn resolve_seed_peer_multiaddr(peer_url: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(peer_url)
+        .with_context(|| format!("invalid sync peer URL: {}", peer_url))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("sync peer URL has no host: {}", peer_url))?
+        .to_string();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let status: serde_json::Value = client
+        .get(format!("{}/status", peer_url.trim_end_matches('/')))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let p2p_port = status
+        .get("p2p_port")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("peer's /status has no p2p_port field (older version?)"))?;
+
+    Ok(format!("/{}/{host}/tcp/{p2p_port}", multiaddr_kind(&host)))
+}
+
+/// Distinguishes literal IPs from hostnames/domains so a `sync_peer` set to a real domain
+/// (not just an IP or "localhost") still produces a multiaddr libp2p can dial and resolve.
+fn multiaddr_kind(host: &str) -> &'static str {
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        "ip4"
+    } else if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        "ip6"
+    } else {
+        "dns4"
+    }
+}
+
 /// Skips genesis (height 0) — either loaded from this node's own existing data or, for a
 /// genuinely fresh node, adopted from this same peer via `fetch_genesis_from_peer` before
 /// this function is ever called.
@@ -1377,6 +1447,74 @@ mod sync_blocks_from_peer_tests {
         // Block 1 stays applied, block 2 (the non-chaining one) is never persisted.
         assert_eq!(store.latest_height(), 1);
         assert!(store.get_block_by_height(2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod multiaddr_kind_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_ipv4() {
+        assert_eq!(multiaddr_kind("127.0.0.1"), "ip4");
+        assert_eq!(multiaddr_kind("203.0.113.7"), "ip4");
+    }
+
+    #[test]
+    fn recognizes_ipv6() {
+        assert_eq!(multiaddr_kind("::1"), "ip6");
+    }
+
+    #[test]
+    fn falls_back_to_dns4_for_hostnames() {
+        assert_eq!(multiaddr_kind("localhost"), "dns4");
+        assert_eq!(multiaddr_kind("helix.silvra.net"), "dns4");
+    }
+}
+
+#[cfg(test)]
+mod resolve_seed_peer_multiaddr_tests {
+    use super::*;
+    use axum::{routing::get, Json, Router};
+
+    /// Spins up a real HTTP server on a free local port that serves a fixed `/status`
+    /// JSON body — same pattern as `sync_blocks_from_peer_tests::serve_blocks`, so this
+    /// exercises the real HTTP + JSON-parsing path, not just the string formatting.
+    async fn serve_status(body: serde_json::Value) -> String {
+        let app = Router::new().route("/status", get(move || async move { Json(body) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn resolves_to_a_dialable_multiaddr_using_the_peers_own_p2p_port() {
+        let peer_url = serve_status(serde_json::json!({ "p2p_port": 9999 })).await;
+
+        let addr = resolve_seed_peer_multiaddr(&peer_url).await.unwrap();
+
+        assert_eq!(addr, "/ip4/127.0.0.1/tcp/9999");
+    }
+
+    #[tokio::test]
+    async fn errors_when_the_peer_omits_p2p_port() {
+        // An older node's /status response, before this field existed — must be treated
+        // as "no seed peer available", not crash node startup.
+        let peer_url = serve_status(serde_json::json!({ "height": 5 })).await;
+
+        let result = resolve_seed_peer_multiaddr(&peer_url).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("p2p_port"));
+    }
+
+    #[tokio::test]
+    async fn errors_on_unreachable_peer() {
+        let result = resolve_seed_peer_multiaddr("http://127.0.0.1:1").await;
+        assert!(result.is_err());
     }
 }
 

@@ -217,6 +217,15 @@ verifying each one's signature, validator legitimacy, and chain continuity befor
 it. If sync stops partway (e.g. the peer becomes unreachable), whatever was already applied
 stays persisted — just restart with the same `sync_peer` to resume.
 
+Beyond that one-time historical sync, the node also asks `sync_peer` (via `GET /status`)
+which port it listens on for P2P and dials it directly for live gossip — this matters
+because the P2P layer's other discovery mechanism, mDNS, only ever finds peers on the same
+local multicast segment and never works across the open internet, so a `sync_peer` reachable
+only over a real network needs this explicit dial to receive any block after the one it
+synced at startup. This is best-effort: if it fails (e.g. the peer is running an older
+version without `p2p_port` in its `/status`), the node still starts and falls back to
+mDNS-only discovery.
+
 ### Docker Deployment
 
 A `Dockerfile` is provided for running a validator node without a local Rust toolchain.
@@ -668,12 +677,15 @@ Base URL: `http://127.0.0.1:8545` (or wherever you've bound/proxied it — see `
   "total_accounts": 2,
   "circulating_supply_hlx": 1000141.9995,
   "total_burned_hlx": 0.0005,
-  "state_hash": "b3f1a9..."
+  "state_hash": "b3f1a9...",
+  "p2p_port": 8546
 }
 ```
 
 `state_hash` is an operator-facing diagnostic (not part of consensus, not signed) — compare it
-across nodes at the same height to spot execution divergence.
+across nodes at the same height to spot execution divergence. `p2p_port` is this node's own
+libp2p listen port — used by a joining peer to dial it directly, see "Joining an Existing
+Network" above.
 
 ---
 

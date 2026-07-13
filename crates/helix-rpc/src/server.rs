@@ -34,6 +34,9 @@ pub struct AppState {
     pub chain_state: Arc<RwLock<ChainState>>,
     pub node_address: String,
     pub peer_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// This node's own libp2p listen port — surfaced via `GET /status` so a joining peer
+    /// can derive a dialable seed address without needing mDNS. See `NodeStatus::p2p_port`.
+    pub p2p_port: u16,
     /// Used to gossip an RPC-submitted transaction to the rest of the network. Without
     /// this, a transaction submitted to a node that never proposes a block itself (any
     /// non-genesis validator, or a pure full node) would sit in that node's local
@@ -150,6 +153,7 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
         circulating_supply_hlx: chain.circulating_supply() as f64 / 1_000_000_000.0,
         total_burned_hlx: chain.total_burned as f64 / 1_000_000_000.0,
         state_hash: chain.state_hash().to_hex(),
+        p2p_port: state.p2p_port,
     })
 }
 
@@ -940,6 +944,7 @@ mod tests {
             chain_state: Arc::new(RwLock::new(ChainState::new(0))),
             node_address: String::new(),
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            p2p_port: 0,
             p2p_command_tx,
         };
         (state, path)
@@ -1185,6 +1190,7 @@ mod tests {
             chain_state: Arc::new(RwLock::new(ChainState::new(0))),
             node_address: "test-node".to_string(),
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            p2p_port: 0,
             p2p_command_tx,
         }
     }
