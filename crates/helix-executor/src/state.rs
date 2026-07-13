@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::governance::{GovernanceParams, GovernanceProposal};
 
-/// Unbonding period in blocks — stake stays slashable for 7 days (≈ 12s/block).
-/// After this many blocks past the unstake tx, `ClaimUnbonded` releases the funds.
-pub const UNBONDING_PERIOD: u64 = 50_400;
+/// Unbonding period in blocks — stake stays slashable for 7 days at the actual 2s block
+/// time (`BLOCK_TIME_MS` in `helix-node`). Was 50_400 (7 days at an earlier, since-changed
+/// 12s block time) — silently drifted to ~28 hours of real protection when block time was
+/// tuned down, never caught since nothing enforces this constant against the live block
+/// time. After this many blocks past the unstake tx, `ClaimUnbonded` releases the funds.
+pub const UNBONDING_PERIOD: u64 = 302_400;
 
 /// Per-account ledger state
 #[derive(Debug, Clone, Serialize, Deserialize)]

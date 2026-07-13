@@ -6,7 +6,14 @@
 
 > The quantum-secure, human-centric blockchain for everyone.
 
-Helix is a Layer-1 blockchain built from the ground up for the post-quantum era. It uses NIST-standardized post-quantum cryptography, delivers instant BFT finality, and makes blockchain accessible to everyday users through human-readable names and social wallet recovery.
+Helix is a Layer-1 blockchain built from the ground up for the post-quantum era. It uses
+NIST-standardized post-quantum cryptography, delivers instant BFT finality, and makes
+blockchain accessible to everyday users through human-readable names and social wallet
+recovery.
+
+This README is a practical guide: install it, run a node, use the CLI, stake — as an
+operator or as a regular holder. Deeper reference material (REST API, wire formats, crate
+layout) lives further down for when you need it.
 
 ---
 
@@ -19,95 +26,70 @@ Helix is a Layer-1 blockchain built from the ground up for the post-quantum era.
 | Hexadecimal addresses, no recovery | `alice.hlx` names + social guardian recovery |
 | No plan for quantum migration | Algorithm versioning built into the protocol |
 | ZK proofs vulnerable (SNARKs use elliptic curves) | ZK-STARKs only — hash-based, quantum-safe |
-| Billions lost to smart contract bugs | WASM VM + formal verification tooling (Phase 6) |
+| Billions lost to smart contract bugs | WASM VM, fuel-metered, deterministic by construction |
 
 ---
 
-## Architecture
+## Quick Start
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        helix-node                           │
-│              (orchestrator, event loop, P2P)                │
-├──────────────┬──────────────┬──────────────┬────────────────┤
-│ helix-rpc    │ helix-p2p    │helix-consensus│helix-executor  │
-│ REST API     │ libp2p       │ PoS + BFT    │ State machine  │
-├──────────────┴──────────────┴──────────────┴────────────────┤
-│                       helix-storage                         │
-│              Persistent (redb-backed HelixDb)               │
-├─────────────────────────────────────────────────────────────┤
-│  helix-core    │  helix-crypto   │  helix-identity          │
-│  Block, Tx     │  ML-DSA, BLAKE3 │  Names, Personhood       │
-│  TxType, etc.  │  Addresses      │  Social Recovery         │
-└─────────────────────────────────────────────────────────────┘
+The fastest path from a clean checkout to a running node and your first transaction.
 
-CLI: hlx (helix-cli)   ←→   REST API :8545   ←→   P2P :8546
+```bash
+# 1. Build
+git clone https://github.com/silvra-net/helix.git
+cd helix
+cargo build --release
+# binaries: target/release/helix (the node), target/release/hlx (the CLI)
+
+# 2. Run a node (starts a fresh devnet genesis on first launch)
+./target/release/helix
+# leave this running in its own terminal — everything below talks to it over
+# its REST API at http://127.0.0.1:8545
 ```
 
----
+In a second terminal:
 
-## Cryptography
+```bash
+HLX=./target/release/hlx
 
-| Primitive | Algorithm | Standard | Quantum-safe |
-|---|---|---|---|
-| Digital Signatures | ML-DSA (Dilithium3) | NIST FIPS 204 | ✅ |
-| Backup Signatures | SLH-DSA (SPHINCS+) | NIST FIPS 205 | ✅ |
-| Hashing | BLAKE3 | — | ✅ (2× security margin vs Grover) |
-| Zero-Knowledge | ZK-STARKs | — | ✅ (hash-based) |
-| Transport | Noise (X25519) + ML-KEM-768 session layer | NIST FIPS 203 | ✅ |
+# 3. Create a wallet
+$HLX wallet new -o alice.json
+#   Address    : hlx...
+#   Saved to   : alice.json
 
-> **Note:** The base P2P transport (Noise/X25519) is classical, but every peer session is additionally wrapped in ML-KEM-768 (post-quantum) encryption negotiated via a `helix/session/1.0.0` handshake — Noise remains only for defense-in-depth underneath it. Consensus signatures and all on-chain data are fully quantum-secure.
+# 4. Check the chain
+$HLX chain status
 
----
+# 5. Fund it — the node's own validator key already holds the genesis stake, so to move
+#    real HLX around you'll first need a funded key (see "Funding a wallet on your own
+#    devnet" below). Once alice.json has a balance:
+$HLX tx send hlx... 10 --key alice.json     # send 10 HLX to another address
+$HLX tx status <hash>                        # check it landed
+$HLX account hlx...                          # see the resulting balance
+```
 
-## Token Economics
+That's the whole loop: a wallet is just a keypair, a transaction is a signed JSON object,
+and the node is the thing that executes and gossips it. Everything past this point is detail
+on top of these five commands.
 
-- **Hard cap:** 100,000,000 HLX — never more, forever. This is an asymptotic ceiling the
-  emission schedule approaches, not an amount handed out at genesis (see below) — the same
-  shape as Bitcoin's 21M cap.
-- **Denomination:** 1 HLX = 1,000,000,000 nano-HLX
-- **Fee split:** 50% burned (deflationary) / 50% to block validator
-- **Block reward:** a halving issuance schedule mints new HLX every block (independent of
-  transaction volume), so validator income doesn't depend on fee revenue alone. Starts at
-  1 HLX/block, halves every 15,768,000 blocks (~1 year at the 2s block time) — the same
-  geometric-decay shape as Bitcoin's coinbase subsidy, always clamped so cumulative issuance
-  never crosses the 100M cap regardless of what the schedule alone would pay out.
-- **Minimum validator stake:** 100,000 HLX (0.1% of supply)
-- **Slashing:** 5% of staked HLX burned on confirmed double-sign
-- **Circulating supply** = total issued − total burned. Total issued starts small (just the
-  genesis validator stake) and grows block by block via the emission schedule above — it
-  does not start at the 100M cap.
+### Funding a wallet on your own devnet
 
-### Genesis allocation (devnet)
-| Account | Amount | Purpose |
-|---|---|---|
-| Validator | 1,000,000 HLX staked | Genesis stake — earns fees + block rewards, cannot spend |
+A freshly started node's genesis allocates stake only to the validator's own address — there
+is no faucet. To get spendable HLX to a new wallet on your own devnet, send from the
+validator key itself:
 
-No liquid HLX is pre-mined to any wallet at genesis (decision 2026-07-15, superseding an
-earlier design that liquid-dumped the remaining ~99M HLX to the validator's spendable balance
-on day one). The validator earns everything beyond its bootstrap stake the same way any future
-validator would: by producing blocks.
+```bash
+# The node's own signing key lives at ./validator-key.bin and is already a valid
+# CLI wallet file (same JSON format `hlx wallet` produces) — use it directly:
+$HLX tx send hlx... 100 --key validator-key.bin
+```
+
+If you're connecting to someone else's running network instead of starting your own, ask
+them for testnet funds the same way — there's no protocol-level faucet.
 
 ---
 
-## Consensus: PoS + BFT + Proof of Personhood
-
-Helix uses Tendermint-style BFT finality on top of a Proof-of-Stake validator set:
-
-1. **Propose** — elected validator proposes a new block
-2. **Prevote** — all validators prevote (2/3+ needed to advance)
-3. **Precommit** — validators precommit (2/3+ = instant finality)
-4. **Commit** — block is final, no reorganizations possible
-
-**Block time:** 2 seconds. Tested stable at 15+ simultaneous transactions per block with no delay.
-
-**Proof of Personhood** prevents stake concentration:
-- Without verification: voting power capped at 0.5% of network
-- With verification: voting power capped at 1% of network
-
----
-
-## Getting Started
+## Installation
 
 ### Prerequisites
 
@@ -120,14 +102,15 @@ source "$HOME/.cargo/env"
 sudo apt-get install pkg-config libssl-dev
 ```
 
-### Download a Release
+### Option A: Download a Release
 
 Prebuilt binaries for Linux, macOS (Apple Silicon), and Windows are published on the
 [Releases page](https://github.com/silvra-net/helix/releases) for every tagged version
-(built automatically by [CI](.github/workflows/release.yml) on every tag push). Download the archive for your
-platform, extract it, and you have `helix` and `hlx` ready to run — no Rust toolchain needed.
+(built automatically by [CI](.github/workflows/release.yml) on every tag push). Download the
+archive for your platform, extract it, and you have `helix` and `hlx` ready to run — no Rust
+toolchain needed.
 
-### Build From Source
+### Option B: Build From Source
 
 ```bash
 git clone https://github.com/silvra-net/helix.git
@@ -139,7 +122,9 @@ Binaries are placed in `target/release/`:
 - `helix` — the node
 - `hlx` — the CLI
 
-### Run a Node (Devnet)
+---
+
+## Running a Node
 
 ```bash
 ./target/release/helix
@@ -147,10 +132,15 @@ Binaries are placed in `target/release/`:
 
 On first start, the node:
 - Loads or generates a persistent ML-DSA keypair (`validator-key.bin`)
-- Creates the genesis block with the configured HLX allocation
+- Creates the genesis block with the configured HLX allocation (or, if `sync_peer`/
+  `HELIX_SYNC_PEER` is set and no local chain exists yet, fetches the *real* genesis from
+  that peer instead — see "Joining an Existing Network" below)
 - Starts producing blocks every 2 seconds
 - Exposes REST API on `http://127.0.0.1:8545`
 - Listens for P2P peers on `0.0.0.0:8546`
+
+Everything the CLI and REST API do is just talking to this process — there's no separate
+indexer or backend.
 
 ### Config File
 
@@ -180,7 +170,7 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_REWARD_ADDRESS` | (validator address) | Address that receives the 50% validator fee reward. Set this to your app wallet address so fees land there instead of the signing key. Overrides `reward_address` in `helix.toml`. |
 | `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). Overrides `rpc_bind` in `helix.toml`. |
 | `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address. Overrides `p2p_listen_addr` in `helix.toml`. |
-| `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer to fetch missing historical blocks from on startup. Overrides `sync_peer` in `helix.toml`. Both the one-off startup sync and the live mid-run gap-fill fallback (triggered when a gossiped block arrives ahead of our tip) honor this — file or env var, either works. |
+| `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks. Overrides `sync_peer` in `helix.toml`. Both the one-off startup sync and the live mid-run gap-fill fallback (triggered when a gossiped block arrives ahead of our tip) honor this. |
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.bin` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.bin` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
 | `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` (30 min) | How long an unconfirmed transaction may sit in the mempool before it's evicted, freeing its (sender, nonce) slot. Overrides `mempool_tx_ttl_secs` in `helix.toml`. |
@@ -197,14 +187,9 @@ The node stores its validator keypair in `validator-key.bin` (in the working dir
   `secret_key`, plus `kdf_salt`/`nonce` when encrypted
 - Generated once on first start (plaintext); reused on every subsequent restart
 - Validator address stays the same across restarts
-- Older raw-bytes files (`sk_bytes ‖ pk_bytes`, no JSON) from before 2026-07-05 are no
-  longer accepted — convert one first with `hlx wallet import-node-key --from <old-file> --output validator-key.bin`
 - **Back this file up** — losing it means losing your validator identity
-
-Use the start script for a consistent setup:
-```bash
-./scripts/start-node.sh
-```
+- Because it's the same format as a CLI wallet, you can use it directly as `--key
+  validator-key.bin` with any `hlx` command — see the Quick Start's funding step above
 
 ### Persistent Chain Data
 
@@ -213,8 +198,24 @@ Blocks and chain state (balances, names, personhood, guardians) are stored in
 database:
 - Written on every finalized block — survives node restarts and crashes
 - On startup, the node loads existing state from this file if present, or
-  builds genesis state on first run
+  builds/fetches genesis on first run (see above)
 - **Back this file up** alongside `validator-key.bin` — losing it loses chain history
+
+### Joining an Existing Network
+
+To sync a new node against an already-running network instead of starting a fresh devnet:
+
+```toml
+# helix.toml
+sync_peer = "http://seed-host:8545"
+```
+
+or `HELIX_SYNC_PEER=http://seed-host:8545 ./target/release/helix`. On first start (no local
+`helix-data.redb` yet) the node fetches the peer's real genesis block and governance
+parameters, adopts them as its own, then downloads every historical block in order,
+verifying each one's signature, validator legitimacy, and chain continuity before applying
+it. If sync stops partway (e.g. the peer becomes unreachable), whatever was already applied
+stays persisted — just restart with the same `sync_peer` to resume.
 
 ### Docker Deployment
 
@@ -235,8 +236,6 @@ docker run -d --name helix \
 Notes:
 - The container's working directory is `/data` — mount a named volume (or bind mount)
   there so `validator-key.bin` and `helix-data.redb` survive container recreation/upgrades.
-  Losing that volume means losing the validator identity and chain history, same as a
-  bare-metal deployment (see the two sections above).
 - `HELIX_RPC_BIND=0.0.0.0:8545` is required for the REST API to be reachable from outside
   the container — the compiled-in default only binds `127.0.0.1`.
 - To join an existing network instead of starting a fresh devnet genesis, set
@@ -246,92 +245,328 @@ Notes:
 
 ---
 
-## CLI Reference (`hlx`)
+## Using the CLI (`hlx`)
+
+Every `hlx` command talks to a node over its REST API (`--node http://host:8545`, defaults
+to `127.0.0.1:8545`) — the CLI itself holds no state beyond whatever wallet file you point
+it at.
+
+### Wallets
 
 ```bash
-# Wallet
-hlx wallet new [--output wallet.json]            # Generate new ML-DSA keypair
-hlx wallet info [--key wallet.json]              # Show address & public key
-hlx wallet address [--key wallet.json]           # Print address only
+hlx wallet new -o alice.json                       # generate a new ML-DSA keypair
+hlx wallet new -o alice.json --passphrase "..."     # ...encrypted at rest (AES-256-GCM + Argon2id)
+hlx wallet new -o alice.json --scheme sphincs-plus  # ...using SPHINCS+ instead of ML-DSA
 
-# Chain queries
-hlx chain status                                 # Node status, height, supply
-hlx chain latest                                 # Latest block
-hlx chain block <height>                         # Block by height
+hlx wallet info --key alice.json                    # address, public key, algorithm
+hlx wallet address --key alice.json                 # just the address (for scripting)
+hlx wallet encrypt "newpass" --key alice.json        # add/change passphrase on an existing wallet
+hlx wallet encrypt "" --key alice.json               # remove passphrase encryption
 
-# Account
-hlx account <address>                            # Balance, nonce, stake
-
-# Transactions
-hlx tx send <to_address> <amount_hlx>            # Send HLX
-  --key wallet.json                              # Signing key
-  --fee <nano_hlx>                              # Custom fee (default: 10000)
-  --nonce <n>                                   # Override nonce (auto-fetched if omitted)
-hlx tx status <hash>                             # Transaction status
-
-# Names
-hlx name register <name> [--key wallet.json]    # Register alice.hlx
-hlx name resolve <name>                         # Resolve name to address
-
-# Proof of Personhood
-hlx identity attest <address> [--key ...]       # Attest a human
-hlx identity status <address>                   # Show verification status
-
-# Social recovery (3-of-5 guardians)
-hlx recovery register-guardians <addr>...       # Set guardians
-hlx recovery approve <target> <new_pubkey_hex>  # Guardian vote
-hlx recovery status <address>                   # Guardian set & pending vote
-
-# Options (global)
---node http://127.0.0.1:8545                    # Override RPC node URL
+# A current validator-key.bin already works directly as --key (see "Persistent
+# Validator Key" below) — this is only needed for older raw-byte key files from
+# before the node switched to the JSON wallet format:
+hlx wallet import-node-key --from old-validator-key.bin -o alice.json
 ```
+
+A wallet file is portable — it's just JSON. Anyone with the file (and its passphrase, if
+encrypted) can sign as that address, so treat it like a private key, because it is one.
+
+### Sending HLX
+
+```bash
+hlx tx send hlx... 10.5 --key alice.json            # send 10.5 HLX
+hlx tx send hlx... 10.5 --key alice.json --fee 20000  # custom fee (default: 10000 nano-HLX)
+hlx tx status <hash>                                 # confirmed / pending / not found
+```
+
+### Querying the Chain
+
+```bash
+hlx chain status               # height, best hash, peer count, mempool size, sync state
+hlx chain latest               # latest block, full transaction list
+hlx chain block 142            # block by height
+hlx account hlx...             # balance, staked amount, nonce
+```
+
+### Human-Readable Names
+
+Register a `name.hlx` alias for your address instead of sharing the raw `hlx...` string:
+
+```bash
+hlx name register alice --key alice.json     # registers alice.hlx to alice.json's address
+hlx name resolve alice.hlx                   # -> hlx...
+```
+
+### Smart Contracts
+
+Contracts are WASM modules; the exported `call` function is the entry point. There are no
+host imports yet (no storage, no programmatic transfers from inside a contract) — see
+[Cryptography & Determinism](#cryptography--determinism) for what that does and doesn't mean for safety.
+
+```bash
+hlx contract deploy my_contract.wasm --key alice.json
+#   Contract address: hlx...   (the deployer's own address — see note below)
+
+hlx contract call hlx... --key alice.json --amount 1.5 --fee 50000
+#   --fee also sets the fuel budget for this call — a call that runs out of fuel still
+#   charges the fee and advances the nonce, exactly like real gas markets do on revert
+```
+
+> **Note:** a contract's address is currently the same as its deployer's address (no derived
+> `CREATE`/`CREATE2`-style contract addresses yet) — one contract per deploying key at a time.
+
+### Proof of Personhood
+
+`hlx identity status <address>` shows an address's verification status
+(`Unverified`/`Verified`). Verification itself is intentionally gated behind a network
+personhood authority's signature over a ZK-STARK proof (`ProvePersonhood`), not exposed as a
+plain CLI flow yet — the point is that Sybil resistance can't come from a client-side command
+alone. `hlx identity attest` still exists as a command but always fails on submission: an
+earlier, unauthenticated "3 peers vouch for you" attestation path existed and was removed
+(the transaction now unconditionally rejects) once it became clear it bypassed the
+authority-gated proof entirely.
+
+Verified personhood matters for one thing: it raises your voting-power cap as a validator
+from 0.5% to 1% of the network (see [Consensus](#consensus)).
+It is not required to hold, send, or stake HLX.
+
+### Social Recovery
+
+Lets a small group of guardians rotate a lost account to a new key, without ever exposing the
+original key or requiring a central recovery authority.
+
+```bash
+# 1. The account owner registers 3-10 guardians (their addresses, not keys)
+hlx recovery register-guardians hlx... hlx... hlx... --key owner.json
+
+# 2. Check the guardian set and quorum threshold at any time
+hlx recovery status hlx...
+#   Guardians (2 of 3): [...]
+#   Quorum is proportional to however many guardians you register (roughly 2/3, rounded
+#   up) — not a fixed "3-of-5" regardless of set size, despite what the set size range
+#   (3-10) might suggest.
+
+# 3. If the owner loses their key: each guardian independently approves rotating
+#    the account to a replacement public key (hex-encoded)
+hlx recovery approve hlx... <new_pubkey_hex> --key guardian1.json
+hlx recovery approve hlx... <new_pubkey_hex> --key guardian2.json
+#    Once enough guardians approve (quorum, shown by `recovery status`), the account's
+#    controlling key rotates immediately — the old key is permanently locked out, the new
+#    key can now sign for that address. Re-recovery to yet another key later works the same
+#    way, any number of times.
+```
+
+A single stuck guardian request that never reaches quorum can be cleared at the protocol
+level (`CancelRecoveryRequest`, signed by the account owner with their still-valid original
+key) so a malicious or unresponsive guardian can't lock you out of ever changing your
+guardian set — but there is no `hlx recovery` CLI subcommand for it yet; it currently
+requires constructing that transaction directly against the REST API.
+
+### Governance
+
+Any account with a nonzero stake (see [Staking](#staking) — this does *not* require the full
+validator minimum) can propose and vote on two runtime-adjustable parameters:
+`min-validator-stake` and `fuel-per-fee-unit`.
+
+```bash
+hlx governance params                          # current values
+hlx governance propose fuel-per-fee-unit 3 --key alice.json
+hlx governance list                            # all proposals
+hlx governance show 0                          # one proposal's vote tally
+hlx governance vote 0 --key alice.json          # cast a stake-weighted yes-vote
+```
+
+A proposal passes once yes-votes reach a 2/3-plus-one supermajority of the total stake that
+existed *when the proposal was created* (frozen at creation so a voter can't game the
+denominator by unstaking after voting), or expires unexecuted after 1000 blocks. Every
+address can vote once per proposal.
+
+---
+
+## Staking
+
+Staking in Helix has two distinct purposes, and it's worth being precise about which one you
+actually want:
+
+- **Run a validator** — actively produce blocks and earn from it. Requires staking *and*
+  running a node with that same key.
+- **Vote in governance** — influence protocol parameters proportionally to your stake.
+  Requires only staking; no node needed.
+
+There is currently no third option — no delegated staking, and no passive yield for simply
+holding a stake without running a node. If you stake without running a node, you still get
+governance voting power, and you may occasionally be assigned a block-proposer turn you can
+never fulfill (harmless: the round just times out and hands off to the next validator after
+a few seconds) — but you earn nothing from it.
+
+### Staking as a Node Operator (Validator)
+
+1. **Get a node running** (see [Running a Node](#running-a-node)) — its `validator-key.bin`
+   is the identity that will stake and produce blocks.
+2. **Stake at least the minimum** (100,000 HLX — 0.1% of the total supply) using that same
+   key:
+   ```bash
+   hlx tx stake 100000 --key validator-key.bin
+   ```
+3. **Wait for the next epoch rotation** (every 100 blocks — at most a few minutes at the 2s
+   block time). The validator set is rebuilt from every account meeting the minimum stake;
+   once included, your node starts getting round-robin proposer turns.
+4. **Earn**: every block you produce mints you 50% of that block's transaction fees (the
+   other 50% is burned) plus a fixed block reward (starts at 1 HLX, halves yearly — see
+   [Token Economics](#token-economics)) — paid even on empty blocks, so income isn't purely
+   fee-dependent.
+5. **Unstaking**: `hlx tx unstake <amount> --key validator-key.bin` moves stake into a
+   7-day unbonding period (still slashable during this window) before it's claimable:
+   ```bash
+   hlx tx unstake 50000 --key validator-key.bin
+   # ... 7 days later ...
+   hlx tx claim-unbonded --key validator-key.bin
+   ```
+   You can't unstake below the minimum if you're currently the *only* account meeting it —
+   that would empty the validator set and halt the chain, so it's rejected outright rather
+   than allowed and left to fail later.
+
+**Slashing risk:** double-signing (proposing or voting for two different blocks at the same
+height/round) burns 5% of the offending validator's stake and jails them from BFT rounds
+immediately — not just at the next epoch. Run one node per key. Ever.
+
+### Staking as a Regular User
+
+If you just want a say in governance without operating infrastructure:
+
+```bash
+hlx tx stake 100 --key alice.json     # any amount above 0 grants voting power
+```
+
+Your voting weight in `hlx governance vote` is exactly your staked balance. Unstaking and
+claiming work identically to the validator flow above (same 7-day unbonding window, same
+commands) — running a node was never required for this path.
+
+---
+
+## Consensus
+
+Helix uses Tendermint-style BFT finality on top of a Proof-of-Stake validator set:
+
+1. **Propose** — elected validator proposes a new block
+2. **Prevote** — all validators prevote (2/3+ needed to advance)
+3. **Precommit** — validators precommit (2/3+ = instant finality)
+4. **Commit** — block is final, no reorganizations possible
+
+**Block time:** 2 seconds. A stalled round (no quorum within 3 block-time ticks — e.g. the
+proposer is offline) automatically advances to the next round-robin proposer instead of
+halting the chain.
+
+**Proof of Personhood** caps how much voting power a single identity can accumulate:
+- Without verification: voting power capped at 0.5% of the network
+- With verification: voting power capped at 1% of the network
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        helix-node                           │
+│              (orchestrator, event loop, P2P)                │
+├──────────────┬──────────────┬──────────────┬────────────────┤
+│ helix-rpc    │ helix-p2p    │helix-consensus│helix-executor  │
+│ REST API     │ libp2p       │ PoS + BFT    │ State machine  │
+├──────────────┴──────────────┴──────────────┴────────────────┤
+│                       helix-storage                         │
+│              Persistent (redb-backed HelixDb)               │
+├─────────────────────────────────────────────────────────────┤
+│  helix-core    │  helix-crypto   │  helix-identity          │
+│  Block, Tx     │  ML-DSA, BLAKE3 │  Names, Personhood       │
+│  TxType, etc.  │  Addresses      │  Social Recovery         │
+└─────────────────────────────────────────────────────────────┘
+
+CLI: hlx (helix-cli)   ←→   REST API :8545   ←→   P2P :8546
+```
+
+---
+
+## Cryptography & Determinism
+
+| Primitive | Algorithm | Standard | Quantum-safe |
+|---|---|---|---|
+| Digital Signatures | ML-DSA (Dilithium3) | NIST FIPS 204 | ✅ |
+| Backup Signatures | SLH-DSA (SPHINCS+) | NIST FIPS 205 | ✅ |
+| Hashing | BLAKE3 | — | ✅ (2× security margin vs Grover) |
+| Zero-Knowledge | ZK-STARKs | — | ✅ (hash-based) |
+| Transport | Noise (X25519) + ML-KEM-768 session layer | NIST FIPS 203 | ✅ |
+
+> The base P2P transport (Noise/X25519) is classical, but every peer session is additionally
+> wrapped in ML-KEM-768 (post-quantum) encryption negotiated via a `helix/session/1.0.0`
+> handshake — Noise remains only for defense-in-depth underneath it. Consensus signatures and
+> all on-chain data are fully quantum-secure.
+
+**Contract determinism:** `helix-vm` disables WASM floats entirely (via wasmi's
+`WasmFeatures` validator gate, rejected at deploy time) — every validator must reach the
+identical execution result for the identical call, and floats are a known cross-platform
+non-determinism risk (the reason the EVM never got them). Contracts have no host imports yet
+(no storage, no programmatic transfers out of a contract), so classic bug classes like
+reentrancy can't exist until that surface is added.
+
+---
+
+## Token Economics
+
+- **Hard cap:** 100,000,000 HLX — never more, forever. This is an asymptotic ceiling the
+  emission schedule approaches, not an amount handed out at genesis — the same shape as
+  Bitcoin's 21M cap.
+- **Denomination:** 1 HLX = 1,000,000,000 nano-HLX
+- **Fee split:** 50% burned (deflationary) / 50% to block validator
+- **Block reward:** a halving issuance schedule mints new HLX every block (independent of
+  transaction volume), so validator income doesn't depend on fee revenue alone. Starts at
+  1 HLX/block, halves every 15,768,000 blocks (~1 year at the 2s block time) — the same
+  geometric-decay shape as Bitcoin's coinbase subsidy, always clamped so cumulative issuance
+  never crosses the 100M cap regardless of what the schedule alone would pay out.
+- **Minimum validator stake:** 100,000 HLX (0.1% of supply) — runtime-adjustable via
+  governance, floored at 0.001% of supply so it can never be pushed low enough to let
+  unstaked accounts flood the validator set.
+- **Unbonding period:** 7 days from `tx unstake` to claimable — stake stays slashable the
+  whole time.
+- **Slashing:** 5% of staked HLX burned, plus immediate exclusion from BFT rounds, on
+  confirmed double-sign.
+- **Circulating supply** = total issued − total burned. Total issued starts small (just the
+  genesis validator stake) and grows block by block via the emission schedule above.
+- No liquid HLX is pre-mined to any wallet at genesis — the genesis validator receives only
+  its bootstrap stake, and earns everything beyond that the same way any future validator
+  would: by producing blocks.
 
 ---
 
 ## REST API
 
-Base URL: `http://127.0.0.1:8545` (proxied via nginx to `https://helix.silvra.net` in production)
+Base URL: `http://127.0.0.1:8545` (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/` | Node info & endpoint list |
 | GET | `/status` | Height, hash, mempool size, supply stats |
+| GET | `/genesis` | This chain's genesis block + governance params (used by fresh nodes joining via `sync_peer`) |
 | GET | `/blocks/latest` | Latest block with full transaction list |
 | GET | `/blocks/height/:n` | Block by height |
+| GET | `/blocks/height/:n/header` | Header only (for light clients) |
+| GET | `/blocks/height/:n/proof/:tx_hash` | Merkle inclusion proof for a transaction |
 | GET | `/blocks/hash/:hash` | Block by hash |
-| GET | `/accounts/:address` | Balance (HLX), nonce, staked amount — 400 on invalid address format |
+| GET | `/blocks/range` | Range of blocks (`?from=&count=`) |
+| GET | `/accounts/:address` | Balance, staked amount, nonce — 400 on invalid address format |
 | GET | `/accounts/:address/name` | Registered `.hlx` name for this address |
 | GET | `/accounts/:address/personhood` | Proof of Personhood status |
 | GET | `/accounts/:address/guardians` | Social-recovery guardian set |
 | GET | `/accounts/:address/recovery` | Pending/active recovery status |
+| GET | `/accounts/:address/transactions` | Transaction history (`?limit=&offset=`) |
 | GET | `/names/:name` | Resolve name to address |
+| GET | `/governance/params` | Current runtime-adjustable protocol parameters |
+| GET | `/governance/proposals` | All proposals (`?limit=&offset=`) |
+| GET | `/governance/proposals/:id` | One proposal's status |
 | GET | `/mempool` | Pending transaction count |
+| GET | `/sync/blocks` | Raw block range for peer sync (`?from=&count=`) |
 | POST | `/transactions` | Submit a signed transaction |
-
-### Block response (includes full transaction list)
-
-```json
-{
-  "hash": "a3f8c2...",
-  "height": 142,
-  "timestamp": 1782900000000,
-  "tx_count": 3,
-  "validator": "hlx...",
-  "prev_hash": "...",
-  "merkle_root": "...",
-  "transactions": [
-    {
-      "hash": "6f6559...",
-      "from": "hlxnxh...",
-      "to": "hlxmtJ...",
-      "amount_hlx": 100.0,
-      "fee_hlx": 0.001,
-      "tx_type": "Transfer",
-      "nonce": 0
-    }
-  ]
-}
-```
+| GET | `/transactions/:hash` | Transaction status (confirmed/pending/not found) |
 
 ### Status response
 
@@ -350,11 +585,18 @@ Base URL: `http://127.0.0.1:8545` (proxied via nginx to `https://helix.silvra.ne
 }
 ```
 
+`state_hash` is an operator-facing diagnostic (not part of consensus, not signed) — compare it
+across nodes at the same height to spot execution divergence.
+
 ---
 
-## Transaction Format
+## Reference
 
-Transactions are signed ML-DSA objects. The signing hash is `BLAKE3(bincode::serialize(TxPayload))` where `TxPayload` excludes `signature` and `public_key`.
+### Transaction Format
+
+Transactions are signed ML-DSA (or SPHINCS+) objects. The signing hash is
+`BLAKE3(bincode::serialize(TxPayload))`, where `TxPayload` excludes `signature` and
+`public_key`.
 
 ```json
 {
@@ -372,17 +614,12 @@ Transactions are signed ML-DSA objects. The signing hash is `BLAKE3(bincode::ser
 ```
 
 - `amount` and `fee` are in **nano-HLX** (1 HLX = 1,000,000,000 nano-HLX)
-- `nonce` is per-sender, strictly monotonic, starts at 0
+- `nonce` is per-sender, strictly monotonic, starts at 0 — multiple sequential-nonce
+  transactions from one sender can be submitted and included in the same block
 - Minimum fee: 1,000 nano-HLX
 - The mempool validates the signature before accepting
 
-### Nonce behaviour
-
-The executor validates nonces strictly. Multiple TXs from the same sender with sequential nonces (`N`, `N+1`, `N+2`) are all safe to submit in the same block — the mempool sorts them by `(sender, nonce)` before block inclusion.
-
----
-
-## Address Format
+### Address Format
 
 ```
 hlx  +  Base58( 0x01 ‖ BLAKE3(pubkey)[0..20] ‖ checksum[0..4] )
@@ -393,29 +630,11 @@ hlx  +  Base58( 0x01 ‖ BLAKE3(pubkey)[0..20] ‖ checksum[0..4] )
 
 Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 
----
-
-## Fee Distribution (50/50 Split)
-
-Every confirmed transaction fee is split at execution time:
-
-```
-Fee (nano-HLX)
-  ├── 50% → burned (subtracted from circulating_supply permanently)
-  └── 50% → fee recipient
-
-Fee recipient = HELIX_REWARD_ADDRESS env var (if set) OR block validator address
-```
-
-This makes HLX deflationary by design: every transaction reduces supply.
-
----
-
-## Crate Structure
+### Crate Structure
 
 | Crate | Description |
 |---|---|
-| `helix-crypto` | ML-DSA keypairs, BLAKE3 hash, addresses, merkle trees |
+| `helix-crypto` | ML-DSA/SPHINCS+ keypairs, BLAKE3 hash, addresses, merkle trees |
 | `helix-core` | Block, BlockHeader, Transaction, TxType primitives |
 | `helix-executor` | Transaction execution, account state, genesis, fee distribution |
 | `helix-consensus` | PoS + BFT engine, validator set rotation, slashing |
@@ -423,75 +642,23 @@ This makes HLX deflationary by design: every transaction reduces supply.
 | `helix-storage` | Persistent redb-backed block + chain-state store (`HelixDb`) |
 | `helix-p2p` | libp2p networking: gossipsub + mDNS discovery |
 | `helix-identity` | Proof of Personhood, human-readable names, social recovery |
+| `helix-vm` | WASM contract execution (`wasmi`, fuel-metered, deterministic) |
+| `helix-zkp` | ZK-STARK proof generation/verification for Proof of Personhood |
 | `helix-rpc` | Axum REST API server (`:8545`) |
 | `helix-node` | Node binary — orchestrates all subsystems |
 | `helix-cli` | `hlx` command-line tool |
 
 ---
 
-## Roadmap
-
-### ✅ Phase 1 — Foundation
-- [x] ML-DSA (Dilithium3) keypairs and signatures
-- [x] BLAKE3 hashing and Merkle trees
-- [x] Address format with checksum and version byte
-- [x] Block and Transaction types
-
-### ✅ Phase 2 — Living Chain
-- [x] BFT consensus engine (single-validator devnet)
-- [x] Block production loop (2s block time)
-- [x] Fee-prioritized mempool with nonce ordering
-- [x] Axum REST API (12 endpoints, full block TX data)
-
-### ✅ Phase 3 — State Machine
-- [x] Transaction execution (Transfer, Stake, Unstake)
-- [x] 50/50 fee burn / validator split
-- [x] 100M HLX hard cap — an asymptotic ceiling total issuance can never cross, not a
-  genesis pre-mine; see "Token Economics" above for the halving block-reward schedule that
-  replaced the original "dump the remaining supply to the validator at genesis" design
-- [x] Configurable fee reward address (`HELIX_REWARD_ADDRESS`)
-- [x] Genesis state with pre-staked validator
-- [x] `hlx` CLI tool
-
-### ✅ Phase 4 — Networking & Hardening
-- [x] libp2p P2P networking (gossipsub + mDNS)
-- [x] Block and transaction broadcasting
-- [x] Wallet passphrase encryption (AES-256-GCM + Argon2id)
-- [x] Persistent validator keypair (`validator-key.bin`)
-- [x] Slashing on double-signing (5% stake burned)
-- [x] Validator minimum stake (100,000 HLX)
-
-### ✅ Phase 5 — Identity & Recovery
-- [x] Proof of Personhood (social attestation)
-- [x] Human-readable names (`alice.hlx`)
-- [x] Social recovery wallets (3-of-5 guardians)
-
-### ✅ Phase 6 — Smart Contracts
-- [x] WASM VM integration (`helix-vm` crate, `wasmi` interpreter, fuel-metered, no host imports)
-- [x] Contract deployment and execution (`DeployContract`/`CallContract` txs; deployer address doubles as the contract account — no derived contract addresses yet)
-- [x] Gas metering (fuel-based; `tx.fee` currently doubles as the execution fuel budget — no separate gas-price market yet)
-- [x] Formal verification tooling — scoped to what's actually meaningful for the current VM: contracts have no host imports yet (no storage, no programmatic transfers), so classic smart-contract bug classes (reentrancy, access control) can't exist until that surface is added. What *is* provable now is determinism: `helix-vm`'s `engine()` disables WASM float types/instructions entirely via wasmi's `WasmFeatures` validator gate (exhaustive by construction, not a hand-rolled opcode blocklist) — floats are a known cross-validator non-determinism risk (the reason the EVM never got them), and any module declaring or using one anywhere is rejected at deploy time. A v2 covering host-import-aware verification (once contracts can move funds/state) is future work once that surface exists.
-
-### ✅ Phase 7 — Production Hardening
-- [x] Persistent block storage (redb on disk)
-- [x] BFT round-timeout — a stalled round (no quorum within 3 block-time ticks) auto-advances to the next round-robin proposer instead of halting the chain
-- [x] ML-KEM transport encryption (quantum-secure P2P) — ML-KEM-768 (NIST FIPS 203) key encapsulation in `helix-crypto`; per-peer post-quantum session keys established via `helix/session/1.0.0` gossipsub handshake (Hello/KemCt); session keys derived with BLAKE3 and used for AES-256-GCM message encryption — layered on top of Noise (X25519) for defense-in-depth
-- [x] ZK-STARK integration — `helix-zkp` crate (winterfell 0.13, Blake3 Merkle commitments, ~95 bits conjectured security); `PersonhoodAir` 64-row squaring circuit (`C = secret^(2^63)` in the 128-bit prime field); `TxType::ProvePersonhood` submits a STARK proof on-chain; executor verifies proof + marks account `PersonhoodStatus::Verified`; 4 tests: roundtrip, wrong-commitment rejected, truncated proof rejected, distinct commitments per secret
-- [x] Quantum algorithm migration protocol — crypto-agility in key files (scheme-tagged `[tag][sk][pk]`), `CryptoScheme` dispatch for signing and verification, `Vote::crypto_version` and `BlockHeader::crypto_version` propagate the scheme through consensus; `HELIX_VALIDATOR_CRYPTO_SCHEME=sphincs-plus` env var for new keys
-- [x] Block proposer signature verification — `BlockHeader::verify_signature()` checks public key → address derivation and ML-DSA/SPHINCS+ signature under `crypto_version`; `validate_block()` rejects forged blocks
-- [x] On-chain governance (`CreateProposal`/`VoteProposal` txs; stake-weighted 2/3-plus-one supermajority adjusts `min_validator_stake` or `fuel_per_fee_unit`; 1000-block voting window)
-- [x] Light client protocol (header-only sync via `GET /blocks/height/:n/header`; Merkle inclusion proofs via `GET /blocks/height/:n/proof/:tx_hash` + `helix_crypto::verify_merkle_proof`; block proposer signature self-verifiable via `BlockHeader::verify_signature()` — `public_key` travels with the header so a light client without full state can verify)
-- [x] Tx-History endpoint (`GET /accounts/:address/transactions`)
-- [x] Per-IP rate limiting on the REST API (`helix-rpc::rate_limit`; token-bucket, 30 burst / 10 req/s sustained per IP; Cloudflare `CF-Connecting-IP`/`X-Forwarded-For`-aware so the public tunnel doesn't bucket every visitor under one IP)
-- [x] P2P connection limits (`helix-p2p`) — `libp2p::connection_limits::Behaviour` bounds global/incoming/pending/per-peer connection counts; a custom `IpConnLimiter` behaviour additionally caps concurrent connections per source IP, since a Sybil attacker presenting a fresh `PeerId` per socket isn't bounded by peer-based limits alone
-
----
-
 ## Security
 
-- **Persistent validator key** is stored unencrypted in `validator-key.bin` — protect this file
-- The base transport layer (Noise/X25519) is classical, but P2P messages are additionally encrypted with ML-KEM-768 (post-quantum) session keys — see Phase 7 above; Noise remains for defense-in-depth
-- Minimum fee (1,000 nano-HLX) prevents zero-cost spam
+- **Persistent validator key** is stored unencrypted in `validator-key.bin` by default —
+  protect this file, or encrypt it (`HELIX_VALIDATOR_KEY_PASSPHRASE` / `hlx wallet encrypt`)
+- The base transport layer (Noise/X25519) is classical, but P2P messages are additionally
+  encrypted with ML-KEM-768 (post-quantum) session keys — see [Cryptography](#cryptography--determinism)
+- Per-IP rate limiting and connection limits protect the public RPC and P2P surface from
+  simple flood/spam abuse
+- Minimum fee (1,000 nano-HLX) prevents zero-cost transaction spam
 - Report security issues privately before public disclosure
 
 ---
