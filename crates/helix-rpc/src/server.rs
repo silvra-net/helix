@@ -77,6 +77,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/governance/proposals", get(get_governance_proposals))
         .route("/governance/proposals/:id", get(get_governance_proposal))
         .route("/mempool", get(get_mempool_info))
+        .route("/genesis", get(get_genesis))
         .route("/sync/blocks", get(get_sync_blocks))
         .route(
             "/transactions",
@@ -121,6 +122,7 @@ async fn root() -> Json<Value> {
             "GET  /governance/proposals",
             "GET  /governance/proposals/{id}",
             "GET  /mempool",
+            "GET  /genesis",
             "POST /transactions",
             "GET  /transactions/{hash}"
         ]
@@ -212,6 +214,42 @@ async fn get_blocks_range(
 /// Unlike `/blocks/range` (which returns the lossy `BlockResponse` display view),
 /// this endpoint returns the full `Block` including signatures and public keys, so
 /// a syncing node can replay execution and store blocks in its local database.
+/// `GET /genesis` — everything a node bootstrapping fresh against this one as its
+/// `sync_peer` needs to reconstruct an identical genesis, instead of self-signing its own
+/// (see `HelixNode::new`'s doc comment on why that produces a distinct, incompatible
+/// height-0 block per node): the genesis block itself (`validator` in its header identifies
+/// who got the bootstrap stake) plus `personhood_authorities`, which — unlike the
+/// (currently always empty) `GENESIS_PREFUND` allocations — is a per-deployment choice with
+/// no way to re-derive it from the block alone. Both together let a new node build the
+/// exact same initial `ChainState` this one started from.
+async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
+    let store = state.store.read().await;
+    let block = match store.get_block_by_height(0) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+    drop(store);
+    let cs = state.chain_state.read().await;
+    let personhood_authorities: Vec<String> =
+        cs.personhood_authorities.iter().map(|pk| pk.to_hex()).collect();
+    // This node's *current* governance_params, not necessarily its genesis-time ones — if a
+    // proposal changed a param since genesis, a node adopting this as its starting value will
+    // (mis)apply the current value retroactively from height 0, rather than the true original
+    // value up to the proposal's real execution height. Narrower and strictly better than the
+    // alternative this replaces (a hardcoded compile-time default that can silently drift from
+    // what this chain's real genesis actually used, as MIN_VALIDATOR_STAKE already has here),
+    // but not a full historical-params replay — accept the gap rather than build that.
+    let governance_params = cs.governance_params.clone();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "block": block,
+            "personhood_authorities": personhood_authorities,
+            "governance_params": governance_params,
+        })),
+    )
+}
+
 async fn get_sync_blocks(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, u64>>,
@@ -598,8 +636,9 @@ async fn submit_transaction(
     Json(tx): Json<Transaction>,
 ) -> impl IntoResponse {
     let tx_hash = tx.hash().to_hex();
+    let recovery_key = state.chain_state.read().await.recovery_key(&tx.from).cloned();
     let mut mempool = state.mempool.write().await;
-    let result = mempool.add(tx.clone());
+    let result = mempool.add_with_recovery_key(tx.clone(), recovery_key.as_ref());
     drop(mempool);
     match result {
         Ok(()) => {

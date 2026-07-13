@@ -6,11 +6,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use helix_consensus::{BftEngine, ConsensusError, DoubleSignEvidence, Proposal, Validator, ValidatorSet};
 use helix_core::{genesis_block, Block, Transaction, TxType};
-use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair, Signature};
+use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair, PublicKey, Signature};
 use helix_executor::{
     execute_block,
     genesis::{GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX},
     state::ChainState,
+    GovernanceParams,
 };
 use helix_mempool::Mempool;
 use helix_p2p::{
@@ -280,9 +281,43 @@ impl HelixNode {
             info!("No personhood authorities configured — ProvePersonhood transactions will be rejected");
         }
         let genesis_cfg = GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authorities);
+
+        // `sync_peer = "http://seed:8545"` in helix.toml, or HELIX_SYNC_PEER — resolved here
+        // (rather than after genesis, as before) because a node with no local chain yet needs
+        // it to decide *which* genesis it starts from.
+        let sync_peer = config::resolve("HELIX_SYNC_PEER", &cfg.sync_peer);
+
         let mut chain_state = if store.get_block_by_height(0).is_ok() {
             info!("Loaded existing chain state from {}", db_path.display());
             store.load_chain_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX)?
+        } else if let Some(peer_url) = &sync_peer {
+            // Adopt the peer's real genesis instead of self-signing one. Every node used to
+            // sign its own height-0 block with its own key — deterministic in every field
+            // except `validator`/`public_key`/`signature`, so two independently-bootstrapped
+            // nodes always produced two distinct, mutually incompatible genesis hashes. That
+            // meant `sync_blocks_from_peer` could never succeed for a genuinely fresh node:
+            // block 1 either failed the validator-membership check (this node's own genesis
+            // only ever pre-stakes itself, never the peer's real validator) or, had that
+            // passed, the prev_hash continuity check right after it (block 1's prev_hash
+            // names the peer's genesis hash, not this node's self-signed one) — found by
+            // actually wiping a node's data and watching it fail to rejoin the network it
+            // just left, then re-derive its own solo chain instead. Every prior node in this
+            // fleet was in fact bootstrapped by copying an already-populated database file,
+            // never through this path — this is the first time it's been exercised for real.
+            info!("No local chain yet — fetching genesis from sync peer {}", peer_url);
+            let (genesis, personhood_authorities, governance_params) =
+                fetch_genesis_from_peer(peer_url).await?;
+            store.put_block(genesis.clone())?;
+            info!(validator = %genesis.header.validator, "Adopted peer's genesis block (height 0)");
+
+            let mut state = GenesisConfig::devnet_with_personhood_authority(
+                genesis.header.validator.clone(),
+                personhood_authorities,
+            )
+            .build_state();
+            state.governance_params = governance_params;
+            store.save_chain_state(&state)?;
+            state
         } else {
             let sig = keypair.sign(b"helix-genesis-v1")?;
             let genesis = genesis_block(address.clone(), keypair.public.clone(), sig);
@@ -296,9 +331,8 @@ impl HelixNode {
         };
 
         // Block sync — download historical blocks from a trusted peer if configured.
-        // `sync_peer = "http://seed:8545"` in helix.toml, or HELIX_SYNC_PEER — fetches
-        // all blocks this node is missing.
-        let sync_peer = config::resolve("HELIX_SYNC_PEER", &cfg.sync_peer);
+        // Fetches all blocks this node is missing (from height 1 on — genesis, height 0, was
+        // either loaded above or adopted from this same peer just above).
         if let Some(peer_url) = &sync_peer {
             let local_tip = store.latest_height();
             info!("Syncing blocks from {} (local tip: {})", peer_url, local_tip);
@@ -404,6 +438,14 @@ impl HelixNode {
             self.address.clone(),
             genesis_height,
         )));
+        // Seed the engine's chain-continuity check with the real tip hash — without
+        // this, `validate_block`'s prev_hash check stays silently disabled until this
+        // engine's own first `finalize()`, the exact restart window a diverged
+        // proposal is most likely to slip through in.
+        {
+            let tip_hash = self.store.read().await.latest_hash();
+            engine.write().await.seed_last_committed(tip_hash);
+        }
 
         // Spawn P2P event handler
         let mempool_for_p2p = self.mempool.clone();
@@ -471,8 +513,9 @@ async fn handle_p2p_event(
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
+            let recovery_key = chain_state.read().await.recovery_key(&tx.from).cloned();
             let mut pool = mempool.write().await;
-            match pool.add(tx) {
+            match pool.add_with_recovery_key(tx, recovery_key.as_ref()) {
                 Ok(()) => {}
                 Err(e) => warn!("Rejected peer tx: {}", e),
             }
@@ -950,7 +993,53 @@ async fn block_production_loop(
 /// (chain state is saved before returning), nothing already-valid is rolled back,
 /// but nothing after the bad block is trusted either.
 ///
-/// Skips genesis (height 0) — every node generates it locally.
+/// Fetch `peer_url`'s actual genesis block (height 0), the `personhood_authorities` it was
+/// built with, and its current `governance_params`, so a fresh node can adopt them verbatim
+/// instead of self-signing its own incompatible genesis (see the call site in
+/// `HelixNode::new` for why that matters) or assuming today's hardcoded compile-time
+/// defaults, which can silently drift from what this specific chain's real genesis actually
+/// used (e.g. `MIN_VALIDATOR_STAKE` changing in source code after a long-running testnet's
+/// genesis already locked in a different value) — found the same way as the genesis-adoption
+/// gap itself: a freshly re-synced node rejecting real historical blocks as coming from an
+/// "unstaked" validator that has, in fact, been staked above the true (lower) threshold since
+/// block 106.
+async fn fetch_genesis_from_peer(peer_url: &str) -> Result<(Block, Vec<PublicKey>, GovernanceParams)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let resp: serde_json::Value = client
+        .get(format!("{}/genesis", peer_url.trim_end_matches('/')))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let block: Block = serde_json::from_value(
+        resp.get("block")
+            .cloned()
+            .context("peer's /genesis response is missing \"block\"")?,
+    )
+    .context("peer's /genesis \"block\" did not deserialize as a Block")?;
+    let personhood_authorities = resp
+        .get("personhood_authorities")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|hex| PublicKey::from_hex(hex).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let governance_params: GovernanceParams = match resp.get("governance_params").cloned() {
+        Some(v) => serde_json::from_value(v)
+            .context("peer's /genesis \"governance_params\" did not deserialize")?,
+        None => GovernanceParams::default(),
+    };
+    Ok((block, personhood_authorities, governance_params))
+}
+
+/// Skips genesis (height 0) — either loaded from this node's own existing data or, for a
+/// genuinely fresh node, adopted from this same peer via `fetch_genesis_from_peer` before
+/// this function is ever called.
 /// Returns the number of blocks successfully applied.
 async fn sync_blocks_from_peer(
     peer_url: &str,
@@ -997,10 +1086,24 @@ async fn sync_blocks_from_peer(
             // iteration's `execute_block` applied any staking txs) — same gap as the
             // one just closed in `handle_p2p_event`'s `NewCommittedBlock` arm, but
             // reachable via a compromised/MITM'd sync peer instead of public gossip.
-            let is_known_validator = chain_state
-                .stakers()
-                .iter()
-                .any(|(addr, _)| addr == &block.header.validator);
+            //
+            // `chain_state.stakers().is_empty()` mirrors the exact bootstrap fallback
+            // every node's own BFT engine already applies before anyone has ever staked
+            // (see `HelixNode::run`'s "no qualifying stakers yet — fall back to self as
+            // sole validator" branch): that fallback validator never appears in
+            // `chain_state.stakers()`, since it was never established via an on-chain
+            // `Stake` tx, so without this the *very first* synced block (and every one
+            // before the network's first `Stake` tx) would always fail this check —
+            // sync could never get past block 1, for any node, ever. Found by actually
+            // wiping a node's data and trying to resync it from scratch: it re-derived
+            // its own solo genesis fallback instead, forking itself off the real chain
+            // block by block. Once real stake exists, this reduces to the strict
+            // membership check exactly as before.
+            let is_known_validator = chain_state.stakers().is_empty()
+                || chain_state
+                    .stakers()
+                    .iter()
+                    .any(|(addr, _)| addr == &block.header.validator);
             if !is_known_validator {
                 store.save_chain_state(chain_state)?;
                 anyhow::bail!(
@@ -1163,9 +1266,15 @@ mod sync_blocks_from_peer_tests {
     }
 
     #[tokio::test]
-    async fn rejects_validly_signed_block_from_unstaked_address() {
-        // Signature is perfectly valid, but `kp` was never registered as a staker —
-        // simulates an attacker with a free, throwaway keypair and no stake.
+    async fn accepts_unstaked_validator_for_the_very_first_block_when_no_stakers_exist_yet() {
+        // A block signed by a not-yet-staked address, synced against a chain_state with
+        // literally no stakers registered, is indistinguishable from every real node's own
+        // legitimate bootstrap block — every node's BFT engine falls back to "no qualifying
+        // stakers yet, accept self as sole validator" before anyone has ever submitted a
+        // real on-chain Stake tx (see `HelixNode::run`), and that fallback validator is never
+        // reflected in `chain_state.stakers()` since it was never established via a Stake tx.
+        // Before this fix, sync could never get past this very first block for any node —
+        // found by wiping a node's data and watching it fail to resync from a live peer.
         let kp = KeyPair::generate();
         let blocks = vec![signed_block(&kp, 1, Hash::ZERO)];
         let peer_url = serve_blocks(blocks).await;
@@ -1174,10 +1283,31 @@ mod sync_blocks_from_peer_tests {
         let mut chain_state = ChainState::new(0); // no stakers registered
         let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
 
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(store.latest_height(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_validly_signed_block_from_unstaked_address_once_real_stake_exists() {
+        // Once a real staker exists in chain_state, an unrelated free, throwaway keypair
+        // with no stake must still be rejected — the bootstrap fallback above only ever
+        // applies while stakers() is genuinely empty, not as a general bypass.
+        let real_kp = KeyPair::generate();
+        let block1 = signed_block(&real_kp, 1, Hash::ZERO);
+        let attacker_kp = KeyPair::generate();
+        let block2 = signed_block(&attacker_kp, 2, block1.hash());
+        let peer_url = serve_blocks(vec![block1, block2]).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &real_kp);
+        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("outside the current validator set"));
-        assert_eq!(store.latest_height(), 0);
-        assert!(store.get_block_by_height(1).is_err());
+        // Block 1 (the real staker) stays applied, block 2 (the impersonator) does not.
+        assert_eq!(store.latest_height(), 1);
+        assert!(store.get_block_by_height(2).is_err());
     }
 
     #[tokio::test]

@@ -335,6 +335,28 @@ impl BftEngine {
             });
         }
 
+        // Chain continuity: a proposal can have the right height, a valid proposer
+        // signature, and still not build on the block we actually finalized last —
+        // e.g. a proposer that raced this node's own commit and embedded the prev_hash
+        // of a sibling that lost. Without this check, `receive_proposal` would vote
+        // for (and this node's own peers help finalize) a block that silently forks
+        // the chain: this is the same guard `NewCommittedBlock`'s passive gossip path
+        // already applies (see node.rs's "does not chain from our tip" check) — this
+        // is the self-produced/BFT-voted path's missing counterpart to it. `None`
+        // means this engine was never seeded with a real tip (only exercised by tests
+        // that construct blocks with an arbitrary prev_hash) — skip rather than reject.
+        if let Some(expected_prev) = &self.last_committed {
+            if &block.header.prev_hash != expected_prev {
+                return Err(ConsensusError::InvalidBlock {
+                    height: h,
+                    reason: format!(
+                        "prev_hash mismatch: expected {}, got {}",
+                        expected_prev, block.header.prev_hash
+                    ),
+                });
+            }
+        }
+
         block
             .header
             .verify_signature()
@@ -475,6 +497,16 @@ impl BftEngine {
         self.last_committed_round = None;
         self.round = None;
         self.round_ticks = 0;
+    }
+
+    /// Seed `last_committed` with the real chain tip's hash right after construction,
+    /// when resuming an existing chain (as opposed to a fresh test engine that starts
+    /// at height 0 with no prior block). Without this, `validate_block`'s prev_hash
+    /// check would silently skip validation for every proposal until this engine's
+    /// own first `finalize()` — the exact restart window where a stale/diverged
+    /// proposal is most likely to slip through unnoticed.
+    pub fn seed_last_committed(&mut self, hash: Hash) {
+        self.last_committed = Some(hash);
     }
 
     fn assert_is_validator(&self) -> ConsensusResult<()> {
@@ -731,6 +763,38 @@ mod tests {
         assert_eq!(finalized.hash(), block_hash);
         assert!(engine.is_finalized(&block_hash));
         assert_eq!(engine.current_height(), 2);
+    }
+
+    /// Regression test for a real chain-corruption bug found by battle-testing a live
+    /// 3-node testnet: a proposal can have the right height, a valid proposer signature,
+    /// merkle root, and proposer-for-this-round assignment, yet still embed a `prev_hash`
+    /// that doesn't chain from the block this engine actually finalized last (e.g. a
+    /// proposer that raced this node's own commit and built on a sibling that lost).
+    /// Before this fix, `validate_block` never checked `prev_hash` at all, so this node
+    /// would prevote/precommit for it and help finalize a block that silently forks the
+    /// chain — observed in practice as two validators' locally-committed chains sharing
+    /// consecutive heights but not actually hash-chaining, permanently desyncing whichever
+    /// node's honest gap-sync then (correctly) refused to apply the discontinuous block.
+    #[test]
+    fn receive_proposal_with_wrong_prev_hash_is_rejected() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 2);
+        engine.seed_last_committed(Hash::digest(b"the-real-tip"));
+
+        // c is the proposer for height 3, round 0 ((3 + 0) % 4 == 3, c's index).
+        let mut proposer_engine = BftEngine::new(v.validator_set.clone(), v.c_addr.clone(), 2);
+        let _ = proposer_engine.produce_block(&v.c_kp, Hash::digest(b"a-different-sibling"), vec![]);
+        let block = proposer_engine.pending_proposal().unwrap().clone();
+
+        let result = engine.receive_proposal(&v.self_kp, 0, block);
+        assert!(
+            matches!(
+                &result,
+                Err(ConsensusError::InvalidBlock { reason, .. }) if reason.contains("prev_hash mismatch")
+            ),
+            "a proposal built on the wrong prev_hash must be rejected, not voted for: {result:?}"
+        );
+        assert!(!engine.has_active_round(), "the rejected proposal must not start a round");
     }
 
     /// A proposal for a height we've already finalized — e.g. our own block

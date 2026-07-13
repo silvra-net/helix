@@ -143,13 +143,39 @@ impl Transaction {
     }
 
     pub fn verify_signature(&self) -> CryptoResult<()> {
-        // The attached public key must actually derive the claimed sender address —
-        // otherwise anyone could sign with their own key while setting `from` to a
-        // victim's address, since the ML-DSA check alone only proves key possession.
-        if Address::from_public_key(&self.public_key) != self.from {
-            return Err(helix_crypto::CryptoError::InvalidAddress(
-                "public key does not match sender address".to_string(),
-            ));
+        self.verify_signature_with_recovery_key(None)
+    }
+
+    /// Same check as `verify_signature`, but for a `from` address whose control was ever
+    /// rotated by social-recovery guardian quorum (see `execute_approve_recovery`),
+    /// `recovery_key` is the active override key: it must have produced the signature,
+    /// and the normal "public key derives the address" rule is intentionally skipped,
+    /// since that's the whole point of a recovered account. `recovery_key: None` (the
+    /// common case) falls back to the plain address-derivation + signature check.
+    ///
+    /// Mempool admission must use this — not `verify_signature` — for any tx whose sender
+    /// has a recovery key set, or `execute_transaction`'s equally recovery-aware
+    /// `verify_tx_signature` check is unreachable: every such tx would already have been
+    /// rejected before it ever reached the executor.
+    pub fn verify_signature_with_recovery_key(&self, recovery_key: Option<&PublicKey>) -> CryptoResult<()> {
+        match recovery_key {
+            Some(active_key) => {
+                if self.public_key.as_bytes() != active_key.as_bytes() {
+                    return Err(helix_crypto::CryptoError::InvalidAddress(
+                        "public key does not match the active recovery key".to_string(),
+                    ));
+                }
+            }
+            None => {
+                // The attached public key must actually derive the claimed sender address —
+                // otherwise anyone could sign with their own key while setting `from` to a
+                // victim's address, since the ML-DSA check alone only proves key possession.
+                if Address::from_public_key(&self.public_key) != self.from {
+                    return Err(helix_crypto::CryptoError::InvalidAddress(
+                        "public key does not match sender address".to_string(),
+                    ));
+                }
+            }
         }
         let hash = self.signing_hash();
         helix_crypto::verify_with_scheme(

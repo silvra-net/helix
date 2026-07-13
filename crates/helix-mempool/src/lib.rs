@@ -1,5 +1,5 @@
 use helix_core::{transaction::Amount, Transaction};
-use helix_crypto::Hash;
+use helix_crypto::{Hash, PublicKey};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -119,6 +119,26 @@ impl Mempool {
     }
 
     pub fn add(&mut self, tx: Transaction) -> MempoolResult<()> {
+        self.add_inner(tx, None)
+    }
+
+    /// Like `add`, but for a sender whose control was ever rotated by social-recovery
+    /// guardian quorum: `recovery_key` (looked up via `ChainState::recovery_key` by the
+    /// caller, which alone has chain-state access) is the active override key that must
+    /// have produced the signature. Without this, `add`'s plain `verify_signature` would
+    /// reject every transaction from a recovered account outright — the new key never
+    /// hashes to the (unchanged) address by design — and `execute_transaction`'s equally
+    /// recovery-aware check would never be reachable for it. `recovery_key: None` behaves
+    /// exactly like `add`.
+    pub fn add_with_recovery_key(
+        &mut self,
+        tx: Transaction,
+        recovery_key: Option<&PublicKey>,
+    ) -> MempoolResult<()> {
+        self.add_inner(tx, recovery_key)
+    }
+
+    fn add_inner(&mut self, tx: Transaction, recovery_key: Option<&PublicKey>) -> MempoolResult<()> {
         self.evict_expired();
 
         if tx.fee < self.min_fee {
@@ -153,7 +173,7 @@ impl Mempool {
         // an inflated fee to have `evict_lowest_fee()` discard a legitimate tx, then
         // have their own (never-admitted) tx rejected here — a free way to grind
         // down other users' pending transactions.
-        tx.verify_signature()
+        tx.verify_signature_with_recovery_key(recovery_key)
             .map_err(|e| MempoolError::Invalid(e.to_string()))?;
 
         if self.by_hash.len() >= self.max_size {
