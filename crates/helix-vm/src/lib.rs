@@ -3,6 +3,19 @@
 //! Contracts are self-contained WASM modules with no host imports (rejected at
 //! instantiation) and must export a zero-argument, zero-return entry point named
 //! `call`. Execution is fuel-metered so a contract can never run unbounded.
+//!
+//! # Determinism
+//!
+//! Every validator must reach the same result executing the same contract call,
+//! or the chain forks. `wasmi` is a pure interpreter (no JIT, no platform-specific
+//! codegen), which already rules out most sources of cross-machine divergence. The
+//! remaining classic risk for a WASM-based VM is floating point: IEEE 754 pins down
+//! most float behavior, but real toolchains/hardware have historically disagreed on
+//! edge cases (canonical-NaN payload bits, fused-multiply-add availability) — the
+//! reason the EVM never got native floats. `engine()` disables float types and
+//! instructions outright via wasmi's `WasmFeatures` validator gate, so a module
+//! that declares or uses one anywhere is rejected at `validate()` (deploy time),
+//! before it can ever reach the chain.
 
 use thiserror::Error;
 use wasmi::{core::TrapCode, Config, Engine, Linker, Module, Store, StoreLimitsBuilder};
@@ -38,6 +51,16 @@ pub type VmResult<T> = Result<T, VmError>;
 fn engine() -> Engine {
     let mut config = Config::default();
     config.consume_fuel(true);
+    // Reject f32/f64 types and instructions entirely (formal determinism guarantee,
+    // not just a style preference): WASM's float semantics are precisely specified,
+    // but real-world float non-determinism across validator hardware/toolchains
+    // (canonical-NaN propagation edge cases, fused-multiply-add availability) is a
+    // well-known blockchain VM risk class — it's exactly why the EVM never got native
+    // floats. Enforced by wasmi's own WasmFeatures validator gate (not a hand-rolled
+    // instruction blocklist), so it's exhaustive by construction: any module
+    // declaring or using a float type/instruction anywhere fails `Module::new` before
+    // a single fuel unit is spent, for both `validate()` and `call()`.
+    config.floats(false);
     Engine::new(&config)
 }
 
@@ -167,5 +190,55 @@ mod tests {
             r#"(module (import "env" "host_fn" (func)) (func (export "call")))"#,
         );
         assert!(matches!(call(&wasm, 1_000_000), Err(VmError::Instantiation(_))));
+    }
+
+    // Determinism guarantees (formal verification tooling — see engine()'s doc
+    // comment): floats are rejected wherever they could appear in a module, not
+    // just when actually executed, so this is checked at `validate()` time (i.e.
+    // at deploy, before the bytecode is ever accepted on-chain).
+
+    #[test]
+    fn validate_rejects_a_module_using_a_float_instruction() {
+        let wasm = wat_to_wasm(r#"(module (func (export "call") (drop (f32.const 1.0))))"#);
+        assert!(matches!(validate(&wasm), Err(VmError::InvalidModule(_))));
+    }
+
+    #[test]
+    fn validate_rejects_a_module_with_a_float_typed_global() {
+        let wasm = wat_to_wasm(
+            r#"(module (global $g f64 (f64.const 0.0)) (func (export "call")))"#,
+        );
+        assert!(matches!(validate(&wasm), Err(VmError::InvalidModule(_))));
+    }
+
+    #[test]
+    fn validate_rejects_a_module_with_a_float_typed_local() {
+        let wasm = wat_to_wasm(r#"(module (func (export "call") (local f32)))"#);
+        assert!(matches!(validate(&wasm), Err(VmError::InvalidModule(_))));
+    }
+
+    #[test]
+    fn validate_rejects_a_module_with_a_float_typed_parameter() {
+        let wasm = wat_to_wasm(
+            r#"(module (func $helper (param f64)) (func (export "call")))"#,
+        );
+        assert!(matches!(validate(&wasm), Err(VmError::InvalidModule(_))));
+    }
+
+    #[test]
+    fn call_rejects_float_instructions_too_not_just_validate() {
+        // Defense in depth: both validate() and call() build the module through the
+        // same engine(), so this is really the same guarantee exercised via the
+        // other entry point — but it's the one that matters at contract-call time.
+        let wasm = wat_to_wasm(r#"(module (func (export "call") (drop (f32.const 1.0))))"#);
+        assert!(matches!(call(&wasm, 1_000_000), Err(VmError::InvalidModule(_))));
+    }
+
+    #[test]
+    fn validate_still_accepts_integer_only_modules() {
+        let wasm = wat_to_wasm(
+            r#"(module (func (export "call") (local i32 i64) (drop (i32.const 1))))"#,
+        );
+        assert!(validate(&wasm).is_ok());
     }
 }

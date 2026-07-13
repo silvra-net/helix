@@ -466,13 +466,13 @@ This makes HLX deflationary by design: every transaction reduces supply.
 - [x] Human-readable names (`alice.hlx`)
 - [x] Social recovery wallets (3-of-5 guardians)
 
-### 🔄 Phase 6 — Smart Contracts
+### ✅ Phase 6 — Smart Contracts
 - [x] WASM VM integration (`helix-vm` crate, `wasmi` interpreter, fuel-metered, no host imports)
 - [x] Contract deployment and execution (`DeployContract`/`CallContract` txs; deployer address doubles as the contract account — no derived contract addresses yet)
 - [x] Gas metering (fuel-based; `tx.fee` currently doubles as the execution fuel budget — no separate gas-price market yet)
-- [ ] Formal verification tooling
+- [x] Formal verification tooling — scoped to what's actually meaningful for the current VM: contracts have no host imports yet (no storage, no programmatic transfers), so classic smart-contract bug classes (reentrancy, access control) can't exist until that surface is added. What *is* provable now is determinism: `helix-vm`'s `engine()` disables WASM float types/instructions entirely via wasmi's `WasmFeatures` validator gate (exhaustive by construction, not a hand-rolled opcode blocklist) — floats are a known cross-validator non-determinism risk (the reason the EVM never got them), and any module declaring or using one anywhere is rejected at deploy time. A v2 covering host-import-aware verification (once contracts can move funds/state) is future work once that surface exists.
 
-### 📋 Phase 7 — Production Hardening
+### ✅ Phase 7 — Production Hardening
 - [x] Persistent block storage (redb on disk)
 - [x] BFT round-timeout — a stalled round (no quorum within 3 block-time ticks) auto-advances to the next round-robin proposer instead of halting the chain
 - [x] ML-KEM transport encryption (quantum-secure P2P) — ML-KEM-768 (NIST FIPS 203) key encapsulation in `helix-crypto`; per-peer post-quantum session keys established via `helix/session/1.0.0` gossipsub handshake (Hello/KemCt); session keys derived with BLAKE3 and used for AES-256-GCM message encryption — layered on top of Noise (X25519) for defense-in-depth
