@@ -1,5 +1,9 @@
 # Helix Blockchain (HLX)
 
+[![CI](https://github.com/silvra-net/helix/actions/workflows/ci.yml/badge.svg)](https://github.com/silvra-net/helix/actions/workflows/ci.yml)
+[![Release](https://github.com/silvra-net/helix/actions/workflows/release.yml/badge.svg)](https://github.com/silvra-net/helix/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 > The quantum-secure, human-centric blockchain for everyone.
 
 Helix is a Layer-1 blockchain built from the ground up for the post-quantum era. It uses NIST-standardized post-quantum cryptography, delivers instant BFT finality, and makes blockchain accessible to everyday users through human-readable names and social wallet recovery.
@@ -116,10 +120,17 @@ source "$HOME/.cargo/env"
 sudo apt-get install pkg-config libssl-dev
 ```
 
-### Build
+### Download a Release
+
+Prebuilt binaries for Linux, macOS (Apple Silicon), and Windows are published on the
+[Releases page](https://github.com/silvra-net/helix/releases) for every tagged version
+(built automatically by [CI](.github/workflows/release.yml) on every tag push). Download the archive for your
+platform, extract it, and you have `helix` and `hlx` ready to run — no Rust toolchain needed.
+
+### Build From Source
 
 ```bash
-git clone <repo>
+git clone https://github.com/silvra-net/helix.git
 cd helix
 cargo build --release
 ```
@@ -186,8 +197,8 @@ The node stores its validator keypair in `validator-key.bin` (in the working dir
   `secret_key`, plus `kdf_salt`/`nonce` when encrypted
 - Generated once on first start (plaintext); reused on every subsequent restart
 - Validator address stays the same across restarts
-- Older raw-bytes files (`sk_bytes ‖ pk_bytes`, no JSON) from before 2026-07-05 are
-  still read transparently, but new keys are always written in `KeyFile` format
+- Older raw-bytes files (`sk_bytes ‖ pk_bytes`, no JSON) from before 2026-07-05 are no
+  longer accepted — convert one first with `hlx wallet import-node-key --from <old-file> --output validator-key.bin`
 - **Back this file up** — losing it means losing your validator identity
 
 Use the start script for a consistent setup:
