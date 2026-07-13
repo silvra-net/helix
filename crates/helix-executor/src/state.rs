@@ -286,13 +286,28 @@ impl ChainState {
     }
 
     /// Addresses that meet the minimum stake threshold — candidates for the next validator epoch.
+    ///
+    /// Sorted by address: `self.accounts` is a `HashMap`, whose iteration order depends on
+    /// a per-process random seed (Rust's `RandomState`, by design — DoS hardening) and is
+    /// therefore *not* the same across independently-running validator processes, even
+    /// with identical account state. `ValidatorSet::new()` does not sort its input, and
+    /// `proposer_for_round()` picks the proposer by index into that list — so every node
+    /// building a `ValidatorSet` from an unsorted `stakers()` could compute a different
+    /// round-robin order, and thus disagree on whose turn it is, silently halting the
+    /// chain the moment more than one validator is active. Found by actually running a
+    /// multi-node local testnet: rock solid with a single validator (this was
+    /// unreachable — a one-element list has only one possible order), silent full
+    /// consensus stall at the very first epoch rotation with three.
     pub fn stakers(&self) -> Vec<(Address, u64)> {
         let min_stake = self.governance_params.min_validator_stake;
-        self.accounts
+        let mut stakers: Vec<(Address, u64)> = self
+            .accounts
             .values()
             .filter(|acc| acc.staked >= min_stake)
             .filter_map(|acc| Address::from_str(&acc.address).ok().map(|addr| (addr, acc.staked)))
-            .collect()
+            .collect();
+        stakers.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+        stakers
     }
 
     /// Total HLX staked across every account — the governance voting-power pool.
@@ -447,6 +462,37 @@ mod tests {
             forward.state_hash(),
             backward.state_hash(),
             "identical accounts inserted in different order must hash the same"
+        );
+    }
+
+    /// Regression test for a consensus-halting bug found by actually running a
+    /// multi-node local testnet (single-validator devnets can never exercise this —
+    /// a one-element list has only one possible order): `stakers()` used to return
+    /// `self.accounts.values()` in raw HashMap iteration order, which depends on a
+    /// per-process random seed. `ValidatorSet::new()` doesn't sort its input, and
+    /// `proposer_for_round()` indexes into that list — so two validator processes
+    /// with byte-identical stake could still disagree on round-robin order, and thus
+    /// on whose turn it is to propose, silently halting the chain the moment more
+    /// than one validator is active. `stakers()` must return the same order no
+    /// matter what order the underlying HashMap happens to iterate in.
+    #[test]
+    fn stakers_is_stable_regardless_of_account_insertion_order() {
+        let mut forward = ChainState::new(1_000_000);
+        forward.governance_params.min_validator_stake = 1;
+        for i in 0..20u8 {
+            forward.update_account(&addr(i), |acc| acc.staked = (i as u64) + 1);
+        }
+
+        let mut backward = ChainState::new(1_000_000);
+        backward.governance_params.min_validator_stake = 1;
+        for i in (0..20u8).rev() {
+            backward.update_account(&addr(i), |acc| acc.staked = (i as u64) + 1);
+        }
+
+        assert_eq!(
+            forward.stakers(),
+            backward.stakers(),
+            "identical stakers inserted in different order must come back in the same order"
         );
     }
 
