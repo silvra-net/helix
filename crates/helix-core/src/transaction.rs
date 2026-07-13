@@ -69,6 +69,27 @@ pub enum TxType {
     /// the slash that active participants applied: the same validator set diverging on
     /// `staked` amounts between nodes, with no `state_root` anywhere to ever detect it.
     SubmitDoubleSignEvidence,
+    /// Delegate `tx.amount` of liquid HLX to the validator named in `tx.to`, in exchange for
+    /// pool shares (see `ChainState::validator_pools`). Unlike self-staking (`TxType::Stake`),
+    /// delegation earns a proportional cut of that validator's block rewards without running
+    /// a node — but grants no governance voting power (see `TxType::CreateProposal`'s doc
+    /// comment on why voting weight stays tied to `AccountState::staked` alone).
+    Delegate,
+    /// Redeem `tx.amount` (denominated in HLX, converted to shares internally) of `tx.from`'s
+    /// delegation to the validator named in `tx.to`. The HLX value (principal plus any
+    /// auto-compounded rewards, minus any slashing since delegating) moves into `tx.from`'s
+    /// own `unbonding_stake` — the same unbonding queue and `TxType::ClaimUnbonded` used by
+    /// self-staking, so delegated funds are just as slashable during the wait and claimed the
+    /// same way.
+    Undelegate,
+    /// `tx.from` (a validator with an existing or new delegation pool) sets the commission
+    /// rate it keeps from delegator rewards. `tx.data` carries the new rate as 2
+    /// little-endian bytes (basis points, 0-10000). Capped well below 100% (see
+    /// `MAX_COMMISSION_BPS`) — not because a validator can't legitimately choose to reward
+    /// delegators poorly, but because an *uncapped* rate lets a validator advertise a low
+    /// commission to attract delegators, then raise it to 100% after the fact and keep every
+    /// future reward, with delegators locked in until they notice and unbond.
+    SetCommission,
 }
 
 /// Payload embedded in `Transaction::data` for `TxType::ProvePersonhood`.

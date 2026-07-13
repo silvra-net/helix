@@ -24,6 +24,12 @@ const SLASHED_DOUBLE_SIGN_INCIDENTS: TableDefinition<&str, &[u8]> = TableDefinit
 /// `PERSONHOOD_COMMITMENTS`. A node accepts a `ProvePersonhood` signature from any one
 /// entry in this table (see `ChainState::personhood_authorities`'s doc comment).
 const PERSONHOOD_AUTHORITIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("personhood_authorities");
+/// validator address string → bincode(`DelegationPool`).
+const VALIDATOR_POOLS: TableDefinition<&str, &[u8]> = TableDefinition::new("validator_pools");
+/// validator address string → bincode(`HashMap<delegator_address, shares>`) — the whole
+/// per-validator delegator map stored as one blob, same "one blob per outer key" shape as
+/// `GUARDIANS`/`RECOVERY_REQUESTS` rather than a multimap keyed by (validator, delegator).
+const DELEGATOR_SHARES: TableDefinition<&str, &[u8]> = TableDefinition::new("delegator_shares");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// address string → (block height, tx index within block), both big-endian so a
 /// key's values sort in ascending chain order for free. Lets `address_transactions`
@@ -64,6 +70,8 @@ impl HelixDb {
         tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -86,6 +94,8 @@ impl HelixDb {
             let mut personhood_commitments = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut slashed_double_sign_incidents = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut personhood_authorities = tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut validator_pools = tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut delegator_shares = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
             for (addr, account) in &state.accounts {
@@ -156,6 +166,18 @@ impl HelixDb {
                 personhood_authorities.insert(authority.as_bytes(), &[][..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            for (addr, pool) in &state.validator_pools {
+                let encoded = bincode::serialize(pool)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                validator_pools.insert(addr.as_str(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+            for (addr, shares) in &state.delegator_shares {
+                let encoded = bincode::serialize(shares)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                delegator_shares.insert(addr.as_str(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
         }
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))
     }
@@ -172,6 +194,8 @@ impl HelixDb {
         let personhood_commitments_table = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let slashed_double_sign_incidents_table = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let personhood_authorities_table = tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
+        let validator_pools_table = tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let delegator_shares_table = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
         let mut accounts = std::collections::HashMap::new();
@@ -259,6 +283,24 @@ impl HelixDb {
             personhood_authorities.push(PublicKey::from_bytes(k.value().to_vec()));
         }
 
+        let mut validator_pools = std::collections::HashMap::new();
+        let mut validator_pools_iter = validator_pools_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = validator_pools_iter.next() {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let pool = bincode::deserialize(v.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            validator_pools.insert(k.value().to_string(), pool);
+        }
+
+        let mut delegator_shares = std::collections::HashMap::new();
+        let mut delegator_shares_iter = delegator_shares_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = delegator_shares_iter.next() {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let shares = bincode::deserialize(v.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            delegator_shares.insert(k.value().to_string(), shares);
+        }
+
         let read_meta_u64 = |key: &str| -> Option<u64> {
             meta_table.get(key).ok().flatten().and_then(|v| {
                 let bytes: [u8; 8] = v.value().try_into().ok()?;
@@ -293,6 +335,8 @@ impl HelixDb {
             used_personhood_commitments,
             slashed_double_sign_incidents,
             personhood_authorities,
+            validator_pools,
+            delegator_shares,
         })
     }
 
@@ -528,6 +572,17 @@ mod tests {
             state.used_personhood_commitments.insert([7u8; 16]);
             state.slashed_double_sign_incidents.insert("validator1:10:0".to_string());
             state.personhood_authorities.push(kp.public.clone());
+            state.validator_pools.insert(
+                validator.to_string(),
+                helix_executor::state::DelegationPool {
+                    total_shares: 500,
+                    total_delegated_stake: 550,
+                    commission_bps: 1_500,
+                },
+            );
+            let mut delegators = std::collections::HashMap::new();
+            delegators.insert(addr(9).to_string(), 500u64);
+            state.delegator_shares.insert(validator.to_string(), delegators);
             db.save_chain_state(&state).unwrap();
         }
 
@@ -553,6 +608,17 @@ mod tests {
         // The personhood authority must also survive a restart — it's genesis-time-only
         // configuration, never re-read from env/config on subsequent starts.
         assert_eq!(loaded.personhood_authorities, vec![kp.public.clone()]);
+        // Delegation pools and delegator shares must also survive a restart — otherwise
+        // every delegator's stake and every validator's commission rate would silently
+        // vanish the moment a node restarts.
+        let pool = loaded.validator_pools.get(&validator.to_string()).unwrap();
+        assert_eq!(pool.total_shares, 500);
+        assert_eq!(pool.total_delegated_stake, 550);
+        assert_eq!(pool.commission_bps, 1_500);
+        assert_eq!(
+            loaded.delegator_shares.get(&validator.to_string()).unwrap().get(&addr(9).to_string()),
+            Some(&500u64)
+        );
 
         let _ = std::fs::remove_file(&path);
     }

@@ -68,6 +68,8 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/accounts/:address/personhood", get(get_account_personhood))
         .route("/accounts/:address/guardians", get(get_account_guardians))
         .route("/accounts/:address/recovery", get(get_account_recovery))
+        .route("/accounts/:address/delegations", get(get_account_delegations))
+        .route("/validators/:address/pool", get(get_validator_pool))
         .route(
             "/accounts/:address/transactions",
             get(get_account_transactions),
@@ -117,6 +119,8 @@ async fn root() -> Json<Value> {
             "GET  /accounts/{address}/guardians",
             "GET  /accounts/{address}/recovery",
             "GET  /accounts/{address}/transactions",
+            "GET  /accounts/{address}/delegations",
+            "GET  /validators/{address}/pool",
             "GET  /names/{name}",
             "GET  /governance/params",
             "GET  /governance/proposals",
@@ -537,6 +541,82 @@ async fn get_account_recovery(
             pending_approvals,
             threshold,
         })),
+    )
+}
+
+/// `GET /validators/:address/pool` — a validator's delegation pool: how much delegated
+/// stake it currently has backing it, at what commission rate, plus its own self-stake and
+/// the effective total (self + delegated) that actually counts for validator-set eligibility
+/// and BFT voting weight (see `ChainState::effective_stake`). `has_pool: false` with the
+/// rest zeroed means nobody has ever delegated to this address — not an error, since any
+/// address can in principle receive a delegation once it self-stakes.
+async fn get_validator_pool(
+    State(state): State<AppState>,
+    Path(address_str): Path<String>,
+) -> impl IntoResponse {
+    let address = match Address::from_str(&address_str) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid address format" })),
+            )
+        }
+    };
+    let chain = state.chain_state.read().await;
+    let self_staked = chain.get(&address).map(|a| a.staked).unwrap_or(0);
+    let pool = chain.validator_pools.get(&address_str);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "address": address_str,
+            "has_pool": pool.is_some(),
+            "self_staked_hlx": self_staked as f64 / 1_000_000_000.0,
+            "delegated_stake_hlx": pool.map(|p| p.total_delegated_stake).unwrap_or(0) as f64 / 1_000_000_000.0,
+            "effective_stake_hlx": chain.effective_stake(&address) as f64 / 1_000_000_000.0,
+            "total_shares": pool.map(|p| p.total_shares).unwrap_or(0),
+            "commission_bps": pool.map(|p| p.commission_bps),
+        })),
+    )
+}
+
+/// `GET /accounts/:address/delegations` — every validator this address currently has an
+/// active delegation to, with the current redeemable HLX value of each (principal plus any
+/// auto-compounded rewards, minus any slashing since delegating — see
+/// `ChainState::delegation_value`). Scans `validator_pools` (bounded by validator count, not
+/// delegator count) rather than requiring a reverse index, since looking up "my own
+/// delegations" is an infrequent, operator-facing query, not a consensus-critical hot path.
+async fn get_account_delegations(
+    State(state): State<AppState>,
+    Path(address_str): Path<String>,
+) -> impl IntoResponse {
+    let address = match Address::from_str(&address_str) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid address format" })),
+            )
+        }
+    };
+    let chain = state.chain_state.read().await;
+    let delegations: Vec<Value> = chain
+        .delegator_shares
+        .iter()
+        .filter_map(|(validator_addr, delegators)| {
+            let shares = *delegators.get(&address_str)?;
+            let validator = Address::from_str(validator_addr).ok()?;
+            let value = chain.delegation_value(&validator, &address)?;
+            Some(json!({
+                "validator": validator_addr,
+                "shares": shares,
+                "value_hlx": value as f64 / 1_000_000_000.0,
+            }))
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "address": address_str, "delegations": delegations })),
     )
 }
 

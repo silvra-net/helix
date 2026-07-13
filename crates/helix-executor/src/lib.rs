@@ -6,7 +6,10 @@ pub mod state;
 pub use genesis::GenesisConfig;
 pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal};
 pub use receipt::{BlockReceipt, Receipt};
-pub use state::{AccountState, ChainState, UNBONDING_PERIOD};
+pub use state::{
+    AccountState, ChainState, DelegationPool, DEFAULT_COMMISSION_BPS, MAX_COMMISSION_BPS,
+    UNBONDING_PERIOD,
+};
 
 use helix_consensus::DoubleSignEvidence;
 use helix_core::{
@@ -69,9 +72,7 @@ pub fn execute_block(
     let scheduled = genesis::scheduled_block_reward(height);
     let block_reward_minted = scheduled.min(state.mintable_headroom());
     if block_reward_minted > 0 {
-        state.update_account(fee_recipient, |acc| {
-            acc.balance = acc.balance.saturating_add(block_reward_minted);
-        });
+        credit_validator_reward(state, fee_recipient, block_reward_minted);
         state.total_issued = state.total_issued.saturating_add(block_reward_minted);
     }
 
@@ -116,6 +117,9 @@ pub fn execute_transaction(
         TxType::ClaimUnbonded => execute_claim_unbonded(state, tx, validator, tx_hash, height),
         TxType::CancelRecoveryRequest => execute_cancel_recovery_request(state, tx, validator, tx_hash),
         TxType::SubmitDoubleSignEvidence => execute_submit_double_sign_evidence(state, tx, validator, tx_hash),
+        TxType::Delegate => execute_delegate(state, tx, validator, tx_hash),
+        TxType::Undelegate => execute_undelegate(state, tx, validator, tx_hash, height),
+        TxType::SetCommission => execute_set_commission(state, tx, validator, tx_hash),
     }
 }
 
@@ -320,6 +324,226 @@ fn execute_claim_unbonded(
         acc.balance += acc.unbonding_stake;
         acc.unbonding_stake = 0;
         acc.unbonding_unlock_height = 0;
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// `tx.to` names the validator to delegate to, `tx.amount` is how much liquid HLX to lock
+/// into its pool. Mints pool shares proportional to the pool's current value per share (see
+/// `DelegationPool`'s doc comment) — a fresh or fully-slashed-out pool (`total_shares == 0`
+/// or `total_delegated_stake == 0`) prices new shares 1:1 with the deposited amount rather
+/// than dividing by zero, exactly like a brand-new pool would.
+fn execute_delegate(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    let Some(target) = &tx.to else {
+        return Receipt::failure(tx_hash, "delegate requires a target validator address", 0, 0);
+    };
+    if tx.amount == 0 {
+        return Receipt::failure(tx_hash, "delegation amount must be greater than zero", 0, 0);
+    }
+    let total_cost = tx.amount.saturating_add(tx.fee);
+    if sender.balance < total_cost {
+        return Receipt::failure(
+            tx_hash,
+            &format!("insufficient balance: need {}, have {}", total_cost, sender.balance),
+            0,
+            0,
+        );
+    }
+    let target_key = target.to_string();
+    let target_self_staked = state.accounts.get(&target_key).map(|a| a.staked).unwrap_or(0);
+    if target_self_staked == 0 {
+        return Receipt::failure(
+            tx_hash,
+            "target address has never self-staked — not a recognized validator identity",
+            0,
+            0,
+        );
+    }
+
+    let pool = state
+        .validator_pools
+        .entry(target_key.clone())
+        .or_insert_with(|| DelegationPool {
+            total_shares: 0,
+            total_delegated_stake: 0,
+            commission_bps: DEFAULT_COMMISSION_BPS,
+        });
+    let shares_to_mint = if pool.total_shares == 0 || pool.total_delegated_stake == 0 {
+        tx.amount
+    } else {
+        (tx.amount as u128 * pool.total_shares as u128 / pool.total_delegated_stake as u128) as u64
+    };
+    pool.total_shares += shares_to_mint;
+    pool.total_delegated_stake += tx.amount;
+
+    *state
+        .delegator_shares
+        .entry(target_key)
+        .or_default()
+        .entry(tx.from.to_string())
+        .or_insert(0) += shares_to_mint;
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= total_cost;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// `tx.to` names the validator to undelegate from, `tx.amount` is the HLX value (not raw
+/// shares) to redeem — including any rewards auto-compounded, or losses from slashing, since
+/// the delegation was made. Converts to shares internally, rounding the share count *up*
+/// (against the withdrawer, in the remaining delegators' favor) so a delegator can never
+/// extract fractionally more than their true proportional share of the pool. The redeemed
+/// value moves into `tx.from`'s own unbonding queue — the exact same one `TxType::Unstake`
+/// uses, including the single-slot-at-a-time restriction (see `execute_unstake`), so it's
+/// just as slashable during the wait and claimed the same way via `TxType::ClaimUnbonded`.
+fn execute_undelegate(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+    height: u64,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+    let Some(target) = &tx.to else {
+        return Receipt::failure(tx_hash, "undelegate requires a target validator address", 0, 0);
+    };
+    if tx.amount == 0 {
+        return Receipt::failure(tx_hash, "undelegation amount must be greater than zero", 0, 0);
+    }
+    if sender.unbonding_stake > 0 {
+        return Receipt::failure(
+            tx_hash,
+            "an unbonding is already in progress; claim it before undelegating more",
+            0,
+            0,
+        );
+    }
+
+    let target_key = target.to_string();
+    let Some(pool) = state.validator_pools.get(&target_key) else {
+        return Receipt::failure(tx_hash, "no delegation pool for this validator", 0, 0);
+    };
+    if pool.total_shares == 0 || pool.total_delegated_stake == 0 {
+        return Receipt::failure(tx_hash, "delegation pool is empty", 0, 0);
+    }
+    let Some(owned_shares) = state
+        .delegator_shares
+        .get(&target_key)
+        .and_then(|m| m.get(&tx.from.to_string()))
+        .copied()
+    else {
+        return Receipt::failure(tx_hash, "no delegation from this address to this validator", 0, 0);
+    };
+    let my_value = (owned_shares as u128 * pool.total_delegated_stake as u128 / pool.total_shares as u128) as u64;
+    if tx.amount > my_value {
+        return Receipt::failure(
+            tx_hash,
+            &format!("insufficient delegated balance: have {}, requested {}", my_value, tx.amount),
+            0,
+            0,
+        );
+    }
+    // Ceiling division: burn at least enough shares to cover `tx.amount`, never less —
+    // rounds against the withdrawer rather than the remaining pool.
+    let shares_to_burn = ((tx.amount as u128 * pool.total_shares as u128)
+        .div_ceil(pool.total_delegated_stake as u128)) as u64;
+    let shares_to_burn = shares_to_burn.min(owned_shares);
+
+    {
+        let pool = state.validator_pools.get_mut(&target_key).unwrap();
+        pool.total_shares -= shares_to_burn;
+        pool.total_delegated_stake -= tx.amount;
+    }
+    let delegator_map = state.delegator_shares.get_mut(&target_key).unwrap();
+    let remaining = owned_shares - shares_to_burn;
+    if remaining == 0 {
+        delegator_map.remove(&tx.from.to_string());
+    } else {
+        delegator_map.insert(tx.from.to_string(), remaining);
+    }
+
+    let unlock_height = height + state::UNBONDING_PERIOD;
+    state.update_account(&tx.from, |acc| {
+        acc.unbonding_stake = tx.amount;
+        acc.unbonding_unlock_height = unlock_height;
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// `tx.from` sets its own validator commission rate — `tx.data` is 2 little-endian bytes
+/// (basis points, 0-`MAX_COMMISSION_BPS`). Creates an empty pool entry if `tx.from` has never
+/// had a delegator yet, purely to record the rate so the first delegation reads it back
+/// instead of silently falling to `DEFAULT_COMMISSION_BPS`.
+fn execute_set_commission(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+    if tx.data.len() != 2 {
+        return Receipt::failure(tx_hash, "malformed commission payload: expected 2 bytes", 0, 0);
+    }
+    let commission_bps = u16::from_le_bytes([tx.data[0], tx.data[1]]);
+    if commission_bps > MAX_COMMISSION_BPS {
+        return Receipt::failure(
+            tx_hash,
+            &format!("commission {} bps exceeds the maximum of {} bps", commission_bps, MAX_COMMISSION_BPS),
+            0,
+            0,
+        );
+    }
+
+    state
+        .validator_pools
+        .entry(tx.from.to_string())
+        .or_insert_with(|| DelegationPool {
+            total_shares: 0,
+            total_delegated_stake: 0,
+            commission_bps: DEFAULT_COMMISSION_BPS,
+        })
+        .commission_bps = commission_bps;
+
+    state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
         acc.nonce += 1;
     });
@@ -933,7 +1157,46 @@ fn execute_prove_personhood(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
-/// 50% of fee is burned (deflationary), 50% goes to the block validator
+/// Credit a validator reward (a block-reward mint or a fee's validator-half) to `recipient`,
+/// splitting it between the validator's own balance and its delegation pool (if it has one)
+/// — see `DelegationPool`'s doc comment for why this stays O(1) regardless of delegator
+/// count. `recipient` is normally the real block validator, but can be a
+/// `HELIX_REWARD_ADDRESS` override (see `execute_block`) — in that case a pool keyed to the
+/// *real* validator's address is correctly left untouched here (nobody delegates to a
+/// reward-redirect address, only to the validator identity itself), so this degrades safely
+/// to the pre-delegation 100%-to-recipient behavior in that one edge case.
+fn credit_validator_reward(state: &mut ChainState, recipient: &Address, amount: u64) {
+    if amount == 0 {
+        return;
+    }
+    let key = recipient.to_string();
+    let Some(pool) = state.validator_pools.get(&key) else {
+        state.update_account(recipient, |acc| acc.balance = acc.balance.saturating_add(amount));
+        return;
+    };
+    let self_stake = state.accounts.get(&key).map(|a| a.staked).unwrap_or(0) as u128;
+    let total_stake = self_stake + pool.total_delegated_stake as u128;
+    if total_stake == 0 {
+        state.update_account(recipient, |acc| acc.balance = acc.balance.saturating_add(amount));
+        return;
+    }
+    let self_share = (amount as u128 * self_stake / total_stake) as u64;
+    let delegated_share = amount - self_share;
+    let commission = (delegated_share as u128 * pool.commission_bps as u128 / 10_000) as u64;
+    let pool_gain = delegated_share - commission;
+    let validator_total = self_share + commission;
+
+    state.update_account(recipient, |acc| {
+        acc.balance = acc.balance.saturating_add(validator_total)
+    });
+    if pool_gain > 0 {
+        // Just inserted/confirmed present via the `let Some(pool)` above.
+        state.validator_pools.get_mut(&key).unwrap().total_delegated_stake += pool_gain;
+    }
+}
+
+/// 50% of fee is burned (deflationary), 50% goes to the block validator (split with its
+/// delegation pool, if any — see `credit_validator_reward`).
 fn distribute_fee(
     state: &mut ChainState,
     validator: &Address,
@@ -941,9 +1204,7 @@ fn distribute_fee(
 ) -> ExecutionResult<(u64, u64)> {
     let burned = fee / 2;      // 50% deflationary burn
     let reward = fee - burned; // 50% to block validator
-    state.update_account(validator, |acc| {
-        acc.balance += reward;
-    });
+    credit_validator_reward(state, validator, reward);
     Ok((burned, reward))
 }
 
@@ -2654,5 +2915,311 @@ mod tests {
 
         assert_eq!(r1, crate::genesis::INITIAL_BLOCK_REWARD_HLX * crate::genesis::NANO_PER_HLX);
         assert_eq!(r2, r1 / 2, "reward must halve once height crosses a halving interval boundary");
+    }
+
+    fn signed_tx(
+        kp: &KeyPair,
+        from: &Address,
+        tx_type: TxType,
+        to: Option<Address>,
+        amount: u64,
+        data: Vec<u8>,
+        nonce: u64,
+        fee: u64,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type,
+            from: from.clone(),
+            to,
+            amount,
+            fee,
+            nonce,
+            data,
+            crypto_version: kp.scheme,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    #[test]
+    fn delegate_rejects_target_that_never_self_staked() {
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
+
+        let tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target), 500_000_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success);
+        assert!(state.validator_pools.is_empty());
+    }
+
+    #[test]
+    fn delegate_mints_shares_1to1_for_a_fresh_pool() {
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let target_kp = KeyPair::generate();
+        let target = Address::from_public_key(&target_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
+        state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
+
+        let tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 500_000_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(receipt.success, "{:?}", receipt);
+        let pool = state.validator_pools.get(&target.to_string()).unwrap();
+        assert_eq!(pool.total_shares, 500_000_000);
+        assert_eq!(pool.total_delegated_stake, 500_000_000);
+        assert_eq!(pool.commission_bps, DEFAULT_COMMISSION_BPS);
+        assert_eq!(
+            state.delegator_shares.get(&target.to_string()).unwrap().get(&delegator.to_string()).copied(),
+            Some(500_000_000)
+        );
+        // Effective stake now includes the delegation.
+        assert_eq!(state.effective_stake(&target), 100_000 * 1_000_000_000 + 500_000_000);
+    }
+
+    #[test]
+    fn delegate_second_delegator_gets_fewer_shares_after_pool_appreciates() {
+        let d1_kp = KeyPair::generate();
+        let d1 = Address::from_public_key(&d1_kp.public);
+        let d2_kp = KeyPair::generate();
+        let d2 = Address::from_public_key(&d2_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&d1, |acc| acc.balance = 1_000_000_000_000);
+        state.update_account(&d2, |acc| acc.balance = 1_000_000_000_000);
+        state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
+
+        let tx1 = signed_tx(&d1_kp, &d1, TxType::Delegate, Some(target.clone()), 1_000_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx1, &validator, 0).success);
+
+        // Pool appreciates 10x (simulating compounded rewards) without any new shares minted.
+        state.validator_pools.get_mut(&target.to_string()).unwrap().total_delegated_stake = 10_000_000_000;
+
+        let tx2 = signed_tx(&d2_kp, &d2, TxType::Delegate, Some(target.clone()), 1_000_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx2, &validator, 0).success);
+
+        let d2_shares = *state.delegator_shares.get(&target.to_string()).unwrap().get(&d2.to_string()).unwrap();
+        // d2 paid the same HLX as d1 but into a pool worth 10x per share, so gets ~1/10th the shares.
+        assert_eq!(d2_shares, 100_000_000, "buying into an appreciated pool must mint proportionally fewer shares");
+    }
+
+    #[test]
+    fn undelegate_redeems_value_and_moves_to_own_unbonding_queue() {
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
+        state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
+
+        let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 500_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0).success);
+
+        let undelegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 200_000_000, vec![], 1, 10_000);
+        let receipt = execute_transaction(&mut state, &undelegate_tx, &validator, 10);
+        assert!(receipt.success, "{:?}", receipt);
+
+        let acc = state.get(&delegator).unwrap();
+        assert_eq!(acc.unbonding_stake, 200_000_000);
+        assert_eq!(acc.unbonding_unlock_height, 10 + state::UNBONDING_PERIOD);
+
+        let pool = state.validator_pools.get(&target.to_string()).unwrap();
+        assert_eq!(pool.total_delegated_stake, 300_000_000);
+        let remaining_shares = *state.delegator_shares.get(&target.to_string()).unwrap().get(&delegator.to_string()).unwrap();
+        assert_eq!(remaining_shares, 300_000_000);
+    }
+
+    #[test]
+    fn undelegate_rejects_amount_above_owned_value() {
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
+        state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
+
+        let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 500_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0).success);
+
+        let undelegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 999_999_999, vec![], 1, 10_000);
+        let receipt = execute_transaction(&mut state, &undelegate_tx, &validator, 10);
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn undelegate_rejects_while_unbonding_already_in_progress() {
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
+        state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
+
+        let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 500_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0).success);
+
+        let u1 = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 100_000_000, vec![], 1, 10_000);
+        assert!(execute_transaction(&mut state, &u1, &validator, 10).success);
+
+        let u2 = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 100_000_000, vec![], 2, 10_000);
+        let receipt = execute_transaction(&mut state, &u2, &validator, 11);
+        assert!(!receipt.success, "a second concurrent unbonding must be rejected, same as self-unstake");
+    }
+
+    #[test]
+    fn set_commission_rejects_above_max() {
+        let kp = KeyPair::generate();
+        let from = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&from, |acc| acc.balance = 1_000_000);
+
+        let over_max = MAX_COMMISSION_BPS + 1;
+        let tx = signed_tx(&kp, &from, TxType::SetCommission, None, 0, over_max.to_le_bytes().to_vec(), 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn set_commission_applies_before_any_delegation_and_is_read_back() {
+        let kp = KeyPair::generate();
+        let from = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&from, |acc| acc.balance = 1_000_000);
+
+        let tx = signed_tx(&kp, &from, TxType::SetCommission, None, 0, 2_500u16.to_le_bytes().to_vec(), 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx, &validator, 0).success);
+
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
+        state.update_account(&from, |acc| acc.staked += 100_000 * 1_000_000_000);
+
+        let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(from.clone()), 500_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0).success);
+
+        assert_eq!(state.validator_pools.get(&from.to_string()).unwrap().commission_bps, 2_500);
+    }
+
+    #[test]
+    fn credit_validator_reward_splits_by_stake_ratio_and_commission() {
+        let target_kp = KeyPair::generate();
+        let target = Address::from_public_key(&target_kp.public);
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+
+        let fee_validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        // Self-stake 100, delegated 300 -> 25%/75% split of the reward before commission.
+        state.update_account(&target, |acc| acc.staked = 100 * 1_000_000_000);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000_000);
+        let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 300 * 1_000_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0).success);
+        // Commission 10% (default) on the delegated 75% share.
+        let pool_before = state.validator_pools.get(&target.to_string()).unwrap().total_delegated_stake;
+        let validator_balance_before = state.get(&target).unwrap().balance;
+
+        credit_validator_reward(&mut state, &target, 1_000_000_000);
+
+        let self_share = 250_000_000u64; // 25% of 1e9
+        let delegated_share = 750_000_000u64; // 75%
+        let commission = delegated_share / 10; // 10% default commission
+        let pool_gain = delegated_share - commission;
+
+        assert_eq!(
+            state.get(&target).unwrap().balance,
+            validator_balance_before + self_share + commission
+        );
+        assert_eq!(
+            state.validator_pools.get(&target.to_string()).unwrap().total_delegated_stake,
+            pool_before + pool_gain
+        );
+    }
+
+    #[test]
+    fn credit_validator_reward_is_unchanged_when_no_pool_exists() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.update_account(&validator, |acc| acc.staked = 100_000 * 1_000_000_000);
+
+        credit_validator_reward(&mut state, &validator, 1_000_000_000);
+
+        assert_eq!(state.get(&validator).unwrap().balance, 1_000_000_000, "100% must go to the validator when it has no delegators");
+    }
+
+    #[test]
+    fn slash_reduces_delegation_pool_proportionally() {
+        let target_kp = KeyPair::generate();
+        let target = Address::from_public_key(&target_kp.public);
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+
+        let fee_validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000_000);
+        let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 100_000_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0).success);
+
+        let shares_before = *state.delegator_shares.get(&target.to_string()).unwrap().get(&delegator.to_string()).unwrap();
+
+        state.slash(&target, 500); // 5%, same fraction as real double-sign slashing
+
+        let pool = state.validator_pools.get(&target.to_string()).unwrap();
+        assert_eq!(pool.total_delegated_stake, 95_000_000_000, "pool value must drop by exactly 5%");
+        let shares_after = *state.delegator_shares.get(&target.to_string()).unwrap().get(&delegator.to_string()).unwrap();
+        assert_eq!(shares_after, shares_before, "shares outstanding must not change — only the pool's value per share does");
+        // Self-stake also slashed 5%, exactly as before delegation existed.
+        assert_eq!(state.get(&target).unwrap().staked, 100_000 * 1_000_000_000 * 95 / 100);
+    }
+
+    #[test]
+    fn stakers_counts_delegated_stake_toward_validator_set_eligibility() {
+        let target_kp = KeyPair::generate();
+        let target = Address::from_public_key(&target_kp.public);
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+
+        let fee_validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100_000 * 1_000_000_000;
+        // Below the minimum on self-stake alone.
+        state.update_account(&target, |acc| acc.staked = 10 * 1_000_000_000);
+        state.update_account(&delegator, |acc| acc.balance = 200_000 * 1_000_000_000_000);
+
+        assert!(state.stakers().is_empty(), "self-stake alone is below the minimum");
+
+        let delegate_tx = signed_tx(
+            &delegator_kp, &delegator, TxType::Delegate, Some(target.clone()),
+            200_000 * 1_000_000_000, vec![], 0, 10_000,
+        );
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0).success);
+
+        let stakers = state.stakers();
+        assert_eq!(stakers.len(), 1, "effective (self + delegated) stake now clears the minimum");
+        assert_eq!(stakers[0].0, target);
     }
 }

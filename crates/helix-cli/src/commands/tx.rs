@@ -62,6 +62,45 @@ pub enum TxCmd {
         #[arg(long)]
         nonce: Option<u64>,
     },
+    /// Delegate HLX to a validator's pool — earns a share of its block rewards without
+    /// running a node, but grants no governance voting power (self-stake for that instead)
+    Delegate {
+        /// Validator address to delegate to
+        validator: String,
+        /// Amount in HLX to delegate
+        amount: f64,
+        #[arg(short, long, default_value = "wallet.json")]
+        key: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
+        fee: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
+    /// Redeem a delegation's current HLX value (principal plus auto-compounded rewards,
+    /// minus any slashing) into the same 7-day unbonding queue self-staking uses
+    Undelegate {
+        /// Validator address to undelegate from
+        validator: String,
+        /// Amount in HLX to undelegate (its current value, not raw shares)
+        amount: f64,
+        #[arg(short, long, default_value = "wallet.json")]
+        key: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
+        fee: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
+    /// Set the commission rate this validator keeps from delegator rewards
+    SetCommission {
+        /// Commission in basis points (0-5000, i.e. 0%-50%)
+        bps: u16,
+        #[arg(short, long, default_value = "wallet.json")]
+        key: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
+        fee: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
     /// Check transaction status
     Status {
         /// Transaction hash
@@ -82,6 +121,15 @@ pub async fn run(cmd: TxCmd, node: &str) -> Result<()> {
         }
         TxCmd::ClaimUnbonded { key, fee, nonce } => {
             zero_amount_tx(TxType::ClaimUnbonded, key, fee, nonce, node).await
+        }
+        TxCmd::Delegate { validator, amount, key, fee, nonce } => {
+            targeted_amount_tx(TxType::Delegate, validator, amount, key, fee, nonce, node).await
+        }
+        TxCmd::Undelegate { validator, amount, key, fee, nonce } => {
+            targeted_amount_tx(TxType::Undelegate, validator, amount, key, fee, nonce, node).await
+        }
+        TxCmd::SetCommission { bps, key, fee, nonce } => {
+            set_commission(bps, key, fee, nonce, node).await
         }
         TxCmd::Status { hash } => tx_status(hash, node).await,
     }
@@ -220,6 +268,102 @@ async fn zero_amount_tx(
     };
     let signing_hash = tx.signing_hash();
     tx.signature = kp.sign(signing_hash.as_bytes())?;
+
+    submit_tx(&tx, node).await
+}
+
+/// Delegate / Undelegate — sends `amount_hlx` (the delegation amount, or its current value
+/// to redeem) to a named validator address.
+async fn targeted_amount_tx(
+    tx_type: TxType,
+    validator: String,
+    amount_hlx: f64,
+    key_path: PathBuf,
+    fee: u64,
+    nonce_override: Option<u64>,
+    node: &str,
+) -> Result<()> {
+    let kf = KeyFile::load(&key_path)?;
+    let kp = if kf.is_encrypted() {
+        let pass = rpassword_read("Wallet passphrase: ")?;
+        kf.to_keypair(Some(&pass))?
+    } else {
+        kf.to_keypair(None)?
+    };
+    let from = Address::from_str(&kf.address)
+        .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
+    let validator_addr = Address::from_str(&validator)
+        .map_err(|e| anyhow::anyhow!("Invalid validator address: {}", e))?;
+    let amount_nano = (amount_hlx * NANO_PER_HLX) as u64;
+    let nonce = match nonce_override {
+        Some(n) => n,
+        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+    };
+    let mut tx = Transaction {
+        version: 1,
+        tx_type,
+        from: from.clone(),
+        to: Some(validator_addr),
+        amount: amount_nano,
+        fee,
+        nonce,
+        data: vec![],
+        crypto_version: kp.scheme,
+        signature: Signature::from_bytes(vec![]),
+        public_key: kp.public.clone(),
+    };
+    let signing_hash = tx.signing_hash();
+    tx.signature = kp.sign(signing_hash.as_bytes())?;
+
+    println!("  From      : {}", kf.address);
+    println!("  Validator : {}", validator);
+    println!("  Amount    : {:.9} HLX", amount_hlx);
+    println!("  Fee       : {} nano-HLX", fee);
+    println!("  Nonce     : {}", nonce);
+
+    submit_tx(&tx, node).await
+}
+
+async fn set_commission(
+    bps: u16,
+    key_path: PathBuf,
+    fee: u64,
+    nonce_override: Option<u64>,
+    node: &str,
+) -> Result<()> {
+    let kf = KeyFile::load(&key_path)?;
+    let kp = if kf.is_encrypted() {
+        let pass = rpassword_read("Wallet passphrase: ")?;
+        kf.to_keypair(Some(&pass))?
+    } else {
+        kf.to_keypair(None)?
+    };
+    let from = Address::from_str(&kf.address)
+        .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
+    let nonce = match nonce_override {
+        Some(n) => n,
+        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+    };
+    let mut tx = Transaction {
+        version: 1,
+        tx_type: TxType::SetCommission,
+        from: from.clone(),
+        to: None,
+        amount: 0,
+        fee,
+        nonce,
+        data: bps.to_le_bytes().to_vec(),
+        crypto_version: kp.scheme,
+        signature: Signature::from_bytes(vec![]),
+        public_key: kp.public.clone(),
+    };
+    let signing_hash = tx.signing_hash();
+    tx.signature = kp.sign(signing_hash.as_bytes())?;
+
+    println!("  Validator  : {}", kf.address);
+    println!("  Commission : {} bps ({:.2}%)", bps, bps as f64 / 100.0);
+    println!("  Fee        : {} nano-HLX", fee);
+    println!("  Nonce      : {}", nonce);
 
     submit_tx(&tx, node).await
 }

@@ -386,19 +386,15 @@ address can vote once per proposal.
 
 ## Staking
 
-Staking in Helix has two distinct purposes, and it's worth being precise about which one you
-actually want:
+Staking in Helix serves three distinct purposes — pick the one you actually want, they're not
+mutually exclusive:
 
-- **Run a validator** — actively produce blocks and earn from it. Requires staking *and*
-  running a node with that same key.
-- **Vote in governance** — influence protocol parameters proportionally to your stake.
-  Requires only staking; no node needed.
-
-There is currently no third option — no delegated staking, and no passive yield for simply
-holding a stake without running a node. If you stake without running a node, you still get
-governance voting power, and you may occasionally be assigned a block-proposer turn you can
-never fulfill (harmless: the round just times out and hands off to the next validator after
-a few seconds) — but you earn nothing from it.
+- **Run a validator** (self-stake + a node) — actively produce blocks, earn from it, and get
+  governance voting power.
+- **Delegate to a validator** — earn a share of *its* block rewards, proportional to your
+  delegation, without running anything yourself. No governance voting power.
+- **Self-stake without running a node** — governance voting power only, no yield (you're not
+  producing blocks, so there's nothing to earn a share of).
 
 ### Staking as a Node Operator (Validator)
 
@@ -410,12 +406,14 @@ a few seconds) — but you earn nothing from it.
    hlx tx stake 100000 --key validator-key.bin
    ```
 3. **Wait for the next epoch rotation** (every 100 blocks — at most a few minutes at the 2s
-   block time). The validator set is rebuilt from every account meeting the minimum stake;
-   once included, your node starts getting round-robin proposer turns.
-4. **Earn**: every block you produce mints you 50% of that block's transaction fees (the
-   other 50% is burned) plus a fixed block reward (starts at 1 HLX, halves yearly — see
-   [Token Economics](#token-economics)) — paid even on empty blocks, so income isn't purely
-   fee-dependent.
+   block time). The validator set is rebuilt from every account meeting the minimum stake —
+   counting both self-stake and anything delegated to it (see below) — once included, your
+   node starts getting round-robin proposer turns.
+4. **Earn**: every block you produce mints you a share of that block's transaction fees (50%
+   of each fee; the other 50% is burned) plus a fixed block reward (starts at 1 HLX, halves
+   yearly — see [Token Economics](#token-economics)), paid even on empty blocks. If you have
+   delegators, your share is proportional to your self-stake versus their delegated total,
+   plus a commission cut of theirs (see below) — with none, you keep 100% exactly as before.
 5. **Unstaking**: `hlx tx unstake <amount> --key validator-key.bin` moves stake into a
    7-day unbonding period (still slashable during this window) before it's claimable:
    ```bash
@@ -426,14 +424,61 @@ a few seconds) — but you earn nothing from it.
    You can't unstake below the minimum if you're currently the *only* account meeting it —
    that would empty the validator set and halt the chain, so it's rejected outright rather
    than allowed and left to fail later.
+6. **Set your commission** (optional, before or after you have delegators):
+   ```bash
+   hlx tx set-commission 1000 --key validator-key.bin   # 1000 bps = 10% (the default)
+   ```
+   Capped at 5000 bps (50%) — not to stop you from legitimately charging more, but to bound
+   the "advertise a low rate, raise it once delegators are locked in" rug-pull: even a
+   maximally hostile change can never claim more than half of what delegators earn.
 
 **Slashing risk:** double-signing (proposing or voting for two different blocks at the same
-height/round) burns 5% of the offending validator's stake and jails them from BFT rounds
-immediately — not just at the next epoch. Run one node per key. Ever.
+height/round) burns 5% of your stake *and* 5% of your delegators' pooled stake, and jails you
+from BFT rounds immediately — not just at the next epoch. Run one node per key. Ever.
 
-### Staking as a Regular User
+### Delegating to a Validator
 
-If you just want a say in governance without operating infrastructure:
+Earn a share of a validator's block rewards without running any infrastructure:
+
+```bash
+hlx tx delegate hlxValidatorAddress... 100 --key alice.json    # delegate 100 HLX
+hlx validator show hlxValidatorAddress...                       # see the pool: delegated
+                                                                  # total, commission, effective stake
+hlx account alice_address                                       # see your own position's
+                                                                  # current value, under "Delegations"
+```
+
+Delegation uses a share-pool model (the same one Cosmos SDK and liquid-staking protocols like
+Lido use): you receive pool shares priced at the pool's current value per share, and every
+reward the validator earns adds directly to the pool's total value — instantly making every
+existing share worth more, with no separate "claim rewards" step. Your position **auto-
+compounds** for free; check its current value any time with `hlx account`.
+
+```bash
+hlx tx undelegate hlxValidatorAddress... 50 --key alice.json   # redeem 50 HLX of current value
+# ... 7 days later (same unbonding queue as self-staking) ...
+hlx tx claim-unbonded --key alice.json
+```
+
+`undelegate`'s amount is the HLX value you want back (principal plus whatever compounded, or
+minus anything lost to a slash since you delegated), not raw shares — the CLI/executor
+convert internally. A few things worth knowing:
+
+- **No governance power.** Delegating moves your economic exposure to the validator's
+  performance, not your vote — governance weight stays tied to your own `hlx tx stake`
+  balance only (see [Governance](#governance)). Want both? Self-stake for the vote, delegate
+  separately (to any validator, including a different one) for the yield.
+- **You share slashing risk.** If the validator you delegated to double-signs, your pool
+  value drops by the same 5% its own self-stake does — this is deliberate, not a bug: it's
+  what gives delegators a real reason to pick a reliable validator instead of just the lowest
+  commission rate.
+- **Only one unbonding slot at a time**, same as self-staking — claim a pending unbonding
+  before starting another (whether from undelegating or unstaking).
+
+### Self-Staking Without a Node (Governance Only)
+
+If you just want a say in governance without operating infrastructure or picking a validator
+to trust:
 
 ```bash
 hlx tx stake 100 --key alice.json     # any amount above 0 grants voting power
@@ -441,7 +486,8 @@ hlx tx stake 100 --key alice.json     # any amount above 0 grants voting power
 
 Your voting weight in `hlx governance vote` is exactly your staked balance. Unstaking and
 claiming work identically to the validator flow above (same 7-day unbonding window, same
-commands) — running a node was never required for this path.
+commands). This path earns nothing — for yield without running a node, delegate instead (see
+above).
 
 ---
 
@@ -559,6 +605,8 @@ Base URL: `http://127.0.0.1:8545` (or wherever you've bound/proxied it — see `
 | GET | `/accounts/:address/guardians` | Social-recovery guardian set |
 | GET | `/accounts/:address/recovery` | Pending/active recovery status |
 | GET | `/accounts/:address/transactions` | Transaction history (`?limit=&offset=`) |
+| GET | `/accounts/:address/delegations` | This account's delegations across validators, with current value |
+| GET | `/validators/:address/pool` | A validator's delegation pool — delegated stake, commission, effective stake |
 | GET | `/names/:name` | Resolve name to address |
 | GET | `/governance/params` | Current runtime-adjustable protocol parameters |
 | GET | `/governance/proposals` | All proposals (`?limit=&offset=`) |

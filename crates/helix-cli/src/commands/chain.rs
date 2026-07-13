@@ -74,5 +74,18 @@ pub async fn show_account(address: &str, node: &str) -> Result<()> {
         println!("  Unbonding: {} HLX (unlocks at block #{})", unbonding, res["unbonding_unlock_height"]);
     }
     println!("  Nonce    : {}", res["nonce"]);
+
+    let delegations: serde_json::Value = reqwest::get(format!("{}/accounts/{}/delegations", node, address))
+        .await?
+        .json()
+        .await?;
+    if let Some(list) = delegations["delegations"].as_array() {
+        if !list.is_empty() {
+            println!("  Delegations:");
+            for d in list {
+                println!("    → {} : {} HLX", d["validator"].as_str().unwrap_or("?"), d["value_hlx"]);
+            }
+        }
+    }
     Ok(())
 }

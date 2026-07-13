@@ -67,6 +67,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::governance::GovernanceCmd,
     },
+    /// Validator delegation pool info
+    Validator {
+        #[command(subcommand)]
+        action: commands::validator::ValidatorCmd,
+    },
 }
 
 #[tokio::main]
@@ -84,5 +89,6 @@ async fn main() -> Result<()> {
         Commands::Recovery { action } => commands::recovery::run(action, &node).await,
         Commands::Contract { action } => commands::contract::run(action, &node).await,
         Commands::Governance { action } => commands::governance::run(action, &node).await,
+        Commands::Validator { action } => commands::validator::run(action, &node).await,
     }
 }
