@@ -339,12 +339,27 @@ async fn get_governance_params(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn get_governance_proposals(State(state): State<AppState>) -> Json<Value> {
+const DEFAULT_PROPOSALS_LIMIT: u64 = 50;
+const MAX_PROPOSALS_LIMIT: u64 = 200;
+
+/// `GET /governance/proposals?limit=<n>&offset=<n>` — proposals are never pruned
+/// (they're the permanent governance record, like blocks), so without pagination
+/// this response grows unbounded as proposals accumulate over the chain's
+/// lifetime. Same `limit`/`offset` convention as `/accounts/{address}/transactions`.
+async fn get_governance_proposals(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, u64>>,
+) -> Json<Value> {
+    let limit = params.get("limit").copied().unwrap_or(DEFAULT_PROPOSALS_LIMIT).min(MAX_PROPOSALS_LIMIT);
+    let offset = params.get("offset").copied().unwrap_or(0);
+
     let chain = state.chain_state.read().await;
     let mut proposals: Vec<GovernanceProposalResponse> =
         chain.proposals.values().map(GovernanceProposalResponse::from).collect();
     proposals.sort_by_key(|p| p.id);
-    Json(json!({ "proposals": proposals }))
+    let page: Vec<GovernanceProposalResponse> =
+        proposals.into_iter().skip(offset as usize).take(limit as usize).collect();
+    Json(json!({ "proposals": page }))
 }
 
 async fn get_governance_proposal(
@@ -847,5 +862,65 @@ mod tests {
 
         let response = get_sync_blocks(State(state), Query(params)).await;
         assert_eq!(response.into_response().status(), StatusCode::OK);
+    }
+
+    fn dummy_proposal(id: u64) -> helix_executor::governance::GovernanceProposal {
+        helix_executor::governance::GovernanceProposal {
+            id,
+            proposer: addr(1).to_string(),
+            param: helix_executor::governance::GovernanceParam::FuelPerFeeUnit,
+            new_value: 2,
+            created_at_height: 0,
+            voters: Default::default(),
+            yes_stake: 0,
+            total_staked_at_creation: 0,
+            executed: false,
+        }
+    }
+
+    /// Proposals are never pruned (permanent governance record), so the endpoint
+    /// must paginate instead of returning the whole set. Regression test for CTO
+    /// backlog item 40.
+    #[tokio::test]
+    async fn get_governance_proposals_paginates_and_defaults() {
+        let state = fresh_test_state();
+        {
+            let mut chain = state.chain_state.write().await;
+            for id in 0..5 {
+                chain.set_proposal(dummy_proposal(id));
+            }
+        }
+
+        let response = get_governance_proposals(State(state.clone()), Query(Default::default())).await;
+        let body: Value = serde_json::from_str(
+            &String::from_utf8(
+                axum::body::to_bytes(response.into_response().into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["proposals"].as_array().unwrap().len(), 5);
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("limit".to_string(), 2u64);
+        params.insert("offset".to_string(), 3u64);
+        let response = get_governance_proposals(State(state), Query(params)).await;
+        let body: Value = serde_json::from_str(
+            &String::from_utf8(
+                axum::body::to_bytes(response.into_response().into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let page = body["proposals"].as_array().unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0]["id"], 3);
+        assert_eq!(page[1]["id"], 4);
     }
 }
