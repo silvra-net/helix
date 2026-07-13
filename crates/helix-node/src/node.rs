@@ -27,15 +27,16 @@ use crate::config::{self, NodeConfig};
 /// Load the validator keypair from disk, or generate + persist a new one for
 /// `scheme_for_new` (the scheme to use only if no key file exists yet).
 ///
-/// File format is `[scheme tag: 1 byte][secret key][public key]`, which lets a
-/// validator migrate to a new PQC scheme (see `helix_crypto::CryptoScheme`) by
-/// setting `HELIX_VALIDATOR_CRYPTO_SCHEME=sphincs-plus` and regenerating the key —
-/// blocks/votes it already signed under the old scheme stay verifiable forever
-/// since each one carries its own `crypto_version` tag.
+/// File format is the unified KeyFile JSON format shared with `hlx wallet` (see
+/// `helix_crypto::keyfile`). A validator migrates to a new PQC scheme (see
+/// `helix_crypto::CryptoScheme`) by setting `HELIX_VALIDATOR_CRYPTO_SCHEME=sphincs-plus`
+/// and regenerating the key — blocks/votes it already signed under the old scheme stay
+/// verifiable forever since each one carries its own `crypto_version` tag.
 ///
-/// Pre-migration key files (raw ML-DSA `secret key || public key`, no tag byte)
-/// are still read correctly: their length exactly matches the untagged legacy
-/// size, which no valid tagged file can produce.
+/// Support for the pre-2026-07-05 raw-bytes format (`[scheme tag][secret][public]`,
+/// or untagged legacy ML-DSA `secret || public`) was removed once no known key file
+/// still used it — convert an old file first with `hlx wallet import-node-key`.
+///
 /// Passphrase used to decrypt an encrypted `validator-key.bin` (KeyFile format with
 /// `encryption = "aes256gcm-argon2id"`, e.g. produced by `hlx wallet encrypt`). There
 /// is no interactive prompt at node startup, so this is the only way to unlock one.
@@ -53,44 +54,19 @@ fn load_or_create_keypair_with(
     if path.exists() {
         let data = std::fs::read(path)?;
 
-        // Bevorzugt: vereinheitlichtes KeyFile-JSON-Format (seit 2026-07-05, dasselbe
-        // Format wie `hlx wallet` — kein separates Node-Rohformat mehr nötig, siehe
-        // helix-crypto::keyfile). Fallback darunter: legacy Rohformat für bereits
-        // bestehende validator-key.bin-Dateien, die noch im alten Format sind.
-        if let Ok(text) = std::str::from_utf8(&data) {
-            if let Ok(kf) = KeyFile::from_json_str(text) {
-                let kp = kf
-                    .to_keypair(passphrase.as_deref())
-                    .map_err(|e| anyhow::anyhow!("Invalid key in {}: {}", path.display(), e))?;
-                info!("Loaded persistent validator keypair ({:?}) from {} (KeyFile format)", kp.scheme, path.display());
-                return Ok(kp);
-            }
-        }
-
-        let legacy_len = CryptoScheme::MlDsa.secret_key_len() + CryptoScheme::MlDsa.public_key_len();
-        let (scheme, sk_bytes, pk_bytes) = if data.len() == legacy_len {
-            let sk_len = CryptoScheme::MlDsa.secret_key_len();
-            (CryptoScheme::MlDsa, data[..sk_len].to_vec(), data[sk_len..].to_vec())
-        } else {
-            if data.is_empty() {
-                anyhow::bail!("Validator key file is empty");
-            }
-            let scheme = CryptoScheme::from_tag(data[0])
-                .map_err(|e| anyhow::anyhow!("Validator key file: {e}"))?;
-            let sk_len = scheme.secret_key_len();
-            let pk_len = scheme.public_key_len();
-            if data.len() != 1 + sk_len + pk_len {
-                anyhow::bail!(
-                    "Validator key file has unexpected size ({} bytes, expected {})",
-                    data.len(), 1 + sk_len + pk_len
-                );
-            }
-            (scheme, data[1..1 + sk_len].to_vec(), data[1 + sk_len..].to_vec())
-        };
-
-        let kp = KeyPair::from_raw(scheme, sk_bytes, pk_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid key in validator key file: {e}"))?;
-        info!("Loaded persistent validator keypair ({:?}) from {} (legacy raw format)", scheme, path.display());
+        let text = std::str::from_utf8(&data).map_err(|_| {
+            anyhow::anyhow!(
+                "Validator key file {} is not valid KeyFile JSON (old raw-format key files are no longer supported — convert with `hlx wallet import-node-key --from {} --output {}`)",
+                path.display(), path.display(), path.display()
+            )
+        })?;
+        let kf = KeyFile::from_json_str(text).map_err(|e| {
+            anyhow::anyhow!("Invalid key file {}: {}", path.display(), e)
+        })?;
+        let kp = kf
+            .to_keypair(passphrase.as_deref())
+            .map_err(|e| anyhow::anyhow!("Invalid key in {}: {}", path.display(), e))?;
+        info!("Loaded persistent validator keypair ({:?}) from {} (KeyFile format)", kp.scheme, path.display());
         Ok(kp)
     } else {
         let kp = KeyPair::generate_for(scheme_for_new);
@@ -126,17 +102,18 @@ mod keypair_file_tests {
     }
 
     #[test]
-    fn reads_pre_migration_legacy_format_as_ml_dsa() {
-        let path = std::env::temp_dir().join(format!("helix-test-legacy-key-{}.bin", std::process::id()));
+    fn rejects_a_raw_non_json_key_file_with_a_helpful_error() {
+        let path = std::env::temp_dir().join(format!("helix-test-raw-key-{}.bin", std::process::id()));
         let kp = KeyPair::generate();
-        // Legacy format: no scheme tag byte, just sk || pk.
+        // Old raw format: no longer accepted — must be converted first.
         let mut data = kp.secret.as_bytes().to_vec();
         data.extend_from_slice(kp.public.as_bytes());
         std::fs::write(&path, &data).unwrap();
 
-        let loaded = load_or_create_keypair(&path, CryptoScheme::SphincsPlus).unwrap();
-        assert_eq!(loaded.scheme, CryptoScheme::MlDsa);
-        assert_eq!(loaded.public.as_bytes(), kp.public.as_bytes());
+        match load_or_create_keypair(&path, CryptoScheme::SphincsPlus) {
+            Err(e) => assert!(e.to_string().contains("import-node-key"), "error should point at the migration path: {e}"),
+            Ok(_) => panic!("expected loading a raw non-JSON key file to fail"),
+        }
 
         std::fs::remove_file(&path).unwrap();
     }

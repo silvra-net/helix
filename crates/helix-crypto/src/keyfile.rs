@@ -33,8 +33,10 @@ fn scheme_from_algo(algo: &str) -> Result<CryptoScheme> {
 /// Unified on-disk key format — used by both the `hlx` CLI (wallets) and `helix-node`
 /// (validator identity). Supports plaintext (devnet) and passphrase-encrypted (mainnet)
 /// storage. Moved here from `helix-cli` (2026-07-05) so node and CLI share one format
-/// instead of the node using a separate raw-bytes file — see `helix-node`'s
-/// `load_or_create_keypair` for the (still supported) legacy raw-format fallback.
+/// instead of the node using a separate raw-bytes file. The node's old raw-bytes
+/// fallback (pre-2026-07-05 key files) was removed on 2026-07-13 once no known key
+/// file still used it — `hlx wallet import-node-key` (`WalletCmd::ImportNodeKey` in
+/// helix-cli) still knows how to convert an old file to this format if one turns up.
 #[derive(Serialize, Deserialize)]
 pub struct KeyFile {
     pub address: String,
