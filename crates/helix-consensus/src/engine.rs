@@ -615,6 +615,53 @@ mod tests {
         assert_eq!(engine.current_height(), 1);
     }
 
+    /// Regression test for a real (if self-healing) inefficiency found by running
+    /// a multi-node local testnet: a faster peer's precommit routinely arrives
+    /// before this node's own round has reached precommit phase, since votes and
+    /// phase transitions race independently across a real network. That must not
+    /// be rejected — it should count toward quorum once this node catches up to
+    /// precommit phase itself, without needing the peer to resend anything.
+    #[test]
+    fn a_precommit_that_arrives_before_prevote_quorum_is_buffered_and_counted() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 0);
+
+        let err = engine
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        assert!(matches!(err, ConsensusError::AwaitingVotes { height: 1, round: 0 }));
+        engine.take_outbound_votes();
+        let block_hash = engine.pending_proposal().unwrap().hash();
+
+        // a's precommit arrives while this engine is still in Prevote phase (only
+        // self's own prevote has been cast so far). Before this fix, this was
+        // ConsensusError::InvalidVote { "precommit received in phase Prevote" }.
+        let precommit_a = peer_vote(&v.a_kp, VoteType::Precommit, 1, 0, block_hash.clone());
+        assert_eq!(
+            engine.add_vote(&v.self_kp, precommit_a).unwrap(),
+            None,
+            "an early precommit must be buffered, not rejected"
+        );
+
+        // Two more prevotes reach prevote quorum (self + a + b = 3 of 4), which
+        // must replay the buffered precommit (a) and cast this engine's own —
+        // 2 of the 3 precommits needed for quorum, without a or self resending.
+        let prevote_a = peer_vote(&v.a_kp, VoteType::Prevote, 1, 0, block_hash.clone());
+        assert_eq!(engine.add_vote(&v.self_kp, prevote_a).unwrap(), None);
+        let prevote_b = peer_vote(&v.b_kp, VoteType::Prevote, 1, 0, block_hash.clone());
+        assert_eq!(engine.add_vote(&v.self_kp, prevote_b).unwrap(), None);
+        assert!(!engine.is_finalized(&block_hash), "only 2 of 4 precommits so far");
+
+        // b's precommit is the third (a[buffered] + self + b) — quorum, finalized.
+        let precommit_b = peer_vote(&v.b_kp, VoteType::Precommit, 1, 0, block_hash.clone());
+        let finalized = engine.add_vote(&v.self_kp, precommit_b).unwrap();
+        assert_eq!(
+            finalized.expect("a's buffered precommit must count toward quorum").hash(),
+            block_hash
+        );
+        assert!(engine.is_finalized(&block_hash));
+    }
+
     #[test]
     fn add_vote_without_active_round_errors() {
         let v = four_validators();
