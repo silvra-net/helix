@@ -13,6 +13,7 @@ helix-storage.workspace = true
 helix-mempool.workspace = true
 helix-executor.workspace = true
 helix-identity.workspace = true
+helix-p2p.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

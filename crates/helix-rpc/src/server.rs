@@ -13,9 +13,10 @@ use helix_core::{Block, Transaction};
 use helix_crypto::{Address, Hash};
 use helix_executor::state::ChainState;
 use helix_mempool::Mempool;
+use helix_p2p::P2PCommand;
 use helix_storage::{db::HelixDb, BlockStore};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
@@ -33,6 +34,13 @@ pub struct AppState {
     pub chain_state: Arc<RwLock<ChainState>>,
     pub node_address: String,
     pub peer_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Used to gossip an RPC-submitted transaction to the rest of the network. Without
+    /// this, a transaction submitted to a node that never proposes a block itself (any
+    /// non-genesis validator, or a pure full node) would sit in that node's local
+    /// mempool forever — found by actually running a multi-node local testnet, not by
+    /// any single-node unit/integration test, since a lone node is always its own
+    /// proposer and never needed this path.
+    pub p2p_command_tx: mpsc::Sender<P2PCommand>,
 }
 
 /// Explicit request-body cap for `POST /transactions`, well above any plausible signed
@@ -589,11 +597,20 @@ async fn submit_transaction(
 ) -> impl IntoResponse {
     let tx_hash = tx.hash().to_hex();
     let mut mempool = state.mempool.write().await;
-    match mempool.add(tx) {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(json!({ "tx_hash": tx_hash, "status": "accepted" })),
-        ),
+    let result = mempool.add(tx.clone());
+    drop(mempool);
+    match result {
+        Ok(()) => {
+            // Gossip to the rest of the network — this node may never propose a block
+            // itself (see AppState::p2p_command_tx's doc comment). Best-effort: a full
+            // outbound command channel shouldn't fail the client's submission, since the
+            // tx is already safely in our own mempool either way.
+            let _ = state.p2p_command_tx.try_send(P2PCommand::BroadcastTransaction(tx));
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "tx_hash": tx_hash, "status": "accepted" })),
+            )
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": e.to_string() })),
@@ -605,7 +622,7 @@ async fn submit_transaction(
 mod tests {
     use super::*;
     use helix_core::{Block, BlockHeader, CryptoVersion, TxType};
-    use helix_crypto::{Hash, PublicKey, Signature};
+    use helix_crypto::{Hash, KeyPair, PublicKey, Signature};
 
     fn addr(seed: u8) -> Address {
         Address::from_public_key(&PublicKey::from_bytes(vec![seed; 8]))
@@ -686,12 +703,14 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let store = HelixDb::open(&path).unwrap();
+        let (p2p_command_tx, _p2p_command_rx) = mpsc::channel(8);
         let state = AppState {
             store: Arc::new(RwLock::new(store)),
             mempool: Arc::new(RwLock::new(Mempool::new())),
             chain_state: Arc::new(RwLock::new(ChainState::new(0))),
             node_address: String::new(),
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            p2p_command_tx,
         };
         (state, path)
     }
@@ -820,6 +839,47 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// Regression test for a bug found by actually running a multi-node local testnet
+    /// (not by any single-node test): `submit_transaction` used to only add the tx to
+    /// this node's own local mempool, with no P2P broadcast — fine for a lone node
+    /// (always its own proposer) but silently swallows every transaction submitted to
+    /// any node that isn't the current block producer on a real multi-validator network.
+    #[tokio::test]
+    async fn submit_transaction_broadcasts_to_the_p2p_network() {
+        // fresh_app_state()'s own receiver is dropped at the end of that function, so
+        // this test needs its own channel to actually observe what gets sent.
+        let (state, path) = fresh_app_state();
+        let (p2p_command_tx, mut p2p_command_rx) = mpsc::channel(8);
+        let state = AppState { p2p_command_tx, ..state };
+
+        // Mempool::add() verifies the signature before admitting a tx (see its own doc
+        // comment on why that ordering matters) — the addr()/tx() helpers used elsewhere
+        // in this file build unsigned fixtures, which is fine for tests that only ever
+        // touch storage/state directly, but not here.
+        let keypair = KeyPair::generate();
+        let alice = Address::from_public_key(&keypair.public);
+        let bob = addr(2);
+        let mut submitted = Transaction {
+            fee: 1_000, // clears Mempool::DEFAULT_MIN_FEE
+            public_key: keypair.public.clone(),
+            ..tx(&alice, &bob, 1, 0)
+        };
+        submitted.signature = keypair.sign(submitted.signing_hash().as_bytes()).unwrap();
+        let expected_hash = submitted.hash();
+
+        let response = submit_transaction(State(state), Json(submitted)).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        match p2p_command_rx.try_recv() {
+            Ok(P2PCommand::BroadcastTransaction(broadcast)) => {
+                assert_eq!(broadcast.hash(), expected_hash);
+            }
+            other => panic!("expected a BroadcastTransaction command, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn fresh_test_state() -> AppState {
         let path = std::env::temp_dir().join(format!(
             "helix-rpc-test-store-{}-{}.redb",
@@ -831,12 +891,14 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let store = HelixDb::open(&path).unwrap();
+        let (p2p_command_tx, _p2p_command_rx) = mpsc::channel(8);
         AppState {
             store: Arc::new(RwLock::new(store)),
             mempool: Arc::new(RwLock::new(Mempool::new())),
             chain_state: Arc::new(RwLock::new(ChainState::new(0))),
             node_address: "test-node".to_string(),
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            p2p_command_tx,
         }
     }
 

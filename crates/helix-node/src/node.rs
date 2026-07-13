@@ -340,6 +340,7 @@ impl HelixNode {
             chain_state: self.chain_state.clone(),
             node_address: self.address.to_string(),
             peer_count: peer_count.clone(),
+            p2p_command_tx: self.p2p_command_tx.clone(),
         };
 
         // Spawn RPC server
