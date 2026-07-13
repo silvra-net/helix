@@ -69,6 +69,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/accounts/:address/guardians", get(get_account_guardians))
         .route("/accounts/:address/recovery", get(get_account_recovery))
         .route("/accounts/:address/delegations", get(get_account_delegations))
+        .route("/accounts/:address/storage/:key_hex", get(get_contract_storage))
         .route("/validators/:address/pool", get(get_validator_pool))
         .route(
             "/accounts/:address/transactions",
@@ -120,6 +121,7 @@ async fn root() -> Json<Value> {
             "GET  /accounts/{address}/recovery",
             "GET  /accounts/{address}/transactions",
             "GET  /accounts/{address}/delegations",
+            "GET  /accounts/{address}/storage/{key_hex}",
             "GET  /validators/{address}/pool",
             "GET  /names/{name}",
             "GET  /governance/params",
@@ -618,6 +620,52 @@ async fn get_account_delegations(
         StatusCode::OK,
         Json(json!({ "address": address_str, "delegations": delegations })),
     )
+}
+
+/// `GET /accounts/:address/storage/:key_hex` — reads one key out of a deployed contract's
+/// own storage (see `ChainState.contract_storage`'s doc comment). Debugging/exploration
+/// endpoint, not something a wallet needs — a contract's storage schema is entirely up to
+/// its own bytecode, so this just exposes the raw key/value bytes hex-encoded rather than
+/// trying to guess a structure. The key is hex rather than a literal path segment because
+/// storage keys are arbitrary bytes (up to `helix_vm::MAX_KEY_LEN`), not necessarily valid
+/// UTF-8 or URL-safe text.
+async fn get_contract_storage(
+    State(state): State<AppState>,
+    Path((address_str, key_hex)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let address = match Address::from_str(&address_str) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid address format" })),
+            )
+        }
+    };
+    let key = match hex::decode(&key_hex) {
+        Ok(k) => k,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "key must be hex-encoded" })),
+            )
+        }
+    };
+    let chain = state.chain_state.read().await;
+    match chain.contract_storage_read(&address, &key) {
+        Some(value) => (
+            StatusCode::OK,
+            Json(json!({
+                "address": address_str,
+                "key_hex": key_hex,
+                "value_hex": hex::encode(&value),
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no contract storage entry for this address/key" })),
+        ),
+    }
 }
 
 /// Builds the RPC-facing history entry for one transaction from the block it's in.
@@ -1223,5 +1271,57 @@ mod tests {
         assert_eq!(page.len(), 2);
         assert_eq!(page[0]["id"], 3);
         assert_eq!(page[1]["id"], 4);
+    }
+
+    #[tokio::test]
+    async fn get_contract_storage_finds_a_written_key() {
+        let (state, path) = fresh_app_state();
+        let contract = addr(1);
+        {
+            let mut chain = state.chain_state.write().await;
+            chain.contract_storage_write(&contract, b"greeting".to_vec(), b"hello".to_vec());
+        }
+
+        let response = get_contract_storage(
+            State(state),
+            Path((contract.to_string(), hex::encode(b"greeting"))),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["value_hex"], hex::encode(b"hello"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn get_contract_storage_404s_for_an_unwritten_key() {
+        let (state, path) = fresh_app_state();
+        let contract = addr(1);
+
+        let response = get_contract_storage(
+            State(state),
+            Path((contract.to_string(), hex::encode(b"never-written"))),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn get_contract_storage_rejects_non_hex_key() {
+        let (state, path) = fresh_app_state();
+        let contract = addr(1);
+
+        let response = get_contract_storage(State(state), Path((contract.to_string(), "not-hex!!".to_string())))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

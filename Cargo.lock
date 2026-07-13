@@ -1242,6 +1242,7 @@ dependencies = [
  "helix-mempool",
  "helix-p2p",
  "helix-storage",
+ "hex",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

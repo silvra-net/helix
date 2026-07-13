@@ -30,6 +30,11 @@ const VALIDATOR_POOLS: TableDefinition<&str, &[u8]> = TableDefinition::new("vali
 /// per-validator delegator map stored as one blob, same "one blob per outer key" shape as
 /// `GUARDIANS`/`RECOVERY_REQUESTS` rather than a multimap keyed by (validator, delegator).
 const DELEGATOR_SHARES: TableDefinition<&str, &[u8]> = TableDefinition::new("delegator_shares");
+/// contract address string → bincode(`HashMap<key_bytes, value_bytes>`) — the whole
+/// per-contract storage map stored as one blob, same "one blob per outer key" shape as
+/// `DELEGATOR_SHARES`. Without this table, `ChainState.contract_storage` would silently
+/// reset to empty on every node restart, wiping every deployed contract's state.
+const CONTRACT_STORAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("contract_storage");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// address string → (block height, tx index within block), both big-endian so a
 /// key's values sort in ascending chain order for free. Lets `address_transactions`
@@ -72,6 +77,7 @@ impl HelixDb {
         tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -96,6 +102,7 @@ impl HelixDb {
             let mut personhood_authorities = tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut validator_pools = tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut delegator_shares = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut contract_storage = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
             for (addr, account) in &state.accounts {
@@ -178,6 +185,12 @@ impl HelixDb {
                 delegator_shares.insert(addr.as_str(), encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            for (addr, storage) in &state.contract_storage {
+                let encoded = bincode::serialize(storage)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                contract_storage.insert(addr.as_str(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
         }
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))
     }
@@ -196,6 +209,7 @@ impl HelixDb {
         let personhood_authorities_table = tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
         let validator_pools_table = tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
         let delegator_shares_table = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
+        let contract_storage_table = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
         let mut accounts = std::collections::HashMap::new();
@@ -301,6 +315,15 @@ impl HelixDb {
             delegator_shares.insert(k.value().to_string(), shares);
         }
 
+        let mut contract_storage = std::collections::HashMap::new();
+        let mut contract_storage_iter = contract_storage_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = contract_storage_iter.next() {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let storage = bincode::deserialize(v.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            contract_storage.insert(k.value().to_string(), storage);
+        }
+
         let read_meta_u64 = |key: &str| -> Option<u64> {
             meta_table.get(key).ok().flatten().and_then(|v| {
                 let bytes: [u8; 8] = v.value().try_into().ok()?;
@@ -337,6 +360,7 @@ impl HelixDb {
             personhood_authorities,
             validator_pools,
             delegator_shares,
+            contract_storage,
         })
     }
 
@@ -583,6 +607,9 @@ mod tests {
             let mut delegators = std::collections::HashMap::new();
             delegators.insert(addr(9).to_string(), 500u64);
             state.delegator_shares.insert(validator.to_string(), delegators);
+            let mut contract_kv = std::collections::HashMap::new();
+            contract_kv.insert(b"greeting".to_vec(), b"hello".to_vec());
+            state.contract_storage.insert(validator.to_string(), contract_kv);
             db.save_chain_state(&state).unwrap();
         }
 
@@ -618,6 +645,13 @@ mod tests {
         assert_eq!(
             loaded.delegator_shares.get(&validator.to_string()).unwrap().get(&addr(9).to_string()),
             Some(&500u64)
+        );
+        // Deployed contract storage must also survive a restart — otherwise every
+        // contract's on-chain state would silently reset to empty the moment a node
+        // restarts, even though its code and balance would not.
+        assert_eq!(
+            loaded.contract_storage.get(&validator.to_string()).unwrap().get(b"greeting".as_slice()),
+            Some(&b"hello".to_vec())
         );
 
         let _ = std::fs::remove_file(&path);

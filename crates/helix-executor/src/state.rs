@@ -202,6 +202,14 @@ pub struct ChainState {
     /// grow large per popular validator and is only read/written on delegate/undelegate.
     #[serde(default)]
     pub delegator_shares: HashMap<String, HashMap<String, u64>>,
+    /// Per-contract persistent key-value storage: contract address string -> {key -> value}.
+    /// Written only via `TxType::CallContract`'s `storage_write` host call (see
+    /// `helix_vm::HostContext`) — a contract can only ever read/write its *own* entry here
+    /// (there is no cross-contract call yet, so there is no way for one contract's execution
+    /// to even name another contract's storage). Absent entry = this contract has never
+    /// written anything, not an error.
+    #[serde(default)]
+    pub contract_storage: HashMap<String, HashMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl ChainState {
@@ -224,7 +232,18 @@ impl ChainState {
             personhood_authorities: Vec::new(),
             validator_pools: HashMap::new(),
             delegator_shares: HashMap::new(),
+            contract_storage: HashMap::new(),
         }
+    }
+
+    /// Read a value from `contract`'s own persistent storage. `None` if never set.
+    pub fn contract_storage_read(&self, contract: &Address, key: &[u8]) -> Option<Vec<u8>> {
+        self.contract_storage.get(&contract.to_string())?.get(key).cloned()
+    }
+
+    /// Write a value into `contract`'s own persistent storage.
+    pub fn contract_storage_write(&mut self, contract: &Address, key: Vec<u8>, value: Vec<u8>) {
+        self.contract_storage.entry(contract.to_string()).or_default().insert(key, value);
     }
 
     pub fn get(&self, address: &Address) -> Option<&AccountState> {
@@ -506,6 +525,9 @@ impl ChainState {
             // Nested HashMap -> HashMap, same non-determinism problem as everything else
             // here — flattened to a sorted map of maps rather than hashed as-is.
             delegator_shares: BTreeMap<&'a str, BTreeMap<&'a str, u64>>,
+            // Byte-string keys have no Ord impl conflict to worry about (unlike
+            // PublicKey above) — Vec<u8> already implements Ord lexicographically.
+            contract_storage: BTreeMap<&'a str, BTreeMap<&'a Vec<u8>, &'a Vec<u8>>>,
         }
 
         let canonical = Canonical {
@@ -550,6 +572,11 @@ impl ChainState {
                 .delegator_shares
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.iter().map(|(dk, dv)| (dk.as_str(), *dv)).collect()))
+                .collect(),
+            contract_storage: self
+                .contract_storage
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.iter().collect()))
                 .collect(),
         };
 

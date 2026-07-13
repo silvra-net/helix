@@ -33,6 +33,10 @@ pub enum ContractCmd {
         /// Amount in HLX to send along with the call (default: 0)
         #[arg(long, default_value_t = 0.0)]
         amount: f64,
+        /// Input data passed to the contract's `call` function via the `get_input` host
+        /// import, as a UTF-8 string — the contract's own bytecode decides what this means
+        #[arg(long)]
+        data: Option<String>,
         /// Wallet key file
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
@@ -43,14 +47,24 @@ pub enum ContractCmd {
         #[arg(long)]
         nonce: Option<u64>,
     },
+    /// Read one key out of a deployed contract's own storage — a debugging/exploration
+    /// tool, not something most users need day-to-day, since a contract's storage schema
+    /// is entirely up to its own bytecode
+    Storage {
+        /// Contract address
+        address: String,
+        /// Storage key, as a UTF-8 string (hex-encoded automatically before querying)
+        key: String,
+    },
 }
 
 pub async fn run(cmd: ContractCmd, node: &str) -> Result<()> {
     match cmd {
         ContractCmd::Deploy { wasm, key, fee, nonce } => deploy(wasm, key, fee, nonce, node).await,
-        ContractCmd::Call { address, amount, key, fee, nonce } => {
-            call(address, amount, key, fee, nonce, node).await
+        ContractCmd::Call { address, amount, data, key, fee, nonce } => {
+            call(address, amount, data, key, fee, nonce, node).await
         }
+        ContractCmd::Storage { address, key } => storage(address, key, node).await,
     }
 }
 
@@ -111,6 +125,7 @@ async fn deploy(
 async fn call(
     address: String,
     amount_hlx: f64,
+    data: Option<String>,
     key_path: PathBuf,
     fee: u64,
     nonce_override: Option<u64>,
@@ -142,7 +157,7 @@ async fn call(
         amount: amount_nano,
         fee,
         nonce,
-        data: vec![],
+        data: data.map(|d| d.into_bytes()).unwrap_or_default(),
         crypto_version: kp.scheme,
 
         signature: Signature::from_bytes(vec![]),
@@ -160,6 +175,21 @@ async fn call(
     println!();
     println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
     println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
+    Ok(())
+}
+
+async fn storage(address: String, key: String, node: &str) -> Result<()> {
+    let key_hex = hex::encode(key.as_bytes());
+    let url = format!("{}/accounts/{}/storage/{}", node, address, key_hex);
+    let res: serde_json::Value = reqwest::get(&url).await?.json().await?;
+
+    if let Some(err) = res.get("error") {
+        bail!("{}", err);
+    }
+    let value_hex = res["value_hex"].as_str().unwrap_or("");
+    let value_bytes = hex::decode(value_hex).unwrap_or_default();
+    println!("  Key   : {}", key);
+    println!("  Value : {} (hex: {})", String::from_utf8_lossy(&value_bytes), value_hex);
     Ok(())
 }
 

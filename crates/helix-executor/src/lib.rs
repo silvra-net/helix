@@ -110,7 +110,7 @@ pub fn execute_transaction(
         TxType::RegisterGuardians => execute_register_guardians(state, tx, validator, tx_hash),
         TxType::ApproveRecovery => execute_approve_recovery(state, tx, validator, tx_hash),
         TxType::DeployContract => execute_deploy_contract(state, tx, validator, tx_hash),
-        TxType::CallContract => execute_call_contract(state, tx, validator, tx_hash),
+        TxType::CallContract => execute_call_contract(state, tx, validator, tx_hash, height),
         TxType::CreateProposal => execute_create_proposal(state, tx, validator, tx_hash, height),
         TxType::VoteProposal => execute_vote_proposal(state, tx, validator, tx_hash, height),
         TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash),
@@ -905,14 +905,133 @@ fn execute_deploy_contract(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
-/// Call a deployed contract at `tx.to`, running its exported `call()` entry point with
-/// fuel metering. `tx.amount` (if any) is transferred to the contract's balance only on
-/// successful execution, matching normal transfer semantics.
+/// Bridges a running contract to real `ChainState` for the duration of one call, buffering
+/// every `storage_write`/`transfer` in memory rather than applying them immediately — see
+/// `helix_vm`'s module doc comment ("Atomicity") for why: a trap partway through (including
+/// running out of fuel) must leave chain state exactly as it was before the call started.
+/// `into_commit_data` converts the buffered side effects into an owned, `state`-independent
+/// value once the call has returned `Ok` — the caller applies it separately, after this
+/// struct (and the borrow of `state` it holds for reads) has gone out of scope, so the
+/// borrow checker doesn't see a conflict with the mutable access the commit itself needs.
+struct ContractHostContext<'a> {
+    state: &'a ChainState,
+    contract: Address,
+    contract_str: String,
+    caller_str: String,
+    value: u64,
+    height: u64,
+    input: Vec<u8>,
+    storage_writes: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    transfers: Vec<(Address, u64)>,
+    /// Running total already earmarked for `transfers` this call — `available_balance()`
+    /// subtracts this so a contract can't `transfer()` the same nano-HLX twice in one call.
+    pending_debit: u64,
+    return_data: Vec<u8>,
+}
+
+struct ContractCommitData {
+    contract: Address,
+    storage_writes: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    transfers: Vec<(Address, u64)>,
+    #[allow(dead_code)] // not yet surfaced anywhere (no view-call/return-data plumbing to the RPC layer yet) — kept for the next increment rather than discarded
+    return_data: Vec<u8>,
+}
+
+impl<'a> ContractHostContext<'a> {
+    fn new(state: &'a ChainState, contract: Address, caller: Address, value: u64, height: u64, input: Vec<u8>) -> Self {
+        ContractHostContext {
+            contract_str: contract.to_string(),
+            caller_str: caller.to_string(),
+            contract,
+            value,
+            height,
+            input,
+            state,
+            storage_writes: Default::default(),
+            transfers: Vec::new(),
+            pending_debit: 0,
+            return_data: Vec::new(),
+        }
+    }
+
+    /// What this contract could still send via `transfer()` right now: its real on-chain
+    /// balance, plus the value sent with this call (not yet credited to real state — that
+    /// only happens on commit, like everything else here), minus whatever this same call has
+    /// already earmarked.
+    fn available_balance(&self) -> u64 {
+        let real = self.state.get(&self.contract).map(|a| a.balance).unwrap_or(0);
+        real.saturating_add(self.value).saturating_sub(self.pending_debit)
+    }
+
+    fn into_commit_data(self) -> ContractCommitData {
+        ContractCommitData {
+            contract: self.contract,
+            storage_writes: self.storage_writes,
+            transfers: self.transfers,
+            return_data: self.return_data,
+        }
+    }
+}
+
+impl helix_vm::HostContext for ContractHostContext<'_> {
+    fn storage_read(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if let Some(v) = self.storage_writes.get(key) {
+            return Some(v.clone());
+        }
+        self.state.contract_storage_read(&self.contract, key)
+    }
+
+    fn storage_write(&mut self, key: &[u8], value: Vec<u8>) {
+        self.storage_writes.insert(key.to_vec(), value);
+    }
+
+    fn transfer(&mut self, to: &str, amount: u64) -> helix_vm::TransferOutcome {
+        let Ok(to_addr) = Address::from_str(to) else {
+            return helix_vm::TransferOutcome::InvalidAddress;
+        };
+        if amount > self.available_balance() {
+            return helix_vm::TransferOutcome::InsufficientBalance;
+        }
+        self.pending_debit += amount;
+        self.transfers.push((to_addr, amount));
+        helix_vm::TransferOutcome::Ok
+    }
+
+    fn caller(&self) -> &str {
+        &self.caller_str
+    }
+
+    fn self_address(&self) -> &str {
+        &self.contract_str
+    }
+
+    fn value(&self) -> u64 {
+        self.value
+    }
+
+    fn block_height(&self) -> u64 {
+        self.height
+    }
+
+    fn input(&self) -> &[u8] {
+        &self.input
+    }
+
+    fn set_return_data(&mut self, data: Vec<u8>) {
+        self.return_data = data;
+    }
+}
+
+/// Call a deployed contract at `tx.to`, running its exported `call()` entry point with fuel
+/// metering. `tx.amount` (if any) is credited to the contract's balance only on successful
+/// execution, matching normal transfer semantics — and, as of host imports, so is everything
+/// the contract itself did via `storage_write`/`transfer` (see `ContractHostContext`).
 fn execute_call_contract(
     state: &mut ChainState,
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    height: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -939,13 +1058,19 @@ fn execute_call_contract(
     };
 
     let fuel_limit = tx.fee.saturating_mul(state.governance_params.fuel_per_fee_unit);
-    if let Err(e) = helix_vm::call(&code, fuel_limit) {
+    let mut ctx = ContractHostContext::new(state, target.clone(), tx.from.clone(), tx.amount, height, tx.data.clone());
+    let call_result = helix_vm::call(&code, fuel_limit, &mut ctx);
+
+    if let Err(e) = call_result {
         // Charge the fee and advance the nonce even though the call failed — fuel-
         // metered execution was actually attempted and consumed real validator CPU.
         // Without this, the identical tx (nonce never moved, balance never touched)
         // can be resubmitted and re-executed by every validator forever at zero
         // cost — e.g. a deliberately fuel-exhausting loop makes this a free,
-        // repeatable DoS instead of a one-time failed call.
+        // repeatable DoS instead of a one-time failed call. `ctx` (and every
+        // storage_write/transfer it buffered) is simply dropped here, never applied —
+        // this is the atomicity guarantee host imports need: a trap must leave chain
+        // state exactly as it was before the call started.
         state.update_account(&tx.from, |acc| {
             acc.balance -= tx.fee;
             acc.nonce += 1;
@@ -955,6 +1080,10 @@ fn execute_call_contract(
             .unwrap_or_else(|de| Receipt::failure(tx_hash, &de.to_string(), 0, 0));
     }
 
+    // `ctx` is consumed here, ending the immutable borrow of `state` it held for reads —
+    // only past this point can `state` be borrowed mutably again to apply the call's effects.
+    let commit = ctx.into_commit_data();
+
     state.update_account(&tx.from, |acc| {
         acc.balance -= total_cost;
         acc.nonce += 1;
@@ -962,6 +1091,13 @@ fn execute_call_contract(
     state.update_account(&target, |acc| {
         acc.balance += tx.amount;
     });
+    for (key, value) in commit.storage_writes {
+        state.contract_storage_write(&commit.contract, key, value);
+    }
+    for (to, amount) in commit.transfers {
+        state.update_account(&commit.contract, |acc| acc.balance -= amount);
+        state.update_account(&to, |acc| acc.balance += amount);
+    }
 
     distribute_fee(state, validator, tx.fee)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
@@ -1667,6 +1803,7 @@ mod tests {
         wat::parse_str(r#"(module (func (export "call")))"#).unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn signed_contract_tx(
         kp: &KeyPair,
         from: &Address,
@@ -1858,6 +1995,235 @@ mod tests {
         // this exact tx could be resubmitted and re-executed forever for free.
         assert_eq!(state.get(&caller).unwrap().balance, 1_000_000 - 1);
         assert_eq!(state.get(&caller).unwrap().nonce, 1);
+    }
+
+    // ── Host import tests ───────────────────────────────────────────────────────
+    //
+    // These exercise real contract execution against a real ChainState (not the mocked
+    // HostContext in helix-vm's own unit tests) — the whole point is proving the
+    // ContractHostContext bridge, storage persistence/isolation, and atomicity-on-trap all
+    // hold when wired to the actual state machine every other transaction type shares.
+
+    /// A contract that writes a fixed key/value into its own storage on every call.
+    fn storage_writer_wasm() -> Vec<u8> {
+        wat::parse_str(
+            r#"
+            (module
+                (import "env" "storage_write" (func $storage_write (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "greeting")
+                (data (i32.const 16) "hello")
+                (func (export "call")
+                    (drop (call $storage_write (i32.const 0) (i32.const 8) (i32.const 16) (i32.const 5)))
+                )
+            )
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn call_contract_storage_write_persists_into_real_chain_state() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&deployer, |acc| acc.balance = 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000);
+
+        let deploy_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, storage_writer_wasm(), 0, 10_000);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+
+        assert_eq!(state.contract_storage_read(&deployer, b"greeting"), None, "nothing written yet");
+
+        let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.contract_storage_read(&deployer, b"greeting"), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn call_contract_storage_is_isolated_between_different_contracts() {
+        let deployer_a_kp = KeyPair::generate();
+        let deployer_a = Address::from_public_key(&deployer_a_kp.public);
+        let deployer_b_kp = KeyPair::generate();
+        let deployer_b = Address::from_public_key(&deployer_b_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&deployer_a, |acc| acc.balance = 1_000_000);
+        state.update_account(&deployer_b, |acc| acc.balance = 1_000_000);
+
+        // Both contracts write to the exact same key ("greeting") — same bytecode, deployed
+        // by two different addresses, so two different contract accounts.
+        let deploy_a = signed_contract_tx(&deployer_a_kp, &deployer_a, TxType::DeployContract, None, 0, storage_writer_wasm(), 0, 10_000);
+        let deploy_b = signed_contract_tx(&deployer_b_kp, &deployer_b, TxType::DeployContract, None, 0, storage_writer_wasm(), 0, 10_000);
+        assert!(execute_transaction(&mut state, &deploy_a, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &deploy_b, &validator, 0).success);
+
+        let call_a = signed_contract_tx(&deployer_a_kp, &deployer_a, TxType::CallContract, Some(deployer_a.clone()), 0, vec![], 1, 10_000);
+        assert!(execute_transaction(&mut state, &call_a, &validator, 1).success);
+
+        // B never called its own contract — its storage must still be untouched, even though
+        // A's identical contract just wrote the exact same key.
+        assert_eq!(state.contract_storage_read(&deployer_a, b"greeting"), Some(b"hello".to_vec()));
+        assert_eq!(
+            state.contract_storage_read(&deployer_b, b"greeting"),
+            None,
+            "one contract's storage write must never be visible under a different contract's address"
+        );
+    }
+
+    /// A contract that transfers a fixed amount to a fixed recipient address on every call.
+    fn transfer_wasm(recipient: &Address, amount: i64) -> Vec<u8> {
+        let addr_str = recipient.to_string();
+        wat::parse_str(format!(
+            r#"
+            (module
+                (import "env" "transfer" (func $transfer (param i32 i32 i64) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{addr_str}")
+                (func (export "call")
+                    (drop (call $transfer (i32.const 0) (i32.const {len}) (i64.const {amount})))
+                )
+            )
+            "#,
+            len = addr_str.len(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn call_contract_transfer_moves_real_balance_to_a_third_party() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&deployer, |acc| acc.balance = 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000);
+
+        let wasm = transfer_wasm(&recipient, 300);
+        let deploy_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, wasm, 0, 10_000);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+
+        // Send 1000 along with the call — the contract's available balance during execution
+        // is its real balance (0) plus this value, so the 300 transfer only succeeds because
+        // of it (proves `value()` is credited before host calls run, not only after).
+        let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 1_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.get(&recipient).unwrap().balance, 300);
+        // The deployer's address doubles as the contract's account. It started at 1_000_000,
+        // paid a 10_000 deploy fee, then received the 1000 tx.amount and sent 300 back out:
+        // 1_000_000 - 10_000 + 1_000 - 300 = 990_700.
+        assert_eq!(state.get(&deployer).unwrap().balance, 990_700);
+    }
+
+    #[test]
+    fn call_contract_trap_rolls_back_storage_writes_and_transfers_atomically() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&deployer, |acc| acc.balance = 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000);
+
+        // Writes storage, transfers funds out, THEN traps unconditionally — every side
+        // effect before the trap must still be fully rolled back, exactly like every other
+        // transaction type already guarantees.
+        let addr_str = recipient.to_string();
+        let wasm = wat::parse_str(format!(
+            r#"
+            (module
+                (import "env" "storage_write" (func $storage_write (param i32 i32 i32 i32) (result i32)))
+                (import "env" "transfer" (func $transfer (param i32 i32 i64) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "greeting")
+                (data (i32.const 16) "hello")
+                (data (i32.const 32) "{addr_str}")
+                (func (export "call")
+                    (drop (call $storage_write (i32.const 0) (i32.const 8) (i32.const 16) (i32.const 5)))
+                    (drop (call $transfer (i32.const 32) (i32.const {len}) (i64.const 500)))
+                    (unreachable)
+                )
+            )
+            "#,
+            len = addr_str.len(),
+        ))
+        .unwrap();
+
+        let deploy_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, wasm, 0, 10_000);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+
+        let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 1_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+
+        assert!(!receipt.success, "a trapped call must fail");
+        assert_eq!(state.contract_storage_read(&deployer, b"greeting"), None, "the storage write before the trap must be rolled back");
+        assert!(state.get(&recipient).is_none(), "the transfer before the trap must be rolled back — recipient must not even have an account");
+        assert_eq!(
+            state.get(&deployer).unwrap().balance,
+            990_000,
+            "the contract's own balance (1_000_000 minus the 10_000 deploy fee) must be \
+             untouched by the trapped call — tx.amount is only credited on success, same as \
+             before host imports existed"
+        );
+        // Matches the pre-existing out-of-gas-failure contract: fee charged, nonce advanced,
+        // even though the call itself failed — real (fuel-metered) CPU was still spent.
+        assert_eq!(state.get(&caller).unwrap().balance, 1_000_000 - 10_000);
+        assert_eq!(state.get(&caller).unwrap().nonce, 1);
+    }
+
+    #[test]
+    fn call_contract_input_is_the_transaction_data() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&deployer, |acc| acc.balance = 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000);
+
+        // Echoes its call input straight into storage under key "in".
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (import "env" "get_input" (func $get_input (param i32 i32) (result i32)))
+                (import "env" "storage_write" (func $storage_write (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "in")
+                (func (export "call")
+                    (local $len i32)
+                    (local.set $len (call $get_input (i32.const 64) (i32.const 32)))
+                    (drop (call $storage_write (i32.const 0) (i32.const 2) (i32.const 64) (local.get $len)))
+                )
+            )
+            "#,
+        )
+        .unwrap();
+        let deploy_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, wasm, 0, 10_000);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+
+        let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, b"pass-through".to_vec(), 0, 10_000);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.contract_storage_read(&deployer, b"in"), Some(b"pass-through".to_vec()));
     }
 
     fn signed_governance_tx(
@@ -3006,6 +3372,7 @@ mod tests {
         assert_eq!(r2, r1 / 2, "reward must halve once height crosses a halving interval boundary");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn signed_tx(
         kp: &KeyPair,
         from: &Address,

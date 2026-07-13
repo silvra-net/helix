@@ -300,18 +300,33 @@ hlx name resolve alice.hlx                   # -> hlx...
 
 ### Smart Contracts
 
-Contracts are WASM modules; the exported `call` function is the entry point. There are no
-host imports yet (no storage, no programmatic transfers from inside a contract) — see
-[Cryptography & Determinism](#cryptography--determinism) for what that does and doesn't mean for safety.
+Contracts are WASM modules; the exported `call` function is the entry point. A small set of
+host imports lets a contract read/write its own persistent key-value storage, move real HLX
+balance, and read call context (caller, value sent, block height, input data) — see
+[Cryptography & Determinism](#cryptography--determinism) for the full host-function ABI and
+what it does and doesn't mean for safety. There is deliberately no cross-contract call import
+in this version — a contract can only touch its own storage and move its own balance, which
+closes off reentrancy as an attack surface entirely rather than requiring every contract
+author to defend against it.
 
 ```bash
 hlx contract deploy my_contract.wasm --key alice.json
 #   Contract address: hlx...   (the deployer's own address — see note below)
 
-hlx contract call hlx... --key alice.json --amount 1.5 --fee 50000
+hlx contract call hlx... --key alice.json --amount 1.5 --fee 50000 --data "hello"
 #   --fee also sets the fuel budget for this call — a call that runs out of fuel still
 #   charges the fee and advances the nonce, exactly like real gas markets do on revert
+#   --data is passed to the contract's call function as raw input bytes (UTF-8 encoded)
+
+hlx contract storage hlx... greeting
+#   Reads back one key from the contract's own storage — a debugging/exploration
+#   tool, since a contract's storage schema is entirely up to its own bytecode
 ```
+
+If a call traps (an explicit `unreachable`, an out-of-bounds memory access, or running out of
+fuel) every storage write and transfer it made is rolled back completely — nothing it did is
+ever partially applied. The fee is still charged and the nonce still advances, since real
+compute was spent either way.
 
 > **Note:** a contract's address is currently the same as its deployer's address (no derived
 > `CREATE`/`CREATE2`-style contract addresses yet) — one contract per deploying key at a time.
@@ -551,9 +566,32 @@ CLI: hlx (helix-cli)   ←→   REST API :8545   ←→   P2P :8546
 **Contract determinism:** `helix-vm` disables WASM floats entirely (via wasmi's
 `WasmFeatures` validator gate, rejected at deploy time) — every validator must reach the
 identical execution result for the identical call, and floats are a known cross-platform
-non-determinism risk (the reason the EVM never got them). Contracts have no host imports yet
-(no storage, no programmatic transfers out of a contract), so classic bug classes like
-reentrancy can't exist until that surface is added.
+non-determinism risk (the reason the EVM never got them). Execution is fuel-metered
+(`--fee` doubles as the fuel budget), so an out-of-gas contract traps deterministically
+instead of hanging a validator.
+
+**Contract host imports:** a contract talks to the chain through a small `(ptr, len)`
+byte-buffer ABI under the WASM import module `"env"`:
+
+| Function | Signature | Purpose |
+|---|---|---|
+| `storage_read` | `(key_ptr, key_len, out_ptr, out_len) -> i32` | Read this contract's own storage |
+| `storage_write` | `(key_ptr, key_len, val_ptr, val_len) -> i32` | Write this contract's own storage |
+| `transfer` | `(addr_ptr, addr_len, amount) -> i32` | Move real HLX out of this contract's balance |
+| `get_caller` / `get_self_address` | `(out_ptr, out_len) -> i32` | The calling address / this contract's own address |
+| `get_input` | `(out_ptr, out_len) -> i32` | The `--data` bytes passed with this call |
+| `get_value` / `get_block_height` | `() -> i64` / `() -> i64` | HLX sent with this call / current block height |
+| `set_return_data` | `(ptr, len) -> i32` | Set this call's return data (not yet surfaced to callers) |
+
+Every storage read/write, transfer, and context read costs fuel, so there's no free way to
+grief a validator into doing unbounded work. A contract can **only** read/write its own
+storage and move its own balance — there is deliberately no cross-contract call import in
+this version, which removes reentrancy as an attack surface entirely rather than requiring
+every contract author to defend against it themselves. All effects of a call are buffered and
+only committed to real chain state if the call succeeds; a trap (explicit `unreachable`,
+out-of-bounds memory access, running out of fuel) rolls back every storage write and transfer
+the call made, with zero partial effects — while the fee is still charged and the nonce still
+advances, since real compute was spent either way.
 
 ---
 
@@ -606,6 +644,7 @@ Base URL: `http://127.0.0.1:8545` (or wherever you've bound/proxied it — see `
 | GET | `/accounts/:address/recovery` | Pending/active recovery status |
 | GET | `/accounts/:address/transactions` | Transaction history (`?limit=&offset=`) |
 | GET | `/accounts/:address/delegations` | This account's delegations across validators, with current value |
+| GET | `/accounts/:address/storage/:key_hex` | One hex-encoded key/value from a deployed contract's own storage |
 | GET | `/validators/:address/pool` | A validator's delegation pool — delegated stake, commission, effective stake |
 | GET | `/names/:name` | Resolve name to address |
 | GET | `/governance/params` | Current runtime-adjustable protocol parameters |
