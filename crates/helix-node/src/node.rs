@@ -147,6 +147,18 @@ const BLOCK_TIME_MS: u64 = 2_000;
 const MAX_TXS_PER_BLOCK: usize = 1_000;
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
 
+/// Fee for the node-generated `SubmitDoubleSignEvidence` transaction — well above
+/// `helix_mempool`'s `DEFAULT_MIN_FEE` (1,000 nano-HLX), which isn't itself
+/// importable here (private to that crate). Found the hard way: this tx used to
+/// carry `fee: 0`, so `Mempool::add()` rejected it with `FeeTooLow` on *every*
+/// node, including the reporter's own — evidence was detected and logged, but the
+/// slash it should have triggered silently never made it anywhere close to a
+/// block. Unit tests exercise `execute_submit_double_sign_evidence` directly, which
+/// bypasses the mempool entirely, so this was never caught until an actual
+/// double-sign was triggered on a real multi-node network and the resulting
+/// "evidence detected" log was checked against what the chain actually did with it.
+const DOUBLE_SIGN_EVIDENCE_FEE_NANO: u64 = 10_000;
+
 /// RPC bind address — defaults to `RPC_BIND_DEFAULT`, overridable via `helix.toml`'s
 /// `rpc_bind` field or (taking precedence) the `HELIX_RPC_BIND` env var (e.g.
 /// `HELIX_RPC_BIND=0.0.0.0:8545` for non-standard topologies where the node isn't
@@ -652,7 +664,7 @@ async fn report_double_sign_evidence(
         from: self_address,
         to: None,
         amount: 0,
-        fee: 0,
+        fee: DOUBLE_SIGN_EVIDENCE_FEE_NANO,
         nonce,
         data,
         crypto_version: keypair.scheme,
@@ -1363,6 +1375,41 @@ mod handle_p2p_event_tests {
         };
         vote.signature = kp.sign(&vote.signing_bytes()).unwrap();
         vote
+    }
+
+    /// Regression test for a security-critical bug found by actually triggering a real
+    /// double-sign on a multi-node local testnet: `report_double_sign_evidence` used to
+    /// build its `SubmitDoubleSignEvidence` transaction with `fee: 0`. Evidence detection
+    /// itself worked and got logged ("Double-sign evidence detected — reporting on-chain"),
+    /// but the transaction was rejected by `Mempool::add()`'s minimum-fee check on *every*
+    /// node, including the reporter's own — silently, since the rejection is only logged at
+    /// debug level. The slash this was supposed to trigger never came anywhere near a block.
+    /// Existing tests only ever exercised `execute_submit_double_sign_evidence` directly,
+    /// bypassing the mempool entirely, so this was invisible until a real double-sign
+    /// actually happened over a real network and the resulting chain state was checked.
+    #[tokio::test]
+    async fn report_double_sign_evidence_produces_a_transaction_the_mempool_actually_accepts() {
+        let bad_kp = KeyPair::generate();
+        let bad_addr = Address::from_public_key(&bad_kp.public);
+        let vote_a = signed_vote(&bad_kp, &bad_addr, helix_consensus::VoteType::Prevote, 5, 0, Hash::digest(b"a"));
+        let vote_b = signed_vote(&bad_kp, &bad_addr, helix_consensus::VoteType::Prevote, 5, 0, Hash::digest(b"b"));
+        let evidence = DoubleSignEvidence { validator: bad_addr, height: 5, round: 0, vote_a, vote_b };
+
+        let reporter_kp = KeyPair::generate();
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        // Uses Mempool::new()'s real default min-fee — the same one a live node runs
+        // with — not a relaxed test double, since the whole point is proving this
+        // clears the bar a real node's mempool actually enforces.
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+
+        report_double_sign_evidence(evidence, &reporter_kp, &chain_state, &mempool, &p2p_tx).await;
+
+        assert_eq!(
+            mempool.read().await.len(),
+            1,
+            "the evidence tx must actually clear the mempool's fee floor, not just get logged"
+        );
     }
 
     /// A block that includes a valid `SubmitDoubleSignEvidence` transaction must not just
