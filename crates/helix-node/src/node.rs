@@ -20,7 +20,7 @@ use helix_p2p::{
 };
 use helix_rpc::server::{start_rpc_server, AppState};
 use helix_storage::{db::HelixDb, BlockStore};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{self, NodeConfig};
@@ -447,6 +447,21 @@ impl HelixNode {
             engine.write().await.seed_last_committed(tip_hash);
         }
 
+        // Guards against a genuine race between this node's two independent block-ingestion
+        // paths — its own BFT engine reaching quorum (NewProposal/NewVote, in the P2P event
+        // task) versus a `NewCommittedBlock` gossip arrival for the *same* height (also in
+        // the P2P event task, but interleaved with block_production_loop's separate tokio
+        // task) — both of which call `apply_finalized_block`. Each path's own pre-check used
+        // a different piece of state (the engine's `current_height` vs. `store.latest_height()`),
+        // read *before* actually calling `apply_finalized_block`, with no shared lock held
+        // across the gap to the eventual state mutation — so both could observe "not yet
+        // applied" and both proceed, double-executing the same block (unconditionally
+        // double-minting its block reward, since that mint isn't gated by transaction nonces
+        // the way the block's actual transactions mostly are). `apply_finalized_block` now
+        // claims a height atomically against this single shared mutex as its first action,
+        // regardless of which path called it — see its doc comment.
+        let last_applied_height = Arc::new(Mutex::new(genesis_height));
+
         // Spawn P2P event handler
         let mempool_for_p2p = self.mempool.clone();
         let peer_count_for_p2p = peer_count.clone();
@@ -456,6 +471,7 @@ impl HelixNode {
         let keypair_for_p2p = self.keypair.clone();
         let p2p_tx_for_p2p = self.p2p_command_tx.clone();
         let sync_peer_for_p2p = self.sync_peer.clone();
+        let last_applied_height_for_p2p = last_applied_height.clone();
         let mut p2p_event_rx = self.p2p_event_rx;
         tokio::spawn(async move {
             while let Some(event) = p2p_event_rx.recv().await {
@@ -469,6 +485,7 @@ impl HelixNode {
                     &keypair_for_p2p,
                     &p2p_tx_for_p2p,
                     &sync_peer_for_p2p,
+                    &last_applied_height_for_p2p,
                 )
                 .await;
             }
@@ -481,6 +498,7 @@ impl HelixNode {
             self.chain_state.clone(),
             self.keypair.clone(),
             engine,
+            last_applied_height,
             self.p2p_command_tx.clone(),
             self.reward_address.map(Arc::new),
         ));
@@ -510,6 +528,7 @@ async fn handle_p2p_event(
     keypair: &KeyPair,
     p2p_tx: &mpsc::Sender<P2PCommand>,
     sync_peer: &Option<String>,
+    last_applied_height: &Arc<Mutex<u64>>,
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
@@ -548,7 +567,7 @@ async fn handle_p2p_event(
                     // is a per-node config, not part of the block — make every node compute
                     // a different balance for the same block. `None` lets execute_block fall
                     // back to `block.header.validator`, which is identical on every node.
-                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, None).await;
+                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::UnknownValidator(_)) => {
@@ -576,7 +595,7 @@ async fn handle_p2p_event(
                     info!(height = block.height(), "Block finalized via peer votes");
                     // Same reasoning as the NewProposal arm above: this block's proposer
                     // isn't necessarily us, so `None` — not our local reward_address.
-                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, None).await;
+                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::NoActiveRound) => {
@@ -654,7 +673,7 @@ async fn handle_p2p_event(
                     // `None`, same reasoning as the NewProposal/NewVote arms above: this
                     // block came from a peer, not our own block_production_loop, so our
                     // local reward_address override must not apply to it.
-                    apply_finalized_block(block, false, store, mempool, chain_state, engine, p2p_tx, None).await;
+                    apply_finalized_block(block, false, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
                 }
                 Err(e) => {
                     warn!(height = block_height, err = %e, "Committed block from peer failed signature check — dropping");
@@ -746,6 +765,7 @@ async fn report_double_sign_evidence(
 /// (it knows the correct committed round). Set to `false` when applying a block
 /// received via `NewCommittedBlock` — the block has already been broadcast by the
 /// proposer, and re-broadcasting with a wrong round tag would confuse other nodes.
+#[allow(clippy::too_many_arguments)]
 async fn apply_finalized_block(
     block: Block,
     should_broadcast: bool,
@@ -755,10 +775,35 @@ async fn apply_finalized_block(
     engine: &Arc<RwLock<BftEngine>>,
     p2p_tx: &mpsc::Sender<P2PCommand>,
     reward_address: Option<Arc<Address>>,
+    last_applied_height: &Arc<Mutex<u64>>,
 ) {
     let tx_hashes: Vec<_> = block.transactions.iter().map(|t| t.hash()).collect();
     let height = block.height();
     let tx_count = block.tx_count();
+
+    // Atomically claim this height before doing anything else. This node's own BFT engine
+    // reaching quorum (NewProposal/NewVote) and a `NewCommittedBlock` gossip arrival for the
+    // *same* height run as genuinely concurrent tokio tasks, and each call site's own
+    // pre-check reads different state (the engine's `current_height` vs.
+    // `store.latest_height()`) *before* ever calling this function — with no lock held across
+    // that gap to the actual state mutation below, both could observe "not yet applied" and
+    // both proceed. Without this guard that race double-executes the block: every one of its
+    // transactions gets re-applied (mostly rejected the second time on stale nonces, but not
+    // guaranteed to be — see `execute_call_contract`'s side effects on failure, for one), and
+    // the block reward mint always succeeds again regardless, since it isn't nonce-gated at
+    // all — silently inflating supply beyond what the schedule intends. Found by noticing a
+    // small, fixed (non-growing) `circulating_supply` divergence between two nodes that
+    // otherwise agreed on every block hash — same symptom `ChainState::state_hash()` exists to
+    // surface, but this particular cause is a P2P/executor-boundary race, not a state-machine
+    // bug, so the fix belongs here rather than in `helix-executor`.
+    {
+        let mut last = last_applied_height.lock().await;
+        if height <= *last {
+            debug!(height, "Skipping duplicate finalized-block application (already applied via a concurrent path)");
+            return;
+        }
+        *last = height;
+    }
 
     // `should_broadcast == false` means this block arrived already fully committed
     // (the NewCommittedBlock gossip topic) rather than through this node's own
@@ -895,12 +940,14 @@ async fn apply_finalized_block(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn block_production_loop(
     store: Arc<RwLock<HelixDb>>,
     mempool: Arc<RwLock<Mempool>>,
     chain_state: Arc<RwLock<ChainState>>,
     keypair: Arc<KeyPair>,
     engine: Arc<RwLock<BftEngine>>,
+    last_applied_height: Arc<Mutex<u64>>,
     p2p_tx: mpsc::Sender<P2PCommand>,
     reward_address: Option<Arc<Address>>,
 ) {
@@ -936,7 +983,7 @@ async fn block_production_loop(
         };
         match produced {
             Ok(block) => {
-                apply_finalized_block(block, true, &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone())
+                apply_finalized_block(block, true, &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone(), &last_applied_height)
                     .await;
             }
             Err(ConsensusError::AwaitingVotes { round, .. }) => {
@@ -1395,6 +1442,7 @@ mod handle_p2p_event_tests {
             &own_kp,
             &p2p_tx,
             &None,
+            &Arc::new(Mutex::new(0)),
         )
         .await;
 
@@ -1437,6 +1485,7 @@ mod handle_p2p_event_tests {
             &own_kp,
             &p2p_tx,
             &None,
+            &Arc::new(Mutex::new(0)),
         )
         .await;
 
@@ -1478,6 +1527,7 @@ mod handle_p2p_event_tests {
             &own_kp,
             &p2p_tx,
             &None,
+            &Arc::new(Mutex::new(0)),
         )
         .await;
 
@@ -1610,7 +1660,8 @@ mod handle_p2p_event_tests {
         block.transactions = vec![evidence_tx];
 
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
-        apply_finalized_block(block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None).await;
+        let last_applied_height = Arc::new(Mutex::new(0));
+        apply_finalized_block(block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
 
         assert!(
             engine.read().await.validator_set.get(&bad_validator_addr).is_none(),
@@ -1620,5 +1671,43 @@ mod handle_p2p_event_tests {
             chain_state.read().await.get(&bad_validator_addr).unwrap().staked < 1_000_000,
             "slash itself must still have applied"
         );
+    }
+
+    /// Regression test for a real race: this node's own BFT engine reaching quorum
+    /// (NewProposal/NewVote) and a `NewCommittedBlock` gossip arrival for the *same* height
+    /// run as independent tokio tasks, each deciding whether to proceed from different state
+    /// (the engine's `current_height` vs. `store.latest_height()`) read *before* either ever
+    /// calls `apply_finalized_block` — with no lock held across that gap, both could observe
+    /// "not yet applied" and both call it. Without the shared `last_applied_height` guard,
+    /// this double-executes the block: harmless for most of its own transactions (rejected
+    /// the second time on stale nonces), but the block reward mint isn't nonce-gated at all,
+    /// so it mints twice regardless — silently inflating supply. Found in practice as a
+    /// small, fixed `circulating_supply` divergence between two otherwise-identical nodes.
+    /// Simulates the race by calling `apply_finalized_block` twice for the identical block
+    /// against the same `last_applied_height` — the second call must be a complete no-op.
+    #[tokio::test]
+    async fn apply_finalized_block_does_not_double_mint_a_racing_duplicate_for_the_same_height() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let block = signed_block(&kp, 1, Hash::ZERO);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr, 0)));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        let last_applied_height = Arc::new(Mutex::new(0));
+
+        apply_finalized_block(block.clone(), false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        let issued_after_first = chain_state.read().await.total_issued;
+        assert!(issued_after_first > 0, "the first application must mint the scheduled block reward");
+
+        // A second application of the *same* block/height — as a racing duplicate ingestion
+        // path would produce — must change nothing further.
+        apply_finalized_block(block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        let issued_after_second = chain_state.read().await.total_issued;
+        assert_eq!(issued_after_second, issued_after_first, "the block reward must not be minted twice for the same height");
+        assert_eq!(store.read().await.latest_height(), 1, "the duplicate must not re-touch storage either");
     }
 }
