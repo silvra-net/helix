@@ -423,7 +423,6 @@ impl HelixNode {
         let engine_for_p2p = engine.clone();
         let keypair_for_p2p = self.keypair.clone();
         let p2p_tx_for_p2p = self.p2p_command_tx.clone();
-        let reward_for_p2p = self.reward_address.as_ref().map(|a| Arc::new(a.clone()));
         let sync_peer_for_p2p = self.sync_peer.clone();
         let mut p2p_event_rx = self.p2p_event_rx;
         tokio::spawn(async move {
@@ -437,7 +436,6 @@ impl HelixNode {
                     &engine_for_p2p,
                     &keypair_for_p2p,
                     &p2p_tx_for_p2p,
-                    reward_for_p2p.clone(),
                     &sync_peer_for_p2p,
                 )
                 .await;
@@ -479,7 +477,6 @@ async fn handle_p2p_event(
     engine: &Arc<RwLock<BftEngine>>,
     keypair: &KeyPair,
     p2p_tx: &mpsc::Sender<P2PCommand>,
-    reward_address: Option<Arc<Address>>,
     sync_peer: &Option<String>,
 ) {
     match event {
@@ -511,7 +508,14 @@ async fn handle_p2p_event(
             match result {
                 Ok(Some(block)) => {
                     info!(height = block.height(), "Block finalized via peer proposal");
-                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, reward_address.clone()).await;
+                    // `None`, not our own configured reward_address: this block was
+                    // proposed by whichever validator's turn it was (see receive_proposal),
+                    // not necessarily us. Passing our local override here would redirect
+                    // that validator's reward to our own address, and — since reward_address
+                    // is a per-node config, not part of the block — make every node compute
+                    // a different balance for the same block. `None` lets execute_block fall
+                    // back to `block.header.validator`, which is identical on every node.
+                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, None).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::UnknownValidator(_)) => {
@@ -537,7 +541,9 @@ async fn handle_p2p_event(
             match result {
                 Ok(Some(block)) => {
                     info!(height = block.height(), "Block finalized via peer votes");
-                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, reward_address.clone()).await;
+                    // Same reasoning as the NewProposal arm above: this block's proposer
+                    // isn't necessarily us, so `None` — not our local reward_address.
+                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, None).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::NoActiveRound) => {
@@ -612,7 +618,10 @@ async fn handle_p2p_event(
                         return;
                     }
                     info!(height = block_height, "Applying committed block from peer");
-                    apply_finalized_block(block, false, store, mempool, chain_state, engine, p2p_tx, reward_address).await;
+                    // `None`, same reasoning as the NewProposal/NewVote arms above: this
+                    // block came from a peer, not our own block_production_loop, so our
+                    // local reward_address override must not apply to it.
+                    apply_finalized_block(block, false, store, mempool, chain_state, engine, p2p_tx, None).await;
                 }
                 Err(e) => {
                     warn!(height = block_height, err = %e, "Committed block from peer failed signature check — dropping");
@@ -1254,7 +1263,6 @@ mod handle_p2p_event_tests {
             &engine,
             &own_kp,
             &p2p_tx,
-            None,
             &None,
         )
         .await;
@@ -1262,6 +1270,48 @@ mod handle_p2p_event_tests {
         // Dropped: never applied (height unchanged), nothing broadcast.
         assert_eq!(store.read().await.latest_height(), 0);
         assert!(p2p_rx.try_recv().is_err());
+    }
+
+    /// Regression test: a block finalized via a peer's proposal/votes/gossip must mint
+    /// its block reward to the block's own `header.validator`, never to this node's
+    /// locally configured `reward_address`. Before this fix, `handle_p2p_event` threaded
+    /// its own `reward_address` into every `apply_finalized_block` call, including these
+    /// peer-driven ones — a node with `HELIX_REWARD_ADDRESS` set would redirect every
+    /// other validator's block reward to itself, and any two nodes with different
+    /// configs would diverge on the resulting chain state.
+    #[tokio::test]
+    async fn new_committed_block_from_peer_mints_reward_to_block_validator_not_to_local_override() {
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        let block = signed_block(&validator_kp, 1, Hash::ZERO);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let peer_count = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+
+        let validator_set = ValidatorSet::new(vec![Validator::new(validator_addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, validator_addr.clone(), 0)));
+
+        let own_kp = KeyPair::generate();
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+
+        handle_p2p_event(
+            P2PEvent::NewCommittedBlock(block),
+            &mempool,
+            &peer_count,
+            &store,
+            &chain_state,
+            &engine,
+            &own_kp,
+            &p2p_tx,
+            &None,
+        )
+        .await;
+
+        let state = chain_state.read().await;
+        assert!(state.get(&validator_addr).unwrap().balance > 0, "block reward must land on the actual block validator");
+        assert!(state.get(&Address::from_public_key(&own_kp.public)).is_none(), "our own address never participated and must not receive anything");
     }
 
     /// A block from a real, staked validator with a signature that checks out is
@@ -1296,7 +1346,6 @@ mod handle_p2p_event_tests {
             &engine,
             &own_kp,
             &p2p_tx,
-            None,
             &None,
         )
         .await;
