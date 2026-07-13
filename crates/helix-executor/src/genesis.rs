@@ -127,6 +127,45 @@ impl GenesisConfig {
     }
 }
 
+// Kani feasibility study (see CLAUDE.md backlog): example-based tests below check
+// scheduled_block_reward() at a handful of chosen heights. These harnesses instead ask
+// Kani's bounded model checker to prove the same properties for *every* u64 height —
+// the entire input space, not the points we happened to think of — via `cargo kani`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// The shift-overflow guard (`era >= 64`) must hold for literally every u64 height,
+    /// not just u64::MAX and a couple of large multiples as the example tests check —
+    /// this is exactly the class of "did I get the boundary condition right for all
+    /// inputs" question unit tests are structurally unable to answer.
+    #[kani::proof]
+    fn scheduled_block_reward_never_panics() {
+        let height: u64 = kani::any();
+        let _ = scheduled_block_reward(height);
+    }
+
+    /// The schedule must never hand out more than the starting reward, for any height —
+    /// this is the property callers actually rely on to reason about total emission.
+    #[kani::proof]
+    fn scheduled_block_reward_never_exceeds_the_initial_reward() {
+        let height: u64 = kani::any();
+        let reward = scheduled_block_reward(height);
+        assert!(reward <= INITIAL_BLOCK_REWARD_HLX * NANO_PER_HLX);
+    }
+
+    /// Later (or equal) heights must never pay a *larger* reward than earlier ones —
+    /// the halving schedule must be monotonically non-increasing over the entire
+    /// domain, not just at the era boundaries the example tests happen to probe.
+    #[kani::proof]
+    fn scheduled_block_reward_is_monotonically_non_increasing() {
+        let earlier: u64 = kani::any();
+        let later: u64 = kani::any();
+        kani::assume(earlier <= later);
+        assert!(scheduled_block_reward(earlier) >= scheduled_block_reward(later));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

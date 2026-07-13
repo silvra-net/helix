@@ -20,3 +20,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 wat = "1.0"
+
+# `#[cfg(kani)]` gates the Kani proof harnesses (src/lib.rs, src/genesis.rs) — only
+# ever set by `cargo kani`'s own compiler driver, never by plain cargo. Without this,
+# every normal `cargo build`/`check`/`test` prints an unknown-cfg warning for it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

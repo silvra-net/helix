@@ -947,6 +947,19 @@ fn distribute_fee(
     Ok((burned, reward))
 }
 
+// Kani feasibility study (see CLAUDE.md backlog): a harness proving distribute_fee()'s
+// fee-conservation property (burned + reward == fee, for every u64 fee) was attempted
+// here and deliberately removed again — it does not terminate in practice. ChainState
+// is HashMap-backed, and CBMC gets stuck trying to fully unwind the loop inside
+// std's SipHasher13::write (observed hanging past 1200 loop iterations with no default
+// bound, and still not converging within a 150s budget even with an explicit
+// `#[kani::unwind(20)]`). This isn't specific to this function — it's a structural
+// limitation of bounded model checking against anything touching std HashMap without
+// substantially more harness engineering (e.g. a verification-only state stub instead
+// of the real ChainState) than fits a feasibility study. See the backlog entry for the
+// full writeup and recommendation; genesis.rs's kani_proofs module has the harnesses
+// that *do* work (pure arithmetic, no HashMap in the call path).
+
 #[cfg(test)]
 mod tests {
     use super::*;
