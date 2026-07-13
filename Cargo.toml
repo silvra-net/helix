@@ -61,6 +61,7 @@ libp2p = { version = "0.54", features = [
     "gossipsub", "mdns",
     "tokio", "dns", "macros",
 ] }
+void = "1"
 
 # Wallet encryption
 aes-gcm = "0.10"

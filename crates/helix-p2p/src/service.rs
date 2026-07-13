@@ -15,6 +15,7 @@ use helix_consensus::{Proposal, Vote};
 use helix_core::{Block, Transaction};
 
 use crate::config::P2PConfig;
+use crate::conn_limits::IpConnLimiter;
 use crate::reputation::PeerReputation;
 use crate::session::{HandshakeMsg, SessionManager};
 use crate::{P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_SESSION, TOPIC_TRANSACTIONS, TOPIC_VOTES};
@@ -47,6 +48,14 @@ pub enum P2PCommand {
 struct HelixBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
+    /// Global/pending/per-peer connection caps (backlog #44) — a connection flood
+    /// (real or Sybil, distinct `PeerId` per socket) can't grow the swarm's
+    /// established/pending connection tables past these bounds.
+    connection_limits: libp2p::connection_limits::Behaviour,
+    /// Per-source-IP connection cap (backlog #44) — `connection_limits` above has
+    /// no notion of IP, so a Sybil attacker presenting a fresh `PeerId` per socket
+    /// isn't bounded by it; this closes that gap.
+    ip_limits: IpConnLimiter,
 }
 
 pub struct P2PService {
@@ -111,7 +120,16 @@ impl P2PService {
                 )
                 .expect("mdns behaviour is valid");
 
-                HelixBehaviour { gossipsub, mdns }
+                let connection_limits = libp2p::connection_limits::Behaviour::new(
+                    libp2p::connection_limits::ConnectionLimits::default()
+                        .with_max_established(Some(config.max_peers as u32))
+                        .with_max_established_incoming(Some(config.max_established_incoming))
+                        .with_max_pending_incoming(Some(config.max_pending_incoming))
+                        .with_max_established_per_peer(Some(config.max_established_per_peer)),
+                );
+                let ip_limits = IpConnLimiter::new(config.max_connections_per_ip);
+
+                HelixBehaviour { gossipsub, mdns, connection_limits, ip_limits }
             })
             .expect("behaviour setup never fails")
             .build();
@@ -310,7 +328,7 @@ impl P2PService {
 /// Extracts the bare IP address (if any) from a `Multiaddr`, ignoring the
 /// port/transport suffix, so the same address at different ports still maps
 /// to the same reputation entry.
-fn multiaddr_ip(addr: &Multiaddr) -> Option<String> {
+pub(crate) fn multiaddr_ip(addr: &Multiaddr) -> Option<String> {
     addr.iter().find_map(|proto| match proto {
         libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
         libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
