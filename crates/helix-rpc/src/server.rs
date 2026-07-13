@@ -82,6 +82,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
             "/transactions",
             post(submit_transaction).layer(DefaultBodyLimit::max(TX_SUBMIT_BODY_LIMIT_BYTES)),
         )
+        .route("/transactions/:hash", get(get_transaction_status))
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
         .with_state(state);
@@ -120,7 +121,8 @@ async fn root() -> Json<Value> {
             "GET  /governance/proposals",
             "GET  /governance/proposals/{id}",
             "GET  /mempool",
-            "POST /transactions"
+            "POST /transactions",
+            "GET  /transactions/{hash}"
         ]
     }))
 }
@@ -618,6 +620,67 @@ async fn submit_transaction(
     }
 }
 
+/// `GET /transactions/:hash` — was routed to by `hlx tx status` from the very first
+/// version of the CLI, but this endpoint never actually existed server-side (only
+/// `POST /transactions` was registered), so every call 404'd with an empty body,
+/// which the CLI's JSON parser then failed on with an opaque "EOF while parsing a
+/// value" instead of a clear error. Found while using `hlx tx status` for real during
+/// a multi-node testnet session — nobody had actually called it since it was written.
+async fn get_transaction_status(
+    State(state): State<AppState>,
+    Path(hash_hex): Path<String>,
+) -> impl IntoResponse {
+    let tx_hash = match Hash::from_hex(&hash_hex) {
+        Ok(h) => h,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid hash format" })),
+            )
+        }
+    };
+
+    let store = state.store.read().await;
+    let location = store.tx_location(&tx_hash);
+    match location {
+        Ok(Some((height, tx_index))) => {
+            let Ok(block) = store.get_block_by_height(height) else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "indexed block missing from store" })),
+                );
+            };
+            let Some(tx) = block.transactions.get(tx_index as usize) else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "indexed tx position out of range" })),
+                );
+            };
+            let mut entry = json!(tx_history_entry(&block, tx));
+            entry["status"] = json!("confirmed");
+            (StatusCode::OK, Json(entry))
+        }
+        Ok(None) => {
+            drop(store);
+            if state.mempool.read().await.contains(&tx_hash) {
+                (
+                    StatusCode::OK,
+                    Json(json!({ "hash": hash_hex, "status": "pending" })),
+                )
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": format!("transaction {} not found", hash_hex) })),
+                )
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to read transaction index: {e}") })),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +776,63 @@ mod tests {
             p2p_command_tx,
         };
         (state, path)
+    }
+
+    /// Regression test: `GET /transactions/:hash` didn't exist server-side at all
+    /// before this fix — `hlx tx status` 404'd against every hash, confirmed or not.
+    #[tokio::test]
+    async fn get_transaction_status_finds_a_confirmed_transaction() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let bob = addr(2);
+        let committed = tx(&alice, &bob, 10, 0);
+        let hash = committed.hash();
+        state.store.write().await.put_block(block(5, &alice, vec![committed])).unwrap();
+
+        let response = get_transaction_status(State(state), Path(hash.to_hex()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "confirmed");
+        assert_eq!(parsed["block_height"], 5);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn get_transaction_status_reports_pending_for_a_mempool_only_transaction() {
+        let (state, path) = fresh_app_state();
+        let keypair = KeyPair::generate();
+        let alice = Address::from_public_key(&keypair.public);
+        let mut pending = Transaction { fee: 1_000, public_key: keypair.public.clone(), ..tx(&alice, &addr(2), 1, 0) };
+        pending.signature = keypair.sign(pending.signing_hash().as_bytes()).unwrap();
+        let hash = pending.hash();
+        state.mempool.write().await.add(pending).unwrap();
+
+        let response = get_transaction_status(State(state), Path(hash.to_hex()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "pending");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn get_transaction_status_404s_for_an_unknown_hash() {
+        let (state, path) = fresh_app_state();
+        let unknown = tx(&addr(9), &addr(8), 1, 0).hash();
+
+        let response = get_transaction_status(State(state), Path(unknown.to_hex()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The indexed lookup behind `get_account_transactions` must return exactly the

@@ -30,6 +30,10 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// look up only the transactions touching one address instead of scanning every
 /// block in the chain on every request.
 const ADDRESS_TX_INDEX: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::new("address_tx_index");
+/// tx hash bytes → (block height, tx index within block), same 12-byte value
+/// encoding as `ADDRESS_TX_INDEX`. Backs `tx_location()` — a single-key lookup
+/// instead of scanning every block for the one that happens to contain a hash.
+const TX_HASH_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tx_hash_index");
 
 const META_HEIGHT: &str = "latest_height";
 const META_HASH: &str = "latest_hash";
@@ -62,6 +66,7 @@ impl HelixDb {
         tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
         Ok(HelixDb { db })
     }
@@ -329,6 +334,23 @@ impl HelixDb {
         entries.reverse();
         Ok(entries.into_iter().skip(offset).take(limit).collect())
     }
+
+    /// `(block_height, tx_index_within_block)` for the transaction with this hash,
+    /// if it's been included in a block yet — backed by `TX_HASH_INDEX` instead of
+    /// scanning every block looking for the one that happens to contain it.
+    pub fn tx_location(&self, tx_hash: &Hash) -> StorageResult<Option<(u64, u32)>> {
+        let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
+        let table = tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
+        match table.get(tx_hash.as_bytes().as_slice()).map_err(|e| StorageError::Db(e.to_string()))? {
+            Some(v) => {
+                let bytes = v.value();
+                let height = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+                let tx_index = u32::from_be_bytes(bytes[8..].try_into().unwrap());
+                Ok(Some((height, tx_index)))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 impl BlockStore for HelixDb {
@@ -367,6 +389,7 @@ impl BlockStore for HelixDb {
             let mut heights = tx.open_table(HEIGHT_IDX).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut address_tx_index = tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut tx_hash_index = tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
 
             blocks.insert(hash.as_bytes().as_slice(), encoded.as_slice())
                 .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -378,6 +401,8 @@ impl BlockStore for HelixDb {
                 value[..8].copy_from_slice(&height.to_be_bytes());
                 value[8..].copy_from_slice(&(tx_index as u32).to_be_bytes());
 
+                tx_hash_index.insert(txn.hash().as_bytes().as_slice(), value.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
                 address_tx_index.insert(txn.from.as_str(), value.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
                 if let Some(to) = &txn.to {
@@ -567,6 +592,43 @@ mod tests {
         // Carol only appears once, in block 1.
         let carol_refs = db.address_transactions(carol.to_string().as_str(), 10, 0).unwrap();
         assert_eq!(carol_refs, vec![(1, 1)]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tx_location_finds_a_committed_transaction() {
+        let (mut db, path) = fresh_db();
+        let alice = addr(1);
+        let bob = addr(2);
+        let carol = addr(3);
+
+        let tx0 = transfer(&alice, &bob, 0);
+        let tx1_a = transfer(&bob, &alice, 0);
+        let tx1_b = transfer(&carol, &bob, 0);
+        let (hash0, hash1_a, hash1_b) = (tx0.hash(), tx1_a.hash(), tx1_b.hash());
+
+        db.put_block(block_with_txs(0, &alice, vec![tx0])).unwrap();
+        db.put_block(block_with_txs(1, &alice, vec![tx1_a, tx1_b])).unwrap();
+
+        assert_eq!(db.tx_location(&hash0).unwrap(), Some((0, 0)));
+        assert_eq!(db.tx_location(&hash1_a).unwrap(), Some((1, 0)));
+        assert_eq!(db.tx_location(&hash1_b).unwrap(), Some((1, 1)));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression test: `hlx tx status` called `GET /transactions/:hash`, which
+    /// wasn't implemented server-side at all until this fix — a hash that was
+    /// never included in any block must resolve as "not found", not error.
+    #[test]
+    fn tx_location_returns_none_for_an_unknown_hash() {
+        let (mut db, path) = fresh_db();
+        let alice = addr(1);
+        db.put_block(block_with_txs(0, &alice, vec![transfer(&alice, &addr(2), 0)])).unwrap();
+
+        let unknown = transfer(&addr(9), &addr(8), 0).hash();
+        assert_eq!(db.tx_location(&unknown).unwrap(), None);
 
         let _ = std::fs::remove_file(&path);
     }

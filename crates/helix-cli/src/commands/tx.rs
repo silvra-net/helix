@@ -270,6 +270,8 @@ async fn tx_status(hash: String, node: &str) -> Result<()> {
     println!("Transaction: {}", hash);
     println!("─────────────────────────────────────────");
     println!("  Status : {}", res["status"].as_str().unwrap_or("?"));
-    println!("  Block  : #{}", res["block_height"]);
+    if let Some(height) = res["block_height"].as_u64() {
+        println!("  Block  : #{}", height);
+    }
     Ok(())
 }
