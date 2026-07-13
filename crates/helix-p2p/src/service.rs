@@ -132,6 +132,21 @@ impl P2PService {
                 HelixBehaviour { gossipsub, mdns, connection_limits, ip_limits }
             })
             .expect("behaviour setup never fails")
+            .with_swarm_config(|cfg| {
+                // libp2p-swarm defaults this to Duration::ZERO — a connection with no
+                // substream open AT THE EXACT INSTANT it's checked is torn down
+                // immediately, no grace period. Right after a fresh connection
+                // establishes, there's a brief window before gossipsub/mdns have
+                // finished negotiating their own substreams; racing that window against
+                // a zero-duration idle check flakily kills freshly-established
+                // connections before they ever get used — found by running a real
+                // multi-node local testnet (a single-node devnet never has a peer to
+                // race against, so this never showed up before). Once a connection is
+                // actually in use (gossip flowing every ~2s per block), the zero
+                // default was never a problem — this only bites the handshake window
+                // right at connection setup.
+                cfg.with_idle_connection_timeout(Duration::from_secs(60))
+            })
             .build();
 
         let local_peer_id = swarm.local_peer_id().to_string();
