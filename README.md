@@ -178,6 +178,8 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` (30 min) | How long an unconfirmed transaction may sit in the mempool before it's evicted, freeing its (sender, nonce) slot. Overrides `mempool_tx_ttl_secs` in `helix.toml`. |
 | `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable host (a domain or public IP, no scheme/port — the configured P2P port is appended automatically). Set this on any node reachable from the outside so it can announce itself to peers via peer exchange (see "Network Resilience" below). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
 | `HELIX_GENESIS_EXTRA_VALIDATORS` | (none) | Comma-separated `address:stake_hlx` pairs — additional validators to pre-stake directly at genesis, beyond the one bootstrap validator every chain has always had. Only takes effect for a fresh chain (same caveat as `HELIX_PERSONHOOD_AUTHORITIES`). See "Bootstrapping a Multi-Validator Network" below. Overrides `genesis_extra_validators` in `helix.toml`. |
+| `HELIX_P2P_SEED_PEERS` | (none) | Comma-separated libp2p multiaddrs (e.g. `/ip4/1.2.3.4/tcp/8546,/dns4/peer.example/tcp/8546`) to dial directly, in addition to the one derived from `sync_peer`. Use this to wire a validator set into a full mesh — every validator should peer with every other, not hub-and-spoke through one node. Overrides `p2p_seed_peers` in `helix.toml`. |
+| `HELIX_P2P_DISABLE_MDNS` | (off) | Set truthy (`1`/`true`) to turn off mDNS LAN auto-discovery, leaving only seed peers + peer exchange. Needed only when two independent Helix networks share a LAN (mDNS would otherwise cross-wire them). Overrides `p2p_disable_mdns` in `helix.toml`. |
 
 ```bash
 HELIX_REWARD_ADDRESS=hlx... ./target/release/helix
@@ -281,6 +283,21 @@ validator set without needing this variable set anywhere else. Bob and Carol sti
 own node processes running with the matching `validator-key.bin` (the key whose address you
 staked) to actually participate — genesis only grants the stake, it doesn't run their nodes for
 them.
+
+**Wire the validators into a full mesh.** BFT relays prevotes and precommits between *all*
+validators, so every validator should have a direct P2P connection to every other — not
+hub-and-spoke through one seed node. A star topology drops relayed votes and collapses the
+moment the hub goes down. Give each validator the others as `HELIX_P2P_SEED_PEERS` (in addition
+to its one `sync_peer`), pointing at their P2P ports:
+
+```bash
+# on Alice's node (P2P :8546); Bob is bob.example:8546, Carol is carol.example:8546
+HELIX_P2P_SEED_PEERS="/dns4/bob.example/tcp/8546,/dns4/carol.example/tcp/8546"
+```
+
+On first startup a fresh multi-validator network waits out a short one-time delay for the
+gossip mesh to form before producing its first block — so give the fleet a few seconds after
+the last validator comes online before expecting height to climb.
 
 **A note on validator count and fault tolerance:** BFT quorum is `2/3 + 1` of total voting
 power, and each validator's power is capped at 1% of total raw stake regardless of how much it
