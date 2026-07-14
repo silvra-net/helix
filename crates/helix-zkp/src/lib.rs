@@ -17,9 +17,11 @@
 //! # Security
 //!
 //! The squaring chain is a VDF-style one-way function over a 128-bit prime
-//! field.  The STARK provides ~95 bits of conjectured security with Blake3
-//! hashing and 28 queries.  The personhood authority's secret prevents
-//! validators from self-minting credentials.
+//! field.  The STARK uses Blake3 hashing and 48 FRI queries, drawing its
+//! soundness from the query count (which Grover does not weaken) up to the
+//! f128 field's ~128-bit ceiling, rather than from Grover-halvable grinding.
+//! The personhood authority's secret prevents validators from self-minting
+//! credentials — the STARK proves knowledge of the committed secret.
 
 pub mod air;
 pub mod prover;

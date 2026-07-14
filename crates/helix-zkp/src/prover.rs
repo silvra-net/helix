@@ -18,10 +18,15 @@ impl PersonhoodProver {
     pub fn new() -> Self {
         PersonhoodProver {
             options: ProofOptions::new(
-                28,                      // num_queries — ~95 bits conjectured security
+                // num_queries — the query count is what carries the FRI soundness, and unlike
+                // the grinding factor it is NOT weakened by Grover's algorithm, so security is
+                // drawn from queries rather than proof-of-work. 48 queries × log2(blowup=8) = 144
+                // bits before grinding, capped by the 128-bit f128 field — i.e. the proof now
+                // reaches this field's ceiling (~128-bit conjectured) instead of the old ~95.
+                48,
                 8,                       // blowup factor
-                16,                      // grinding factor
-                FieldExtension::None,
+                16,                      // grinding factor (anti-DoS; deliberately not relied on for soundness)
+                FieldExtension::None,    // base field is already f128 (128-bit) — no extension needed
                 8,                       // FRI folding factor
                 255,                     // FRI max remainder polynomial degree
                 BatchingMethod::Linear,  // constraint batching

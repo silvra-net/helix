@@ -126,10 +126,12 @@ impl PublicKey {
         }
     }
 
-    /// True if these bytes parse as a structurally valid ML-DSA (default scheme) public key.
-    /// For a migrated SPHINCS+ key, use `is_valid_for(CryptoScheme::SphincsPlus)`.
+    /// True if these bytes parse as a structurally valid public key under *any* supported
+    /// scheme — so a migrated SPHINCS+ key is accepted just like the default ML-DSA one
+    /// (e.g. a social-recovery rotation to the hash-based scheme). Use `is_valid_for` to
+    /// require one specific scheme.
     pub fn is_valid(&self) -> bool {
-        self.is_valid_for(CryptoScheme::MlDsa)
+        self.is_valid_for(CryptoScheme::MlDsa) || self.is_valid_for(CryptoScheme::SphincsPlus)
     }
 }
 

@@ -742,7 +742,7 @@ fn execute_approve_recovery(
 
     let new_key = PublicKey::from_bytes(tx.data.clone());
     if !new_key.is_valid() {
-        return Receipt::failure(tx_hash, "proposed public key is not a valid ML-DSA key", 0, 0);
+        return Receipt::failure(tx_hash, "proposed public key is not a valid PQC public key", 0, 0);
     }
 
     let mut request = state
