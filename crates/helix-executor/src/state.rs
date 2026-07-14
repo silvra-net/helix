@@ -210,6 +210,16 @@ pub struct ChainState {
     /// written anything, not an error.
     #[serde(default)]
     pub contract_storage: HashMap<String, HashMap<Vec<u8>, Vec<u8>>>,
+    /// Additional validators pre-staked directly at genesis (address, nano-HLX stake),
+    /// beyond the one bootstrap validator every chain has always had — see
+    /// `GenesisConfig::extra_validators`'s doc comment for why this exists. The actual
+    /// stake itself lives in `accounts` like any other; this is purely a record of what
+    /// genesis originally configured, so a node joining long after startup via `GET
+    /// /genesis` can rebuild byte-for-byte identical genesis state instead of only ever
+    /// seeing today's `accounts`, which may have drifted from genesis by then (stakes
+    /// changed, validators slashed, etc).
+    #[serde(default)]
+    pub genesis_extra_validators: Vec<(Address, u64)>,
 }
 
 impl ChainState {
@@ -233,6 +243,7 @@ impl ChainState {
             validator_pools: HashMap::new(),
             delegator_shares: HashMap::new(),
             contract_storage: HashMap::new(),
+            genesis_extra_validators: Vec::new(),
         }
     }
 
@@ -528,6 +539,7 @@ impl ChainState {
             // Byte-string keys have no Ord impl conflict to worry about (unlike
             // PublicKey above) — Vec<u8> already implements Ord lexicographically.
             contract_storage: BTreeMap<&'a str, BTreeMap<&'a Vec<u8>, &'a Vec<u8>>>,
+            genesis_extra_validators: BTreeMap<&'a str, u64>,
         }
 
         let canonical = Canonical {
@@ -577,6 +589,11 @@ impl ChainState {
                 .contract_storage
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.iter().collect()))
+                .collect(),
+            genesis_extra_validators: self
+                .genesis_extra_validators
+                .iter()
+                .map(|(a, s)| (a.as_str(), *s))
                 .collect(),
         };
 

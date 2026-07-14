@@ -284,7 +284,39 @@ impl HelixNode {
         if personhood_authorities.is_empty() {
             info!("No personhood authorities configured — ProvePersonhood transactions will be rejected");
         }
-        let genesis_cfg = GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authorities);
+
+        // Extra genesis validators — only takes effect for a fresh chain, same caveat as
+        // personhood_authorities above. See `GenesisConfig::extra_validators`'s doc comment.
+        let extra_validators: Vec<(Address, u64)> =
+            config::resolve("HELIX_GENESIS_EXTRA_VALIDATORS", &cfg.genesis_extra_validators)
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|entry| {
+                            let (addr_str, stake_str) = entry.split_once(':')?;
+                            let address = match Address::from_str(addr_str) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    warn!(err = %e, addr = addr_str, "HELIX_GENESIS_EXTRA_VALIDATORS / helix.toml contains an invalid address — skipping it");
+                                    return None;
+                                }
+                            };
+                            let stake_hlx: u64 = match stake_str.parse() {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(err = %e, stake = stake_str, "HELIX_GENESIS_EXTRA_VALIDATORS / helix.toml has a non-numeric stake — skipping it");
+                                    return None;
+                                }
+                            };
+                            Some((address, stake_hlx * NANO_PER_HLX))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+        let mut genesis_cfg = GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authorities);
+        genesis_cfg.extra_validators = extra_validators;
 
         // `sync_peer = "http://seed:8545"` in helix.toml, or HELIX_SYNC_PEER — resolved here
         // (rather than after genesis, as before) because a node with no local chain yet needs
@@ -309,16 +341,17 @@ impl HelixNode {
             // fleet was in fact bootstrapped by copying an already-populated database file,
             // never through this path — this is the first time it's been exercised for real.
             info!("No local chain yet — fetching genesis from sync peer {}", peer_url);
-            let (genesis, personhood_authorities, governance_params) =
+            let (genesis, personhood_authorities, governance_params, peer_extra_validators) =
                 fetch_genesis_from_peer(peer_url).await?;
             store.put_block(genesis.clone())?;
             info!(validator = %genesis.header.validator, "Adopted peer's genesis block (height 0)");
 
-            let mut state = GenesisConfig::devnet_with_personhood_authority(
+            let mut peer_genesis_cfg = GenesisConfig::devnet_with_personhood_authority(
                 genesis.header.validator.clone(),
                 personhood_authorities,
-            )
-            .build_state();
+            );
+            peer_genesis_cfg.extra_validators = peer_extra_validators;
+            let mut state = peer_genesis_cfg.build_state();
             state.governance_params = governance_params;
             store.save_chain_state(&state)?;
             state
@@ -1088,7 +1121,9 @@ async fn block_production_loop(
 /// gap itself: a freshly re-synced node rejecting real historical blocks as coming from an
 /// "unstaked" validator that has, in fact, been staked above the true (lower) threshold since
 /// block 106.
-async fn fetch_genesis_from_peer(peer_url: &str) -> Result<(Block, Vec<PublicKey>, GovernanceParams)> {
+async fn fetch_genesis_from_peer(
+    peer_url: &str,
+) -> Result<(Block, Vec<PublicKey>, GovernanceParams, Vec<(Address, u64)>)> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -1119,7 +1154,20 @@ async fn fetch_genesis_from_peer(peer_url: &str) -> Result<(Block, Vec<PublicKey
             .context("peer's /genesis \"governance_params\" did not deserialize")?,
         None => GovernanceParams::default(),
     };
-    Ok((block, personhood_authorities, governance_params))
+    let extra_validators = resp
+        .get("extra_validators")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let address = Address::from_str(entry.get("address")?.as_str()?).ok()?;
+                    let stake = entry.get("stake_nano")?.as_u64()?;
+                    Some((address, stake))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((block, personhood_authorities, governance_params, extra_validators))
 }
 
 /// Resolves a `sync_peer` HTTP URL (e.g. `http://seed:8545`) to a dialable libp2p multiaddr

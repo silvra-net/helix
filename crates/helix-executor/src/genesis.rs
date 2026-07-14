@@ -77,6 +77,20 @@ pub struct GenesisConfig {
     /// default here (auto-generating a keypair would produce an authority nobody actually
     /// holds the private key for, which would just brick the feature a different way).
     pub personhood_authorities: Vec<PublicKey>,
+    /// Additional validators to pre-stake directly at genesis, beyond `validator` (address,
+    /// nano-HLX stake). Empty by default — every chain still starts with exactly one
+    /// bootstrap validator unless an operator explicitly opts into more. Exists because
+    /// organically growing from one validator to several requires each new validator to
+    /// accumulate `MIN_VALIDATOR_STAKE` (100k HLX) via block rewards (1 HLX/block) or
+    /// transfers from an already-funded account — economically real, but far too slow to
+    /// ever set up a genuinely multi-validator network (let alone test one) in anything
+    /// short of months. Setting this lets an operator launch with real multi-validator BFT
+    /// (proposer rotation, live voting) active from block 0 instead. Populated from
+    /// `HELIX_GENESIS_EXTRA_VALIDATORS`/`helix.toml`'s `genesis_extra_validators` — see
+    /// `helix-node::node::HelixNode::new` — and, for a node joining an existing chain via
+    /// `sync_peer`, from that peer's `GET /genesis` response (`ChainState::genesis_extra_validators`
+    /// carries it forward so it can be replayed identically by every later-joining node).
+    pub extra_validators: Vec<(Address, u64)>,
 }
 
 impl GenesisConfig {
@@ -94,7 +108,7 @@ impl GenesisConfig {
                 allocations.push((addr, hlx * NANO_PER_HLX));
             }
         }
-        GenesisConfig { allocations, validator, personhood_authorities }
+        GenesisConfig { allocations, validator, personhood_authorities, extra_validators: Vec::new() }
     }
 
     /// Build the initial ChainState.
@@ -119,6 +133,13 @@ impl GenesisConfig {
         let validator_stake = VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX;
         state.set_validator_stake(&self.validator, validator_stake);
         issued += validator_stake;
+
+        // Extra genesis validators, if configured — see `extra_validators`'s doc comment.
+        for (address, stake) in &self.extra_validators {
+            state.set_validator_stake(address, *stake);
+            issued += stake;
+        }
+        state.genesis_extra_validators = self.extra_validators.clone();
 
         state.total_issued = issued;
         state.personhood_authorities = self.personhood_authorities.clone();

@@ -158,6 +158,7 @@ sync_peer = "http://seed-host:8545"
 validator_crypto_scheme = "ml-dsa"
 mempool_tx_ttl_secs = 1800
 p2p_public_addr = "helix.example.com"
+genesis_extra_validators = "hlx1abc...:100000,hlx1def...:100000"
 ```
 
 An absent file is not an error (all fields default to unset); a present but
@@ -176,6 +177,7 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.bin` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
 | `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` (30 min) | How long an unconfirmed transaction may sit in the mempool before it's evicted, freeing its (sender, nonce) slot. Overrides `mempool_tx_ttl_secs` in `helix.toml`. |
 | `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable host (a domain or public IP, no scheme/port — the configured P2P port is appended automatically). Set this on any node reachable from the outside so it can announce itself to peers via peer exchange (see "Network Resilience" below). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
+| `HELIX_GENESIS_EXTRA_VALIDATORS` | (none) | Comma-separated `address:stake_hlx` pairs — additional validators to pre-stake directly at genesis, beyond the one bootstrap validator every chain has always had. Only takes effect for a fresh chain (same caveat as `HELIX_PERSONHOOD_AUTHORITIES`). See "Bootstrapping a Multi-Validator Network" below. Overrides `genesis_extra_validators` in `helix.toml`. |
 
 ```bash
 HELIX_REWARD_ADDRESS=hlx... ./target/release/helix
@@ -250,6 +252,46 @@ or a domain pointing at one, with port `8546`/your configured P2P port open). A 
 NAT with no forwarded port should leave it unset; it still participates fully, both dialing
 addresses it learns and relaying them onward, it just never advertises an address of its own
 that nobody could actually reach.
+
+### Bootstrapping a Multi-Validator Network
+
+A chain with exactly one validator has a hard liveness ceiling no amount of peer exchange or
+gossip resilience can fix: if that one validator's node goes down, block production stops
+completely, full stop — every other node can still relay and store blocks, none of them can
+propose or vote on new ones. Growing organically from one validator to several means each new
+validator accumulating `MIN_VALIDATOR_STAKE` (100,000 HLX) via block rewards or transfers —
+economically real, but on a 1 HLX/block schedule that's weeks to months, far too slow to stand
+up a genuinely fault-tolerant network in any reasonable timeframe.
+
+`HELIX_GENESIS_EXTRA_VALIDATORS` (or `genesis_extra_validators` in `helix.toml`) skips that
+wait: it pre-stakes additional validators — by address, at whatever stake you choose — directly
+into the genesis state, so they're active BFT participants (real proposer rotation, real
+voting) from block 0, with no staking transactions or epoch rotation needed:
+
+```toml
+# helix.toml, on the node that will self-sign the fresh genesis
+genesis_extra_validators = "hlx1bob...:100000,hlx1carol...:100000"
+```
+
+Only the node building the *fresh* genesis needs this set — it takes effect once, at first
+startup on an empty `helix-data.redb`, exactly like `HELIX_PERSONHOOD_AUTHORITIES`. Every node
+that later joins via `sync_peer` automatically adopts the same pre-staked validators as part of
+genesis adoption (`GET /genesis` carries the list along), so the whole fleet agrees on the same
+validator set without needing this variable set anywhere else. Bob and Carol still need their
+own node processes running with the matching `validator-key.bin` (the key whose address you
+staked) to actually participate — genesis only grants the stake, it doesn't run their nodes for
+them.
+
+**A note on validator count and fault tolerance:** BFT quorum is `2/3 + 1` of total voting
+power, and each validator's power is capped at 1% of total raw stake regardless of how much it
+actually holds (a decentralization guarantee — see `ValidatorSet::new`). With exactly 3
+validators of equal capped power, 2 of them together land *just* short of quorum — meaning
+every single block needs all three to vote, so **3 validators tolerate zero of them being
+offline**, no better than 1 in the specific sense of "how many can go down before the chain
+halts" (though vastly better for censorship-resistance and peer-exchange-style relay
+resilience). Real Byzantine fault tolerance for `f` simultaneously faulty/offline validators
+needs `3f + 1` — 4 validators to tolerate 1 down, 7 for 2, and so on. Plan validator count
+accordingly for how much simultaneous downtime the network actually needs to survive.
 
 ### Docker Deployment
 
@@ -667,7 +709,7 @@ Base URL: `http://127.0.0.1:8545` (or wherever you've bound/proxied it — see `
 |---|---|---|
 | GET | `/` | Node info & endpoint list |
 | GET | `/status` | Height, hash, mempool size, supply stats |
-| GET | `/genesis` | This chain's genesis block + governance params (used by fresh nodes joining via `sync_peer`) |
+| GET | `/genesis` | This chain's genesis block + governance params + any `genesis_extra_validators` (used by fresh nodes joining via `sync_peer`) |
 | GET | `/blocks/latest` | Latest block with full transaction list |
 | GET | `/blocks/height/:n` | Block by height |
 | GET | `/blocks/height/:n/header` | Header only (for light clients) |

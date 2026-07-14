@@ -20,12 +20,29 @@
 //! adoption, `NewCommittedBlock` handling, and prev_hash continuity — exactly the bug classes
 //! found by hand above.
 //!
-//! Deliberately does *not* yet exercise multi-validator BFT (proposer rotation, live voting)
-//! — that needs a staking dance (fund + `Stake` each follower up to `MIN_VALIDATOR_STAKE`)
-//! that's a meaningful next increment, not a blocker for this first, always-on baseline.
+//! A second test below (`three_validators_rotate_proposer_and_finalize_blocks_together`,
+//! CTO backlog item 56) goes further and exercises real multi-validator BFT — proposer
+//! rotation and live voting across independent processes under real network latency, not
+//! just gossip/sync agreement with a single active validator. Organically growing from one
+//! validator to three would mean each follower accumulating `MIN_VALIDATOR_STAKE` (100k HLX)
+//! via block rewards (1 HLX/block) or transfers — economically real, but far too slow for an
+//! automated test (literally weeks). Instead it uses `HELIX_GENESIS_EXTRA_VALIDATORS` (see
+//! `GenesisConfig::extra_validators`'s doc comment) to pre-stake two more validators — with
+//! known keypairs, so the spawned follower processes can be given matching `validator-key.bin`
+//! files — directly at genesis, so all three are active BFT participants from block 0.
+//!
+//! That second test is marked `#[ignore]`: measured wall-clock cost is ~2.5 minutes (real BFT
+//! round timeouts, not a fixed sleep — see the test's own comment on why 3 validators of
+//! *identical capped* voting power make every block depend on all three voting, so any one
+//! delayed message burns a full round), too slow to add to every CI push. Run it explicitly
+//! with `cargo test -p helix-node --test multi_node -- --ignored` (e.g. before a release, or
+//! after touching consensus/BFT code).
 
+use std::collections::HashSet;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+use helix_crypto::{Address, KeyFile, KeyPair};
 
 /// Distinct, uncommon port range so this doesn't collide with anything else that might be
 /// running on a dev machine or CI runner. Nothing else in this workspace uses these.
@@ -35,6 +52,16 @@ const NODE_B_RPC: u16 = 29_555;
 const NODE_B_P2P: u16 = 29_556;
 const NODE_C_RPC: u16 = 29_565;
 const NODE_C_P2P: u16 = 29_566;
+
+/// Separate port range for the multi-validator test below — it runs as a distinct
+/// `#[tokio::test]` in the same test binary, and `cargo test` runs tests within a binary
+/// concurrently by default, so it can't share ports with the test above.
+const VAL_A_RPC: u16 = 29_575;
+const VAL_A_P2P: u16 = 29_576;
+const VAL_B_RPC: u16 = 29_585;
+const VAL_B_P2P: u16 = 29_586;
+const VAL_C_RPC: u16 = 29_595;
+const VAL_C_P2P: u16 = 29_596;
 
 /// Owns a spawned node's child process and its temp working directory. Killing the process
 /// on drop (even if the test panics or an assertion fails partway through) is the whole point
@@ -53,7 +80,27 @@ impl Drop for NodeGuard {
 }
 
 fn spawn_node(rpc_port: u16, p2p_port: u16, sync_peer_rpc_port: Option<u16>) -> NodeGuard {
+    spawn_node_with(rpc_port, p2p_port, sync_peer_rpc_port, &[], None)
+}
+
+/// `extra_env` — additional env vars beyond the standard bind/listen/sync-peer ones (e.g.
+/// `HELIX_GENESIS_EXTRA_VALIDATORS` on the genesis node). `keypair` — if set, pre-writes
+/// `validator-key.bin` into the node's work dir so it starts with this exact validator
+/// identity instead of generating a random one, so a follower's address can be pre-staked in
+/// another node's genesis ahead of time and the follower still ends up controlling it.
+fn spawn_node_with(
+    rpc_port: u16,
+    p2p_port: u16,
+    sync_peer_rpc_port: Option<u16>,
+    extra_env: &[(&str, &str)],
+    keypair: Option<&KeyPair>,
+) -> NodeGuard {
     let work_dir = tempdir::TempDir::new().expect("create temp work dir for node");
+    if let Some(kp) = keypair {
+        KeyFile::from_keypair_plain(kp)
+            .save(&work_dir.path().join("validator-key.bin"))
+            .expect("pre-write validator key file");
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_helix"));
     cmd.current_dir(work_dir.path())
         .env("HELIX_RPC_BIND", format!("127.0.0.1:{rpc_port}"))
@@ -65,8 +112,20 @@ fn spawn_node(rpc_port: u16, p2p_port: u16, sync_peer_rpc_port: Option<u16>) -> 
     if let Some(peer_port) = sync_peer_rpc_port {
         cmd.env("HELIX_SYNC_PEER", format!("http://127.0.0.1:{peer_port}"));
     }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     let child = cmd.spawn().expect("spawn helix node binary");
     NodeGuard { child, _work_dir: work_dir }
+}
+
+async fn block_header(rpc_port: u16, height: u64) -> Option<serde_json::Value> {
+    reqwest::get(format!("http://127.0.0.1:{rpc_port}/blocks/height/{height}/header"))
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()
 }
 
 async fn status(rpc_port: u16) -> Option<serde_json::Value> {
@@ -158,6 +217,90 @@ async fn three_nodes_converge_on_identical_height_hash_and_state() {
         a["state_hash"], c["state_hash"],
         "node A and C agree on the block hash at height {} but computed different state from \
          it — an execution divergence, not a consensus/sync one", a["height"]
+    );
+}
+
+/// CTO backlog item 56 — see the module doc comment for the design (genesis pre-staking
+/// instead of an organic, too-slow-to-automate staking dance). Boots a real 3-validator BFT
+/// set from block 0 and asserts two things a single-active-validator setup structurally
+/// cannot exercise: (1) more than one of the three distinct validator addresses actually
+/// proposes a block — real round-robin rotation, not just one validator winning every round
+/// — and (2) all three nodes still converge on identical height, hash, and state despite that
+/// rotation happening across independent processes over real network latency, the same
+/// bug class (backlog item 47) that a non-deterministic proposer order or an engine height
+/// desync would reproduce under exactly these conditions.
+#[tokio::test]
+#[ignore = "real BFT round timeouts make this ~2.5 minutes wall-clock — run explicitly with --ignored, not on every CI push"]
+async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
+    // B and C's validator identities are generated up front so their addresses can be
+    // pre-staked in A's genesis, and their own processes can later be started with a
+    // matching `validator-key.bin` so they actually control the stake genesis gave them.
+    let kp_b = KeyPair::generate();
+    let kp_c = KeyPair::generate();
+    let addr_b = Address::from_public_key(&kp_b.public);
+    let addr_c = Address::from_public_key(&kp_c.public);
+
+    // Exactly MIN_VALIDATOR_STAKE (100k HLX) each — enough to qualify, nothing more.
+    let extra_validators = format!("{addr_b}:100000,{addr_c}:100000");
+    let _node_a = spawn_node_with(VAL_A_RPC, VAL_A_P2P, None, &[("HELIX_GENESIS_EXTRA_VALIDATORS", &extra_validators)], None);
+    wait_until_reachable(VAL_A_RPC, Duration::from_secs(15)).await;
+
+    // Unlike the single-validator test above, A can NOT be given a head start alone here: with
+    // 3 validators of unequal raw stake, `ValidatorSet::new`'s 1%-of-total-stake cap caps every
+    // validator's voting power identically (see its doc comment), so no 2 of 3 quite reaches
+    // the +1-past-2/3 quorum threshold on the nose — every block genuinely needs all three
+    // validators online and voting, not just a simple majority. B and C join via
+    // HELIX_SYNC_PEER as usual — this adopts A's genesis block byte-for-byte *and* (via GET
+    // /genesis's extra_validators field) rebuilds the same pre-staked state, so all three
+    // independently arrive at an identical 3-validator ValidatorSet from height 0.
+    let _node_b = spawn_node_with(VAL_B_RPC, VAL_B_P2P, Some(VAL_A_RPC), &[], Some(&kp_b));
+    let _node_c = spawn_node_with(VAL_C_RPC, VAL_C_P2P, Some(VAL_A_RPC), &[], Some(&kp_c));
+    wait_until_reachable(VAL_B_RPC, Duration::from_secs(15)).await;
+    wait_until_reachable(VAL_C_RPC, Duration::from_secs(15)).await;
+
+    // Give the fleet real time to produce a window of blocks with all three validators
+    // actively voting (gossipsub mesh formation alone empirically takes 10-40+ seconds — see
+    // backlog item 49's note). Block cadence here is markedly less regular than the
+    // single-validator test above: with exactly 3 validators of unequal raw stake but
+    // *identical* capped voting power (see the 1%-cap comment above), 2 of 3 votes fall
+    // exactly one short of quorum — every single block genuinely needs all three validators'
+    // votes to land, so any one delayed/dropped vote burns a full round timeout before the
+    // next round's proposer gets a chance. Measured empirically: some blocks finalize within
+    // ~1-2s, others take 30-60s+ after a round timeout. This is real BFT math working as
+    // designed (N=3f+1 with f=0 means 3 validators tolerate *zero* offline/faulty members —
+    // worth remembering when deciding how many validators a production deployment needs), not
+    // a test flake — the generous timeout below accommodates it rather than masking it.
+    let target_height = 10;
+    wait_for_height(VAL_A_RPC, target_height, Duration::from_secs(240)).await;
+
+    let mut distinct_proposers = HashSet::new();
+    for height in 1..=target_height {
+        let header = block_header(VAL_A_RPC, height)
+            .await
+            .unwrap_or_else(|| panic!("node A has no header for height {height} despite reporting that height"));
+        distinct_proposers.insert(header["validator"].as_str().unwrap().to_string());
+    }
+    assert!(
+        distinct_proposers.len() > 1,
+        "only one validator ({:?}) ever proposed across the first {target_height} blocks — \
+         proposer rotation isn't actually happening despite 3 active validators",
+        distinct_proposers
+    );
+
+    // Same convergence check as the single-validator test above — rotation happening across
+    // independent processes must not cost agreement on the result.
+    let (a, b, c) = wait_for_matching_snapshot([VAL_A_RPC, VAL_B_RPC, VAL_C_RPC], target_height, Duration::from_secs(120)).await;
+    assert_eq!(a["best_hash"], b["best_hash"], "node A and B disagree on the block hash at height {}", a["height"]);
+    assert_eq!(a["best_hash"], c["best_hash"], "node A and C disagree on the block hash at height {}", a["height"]);
+    assert_eq!(
+        a["state_hash"], b["state_hash"],
+        "node A and B agree on the block hash at height {} but computed different state from it",
+        a["height"]
+    );
+    assert_eq!(
+        a["state_hash"], c["state_hash"],
+        "node A and C agree on the block hash at height {} but computed different state from it",
+        a["height"]
     );
 }
 

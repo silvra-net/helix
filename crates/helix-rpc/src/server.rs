@@ -242,6 +242,14 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
     let cs = state.chain_state.read().await;
     let personhood_authorities: Vec<String> =
         cs.personhood_authorities.iter().map(|pk| pk.to_hex()).collect();
+    // Additional validators pre-staked at genesis beyond this block's own `validator` — see
+    // `ChainState::genesis_extra_validators`'s doc comment for why this can't just be
+    // re-derived from current stakers().
+    let extra_validators: Vec<serde_json::Value> = cs
+        .genesis_extra_validators
+        .iter()
+        .map(|(addr, stake)| json!({ "address": addr.as_str(), "stake_nano": stake }))
+        .collect();
     // This node's *current* governance_params, not necessarily its genesis-time ones — if a
     // proposal changed a param since genesis, a node adopting this as its starting value will
     // (mis)apply the current value retroactively from height 0, rather than the true original
@@ -256,6 +264,7 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
             "block": block,
             "personhood_authorities": personhood_authorities,
             "governance_params": governance_params,
+            "extra_validators": extra_validators,
         })),
     )
 }

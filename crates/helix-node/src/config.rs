@@ -30,6 +30,13 @@ pub struct NodeConfig {
     /// followers / nodes behind NAT with no forwarded port: they still relay addresses they
     /// learn from others, they just never announce themselves.
     pub p2p_public_addr: Option<String>,
+    /// Comma-separated `address:stake_hlx` pairs — validators to pre-stake directly at
+    /// genesis beyond the one bootstrap validator every chain has always had, e.g.
+    /// `hlx1abc...:100000,hlx1def...:100000`. See `GenesisConfig::extra_validators`'s doc
+    /// comment for why this exists (organic staking is far too slow to bootstrap a
+    /// genuinely multi-validator network). Only takes effect for a fresh chain — see
+    /// `personhood_authorities`'s doc comment above for the same caveat.
+    pub genesis_extra_validators: Option<String>,
 }
 
 const CONFIG_PATH_ENV: &str = "HELIX_CONFIG";
