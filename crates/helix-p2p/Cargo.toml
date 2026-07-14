@@ -16,6 +16,4 @@ bincode.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-blake3.workspace = true
-aes-gcm.workspace = true
 void.workspace = true

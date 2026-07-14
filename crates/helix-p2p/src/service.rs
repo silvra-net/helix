@@ -19,9 +19,8 @@ use helix_core::{Block, Transaction};
 use crate::config::P2PConfig;
 use crate::conn_limits::IpConnLimiter;
 use crate::reputation::PeerReputation;
-use crate::session::{HandshakeMsg, SessionManager};
 use crate::{
-    P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_PEER_EXCHANGE, TOPIC_SESSION,
+    P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_PEER_EXCHANGE,
     TOPIC_TRANSACTIONS, TOPIC_VOTES,
 };
 
@@ -179,7 +178,6 @@ impl P2PService {
         let tx_topic = gossipsub::IdentTopic::new(TOPIC_TRANSACTIONS);
         let vote_topic = gossipsub::IdentTopic::new(TOPIC_VOTES);
         let committed_topic = gossipsub::IdentTopic::new(TOPIC_COMMITTED_BLOCKS);
-        let session_topic = gossipsub::IdentTopic::new(TOPIC_SESSION);
         let peer_exchange_topic = gossipsub::IdentTopic::new(TOPIC_PEER_EXCHANGE);
 
         swarm.behaviour_mut().gossipsub.subscribe(&block_topic)
@@ -189,8 +187,6 @@ impl P2PService {
         swarm.behaviour_mut().gossipsub.subscribe(&vote_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
         swarm.behaviour_mut().gossipsub.subscribe(&committed_topic)
-            .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
-        swarm.behaviour_mut().gossipsub.subscribe(&session_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
         swarm.behaviour_mut().gossipsub.subscribe(&peer_exchange_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
@@ -213,9 +209,6 @@ impl P2PService {
         }
 
         info!(listen = %config.listen_addr, peer_id = %local_peer_id, "P2P service started");
-
-        // ML-KEM session manager — maintains per-peer post-quantum session keys
-        let mut session = SessionManager::new();
 
         // Misbehavior scoring — disconnects and refuses reconnection for peers
         // that repeatedly send malformed protocol messages.
@@ -257,16 +250,7 @@ impl P2PService {
 
                             let topic = message.topic.as_str();
 
-                            let malformed = if topic == TOPIC_SESSION {
-                                handle_session_message(
-                                    &message.data,
-                                    &local_peer_id,
-                                    &peer_str,
-                                    &mut session,
-                                    &mut swarm,
-                                    &session_topic,
-                                )
-                            } else if topic == TOPIC_PEER_EXCHANGE {
+                            let malformed = if topic == TOPIC_PEER_EXCHANGE {
                                 handle_peer_exchange_message(
                                     &message.data,
                                     &mut known_addrs,
@@ -314,7 +298,7 @@ impl P2PService {
                                 continue;
                             }
 
-                            info!(peer = %peer_id, "Peer connected — initiating ML-KEM handshake");
+                            info!(peer = %peer_id, "Peer connected");
 
                             // Add every accepted peer to gossipsub's explicit-peer set so it
                             // always forwards messages to them, not just to whatever subset its
@@ -329,21 +313,6 @@ impl P2PService {
                             // exercised this; three did.
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
 
-                            // Kick off the ML-KEM session handshake as initiator
-                            let ek = session.initiate(&peer_str);
-                            let hello = HandshakeMsg::Hello {
-                                from: local_peer_id.clone(),
-                                to: peer_str.clone(),
-                                ek: ek.as_bytes().to_vec(),
-                            };
-                            if let Ok(data) = bincode::serialize(&hello) {
-                                if let Err(e) = swarm.behaviour_mut().gossipsub
-                                    .publish(session_topic.clone(), data)
-                                {
-                                    debug!(peer = %peer_str, err = %e, "ML-KEM Hello publish failed");
-                                }
-                            }
-
                             // Announce what we know right away too — don't make a freshly
                             // connected peer wait up to 30s for the periodic tick just to
                             // learn about other peers it could dial.
@@ -355,7 +324,6 @@ impl P2PService {
                             debug!(peer = %peer_id, "Peer disconnected");
                             swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                             reputation.on_disconnect(&peer_id.to_string());
-                            session.remove(&peer_id.to_string());
                             let _ = event_tx
                                 .send(P2PEvent::PeerDisconnected(peer_id.to_string()))
                                 .await;
@@ -517,87 +485,6 @@ fn broadcast_known_addrs(
     }
 }
 
-// ─── Session handshake handler ───────────────────────────────────────────────
-
-/// Whether a handshake message's self-reported `from` field can be trusted — i.e. it
-/// matches who actually sent it over the gossipsub connection. `from` lives inside the
-/// (otherwise unauthenticated) message payload, so without this check a single connected
-/// peer could broadcast Hello messages under arbitrarily many fabricated `from` values,
-/// each one making `SessionManager::respond` allocate a brand-new session entry for free —
-/// unbounded memory growth against consensus-critical P2P infrastructure. Requiring
-/// `from == actual_sender` caps it at one handshake-driven entry per real connection.
-fn message_sender_is_authentic(msg: &HandshakeMsg, actual_sender: &str) -> bool {
-    msg.from_peer() == actual_sender
-}
-
-/// Returns `true` if the message was malformed (i.e. the sender should be
-/// charged a misbehavior strike).
-fn handle_session_message(
-    data: &[u8],
-    local_peer_id: &str,
-    actual_sender: &str,
-    session: &mut SessionManager,
-    swarm: &mut libp2p::Swarm<HelixBehaviour>,
-    session_topic: &gossipsub::IdentTopic,
-) -> bool {
-    let msg = match bincode::deserialize::<HandshakeMsg>(data) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("Malformed session message: {}", e);
-            return true;
-        }
-    };
-
-    // Messages are broadcast; only process those addressed to us
-    if msg.to_peer() != local_peer_id {
-        return false;
-    }
-
-    if !message_sender_is_authentic(&msg, actual_sender) {
-        warn!(
-            claimed = msg.from_peer(),
-            actual = actual_sender,
-            "Session handshake message's `from` doesn't match the real sender — dropping"
-        );
-        return true;
-    }
-
-    match msg {
-        HandshakeMsg::Hello { from, ek, .. } => {
-            // We are the responder: encapsulate a shared secret
-            if let Some(ct) = session.respond(&from, &ek) {
-                let reply = HandshakeMsg::KemCt {
-                    from: local_peer_id.to_string(),
-                    to: from.clone(),
-                    ct: ct.as_bytes().to_vec(),
-                };
-                if let Ok(encoded) = bincode::serialize(&reply) {
-                    if let Err(e) = swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(session_topic.clone(), encoded)
-                    {
-                        debug!(peer = %from, err = %e, "ML-KEM KemCt publish failed");
-                    } else {
-                        info!(peer = %from, "ML-KEM session established (responder)");
-                    }
-                }
-            }
-            false
-        }
-        HandshakeMsg::KemCt { from, ct, .. } => {
-            // We are the initiator: complete the handshake
-            if session.complete(&from, &ct) {
-                info!(peer = %from, "ML-KEM session established (initiator)");
-                false
-            } else {
-                warn!(peer = %from, "ML-KEM KemCt completion failed");
-                true
-            }
-        }
-    }
-}
-
 // ─── Application message handler ─────────────────────────────────────────────
 
 /// Returns `true` if the message was malformed (i.e. the sender should be
@@ -716,42 +603,5 @@ mod peer_exchange_tests {
 
         assert!(new_addrs.is_empty());
         assert_eq!(known.len(), MAX_KNOWN_PEER_ADDRS);
-    }
-}
-
-#[cfg(test)]
-mod session_auth_tests {
-    use super::{message_sender_is_authentic, HandshakeMsg};
-
-    #[test]
-    fn accepts_a_hello_whose_from_matches_the_real_sender() {
-        let msg = HandshakeMsg::Hello {
-            from: "peer-a".to_string(),
-            to: "peer-b".to_string(),
-            ek: vec![],
-        };
-        assert!(message_sender_is_authentic(&msg, "peer-a"));
-    }
-
-    #[test]
-    fn rejects_a_hello_claiming_to_be_from_someone_else() {
-        // This is the exact free-fabricated-identity attack the check closes: a real,
-        // connected peer ("peer-attacker") broadcasts a Hello claiming to be "peer-victim".
-        let msg = HandshakeMsg::Hello {
-            from: "peer-victim".to_string(),
-            to: "peer-b".to_string(),
-            ek: vec![],
-        };
-        assert!(!message_sender_is_authentic(&msg, "peer-attacker"));
-    }
-
-    #[test]
-    fn rejects_a_kem_ct_claiming_to_be_from_someone_else() {
-        let msg = HandshakeMsg::KemCt {
-            from: "peer-victim".to_string(),
-            to: "peer-b".to_string(),
-            ct: vec![],
-        };
-        assert!(!message_sender_is_authentic(&msg, "peer-attacker"));
     }
 }

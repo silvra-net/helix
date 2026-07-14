@@ -652,12 +652,18 @@ CLI: hlx (helix-cli)   ←→   REST API :8545   ←→   P2P :8546
 | Backup Signatures | SLH-DSA-SHA2-192s | NIST FIPS 205 | ✅ |
 | Hashing | BLAKE3 | — | ✅ (2× security margin vs Grover) |
 | Zero-Knowledge | ZK-STARKs | — | ✅ (hash-based) |
-| Transport | Noise (X25519) + ML-KEM-768 session layer | NIST FIPS 203 | ✅ |
+| Transport | libp2p Noise (X25519) | — | Classical — see note |
 
-> The base P2P transport (Noise/X25519) is classical, but every peer session is additionally
-> wrapped in ML-KEM-768 (post-quantum) encryption negotiated via a `helix/session/1.0.0`
-> handshake — Noise remains only for defense-in-depth underneath it. Consensus signatures and
-> all on-chain data are fully quantum-secure.
+> **What is and isn't quantum-safe here.** Everything that goes *onto the ledger* — signatures
+> (ML-DSA), the state it commits to, and the hashes/proofs binding it together — is
+> post-quantum. The peer-to-peer *transport* encryption is libp2p's classical Noise (X25519),
+> which is fine for a blockchain: all P2P traffic (blocks, transactions, votes) is public data
+> broadcast to every peer, so there is nothing confidential for a "harvest-now-decrypt-later"
+> quantum adversary to steal. What a quantum adversary *could* eventually do — forge signatures
+> or rewrite history — is exactly what the post-quantum signature and hash layer prevents. An
+> earlier ML-KEM-768 session-encryption overlay was removed: it added key-exchange machinery
+> that never actually encrypted anything, so it was misleading complexity rather than added
+> security.
 
 **Contract determinism:** `helix-vm` disables WASM floats entirely (via wasmi's
 `WasmFeatures` validator gate, rejected at deploy time) — every validator must reach the
@@ -840,8 +846,9 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 
 - **Persistent validator key** is stored unencrypted in `validator-key.bin` by default —
   protect this file, or encrypt it (`HELIX_VALIDATOR_KEY_PASSPHRASE` / `hlx wallet encrypt`)
-- The base transport layer (Noise/X25519) is classical, but P2P messages are additionally
-  encrypted with ML-KEM-768 (post-quantum) session keys — see [Cryptography](#cryptography--determinism)
+- The P2P transport uses libp2p's classical Noise (X25519) encryption; this is fine because all
+  P2P traffic is public ledger data — see [Cryptography](#cryptography--determinism) for the full
+  quantum-safety picture
 - Per-IP rate limiting and connection limits protect the public RPC and P2P surface from
   simple flood/spam abuse
 - Minimum fee (1,000 nano-HLX) prevents zero-cost transaction spam

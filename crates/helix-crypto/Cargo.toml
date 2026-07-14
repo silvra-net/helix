@@ -8,7 +8,6 @@ description = "Quantum-secure cryptographic primitives for the Helix blockchain"
 
 [dependencies]
 ml-dsa.workspace = true
-ml-kem.workspace = true
 slh-dsa.workspace = true
 rand_core.workspace = true
 blake3.workspace = true
