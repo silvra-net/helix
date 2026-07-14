@@ -105,6 +105,14 @@ fn spawn_node_with(
     cmd.current_dir(work_dir.path())
         .env("HELIX_RPC_BIND", format!("127.0.0.1:{rpc_port}"))
         .env("HELIX_P2P_LISTEN", format!("127.0.0.1:{p2p_port}"))
+        // Disable mDNS: these test nodes must peer ONLY with each other (via sync_peer +
+        // peer exchange), never with any other Helix node that happens to share the
+        // machine's LAN. A live production node discovered via mDNS would gossip its
+        // height-36000+ proposals/votes/committed-blocks into this fresh testnet, which
+        // then burns every round rejecting them and firing futile catch-up-sync attempts —
+        // observed to stall the testnet near height 1-2 and make this test flaky. See
+        // helix_p2p::P2PConfig::enable_mdns.
+        .env("HELIX_P2P_DISABLE_MDNS", "1")
         // Quiet by default; uncomment locally when debugging a failure.
         .env("RUST_LOG", "error")
         .stdout(Stdio::null())

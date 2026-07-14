@@ -6,7 +6,7 @@ use std::time::Duration;
 use libp2p::{
     futures::StreamExt,
     gossipsub, mdns,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     Multiaddr, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,10 @@ pub enum P2PCommand {
 #[derive(NetworkBehaviour)]
 struct HelixBehaviour {
     gossipsub: gossipsub::Behaviour,
-    mdns: mdns::tokio::Behaviour,
+    /// LAN peer auto-discovery — `Toggle`d off when `P2PConfig::enable_mdns` is false
+    /// (deterministic seed-peer-only peering; see that field's doc comment). When off it
+    /// emits no events, so the `Mdns` match arms below simply never fire.
+    mdns: Toggle<mdns::tokio::Behaviour>,
     /// Global/pending/per-peer connection caps (backlog #44) — a connection flood
     /// (real or Sybil, distinct `PeerId` per socket) can't grow the swarm's
     /// established/pending connection tables past these bounds.
@@ -119,11 +122,18 @@ impl P2PService {
                 )
                 .expect("gossipsub behaviour is valid");
 
-                let mdns = mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
-                    key.public().to_peer_id(),
-                )
-                .expect("mdns behaviour is valid");
+                let mdns: Toggle<mdns::tokio::Behaviour> = if config.enable_mdns {
+                    Some(
+                        mdns::tokio::Behaviour::new(
+                            mdns::Config::default(),
+                            key.public().to_peer_id(),
+                        )
+                        .expect("mdns behaviour is valid"),
+                    )
+                    .into()
+                } else {
+                    None.into()
+                };
 
                 let connection_limits = libp2p::connection_limits::Behaviour::new(
                     libp2p::connection_limits::ConnectionLimits::default()
@@ -297,6 +307,19 @@ impl P2PService {
 
                             info!(peer = %peer_id, "Peer connected — initiating ML-KEM handshake");
 
+                            // Add every accepted peer to gossipsub's explicit-peer set so it
+                            // always forwards messages to them, not just to whatever subset its
+                            // heartbeat-driven mesh happens to graft. Previously this was done
+                            // ONLY for mDNS-discovered peers (see the Mdns::Discovered arm) —
+                            // so a peer reached via seed-peer dial or peer exchange (the only
+                            // paths that work across a real network or with mDNS disabled) got
+                            // a weak, slow-forming mesh. In a small validator set relaying
+                            // consensus votes/proposals through a hub node (B↔C only via A),
+                            // that left cross-validator votes undelivered and rounds drifting
+                            // without ever finalizing. A single production validator never
+                            // exercised this; three did.
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+
                             // Kick off the ML-KEM session handshake as initiator
                             let ek = session.initiate(&peer_str);
                             let hello = HandshakeMsg::Hello {
@@ -321,6 +344,7 @@ impl P2PService {
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             debug!(peer = %peer_id, "Peer disconnected");
+                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                             reputation.on_disconnect(&peer_id.to_string());
                             session.remove(&peer_id.to_string());
                             let _ = event_tx

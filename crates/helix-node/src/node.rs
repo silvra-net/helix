@@ -418,6 +418,18 @@ impl HelixNode {
             p2p_config.public_addr = Some(addr);
         }
 
+        // mDNS LAN auto-discovery is on by default (zero-config peering). Disable it for
+        // deterministic seed-peer-only peering — required when another independent Helix
+        // network shares this LAN (e.g. the multi-node integration test running next to a
+        // live production node), where mDNS would otherwise cross-wire the two and drown
+        // each in the other's incompatible-height gossip. See `P2PConfig::enable_mdns`.
+        if let Some(v) = config::resolve("HELIX_P2P_DISABLE_MDNS", &cfg.p2p_disable_mdns) {
+            if matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") {
+                info!("mDNS LAN discovery disabled — relying on seed peers + peer exchange only");
+                p2p_config.enable_mdns = false;
+            }
+        }
+
         let p2p_port = p2p_config.listen_addr.port();
         let (p2p_service, p2p_command_tx, p2p_event_rx) = P2PService::new(p2p_config);
 

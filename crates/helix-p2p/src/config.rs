@@ -35,6 +35,14 @@ pub struct P2PConfig {
     /// `libp2p::connection_limits` has no per-IP notion — enforced by our own
     /// `conn_limits::IpConnLimiter` behaviour instead.
     pub max_connections_per_ip: u32,
+    /// Whether to run mDNS LAN peer auto-discovery. On by default (zero-config peering
+    /// for nodes on the same network). Turn it OFF for deterministic peering that relies
+    /// only on `seed_peers` + peer exchange — required when two *independent* Helix
+    /// networks share a LAN (e.g. a local integration test running alongside a live
+    /// production node), where mDNS would otherwise cross-wire them: each network's nodes
+    /// would discover the other's, gossip incompatible-height proposals/votes/committed
+    /// blocks at each other, and trigger endless futile catch-up-sync churn.
+    pub enable_mdns: bool,
 }
 
 impl Default for P2PConfig {
@@ -49,6 +57,7 @@ impl Default for P2PConfig {
             max_pending_incoming: 64,
             max_established_per_peer: 4,
             max_connections_per_ip: 8,
+            enable_mdns: true,
         }
     }
 }

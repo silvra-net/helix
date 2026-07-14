@@ -37,6 +37,11 @@ pub struct NodeConfig {
     /// genuinely multi-validator network). Only takes effect for a fresh chain — see
     /// `personhood_authorities`'s doc comment above for the same caveat.
     pub genesis_extra_validators: Option<String>,
+    /// Set truthy (`1`/`true`/`yes`/`on`) to turn OFF mDNS LAN peer auto-discovery, leaving
+    /// only `seed_peers` + peer exchange for connectivity. Needed when two independent Helix
+    /// networks share a LAN (mDNS would otherwise cross-wire them) — see
+    /// `helix_p2p::P2PConfig::enable_mdns`. Absent/false keeps mDNS on (the default).
+    pub p2p_disable_mdns: Option<String>,
 }
 
 const CONFIG_PATH_ENV: &str = "HELIX_CONFIG";
