@@ -78,15 +78,22 @@ pub const MAX_KEY_LEN: usize = 256;
 pub const MAX_VALUE_LEN: usize = 4096;
 /// Ceiling on a call's raw input length. See `MAX_KEY_LEN`.
 pub const MAX_INPUT_LEN: usize = 16_384;
+/// Hard ceiling on a deployed contract's WASM bytecode size. Contract code is written into
+/// account state permanently and replicated to every validator, so it must be bounded at the
+/// consensus layer — not left to the RPC body-size limit, which a P2P-gossiped deploy bypasses.
+/// 64 KiB is generous for real contract logic (this VM has no cross-contract calls or large
+/// libraries) while keeping any single deploy's permanent state footprint bounded.
+pub const MAX_CONTRACT_CODE_SIZE: usize = 64 * 1024;
 
 // Fuel costs for host calls, charged on top of wasmi's own per-WASM-instruction metering
 // (which only prices the contract's *own* bytecode, not the work a host function does on its
-// behalf). Flat per-call costs, not byte-proportional — simple, and sized so that even the
-// most expensive host call is cheap relative to a realistic fuel budget, while a contract
-// that calls storage_write in a tight loop still visibly burns down its budget rather than
-// getting host-side work for free.
+// behalf). Context reads and transfers are O(1) and flat-priced. A storage *write*, though,
+// grows permanent replicated state proportionally to the value size, so it is priced with a
+// per-byte term on top of its base cost — otherwise a contract could bloat chain state by
+// megabytes for the same flat fee as a 1-byte write (the classic under-priced-SSTORE DoS).
 const FUEL_STORAGE_READ: u64 = 500;
-const FUEL_STORAGE_WRITE: u64 = 1_000;
+const FUEL_STORAGE_WRITE_BASE: u64 = 1_000;
+const FUEL_STORAGE_WRITE_PER_BYTE: u64 = 100;
 const FUEL_TRANSFER: u64 = 300;
 const FUEL_CONTEXT_READ: u64 = 50;
 
@@ -292,10 +299,12 @@ fn link_host_functions<C: HostContext>(linker: &mut Linker<StoreState<C>>) -> Re
         "env",
         "storage_write",
         |mut caller: Caller<'_, StoreState<C>>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32| -> Result<i32, Trap> {
-            consume(&mut caller, FUEL_STORAGE_WRITE)?;
+            consume(&mut caller, FUEL_STORAGE_WRITE_BASE)?;
             if val_len < 0 || val_len as usize > MAX_VALUE_LEN {
                 return Ok(-1);
             }
+            // Charge for the permanent state this write commits, proportional to its size.
+            consume(&mut caller, (val_len as u64).saturating_mul(FUEL_STORAGE_WRITE_PER_BYTE))?;
             let key = read_guest_bytes(&mut caller, key_ptr, key_len, MAX_KEY_LEN)?;
             let value = read_guest_bytes(&mut caller, val_ptr, val_len, MAX_VALUE_LEN)?;
             caller.data_mut().host.storage_write(&key, value);
@@ -773,5 +782,34 @@ mod tests {
         // The module declares 2 pages (128 KiB) of memory so the oversized length itself is
         // in-bounds — it's MAX_VALUE_LEN that must reject it, not a memory bounds check.
         assert!(call(&wasm, 1_000_000, &mut host()).is_ok(), "an oversized value must be a reported error, not a trap");
+    }
+
+    #[test]
+    fn storage_write_fuel_scales_with_value_size() {
+        // A write of a large value must cost meaningfully more fuel than a tiny one, so a
+        // contract can't bloat permanent state cheaply (per-byte metering, not flat).
+        fn fuel_for_write(val_len: i32) -> u64 {
+            let wasm = wat_to_wasm(&format!(
+                r#"
+                (module
+                    (import "env" "storage_write" (func $sw (param i32 i32 i32 i32) (result i32)))
+                    (memory (export "memory") 1)
+                    (data (i32.const 0) "k")
+                    (func (export "call")
+                        (drop (call $sw (i32.const 0) (i32.const 1) (i32.const 16) (i32.const {val_len})))
+                    )
+                )
+                "#
+            ));
+            call(&wasm, 10_000_000, &mut host()).expect("call should succeed").fuel_used
+        }
+
+        let small = fuel_for_write(1);
+        let large = fuel_for_write(4000);
+        assert!(
+            large - small >= (4000 - 1) * FUEL_STORAGE_WRITE_PER_BYTE,
+            "a 4000-byte write ({large}) must cost at least ~{} more fuel than a 1-byte write ({small})",
+            (4000 - 1) * FUEL_STORAGE_WRITE_PER_BYTE
+        );
     }
 }

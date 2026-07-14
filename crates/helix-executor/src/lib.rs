@@ -890,6 +890,20 @@ fn execute_deploy_contract(
     if tx.data.is_empty() {
         return Receipt::failure(tx_hash, "deploy transaction is missing WASM bytecode", 0, 0);
     }
+    if tx.data.len() > helix_vm::MAX_CONTRACT_CODE_SIZE {
+        // Enforced here (consensus layer), not just at the RPC body-size limit, so a
+        // P2P-gossiped oversized deploy can't bloat every validator's permanent state.
+        return Receipt::failure(
+            tx_hash,
+            &format!(
+                "contract bytecode {} bytes exceeds the {}-byte limit",
+                tx.data.len(),
+                helix_vm::MAX_CONTRACT_CODE_SIZE
+            ),
+            0,
+            0,
+        );
+    }
     if let Err(e) = helix_vm::validate(&tx.data) {
         return Receipt::failure(tx_hash, &format!("invalid contract bytecode: {e}"), 0, 0);
     }
@@ -1881,6 +1895,34 @@ mod tests {
 
         assert!(!receipt.success);
         assert!(state.get(&addr).unwrap().code.is_none());
+    }
+
+    #[test]
+    fn deploy_contract_rejects_oversized_bytecode() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        // One byte past the consensus-layer code-size ceiling — must be rejected before it
+        // can be written into permanent, replicated account state (regardless of transport).
+        let oversized = vec![0u8; helix_vm::MAX_CONTRACT_CODE_SIZE + 1];
+        let tx = signed_contract_tx(
+            &kp,
+            &addr,
+            TxType::DeployContract,
+            None,
+            0,
+            oversized,
+            0,
+            10_000,
+        );
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success, "oversized deploy must fail");
+        assert!(state.get(&addr).unwrap().code.is_none(), "no code may be stored");
     }
 
     #[test]
