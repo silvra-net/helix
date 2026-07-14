@@ -13,7 +13,23 @@ use crate::{
 /// precommit quorum before it's considered stalled and advanced to the next
 /// round (e.g. the proposer was offline, or its block failed validation for
 /// enough peers that quorum can never be reached). See `BftEngine::advance_round`.
-pub const ROUND_TIMEOUT_TICKS: u32 = 3;
+///
+/// Deliberately generous: a *healthy* round finalizes the instant votes cross
+/// quorum (well under one tick once the gossip mesh is up), so this only bounds
+/// how long the network waits before giving up on a genuinely stuck round. Set
+/// too low, validators whose per-round timers are even slightly skewed (normal
+/// at startup) keep advancing past each other — precommits then land on a round
+/// the receiver has already left and get dropped, so no round ever completes its
+/// two-phase commit. A wide window keeps every validator on the same round long
+/// enough for prevotes *and* precommits to both propagate. Only faulty-proposer
+/// recovery pays the cost, never the common case.
+pub const ROUND_TIMEOUT_TICKS: u32 = 15;
+
+/// Cap on votes buffered ahead of the round they belong to (see
+/// `BftEngine::buffered_votes`). Bounds the memory a peer can make us hold by
+/// flooding votes for a round we haven't started; comfortably above the handful
+/// of real early-arriving votes a normal validator set produces per round.
+const MAX_BUFFERED_VOTES: usize = 512;
 
 /// BFT consensus engine — Tendermint-style two-phase commit.
 ///
@@ -43,6 +59,14 @@ pub struct BftEngine {
     /// Ticks the active round has sat without reaching precommit quorum,
     /// via `note_round_tick()`. Reset whenever a round starts or finalizes.
     round_ticks: u32,
+    /// Votes for the next height that arrived before we had a matching round to
+    /// fold them into — most often a peer's prevote that beat the proposal it
+    /// votes on across the network (gossipsub doesn't order the two). Without
+    /// holding these, that early vote is lost, and in a small validator set
+    /// losing even one prevote keeps a node one short of quorum forever. Drained
+    /// and replayed the moment the matching round is created (see
+    /// `apply_buffered_votes`); cleared when the height advances.
+    buffered_votes: Vec<Vote>,
 }
 
 impl BftEngine {
@@ -57,7 +81,117 @@ impl BftEngine {
             last_committed: None,
             last_committed_round: None,
             round_ticks: 0,
+            buffered_votes: Vec::new(),
         }
+    }
+
+    /// Hold a vote that couldn't be applied to the current round yet (it's for a
+    /// round we haven't started — typically a prevote that outran its proposal).
+    /// Bounded and deduplicated; stale votes (for a height we've already passed)
+    /// are never buffered.
+    fn buffer_vote(&mut self, vote: Vote) {
+        if vote.height != self.current_height + 1 || self.buffered_votes.len() >= MAX_BUFFERED_VOTES {
+            return;
+        }
+        let dup = self.buffered_votes.iter().any(|v| {
+            v.validator == vote.validator && v.round == vote.round && v.vote_type == vote.vote_type
+        });
+        if !dup {
+            self.buffered_votes.push(vote);
+        }
+    }
+
+    /// Replay any buffered votes that belong to `round`, folding them in exactly
+    /// as `add_vote` would (including casting our own follow-up precommit if a
+    /// replayed prevote tips prevote quorum). Best-effort: a buffered vote that
+    /// no longer applies cleanly is skipped, never fatal. Called right after a
+    /// round is created so votes that arrived ahead of the proposal aren't lost.
+    fn apply_buffered_votes(&mut self, keypair: &KeyPair, round: &mut RoundState) {
+        let height = round.height;
+        let round_num = round.round;
+        let mut matching = Vec::new();
+        let mut keep = Vec::with_capacity(self.buffered_votes.len());
+        for v in self.buffered_votes.drain(..) {
+            if v.height == height && v.round == round_num {
+                matching.push(v);
+            } else if v.height == height {
+                keep.push(v); // a later round of the same height — may still be used
+            }
+            // else: stale (past height) — drop
+        }
+        self.buffered_votes = keep;
+
+        for v in matching {
+            let was_prevote = round.phase == RoundPhase::Prevote;
+            let _ = match v.vote_type {
+                VoteType::Prevote => round.add_prevote(v),
+                VoteType::Precommit => round.add_precommit(v),
+            };
+            // Mirror add_vote: if a replayed prevote just tipped prevote quorum,
+            // cast our own precommit so the round can progress to commit.
+            if was_prevote
+                && round.phase == RoundPhase::Precommit
+                && !round.precommits.has_voted(&self.address)
+            {
+                if let Some(block_hash) = round.proposal.as_ref().map(|b| b.hash()) {
+                    if let Ok(precommit) = cast_vote(
+                        &self.address,
+                        keypair,
+                        VoteType::Precommit,
+                        height,
+                        round_num,
+                        block_hash,
+                    ) {
+                        self.outbound_votes.push(precommit.clone());
+                        let _ = round.add_precommit(precommit);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The round number of the currently active round, if any — so the block
+    /// production loop can re-broadcast the pending proposal under the right round.
+    pub fn active_round_num(&self) -> Option<u32> {
+        self.round.as_ref().map(|r| r.round)
+    }
+
+    /// How many *other* validators must be connected and voting for this node to
+    /// be able to reach quorum. While fewer than this are reachable, quorum is
+    /// impossible no matter how many rounds are burned — so the caller holds the
+    /// current round instead of advancing (and running ahead of validators that
+    /// will join at round 0). Zero for a single-validator set, where this node's
+    /// own power already meets quorum and block production never waits on peers.
+    pub fn peers_needed_for_quorum(&self) -> usize {
+        let quorum = self.validator_set.quorum_threshold();
+        let my_power = self
+            .validator_set
+            .get(&self.address)
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        if my_power >= quorum {
+            return 0;
+        }
+        // Greedily count the fewest strongest other validators whose combined
+        // power (with ours) crosses the quorum threshold.
+        let mut others: Vec<u64> = self
+            .validator_set
+            .validators
+            .iter()
+            .filter(|v| v.address != self.address)
+            .map(|v| v.voting_power)
+            .collect();
+        others.sort_unstable_by(|a, b| b.cmp(a));
+        let mut acc = my_power;
+        let mut count = 0;
+        for p in others {
+            if acc >= quorum {
+                break;
+            }
+            acc += p;
+            count += 1;
+        }
+        count
     }
 
     /// Build and sign a new block, drive it through a full BFT round, and return it.
@@ -165,6 +299,9 @@ impl BftEngine {
             self.outbound_votes.push(precommit);
         }
 
+        // Fold in any votes that arrived before this round existed.
+        self.apply_buffered_votes(keypair, &mut round);
+
         if !round.is_committed() {
             // Multi-validator: store round and wait for external votes
             self.round = Some(round);
@@ -193,6 +330,24 @@ impl BftEngine {
     /// a precommit nobody ever sends when quorum is only reached step-by-step
     /// over the network instead of all at once.
     pub fn add_vote(&mut self, keypair: &KeyPair, vote: Vote) -> ConsensusResult<Option<Block>> {
+        // A vote for the next height but a round we're not currently running
+        // (ahead of our active round, or arriving before we have any round for
+        // this height) isn't a protocol violation — it's a vote we simply can't
+        // fold in yet. Buffer it instead of erroring: it's most often a prevote
+        // that beat its own proposal across the network, and dropping it leaves a
+        // small validator set one vote short of quorum for good. It's replayed the
+        // instant the matching round starts (`apply_buffered_votes`).
+        if vote.height == self.current_height + 1 {
+            let not_our_round = match self.round.as_ref() {
+                Some(r) => vote.round != r.round,
+                None => true,
+            };
+            if not_our_round {
+                self.buffer_vote(vote);
+                return Ok(None);
+            }
+        }
+
         let round = self
             .round
             .as_mut()
@@ -280,6 +435,9 @@ impl BftEngine {
             round.add_precommit(precommit.clone())?;
             self.outbound_votes.push(precommit);
         }
+
+        // Fold in any votes for this round that arrived before the proposal did.
+        self.apply_buffered_votes(keypair, &mut round);
 
         if !round.is_committed() {
             self.round = Some(round);
@@ -466,6 +624,8 @@ impl BftEngine {
         self.pending_evidence.extend(round.evidence);
         self.round = None;
         self.round_ticks = 0;
+        // Buffered votes were for the height we just finalized — now stale.
+        self.buffered_votes.clear();
     }
 
     /// Sync bookkeeping to a block that was finalized *without* going through this
@@ -497,6 +657,7 @@ impl BftEngine {
         self.last_committed_round = None;
         self.round = None;
         self.round_ticks = 0;
+        self.buffered_votes.clear();
     }
 
     /// Seed `last_committed` with the real chain tip's hash right after construction,
@@ -694,16 +855,49 @@ mod tests {
         assert!(engine.is_finalized(&block_hash));
     }
 
+    /// A prevote that arrives *before* the proposal it votes on (a normal race —
+    /// gossipsub doesn't order the two across the network) must be buffered and
+    /// replayed once the round starts, not dropped. In a small validator set,
+    /// losing one early prevote leaves a node permanently one short of quorum, so
+    /// no round ever finalizes — the real bug that stalled cold-started
+    /// multi-validator networks at height 1.
     #[test]
-    fn add_vote_without_active_round_errors() {
+    fn a_vote_arriving_before_its_proposal_is_buffered_and_counted() {
         let v = four_validators();
-        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 0);
 
-        let vote = peer_vote(&v.a_kp, VoteType::Prevote, 1, 0, Hash::digest(b"block"));
-        assert!(matches!(
-            engine.add_vote(&v.self_kp, vote),
-            Err(ConsensusError::NoActiveRound)
-        ));
+        // b is the proposer for height 2, round 0 ((2 + 0) % 4 == 2) — build its block.
+        let mut proposer_engine =
+            BftEngine::new(v.validator_set.clone(), Address::from_public_key(&v.b_kp.public), 1);
+        proposer_engine
+            .produce_block(&v.b_kp, Hash::digest(b"block-1"), vec![])
+            .unwrap_err();
+        let block = proposer_engine.pending_proposal().unwrap().clone();
+        let block_hash = block.hash();
+
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+
+        // a's prevote arrives with no active round yet — buffered, not an error.
+        let a_prevote = peer_vote(&v.a_kp, VoteType::Prevote, 2, 0, block_hash.clone());
+        assert_eq!(
+            engine.add_vote(&v.self_kp, a_prevote).unwrap(),
+            None,
+            "a vote for the next height with no active round must be buffered, not rejected"
+        );
+
+        // Now the proposal arrives: the round starts, this node casts its own prevote,
+        // and the buffered a-prevote is replayed — giving 2 of 4 (self + a).
+        assert_eq!(engine.receive_proposal(&v.self_kp, 0, block).unwrap(), None);
+
+        // b's prevote is the third (self + a[buffered] + b) → prevote quorum, which
+        // makes this node cast its own precommit. That precommit only appears if the
+        // buffered a-prevote actually counted; with it lost, self + b would be just 2.
+        let b_prevote = peer_vote(&v.b_kp, VoteType::Prevote, 2, 0, block_hash.clone());
+        assert_eq!(engine.add_vote(&v.self_kp, b_prevote).unwrap(), None);
+        let outbound = engine.take_outbound_votes();
+        assert!(
+            outbound.iter().any(|vt| vt.vote_type == VoteType::Precommit),
+            "reaching prevote quorum via the buffered vote must make this node precommit"
+        );
     }
 
     /// The Phase 5c-follow-up scenario: a non-proposer node receives another

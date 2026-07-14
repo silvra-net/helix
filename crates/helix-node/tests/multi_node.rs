@@ -31,12 +31,12 @@
 //! known keypairs, so the spawned follower processes can be given matching `validator-key.bin`
 //! files — directly at genesis, so all three are active BFT participants from block 0.
 //!
-//! That second test is marked `#[ignore]`: measured wall-clock cost is ~2.5 minutes (real BFT
-//! round timeouts, not a fixed sleep — see the test's own comment on why 3 validators of
-//! *identical capped* voting power make every block depend on all three voting, so any one
-//! delayed message burns a full round), too slow to add to every CI push. Run it explicitly
-//! with `cargo test -p helix-node --test multi_node -- --ignored` (e.g. before a release, or
-//! after touching consensus/BFT code).
+//! That second test is marked `#[ignore]`: it spawns three real validator processes and waits
+//! out a one-time gossip-mesh settle plus a window of finalized blocks (~30s wall-clock),
+//! which is slower than the rest of the suite is meant to be on every CI push. Run it
+//! explicitly with `cargo test -p helix-node --test multi_node -- --ignored` (e.g. before a
+//! release, or after touching consensus/BFT code — it's the regression guard for the
+//! multi-validator round-synchronization and vote-buffering that make cold start converge).
 
 use std::collections::HashSet;
 use std::process::{Child, Command, Stdio};
@@ -238,7 +238,7 @@ async fn three_nodes_converge_on_identical_height_hash_and_state() {
 /// bug class (backlog item 47) that a non-deterministic proposer order or an engine height
 /// desync would reproduce under exactly these conditions.
 #[tokio::test]
-#[ignore = "real BFT round timeouts make this ~2.5 minutes wall-clock — run explicitly with --ignored, not on every CI push"]
+#[ignore = "spawns 3 real validator processes and waits out a mesh-settle + a window of blocks (~30s wall-clock) — run explicitly with --ignored, not on every CI push"]
 async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
     // B and C's validator identities are generated up front so their addresses can be
     // pre-staked in A's genesis, and their own processes can later be started with a
@@ -248,38 +248,45 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
     let addr_b = Address::from_public_key(&kp_b.public);
     let addr_c = Address::from_public_key(&kp_c.public);
 
+    // Wire all three validators into a full P2P mesh via explicit seed peers (each dials the
+    // other two directly), rather than hub-and-spoke through A. In a validator set every node
+    // must peer with every other: BFT relays prevotes/precommits between all of them, and a
+    // star that relays only through one hub both drops votes and can't survive that hub. These
+    // are libp2p multiaddrs for the loopback P2P ports.
+    let ma = |port: u16| format!("/ip4/127.0.0.1/tcp/{port}");
+    let seeds_a = format!("{},{}", ma(VAL_B_P2P), ma(VAL_C_P2P));
+    let seeds_b = format!("{},{}", ma(VAL_A_P2P), ma(VAL_C_P2P));
+    let seeds_c = format!("{},{}", ma(VAL_A_P2P), ma(VAL_B_P2P));
+
     // Exactly MIN_VALIDATOR_STAKE (100k HLX) each — enough to qualify, nothing more.
     let extra_validators = format!("{addr_b}:100000,{addr_c}:100000");
-    let _node_a = spawn_node_with(VAL_A_RPC, VAL_A_P2P, None, &[("HELIX_GENESIS_EXTRA_VALIDATORS", &extra_validators)], None);
+    let _node_a = spawn_node_with(
+        VAL_A_RPC,
+        VAL_A_P2P,
+        None,
+        &[("HELIX_GENESIS_EXTRA_VALIDATORS", &extra_validators), ("HELIX_P2P_SEED_PEERS", &seeds_a)],
+        None,
+    );
     wait_until_reachable(VAL_A_RPC, Duration::from_secs(15)).await;
 
-    // Unlike the single-validator test above, A can NOT be given a head start alone here: with
-    // 3 validators of unequal raw stake, `ValidatorSet::new`'s 1%-of-total-stake cap caps every
-    // validator's voting power identically (see its doc comment), so no 2 of 3 quite reaches
-    // the +1-past-2/3 quorum threshold on the nose — every block genuinely needs all three
-    // validators online and voting, not just a simple majority. B and C join via
-    // HELIX_SYNC_PEER as usual — this adopts A's genesis block byte-for-byte *and* (via GET
-    // /genesis's extra_validators field) rebuilds the same pre-staked state, so all three
-    // independently arrive at an identical 3-validator ValidatorSet from height 0.
-    let _node_b = spawn_node_with(VAL_B_RPC, VAL_B_P2P, Some(VAL_A_RPC), &[], Some(&kp_b));
-    let _node_c = spawn_node_with(VAL_C_RPC, VAL_C_P2P, Some(VAL_A_RPC), &[], Some(&kp_c));
+    // B and C join via HELIX_SYNC_PEER (adopts A's genesis block byte-for-byte *and*, via GET
+    // /genesis's extra_validators field, rebuilds the same pre-staked state, so all three
+    // independently arrive at an identical 3-validator ValidatorSet from height 0) and the
+    // same full-mesh seed peers. With `ValidatorSet::new`'s 1%-of-total-stake cap making every
+    // validator's voting power identical, quorum genuinely needs all three voting — a real
+    // multi-validator BFT round, proposal + two-phase commit, not a single-proposer shortcut.
+    let _node_b = spawn_node_with(VAL_B_RPC, VAL_B_P2P, Some(VAL_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_b)], Some(&kp_b));
+    let _node_c = spawn_node_with(VAL_C_RPC, VAL_C_P2P, Some(VAL_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_c)], Some(&kp_c));
     wait_until_reachable(VAL_B_RPC, Duration::from_secs(15)).await;
     wait_until_reachable(VAL_C_RPC, Duration::from_secs(15)).await;
 
-    // Give the fleet real time to produce a window of blocks with all three validators
-    // actively voting (gossipsub mesh formation alone empirically takes 10-40+ seconds — see
-    // backlog item 49's note). Block cadence here is markedly less regular than the
-    // single-validator test above: with exactly 3 validators of unequal raw stake but
-    // *identical* capped voting power (see the 1%-cap comment above), 2 of 3 votes fall
-    // exactly one short of quorum — every single block genuinely needs all three validators'
-    // votes to land, so any one delayed/dropped vote burns a full round timeout before the
-    // next round's proposer gets a chance. Measured empirically: some blocks finalize within
-    // ~1-2s, others take 30-60s+ after a round timeout. This is real BFT math working as
-    // designed (N=3f+1 with f=0 means 3 validators tolerate *zero* offline/faulty members —
-    // worth remembering when deciding how many validators a production deployment needs), not
-    // a test flake — the generous timeout below accommodates it rather than masking it.
+    // Block production waits out a one-time mesh-settle (so the first round's votes aren't lost
+    // to a half-formed gossip mesh — see block_production_loop) and then finalizes a steady
+    // ~1-2s/block with proposer rotation across all three. The timeout is deliberately far
+    // larger than the ~30s this needs, to stay green on a slow/loaded CI machine without
+    // masking a genuine stall.
     let target_height = 10;
-    wait_for_height(VAL_A_RPC, target_height, Duration::from_secs(240)).await;
+    wait_for_height(VAL_A_RPC, target_height, Duration::from_secs(180)).await;
 
     let mut distinct_proposers = HashSet::new();
     for height in 1..=target_height {

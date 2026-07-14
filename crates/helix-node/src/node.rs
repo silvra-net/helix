@@ -145,6 +145,10 @@ mod keypair_file_tests {
 }
 
 const BLOCK_TIME_MS: u64 = 2_000;
+/// Block-production ticks to wait (after enough validators have connected) for the
+/// gossip mesh to finish forming before producing the first block, in a
+/// multi-validator set. See the startup gate in `block_production_loop`.
+const MESH_SETTLE_TICKS: u32 = 5;
 const MAX_TXS_PER_BLOCK: usize = 1_000;
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
 
@@ -418,6 +422,17 @@ impl HelixNode {
             p2p_config.public_addr = Some(addr);
         }
 
+        // Additional explicit P2P seed peers (comma-separated multiaddrs) to dial directly,
+        // on top of the one derived from `sync_peer`. Lets an operator wire a validator set
+        // into a full mesh (every validator dials every other) rather than hub-and-spoke,
+        // which both survives any single node's outage and gives consensus vote gossip more
+        // than one relay path. Malformed entries are dialed-and-ignored by the P2P layer.
+        if let Some(seeds) = config::resolve("HELIX_P2P_SEED_PEERS", &cfg.p2p_seed_peers) {
+            for s in seeds.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                p2p_config.seed_peers.push(s.to_string());
+            }
+        }
+
         // mDNS LAN auto-discovery is on by default (zero-config peering). Disable it for
         // deterministic seed-peer-only peering — required when another independent Helix
         // network shares this LAN (e.g. the multi-node integration test running next to a
@@ -584,6 +599,7 @@ impl HelixNode {
             last_applied_height,
             self.p2p_command_tx.clone(),
             self.reward_address.map(Arc::new),
+            peer_count.clone(),
         ));
 
         tokio::select! {
@@ -1033,11 +1049,38 @@ async fn block_production_loop(
     last_applied_height: Arc<Mutex<u64>>,
     p2p_tx: mpsc::Sender<P2PCommand>,
     reward_address: Option<Arc<Address>>,
+    peer_count: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(BLOCK_TIME_MS));
 
+    // One-time startup gate: in a multi-validator set, don't produce the very first
+    // block until enough peers are connected AND the gossip mesh has had a few ticks
+    // to finish grafting + exchanging topic subscriptions. A proposal or vote
+    // published into a half-formed mesh is silently dropped by the peers it hasn't
+    // meshed with yet — and gossipsub won't re-publish an identical (already-seen)
+    // message, so those first-round votes are simply lost forever and round 0 never
+    // reaches quorum. Waiting out the mesh makes the first round's delivery as
+    // reliable as every later round's. Single-validator sets need 0 peers, so this
+    // passes through immediately and the live devnet is unaffected.
+    let mut mesh_ready = false;
+    let mut settle_ticks_left: u32 = MESH_SETTLE_TICKS;
+
     loop {
         interval.tick().await;
+
+        if !mesh_ready {
+            let needed = engine.read().await.peers_needed_for_quorum();
+            if needed == 0 {
+                mesh_ready = true;
+            } else if peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed {
+                continue; // still waiting for enough validators to connect
+            } else if settle_ticks_left > 0 {
+                settle_ticks_left -= 1;
+                continue; // peers here — let the mesh settle before first use
+            } else {
+                mesh_ready = true;
+            }
+        }
 
         // A round from a previous tick is still awaiting peer votes — don't
         // clobber it with a brand-new proposal (different timestamp/hash) for
@@ -1047,6 +1090,34 @@ async fn block_production_loop(
         // block failed validation for enough peers that quorum can never be
         // reached) and forcing it to the next round via `advance_round`.
         let stalled = if engine.read().await.has_active_round() {
+            // Re-broadcast our pending proposal every tick so a validator that
+            // connected *after* we first proposed can still receive and vote on
+            // it. Critical at cold start, where the round's proposer is up and
+            // proposing before the other validators have finished joining —
+            // without this they'd never see the one proposal that was sent once,
+            // before they connected. Idempotent: a peer already tracking this
+            // round ignores the duplicate (see `receive_proposal`).
+            let pending = {
+                let e = engine.read().await;
+                e.active_round_num().zip(e.pending_proposal().cloned())
+            };
+            if let Some((round, block)) = pending {
+                let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal { round, block }));
+            }
+
+            // Hold the round instead of advancing while fewer than a quorum's
+            // worth of other validators are connected. Burning through rounds
+            // while under-connected just runs this node ahead of validators that
+            // will (re)join at round 0, into a round they'll never reach back —
+            // the exact cold-start desync that otherwise stalls a multi-validator
+            // chain at height 1 forever. A single-validator set needs 0 peers, so
+            // this never gates production on the live devnet.
+            if peer_count.load(std::sync::atomic::Ordering::Relaxed)
+                < engine.read().await.peers_needed_for_quorum()
+            {
+                continue;
+            }
+
             let timed_out = { engine.write().await.note_round_tick() };
             if !timed_out {
                 continue;

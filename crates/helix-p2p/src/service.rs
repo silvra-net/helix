@@ -109,7 +109,16 @@ impl P2PService {
                 };
 
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
-                    .heartbeat_interval(Duration::from_secs(10))
+                    // 1s (down from libp2p's 1s default that a prior 10s override had
+                    // slowed right down): the heartbeat drives both mesh maintenance and
+                    // the IHAVE/IWANT gossip that recovers messages a peer missed while its
+                    // mesh was still forming. At 10s, a consensus vote dropped during the
+                    // first seconds of a round was not re-offered until long after the round
+                    // had already timed out — so in a multi-validator set some node was
+                    // always short a prevote or precommit and no round ever reached quorum.
+                    // At 1s the recovery lands well within a round. Cheap at Helix's small
+                    // validator-set scale.
+                    .heartbeat_interval(Duration::from_secs(1))
                     .validation_mode(gossipsub::ValidationMode::Strict)
                     .message_id_fn(message_id_fn)
                     .max_transmit_size(max_msg_size)

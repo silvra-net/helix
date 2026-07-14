@@ -42,6 +42,14 @@ pub struct NodeConfig {
     /// networks share a LAN (mDNS would otherwise cross-wire them) — see
     /// `helix_p2p::P2PConfig::enable_mdns`. Absent/false keeps mDNS on (the default).
     pub p2p_disable_mdns: Option<String>,
+    /// Comma-separated list of additional P2P peers to dial directly, as libp2p
+    /// multiaddrs (e.g. `/ip4/1.2.3.4/tcp/8546,/dns4/peer.example/tcp/8546`). Unlike
+    /// `sync_peer` (one HTTP peer for history + its single derived P2P seed), this hard-wires
+    /// several direct P2P peers at once — important for a validator set, where every
+    /// validator should peer with every other rather than hub-and-spoke through one node: a
+    /// hub outage otherwise partitions the rest, and relaying consensus votes through a single
+    /// hub is fragile. Peer exchange still discovers further peers on top of these.
+    pub p2p_seed_peers: Option<String>,
 }
 
 const CONFIG_PATH_ENV: &str = "HELIX_CONFIG";
