@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     info!("╔══════════════════════════════════════════╗");
     info!("║       Helix Node v{}                 ║", env!("CARGO_PKG_VERSION"));
     info!("║   Quantum-Secure Blockchain  •  HLX      ║");
-    info!("║   Crypto: ML-DSA (NIST PQC Dilithium3)   ║");
+    info!("║   Crypto: ML-DSA-65 (NIST FIPS 204)      ║");
     info!("╚══════════════════════════════════════════╝");
 
     let node = node::HelixNode::new().await?;

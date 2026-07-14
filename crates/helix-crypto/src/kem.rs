@@ -1,14 +1,13 @@
-use pqcrypto_kyber::kyber768;
-use pqcrypto_traits::kem::{
-    Ciphertext as KemCtTrait, PublicKey as KemPkTrait, SecretKey as KemSkTrait,
-    SharedSecret as KemSsTrait,
+use ml_kem::{
+    Ciphertext as MlKemCiphertext, Decapsulate, DecapsulationKey as MlKemDk,
+    Encapsulate, EncapsulationKey as MlKemEk, Kem, KeyExport, KeyInit, MlKem768, TryKeyInit,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::error::{CryptoError, CryptoResult};
 
-/// ML-KEM-768 (Kyber-768, NIST FIPS 203 level 3) encapsulation key.
+/// ML-KEM-768 (NIST FIPS 203, security level 3) encapsulation key.
 /// Share this with peers so they can encapsulate a shared secret to you.
 /// 1184 bytes.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,24 +55,26 @@ impl Drop for KemKeyPair {
 impl KemKeyPair {
     /// Generate a fresh ephemeral ML-KEM-768 key pair.
     pub fn generate() -> Self {
-        let (pk, sk) = kyber768::keypair();
+        let (dk, ek) = MlKem768::generate_keypair();
         KemKeyPair {
-            encapsulation_key: KemEncapsulationKey::from_bytes(pk.as_bytes().to_vec()),
-            dk: sk.as_bytes().to_vec(),
+            encapsulation_key: KemEncapsulationKey::from_bytes(KeyExport::to_bytes(&ek).to_vec()),
+            dk: KeyExport::to_bytes(&dk).to_vec(),
         }
     }
 
     /// Decapsulate a ciphertext produced by `kem_encapsulate` against this
     /// key pair's decapsulation key. Returns the 32-byte shared secret.
-    /// Fails if the ciphertext is malformed or was encapsulated to a different key.
+    /// Fails only if the stored key or ciphertext bytes are malformed —
+    /// a *wrong* (mismatched) ciphertext yields a pseudo-random secret by
+    /// design (implicit rejection), not an error.
     pub fn decapsulate(&self, ct: &KemCiphertext) -> CryptoResult<[u8; 32]> {
-        let sk = kyber768::SecretKey::from_bytes(&self.dk)
-            .map_err(|e| CryptoError::InvalidSecretKey(e.to_string()))?;
-        let ct_parsed = kyber768::Ciphertext::from_bytes(ct.as_bytes())
-            .map_err(|e| CryptoError::InvalidSignature(format!("bad ML-KEM ciphertext: {e}")))?;
-        let ss = kyber768::decapsulate(&ct_parsed, &sk);
+        let dk = MlKemDk::<MlKem768>::new_from_slice(self.dk.as_slice())
+            .map_err(|_| CryptoError::InvalidSecretKey("bad ML-KEM decapsulation key".into()))?;
+        let ct_arr = MlKemCiphertext::<MlKem768>::try_from(ct.as_bytes())
+            .map_err(|_| CryptoError::InvalidSignature("bad ML-KEM ciphertext".into()))?;
+        let ss = dk.decapsulate(&ct_arr);
         let mut out = [0u8; 32];
-        out.copy_from_slice(ss.as_bytes());
+        out.copy_from_slice(&ss);
         Ok(out)
     }
 }
@@ -85,12 +86,12 @@ impl KemKeyPair {
 /// The shared secret is 32 bytes — suitable for use as an AEAD key or as
 /// input to a KDF like `blake3::derive_key`.
 pub fn kem_encapsulate(ek: &KemEncapsulationKey) -> CryptoResult<(KemCiphertext, [u8; 32])> {
-    let pk = kyber768::PublicKey::from_bytes(ek.as_bytes())
-        .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
-    let (ss, ct) = kyber768::encapsulate(&pk);
+    let ek = MlKemEk::<MlKem768>::new_from_slice(ek.as_bytes())
+        .map_err(|_| CryptoError::InvalidPublicKey("bad ML-KEM encapsulation key".into()))?;
+    let (ct, ss) = ek.encapsulate();
     let mut shared = [0u8; 32];
-    shared.copy_from_slice(ss.as_bytes());
-    Ok((KemCiphertext::from_bytes(ct.as_bytes().to_vec()), shared))
+    shared.copy_from_slice(&ss);
+    Ok((KemCiphertext::from_bytes(ct.to_vec()), shared))
 }
 
 #[cfg(test)]
@@ -110,7 +111,6 @@ mod tests {
         let kp = KemKeyPair::generate();
         let (ct1, ss1) = kem_encapsulate(&kp.encapsulation_key).unwrap();
         let (ct2, ss2) = kem_encapsulate(&kp.encapsulation_key).unwrap();
-        // Same recipient, fresh encapsulation → different ciphertexts and secrets
         assert_ne!(ct1.as_bytes(), ct2.as_bytes());
         assert_ne!(ss1, ss2);
     }
@@ -120,19 +120,19 @@ mod tests {
         let kp1 = KemKeyPair::generate();
         let kp2 = KemKeyPair::generate();
         let (ct, ss1) = kem_encapsulate(&kp1.encapsulation_key).unwrap();
-        // Decapsulate with wrong key — KEM is designed to return a pseudo-random
-        // (wrong) secret rather than an error, preventing oracle attacks
+        // Implicit rejection: decapsulating with the wrong key returns a pseudo-random
+        // (wrong) secret rather than an error, preventing chosen-ciphertext oracle attacks.
         let ss2 = kp2.decapsulate(&ct).unwrap();
         assert_ne!(ss1, ss2);
     }
 
     #[test]
-    fn kem_encapsulation_key_sizes_match_ml_kem_768_spec() {
+    fn kem_key_and_ciphertext_sizes_match_ml_kem_768_spec() {
         let kp = KemKeyPair::generate();
-        // ML-KEM-768: ek = 1184 bytes, ciphertext = 1088 bytes, shared secret = 32 bytes
-        assert_eq!(kp.encapsulation_key.as_bytes().len(), kyber768::public_key_bytes());
+        // ML-KEM-768: ek = 1184 bytes, ciphertext = 1088 bytes, shared secret = 32 bytes.
+        assert_eq!(kp.encapsulation_key.as_bytes().len(), 1184);
         let (ct, ss) = kem_encapsulate(&kp.encapsulation_key).unwrap();
-        assert_eq!(ct.as_bytes().len(), kyber768::ciphertext_bytes());
+        assert_eq!(ct.as_bytes().len(), 1088);
         assert_eq!(ss.len(), 32);
     }
 }

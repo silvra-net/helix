@@ -109,7 +109,7 @@ async fn root() -> Json<Value> {
         "name": "Helix Node",
         "version": env!("CARGO_PKG_VERSION"),
         "token": "HLX",
-        "crypto": "ML-DSA (Dilithium3) — NIST PQC",
+        "crypto": "ML-DSA-65 — NIST FIPS 204",
         "endpoints": [
             "GET  /status",
             "GET  /blocks/latest",

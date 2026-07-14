@@ -12,8 +12,8 @@ use crate::{Address, CryptoScheme, KeyPair};
 
 /// Human-readable algo strings stored in `KeyFile::algo` — the on-disk name for
 /// each `CryptoScheme`, so a wallet file records which scheme to reconstruct on load.
-const ALGO_ML_DSA: &str = "ML-DSA-Dilithium3";
-const ALGO_SPHINCS_PLUS: &str = "SLH-DSA-SPHINCS+-SHA2-192s";
+const ALGO_ML_DSA: &str = "ML-DSA-65";
+const ALGO_SPHINCS_PLUS: &str = "SLH-DSA-SHA2-192s";
 
 fn algo_name(scheme: CryptoScheme) -> &'static str {
     match scheme {

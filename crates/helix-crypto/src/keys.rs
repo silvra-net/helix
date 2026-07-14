@@ -1,14 +1,44 @@
-use pqcrypto_dilithium::dilithium3;
-use pqcrypto_sphincsplus::sphincssha2192ssimple as sphincsplus;
-use pqcrypto_traits::sign::{
-    DetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
+use core::convert::Infallible;
+
+use ml_dsa::{
+    B32, EncodedSignature as MlDsaEncodedSig, EncodedVerifyingKey as MlDsaEncodedVk, Generate,
+    KeyExport, KeyInit, Keypair, MlDsa65, Signature as MlDsaSignature, Signer,
+    SigningKey as MlDsaSigningKey, Verifier, VerifyingKey as MlDsaVerifyingKey,
 };
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
+use slh_dsa::signature::{Signer as SlhSigner, Verifier as SlhVerifier};
+use slh_dsa::{
+    Sha2_192s, Signature as SlhSignature, SigningKey as SlhSigningKey,
+    VerifyingKey as SlhVerifyingKey,
+};
 use std::fmt;
 use zeroize::Zeroize;
 
 use crate::error::{CryptoError, CryptoResult};
 use crate::hash::Hash;
+
+/// A `rand_core` 0.10 `CryptoRng` bridged from `rand` 0.8's OS CSPRNG. `slh-dsa`'s key
+/// generation is the one primitive here that takes an explicit RNG (ML-DSA and ML-KEM have
+/// `getrandom`-backed convenience constructors); this adapter feeds it OS entropy without
+/// pulling in a second full `rand` stack. `TryRng<Error = Infallible>` + `TryCryptoRng`
+/// blanket-impl into `Rng` + `CryptoRng` in rand_core 0.10.
+struct OsCryptoRng;
+
+impl rand_core::TryRng for OsCryptoRng {
+    type Error = Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        Ok(rand::rngs::OsRng.next_u32())
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        Ok(rand::rngs::OsRng.next_u64())
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
+        rand::rngs::OsRng.fill_bytes(dst);
+        Ok(())
+    }
+}
+impl rand_core::TryCryptoRng for OsCryptoRng {}
 
 /// Which PQC signature scheme a key or signature belongs to. Each signed
 /// artifact (block header, vote) records its own scheme, so the network can
@@ -16,9 +46,9 @@ use crate::hash::Hash;
 /// without a hard fork: old and new signatures stay independently verifiable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CryptoScheme {
-    /// ML-DSA (Dilithium3) — NIST FIPS 204, initial scheme
+    /// ML-DSA-65 — NIST FIPS 204, initial scheme
     MlDsa = 1,
-    /// SLH-DSA (SPHINCS+-SHA2-192s) — NIST FIPS 205, hash-based migration target
+    /// SLH-DSA-SHA2-192s — NIST FIPS 205, hash-based migration target
     SphincsPlus = 2,
 }
 
@@ -39,22 +69,27 @@ impl CryptoScheme {
         }
     }
 
+    /// Serialized secret-key length in bytes. ML-DSA stores the 32-byte seed (FIPS 204's
+    /// "ξ"); the expanded signing key is re-derived from it on load.
     pub fn secret_key_len(self) -> usize {
         match self {
-            CryptoScheme::MlDsa => dilithium3::secret_key_bytes(),
-            CryptoScheme::SphincsPlus => sphincsplus::secret_key_bytes(),
+            CryptoScheme::MlDsa => 32,
+            // SLH-DSA-SHA2-192s: private key = 4·n = 4·24 bytes (FIPS 205 Table 2).
+            CryptoScheme::SphincsPlus => 96,
         }
     }
 
     pub fn public_key_len(self) -> usize {
         match self {
-            CryptoScheme::MlDsa => dilithium3::public_key_bytes(),
-            CryptoScheme::SphincsPlus => sphincsplus::public_key_bytes(),
+            // ML-DSA-65 verifying key = 1952 bytes (FIPS 204).
+            CryptoScheme::MlDsa => 1952,
+            // SLH-DSA-SHA2-192s: public key = 2·n = 2·24 bytes (FIPS 205 Table 2).
+            CryptoScheme::SphincsPlus => 48,
         }
     }
 }
 
-/// ML-DSA (Dilithium3) public key — NIST security level 3
+/// PQC public (verifying) key — opaque scheme-tagged bytes.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicKey(Vec<u8>);
 
@@ -81,17 +116,27 @@ impl PublicKey {
         hex::encode(&h.as_bytes()[..8])
     }
 
-    /// True if these bytes parse as a structurally valid ML-DSA (Dilithium3) public key.
-    /// Only checks the original (default) scheme — callers that need to accept a
-    /// migrated SPHINCS+ key should match on an explicit `CryptoScheme` instead.
+    /// True if these bytes parse as a structurally valid public key under the given scheme.
+    pub fn is_valid_for(&self, scheme: CryptoScheme) -> bool {
+        match scheme {
+            CryptoScheme::MlDsa => MlDsaEncodedVk::<MlDsa65>::try_from(self.0.as_slice()).is_ok(),
+            CryptoScheme::SphincsPlus => {
+                SlhVerifyingKey::<Sha2_192s>::try_from(self.0.as_slice()).is_ok()
+            }
+        }
+    }
+
+    /// True if these bytes parse as a structurally valid ML-DSA (default scheme) public key.
+    /// For a migrated SPHINCS+ key, use `is_valid_for(CryptoScheme::SphincsPlus)`.
     pub fn is_valid(&self) -> bool {
-        dilithium3::PublicKey::from_bytes(&self.0).is_ok()
+        self.is_valid_for(CryptoScheme::MlDsa)
     }
 }
 
 impl fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PublicKey({}...)", &self.to_hex()[..16])
+        let hex = self.to_hex();
+        write!(f, "PublicKey({}...)", &hex[..hex.len().min(16)])
     }
 }
 
@@ -101,7 +146,7 @@ impl fmt::Display for PublicKey {
     }
 }
 
-/// ML-DSA (Dilithium3) secret key — zeroed on drop
+/// PQC secret key — zeroed on drop. For ML-DSA this is the 32-byte seed.
 #[derive(Zeroize)]
 #[zeroize(drop)]
 pub struct SecretKey(Vec<u8>);
@@ -116,7 +161,7 @@ impl SecretKey {
     }
 }
 
-/// ML-DSA detached signature
+/// PQC detached signature — opaque scheme-tagged bytes.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature(Vec<u8>);
 
@@ -140,7 +185,8 @@ impl Signature {
 
 impl fmt::Debug for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Signature({}...)", &self.to_hex()[..16])
+        let hex = self.to_hex();
+        write!(f, "Signature({}...)", &hex[..hex.len().min(16)])
     }
 }
 
@@ -152,7 +198,7 @@ pub struct KeyPair {
 }
 
 impl KeyPair {
-    /// Generate a fresh ML-DSA (Dilithium3) keypair — the default scheme
+    /// Generate a fresh ML-DSA-65 keypair — the default scheme
     pub fn generate() -> Self {
         Self::generate_for(CryptoScheme::MlDsa)
     }
@@ -162,18 +208,20 @@ impl KeyPair {
     pub fn generate_for(scheme: CryptoScheme) -> Self {
         match scheme {
             CryptoScheme::MlDsa => {
-                let (pk, sk) = dilithium3::keypair();
+                let sk = MlDsaSigningKey::<MlDsa65>::generate();
+                let vk = sk.verifying_key();
                 KeyPair {
-                    public: PublicKey::from_bytes(pk.as_bytes().to_vec()),
-                    secret: SecretKey::from_bytes(sk.as_bytes().to_vec()),
+                    public: PublicKey::from_bytes(vk.encode().to_vec()),
+                    secret: SecretKey::from_bytes(KeyExport::to_bytes(&sk).to_vec()),
                     scheme,
                 }
             }
             CryptoScheme::SphincsPlus => {
-                let (pk, sk) = sphincsplus::keypair();
+                let sk = SlhSigningKey::<Sha2_192s>::new(&mut OsCryptoRng);
+                let vk = sk.verifying_key();
                 KeyPair {
-                    public: PublicKey::from_bytes(pk.as_bytes().to_vec()),
-                    secret: SecretKey::from_bytes(sk.as_bytes().to_vec()),
+                    public: PublicKey::from_bytes(vk.to_bytes().to_vec()),
+                    secret: SecretKey::from_bytes(sk.to_bytes().to_vec()),
                     scheme,
                 }
             }
@@ -182,18 +230,29 @@ impl KeyPair {
 
     /// Reconstruct and structurally validate a keypair from raw bytes previously
     /// produced by `generate_for` (e.g. loaded from a wallet or validator key file).
-    pub fn from_raw(scheme: CryptoScheme, secret_bytes: Vec<u8>, public_bytes: Vec<u8>) -> CryptoResult<Self> {
+    pub fn from_raw(
+        scheme: CryptoScheme,
+        secret_bytes: Vec<u8>,
+        public_bytes: Vec<u8>,
+    ) -> CryptoResult<Self> {
         match scheme {
             CryptoScheme::MlDsa => {
-                dilithium3::SecretKey::from_bytes(&secret_bytes)
-                    .map_err(|e| CryptoError::InvalidSecretKey(e.to_string()))?;
-                dilithium3::PublicKey::from_bytes(&public_bytes)
-                    .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
+                // Secret is the 32-byte seed; re-derive the verifying key from it and
+                // require it to match the stored public key — catches a corrupt/mismatched
+                // pair on load rather than at first signature.
+                let seed = mldsa_seed(&secret_bytes)?;
+                let sk = MlDsaSigningKey::<MlDsa65>::new(&seed);
+                let derived = sk.verifying_key().encode().to_vec();
+                if derived != public_bytes {
+                    return Err(CryptoError::InvalidPublicKey(
+                        "ML-DSA public key does not match the secret seed".into(),
+                    ));
+                }
             }
             CryptoScheme::SphincsPlus => {
-                sphincsplus::SecretKey::from_bytes(&secret_bytes)
+                SlhSigningKey::<Sha2_192s>::try_from(secret_bytes.as_slice())
                     .map_err(|e| CryptoError::InvalidSecretKey(e.to_string()))?;
-                sphincsplus::PublicKey::from_bytes(&public_bytes)
+                SlhVerifyingKey::<Sha2_192s>::try_from(public_bytes.as_slice())
                     .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
             }
         }
@@ -208,19 +267,28 @@ impl KeyPair {
     pub fn sign(&self, message: &[u8]) -> CryptoResult<Signature> {
         match self.scheme {
             CryptoScheme::MlDsa => {
-                let sk = dilithium3::SecretKey::from_bytes(self.secret.as_bytes())
-                    .map_err(|e| CryptoError::InvalidSecretKey(e.to_string()))?;
-                let sig = dilithium3::detached_sign(message, &sk);
-                Ok(Signature::from_bytes(sig.as_bytes().to_vec()))
+                let seed = mldsa_seed(self.secret.as_bytes())?;
+                let sk = MlDsaSigningKey::<MlDsa65>::new(&seed);
+                let sig = sk
+                    .try_sign(message)
+                    .map_err(|e| CryptoError::InvalidSignature(e.to_string()))?;
+                Ok(Signature::from_bytes(sig.encode().to_vec()))
             }
             CryptoScheme::SphincsPlus => {
-                let sk = sphincsplus::SecretKey::from_bytes(self.secret.as_bytes())
+                let sk = SlhSigningKey::<Sha2_192s>::try_from(self.secret.as_bytes())
                     .map_err(|e| CryptoError::InvalidSecretKey(e.to_string()))?;
-                let sig = sphincsplus::detached_sign(message, &sk);
-                Ok(Signature::from_bytes(sig.as_bytes().to_vec()))
+                let sig = SlhSigner::try_sign(&sk, message)
+                    .map_err(|e| CryptoError::InvalidSignature(e.to_string()))?;
+                Ok(Signature::from_bytes(sig.to_bytes().to_vec()))
             }
         }
     }
+}
+
+/// Reconstruct an ML-DSA seed (`B32`) from stored secret bytes.
+fn mldsa_seed(bytes: &[u8]) -> CryptoResult<B32> {
+    B32::try_from(bytes)
+        .map_err(|_| CryptoError::InvalidSecretKey("ML-DSA seed must be 32 bytes".into()))
 }
 
 /// Verify an ML-DSA signature (the default scheme). For a signature that may have
@@ -240,20 +308,22 @@ pub fn verify_with_scheme(
 ) -> CryptoResult<()> {
     match scheme {
         CryptoScheme::MlDsa => {
-            let pk = dilithium3::PublicKey::from_bytes(public_key.as_bytes())
-                .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
-            let sig = dilithium3::DetachedSignature::from_bytes(signature.as_bytes())
-                .map_err(|e| CryptoError::InvalidSignature(e.to_string()))?;
-            dilithium3::verify_detached_signature(&sig, message, &pk)
+            let enc_vk = MlDsaEncodedVk::<MlDsa65>::try_from(public_key.as_bytes())
+                .map_err(|_| CryptoError::InvalidPublicKey("bad ML-DSA public key length".into()))?;
+            let vk = MlDsaVerifyingKey::<MlDsa65>::decode(&enc_vk);
+            let enc_sig = MlDsaEncodedSig::<MlDsa65>::try_from(signature.as_bytes())
+                .map_err(|_| CryptoError::InvalidSignature("bad ML-DSA signature length".into()))?;
+            let sig = MlDsaSignature::<MlDsa65>::decode(&enc_sig)
+                .ok_or_else(|| CryptoError::InvalidSignature("malformed ML-DSA signature".into()))?;
+            vk.verify(message, &sig)
                 .map_err(|_| CryptoError::VerificationFailed)
         }
         CryptoScheme::SphincsPlus => {
-            let pk = sphincsplus::PublicKey::from_bytes(public_key.as_bytes())
+            let vk = SlhVerifyingKey::<Sha2_192s>::try_from(public_key.as_bytes())
                 .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
-            let sig = sphincsplus::DetachedSignature::from_bytes(signature.as_bytes())
+            let sig = SlhSignature::<Sha2_192s>::try_from(signature.as_bytes())
                 .map_err(|e| CryptoError::InvalidSignature(e.to_string()))?;
-            sphincsplus::verify_detached_signature(&sig, message, &pk)
-                .map_err(|_| CryptoError::VerificationFailed)
+            SlhVerifier::verify(&vk, message, &sig).map_err(|_| CryptoError::VerificationFailed)
         }
     }
 }
@@ -294,6 +364,16 @@ mod tests {
     }
 
     #[test]
+    fn ml_dsa_key_sizes_match_fips_204_level_3() {
+        // FIPS 204 ML-DSA-65: verifying key 1952 bytes, signature 3309 bytes, seed 32 bytes.
+        let kp = KeyPair::generate();
+        assert_eq!(kp.public.as_bytes().len(), 1952);
+        assert_eq!(kp.secret.as_bytes().len(), 32);
+        let sig = kp.sign(b"x").unwrap();
+        assert_eq!(sig.as_bytes().len(), 3309);
+    }
+
+    #[test]
     fn test_sphincsplus_keygen_sign_verify() {
         let kp = KeyPair::generate_for(CryptoScheme::SphincsPlus);
         assert_eq!(kp.scheme, CryptoScheme::SphincsPlus);
@@ -304,13 +384,14 @@ mod tests {
 
     #[test]
     fn test_verify_with_wrong_scheme_fails() {
-        // A signature produced under one scheme must not verify under the other,
-        // even with the same message and a structurally-parseable key/sig pair.
+        // A signature produced under one scheme must not verify under the other.
         let ml_dsa = KeyPair::generate();
         let sphincs = KeyPair::generate_for(CryptoScheme::SphincsPlus);
         let msg = b"cross-scheme message";
         let ml_dsa_sig = ml_dsa.sign(msg).unwrap();
-        assert!(verify_with_scheme(CryptoScheme::SphincsPlus, &sphincs.public, msg, &ml_dsa_sig).is_err());
+        assert!(
+            verify_with_scheme(CryptoScheme::SphincsPlus, &sphincs.public, msg, &ml_dsa_sig).is_err()
+        );
     }
 
     #[test]
@@ -324,6 +405,21 @@ mod tests {
         .unwrap();
         let msg = b"restored keypair still signs correctly";
         let sig = restored.sign(msg).unwrap();
-        assert!(verify_with_scheme(CryptoScheme::SphincsPlus, &restored.public, msg, &sig).is_ok());
+        assert!(
+            verify_with_scheme(CryptoScheme::SphincsPlus, &restored.public, msg, &sig).is_ok()
+        );
+    }
+
+    #[test]
+    fn ml_dsa_from_raw_rejects_mismatched_public() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        // a's seed with b's public key must be rejected.
+        let res = KeyPair::from_raw(
+            CryptoScheme::MlDsa,
+            a.secret.as_bytes().to_vec(),
+            b.public.as_bytes().to_vec(),
+        );
+        assert!(res.is_err());
     }
 }

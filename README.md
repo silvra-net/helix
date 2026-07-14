@@ -21,7 +21,7 @@ layout) lives further down for when you need it.
 
 | Problem with existing chains | Helix solution |
 |---|---|
-| SHA-256 / ECDSA broken by quantum computers | ML-DSA (Dilithium3) — NIST FIPS 204 |
+| SHA-256 / ECDSA broken by quantum computers | ML-DSA-65 — NIST FIPS 204 |
 | PoW wastes energy, PoS creates plutocracy | PoS + Proof of Personhood — 1% voting cap per identity |
 | Hexadecimal addresses, no recovery | `alice.hlx` names + social guardian recovery |
 | No plan for quantum migration | Algorithm versioning built into the protocol |
@@ -648,8 +648,8 @@ CLI: hlx (helix-cli)   ←→   REST API :8545   ←→   P2P :8546
 
 | Primitive | Algorithm | Standard | Quantum-safe |
 |---|---|---|---|
-| Digital Signatures | ML-DSA (Dilithium3) | NIST FIPS 204 | ✅ |
-| Backup Signatures | SLH-DSA (SPHINCS+) | NIST FIPS 205 | ✅ |
+| Digital Signatures | ML-DSA-65 | NIST FIPS 204 | ✅ |
+| Backup Signatures | SLH-DSA-SHA2-192s | NIST FIPS 205 | ✅ |
 | Hashing | BLAKE3 | — | ✅ (2× security margin vs Grover) |
 | Zero-Knowledge | ZK-STARKs | — | ✅ (hash-based) |
 | Transport | Noise (X25519) + ML-KEM-768 session layer | NIST FIPS 203 | ✅ |

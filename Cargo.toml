@@ -23,11 +23,11 @@ authors = ["SILVRA"]
 license = "MIT"
 
 [workspace.dependencies]
-# Post-Quantum Cryptography (NIST standards)
-pqcrypto-dilithium = "0.5"
-pqcrypto-sphincsplus = "0.7"
-pqcrypto-kyber = "0.8"
-pqcrypto-traits = "0.3"
+# Post-Quantum Cryptography — final NIST FIPS standards (RustCrypto, pure Rust)
+ml-dsa = "0.1.1"       # FIPS 204 ML-DSA (signatures)
+ml-kem = { version = "0.3.2", features = ["getrandom"] } # FIPS 203 ML-KEM (key encapsulation)
+slh-dsa = "0.2.0-rc.5" # FIPS 205 SLH-DSA (hash-based signature migration target)
+rand_core = "0.10"     # slh-dsa keygen wants a rand_core 0.10 CryptoRng (bridged from rand's OsRng)
 blake3 = "1.5"
 zeroize = { version = "1.7", features = ["derive"] }
 rand = "0.8"
