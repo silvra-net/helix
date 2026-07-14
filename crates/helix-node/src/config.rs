@@ -24,6 +24,12 @@ pub struct NodeConfig {
     /// configured with the same value, since it becomes part of consensus-checked state —
     /// this is an operator convention, not cryptographically enforced.
     pub personhood_authorities: Option<String>,
+    /// This node's own externally-dialable host (e.g. `helix.silvra.net` or a public IP,
+    /// no scheme/port) — used to build the multiaddr this node announces to peers via peer
+    /// exchange (`P2PConfig::public_addr`, see its doc comment for why). Absent for pure
+    /// followers / nodes behind NAT with no forwarded port: they still relay addresses they
+    /// learn from others, they just never announce themselves.
+    pub p2p_public_addr: Option<String>,
 }
 
 const CONFIG_PATH_ENV: &str = "HELIX_CONFIG";

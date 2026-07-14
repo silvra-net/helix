@@ -157,6 +157,7 @@ reward_address = "hlx..."
 sync_peer = "http://seed-host:8545"
 validator_crypto_scheme = "ml-dsa"
 mempool_tx_ttl_secs = 1800
+p2p_public_addr = "helix.example.com"
 ```
 
 An absent file is not an error (all fields default to unset); a present but
@@ -174,6 +175,7 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.bin` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.bin` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
 | `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` (30 min) | How long an unconfirmed transaction may sit in the mempool before it's evicted, freeing its (sender, nonce) slot. Overrides `mempool_tx_ttl_secs` in `helix.toml`. |
+| `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable host (a domain or public IP, no scheme/port — the configured P2P port is appended automatically). Set this on any node reachable from the outside so it can announce itself to peers via peer exchange (see "Network Resilience" below). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
 
 ```bash
 HELIX_REWARD_ADDRESS=hlx... ./target/release/helix
@@ -226,6 +228,29 @@ synced at startup. This is best-effort: if it fails (e.g. the peer is running an
 version without `p2p_port` in its `/status`), the node still starts and falls back to
 mDNS-only discovery.
 
+### Network Resilience (Peer Exchange)
+
+Two independent discovery mechanisms feed a node's P2P connections: mDNS (LAN-only) and the
+one explicit `sync_peer` dial described above. On their own, both leave every follower node
+connected to exactly one other peer — the one in its own `sync_peer` setting. That's a
+hub-and-spoke topology: if that one hub goes offline, every follower connected only to it is
+cut off from the rest of the network, with no path to any other follower, even though those
+other followers are still online and reachable.
+
+Peer exchange closes this gap. Every node maintains a set of known-dialable peer addresses
+(seeded from its own `p2p_public_addr`, if set, and its `sync_peer`'s resolved address), and
+gossips that set to its connected peers — once right after each new connection, and every 30
+seconds after that. A node that receives an address it didn't already know dials it directly.
+The practical effect: once even a handful of nodes know each other's public addresses, the
+network self-heals into a real mesh instead of depending on any single node staying up.
+
+Only nodes with `p2p_public_addr` (or `HELIX_P2P_PUBLIC_ADDR`) set actually announce
+themselves — set this on any node with a real, externally-reachable P2P port (a public IP,
+or a domain pointing at one, with port `8546`/your configured P2P port open). A node behind
+NAT with no forwarded port should leave it unset; it still participates fully, both dialing
+addresses it learns and relaying them onward, it just never advertises an address of its own
+that nobody could actually reach.
+
 ### Docker Deployment
 
 A `Dockerfile` is provided for running a validator node without a local Rust toolchain.
@@ -249,7 +274,10 @@ Notes:
   the container — the compiled-in default only binds `127.0.0.1`.
 - To join an existing network instead of starting a fresh devnet genesis, set
   `HELIX_SYNC_PEER=http://<seed-host>:8545` and expose peer `8546/tcp` to the outside
-  world (P2P is TCP-only, no UDP/QUIC in the current transport).
+  world (P2P is TCP-only, no UDP/QUIC in the current transport). If this container has a
+  reachable public host/IP, also set `HELIX_P2P_PUBLIC_ADDR` so other nodes can find it
+  through peer exchange (see "Network Resilience" above) even if the seed peer later goes
+  offline.
 - The image has not been pushed to a registry — build it locally or in your own CI.
 
 ---

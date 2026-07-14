@@ -6,6 +6,14 @@ pub struct P2PConfig {
     pub listen_addr: SocketAddr,
     /// Optional seed peers to connect to on startup
     pub seed_peers: Vec<String>,
+    /// This node's own externally-dialable multiaddr (e.g.
+    /// `/dns4/helix.silvra.net/tcp/8546`), if known — announced to peers via peer
+    /// exchange (`crate::service`'s `TOPIC_PEER_EXCHANGE`) so a node connecting only to
+    /// this one can still be told about, and directly dial, every other peer this node
+    /// knows about. `None` when this node has no known-public address (e.g. behind NAT
+    /// with no port forwarding, or a pure follower with no configured public host) —
+    /// it still relays addresses it learns from others, it just never announces itself.
+    pub public_addr: Option<String>,
     /// Maximum number of established connections (incoming + outgoing combined).
     /// Enforced at the transport layer via `libp2p::connection_limits` — was
     /// previously declared but never wired up (see `helix-p2p::service`).
@@ -34,6 +42,7 @@ impl Default for P2PConfig {
         P2PConfig {
             listen_addr: "0.0.0.0:8546".parse().unwrap(),
             seed_peers: vec![],
+            public_addr: None,
             max_peers: 50,
             max_message_size: 4 * 1024 * 1024, // 4 MB — fits a full block
             max_established_incoming: 40,

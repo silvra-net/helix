@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, SwarmBuilder,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -18,7 +20,10 @@ use crate::config::P2PConfig;
 use crate::conn_limits::IpConnLimiter;
 use crate::reputation::PeerReputation;
 use crate::session::{HandshakeMsg, SessionManager};
-use crate::{P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_SESSION, TOPIC_TRANSACTIONS, TOPIC_VOTES};
+use crate::{
+    P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_PEER_EXCHANGE, TOPIC_SESSION,
+    TOPIC_TRANSACTIONS, TOPIC_VOTES,
+};
 
 /// Events received FROM the P2P network → node
 #[derive(Debug)]
@@ -156,6 +161,7 @@ impl P2PService {
         let vote_topic = gossipsub::IdentTopic::new(TOPIC_VOTES);
         let committed_topic = gossipsub::IdentTopic::new(TOPIC_COMMITTED_BLOCKS);
         let session_topic = gossipsub::IdentTopic::new(TOPIC_SESSION);
+        let peer_exchange_topic = gossipsub::IdentTopic::new(TOPIC_PEER_EXCHANGE);
 
         swarm.behaviour_mut().gossipsub.subscribe(&block_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
@@ -166,6 +172,8 @@ impl P2PService {
         swarm.behaviour_mut().gossipsub.subscribe(&committed_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
         swarm.behaviour_mut().gossipsub.subscribe(&session_topic)
+            .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
+        swarm.behaviour_mut().gossipsub.subscribe(&peer_exchange_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
 
         let listen_addr: Multiaddr = format!(
@@ -194,6 +202,27 @@ impl P2PService {
         // that repeatedly send malformed protocol messages.
         let mut reputation = PeerReputation::new();
 
+        // Peer exchange — every address we know how to dial, seeded with our own public
+        // address (if configured) and our seed peers. Without this, a node that only ever
+        // dials the single configured `seed_peers` address is permanently dependent on that
+        // one peer staying up: mDNS never crosses the open internet, and nothing else ever
+        // tells this node about any *other* peer to fall back on. See `TOPIC_PEER_EXCHANGE`'s
+        // doc comment and `PeerExchangeMsg` below for the full picture.
+        let mut known_addrs: HashSet<String> = HashSet::new();
+        if let Some(addr) = &config.public_addr {
+            known_addrs.insert(addr.clone());
+        }
+        for peer_addr in &config.seed_peers {
+            known_addrs.insert(peer_addr.clone());
+        }
+
+        // Re-announce periodically, not just on connect — a message published right as a
+        // connection is established can be lost before gossipsub's mesh for the topic has
+        // even formed with that peer (same race as the ML-KEM Hello below), and this is also
+        // how newly learned addresses (from a peer exchange we received) eventually reach
+        // peers we were already connected to before we learned them.
+        let mut peer_exchange_interval = tokio::time::interval(Duration::from_secs(30));
+
         loop {
             tokio::select! {
                 event = swarm.next() => {
@@ -217,6 +246,13 @@ impl P2PService {
                                     &mut session,
                                     &mut swarm,
                                     &session_topic,
+                                )
+                            } else if topic == TOPIC_PEER_EXCHANGE {
+                                handle_peer_exchange_message(
+                                    &message.data,
+                                    &mut known_addrs,
+                                    config.public_addr.as_deref(),
+                                    &mut swarm,
                                 )
                             } else {
                                 handle_app_message(topic, &message.data, &event_tx).await
@@ -276,6 +312,11 @@ impl P2PService {
                                 }
                             }
 
+                            // Announce what we know right away too — don't make a freshly
+                            // connected peer wait up to 30s for the periodic tick just to
+                            // learn about other peers it could dial.
+                            broadcast_known_addrs(&mut swarm, &peer_exchange_topic, &known_addrs);
+
                             let _ = event_tx.send(P2PEvent::PeerConnected(peer_str)).await;
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -288,6 +329,10 @@ impl P2PService {
                         }
                         _ => {}
                     }
+                }
+
+                _ = peer_exchange_interval.tick() => {
+                    broadcast_known_addrs(&mut swarm, &peer_exchange_topic, &known_addrs);
                 }
 
                 Some(cmd) = command_rx.recv() => {
@@ -349,6 +394,94 @@ pub(crate) fn multiaddr_ip(addr: &Multiaddr) -> Option<String> {
         libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
         _ => None,
     })
+}
+
+// ─── Peer exchange ────────────────────────────────────────────────────────────
+
+/// Cap on both how many addresses we remember (`known_addrs`) and — since the merge loop in
+/// `select_new_addrs` bails out as soon as the cap is hit — implicitly on how many addresses
+/// a single hostile peer's oversized announcement can ever cause us to dial. One cap serves
+/// both purposes; a separate per-message limit would add complexity without closing a gap
+/// this one doesn't already close.
+const MAX_KNOWN_PEER_ADDRS: usize = 200;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PeerExchangeMsg {
+    peers: Vec<String>,
+}
+
+/// Merges `incoming` into `known`, skipping our own address and anything already known, and
+/// stopping as soon as `known` reaches `MAX_KNOWN_PEER_ADDRS`. Returns only the addresses that
+/// were actually new, for the caller to dial. Pure and side-effect-free apart from mutating
+/// `known` — kept separate from the actual dialing so it's testable without a real `Swarm`.
+fn select_new_addrs(
+    known: &mut HashSet<String>,
+    incoming: &[String],
+    self_addr: Option<&str>,
+) -> Vec<String> {
+    let mut new_addrs = Vec::new();
+    for addr in incoming {
+        if known.len() >= MAX_KNOWN_PEER_ADDRS {
+            break;
+        }
+        if Some(addr.as_str()) == self_addr {
+            continue;
+        }
+        if known.insert(addr.clone()) {
+            new_addrs.push(addr.clone());
+        }
+    }
+    new_addrs
+}
+
+/// Returns `true` if the message was malformed (i.e. the sender should be charged a
+/// misbehavior strike).
+fn handle_peer_exchange_message(
+    data: &[u8],
+    known_addrs: &mut HashSet<String>,
+    self_addr: Option<&str>,
+    swarm: &mut libp2p::Swarm<HelixBehaviour>,
+) -> bool {
+    let msg = match bincode::deserialize::<PeerExchangeMsg>(data) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Malformed peer-exchange message: {}", e);
+            return true;
+        }
+    };
+
+    for addr in select_new_addrs(known_addrs, &msg.peers, self_addr) {
+        match addr.parse::<Multiaddr>() {
+            Ok(multiaddr) => {
+                debug!(addr = %addr, "Dialing newly learned peer address");
+                let _ = swarm.dial(multiaddr);
+            }
+            Err(e) => {
+                debug!(addr = %addr, err = %e, "Peer exchange gave an unparseable address — skipping");
+            }
+        }
+    }
+    false
+}
+
+/// Publishes our full current `known_addrs` set on the peer-exchange topic. No-op when we
+/// don't know any addresses yet (nothing useful to announce).
+fn broadcast_known_addrs(
+    swarm: &mut libp2p::Swarm<HelixBehaviour>,
+    topic: &gossipsub::IdentTopic,
+    known_addrs: &HashSet<String>,
+) {
+    if known_addrs.is_empty() {
+        return;
+    }
+    let msg = PeerExchangeMsg {
+        peers: known_addrs.iter().cloned().collect(),
+    };
+    if let Ok(data) = bincode::serialize(&msg) {
+        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
+            debug!(err = %e, "Peer-exchange broadcast failed");
+        }
+    }
 }
 
 // ─── Session handshake handler ───────────────────────────────────────────────
@@ -509,6 +642,47 @@ mod multiaddr_ip_tests {
     fn returns_none_without_ip_component() {
         let addr: Multiaddr = "/dns4/example.com/tcp/8546".parse().unwrap();
         assert_eq!(multiaddr_ip(&addr), None);
+    }
+}
+
+#[cfg(test)]
+mod peer_exchange_tests {
+    use super::{select_new_addrs, MAX_KNOWN_PEER_ADDRS};
+    use std::collections::HashSet;
+
+    #[test]
+    fn returns_only_genuinely_new_addresses() {
+        let mut known: HashSet<String> = ["addr-a".to_string()].into_iter().collect();
+        let incoming = vec!["addr-a".to_string(), "addr-b".to_string()];
+
+        let new_addrs = select_new_addrs(&mut known, &incoming, None);
+
+        assert_eq!(new_addrs, vec!["addr-b".to_string()]);
+        assert!(known.contains("addr-b"));
+    }
+
+    #[test]
+    fn skips_our_own_address() {
+        let mut known = HashSet::new();
+        let incoming = vec!["addr-self".to_string(), "addr-other".to_string()];
+
+        let new_addrs = select_new_addrs(&mut known, &incoming, Some("addr-self"));
+
+        assert_eq!(new_addrs, vec!["addr-other".to_string()]);
+        assert!(!known.contains("addr-self"));
+    }
+
+    #[test]
+    fn stops_once_the_cap_is_reached() {
+        let mut known: HashSet<String> = (0..MAX_KNOWN_PEER_ADDRS)
+            .map(|i| format!("addr-{i}"))
+            .collect();
+        let incoming = vec!["addr-overflow".to_string()];
+
+        let new_addrs = select_new_addrs(&mut known, &incoming, None);
+
+        assert!(new_addrs.is_empty());
+        assert_eq!(known.len(), MAX_KNOWN_PEER_ADDRS);
     }
 }
 

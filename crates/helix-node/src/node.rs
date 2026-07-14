@@ -374,6 +374,17 @@ impl HelixNode {
             }
         }
 
+        // Our own externally-dialable address (if configured) — announced to peers via peer
+        // exchange (`P2PConfig::public_addr`'s doc comment has the full picture: without this,
+        // followers connected only to a single hub have no path to each other if that hub goes
+        // down). Optional — a node behind NAT or with no public host set still participates in
+        // peer exchange, it just never announces itself, and relays what it learns from others.
+        if let Some(host) = config::resolve("HELIX_P2P_PUBLIC_ADDR", &cfg.p2p_public_addr) {
+            let addr = format!("/{}/{host}/tcp/{}", multiaddr_kind(&host), p2p_config.listen_addr.port());
+            info!(multiaddr = %addr, "Announcing our own P2P address via peer exchange");
+            p2p_config.public_addr = Some(addr);
+        }
+
         let p2p_port = p2p_config.listen_addr.port();
         let (p2p_service, p2p_command_tx, p2p_event_rx) = P2PService::new(p2p_config);
 
