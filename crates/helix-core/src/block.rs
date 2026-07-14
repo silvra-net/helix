@@ -35,7 +35,13 @@ pub struct BlockHeader {
 impl BlockHeader {
     /// Hash of all header fields except the signature (what the validator signs)
     pub fn signing_hash(&self) -> Hash {
+        // The leading domain tag separates a block-header signature from a vote or
+        // transaction signature (each has its own tag). The field layout stays
+        // unambiguous — every field is fixed-length except `validator`, which is the
+        // only variable-length field and is followed by exactly one fixed byte, so the
+        // concatenation has a single possible parse.
         Hash::digest_many(&[
+            b"helix-block-header-v1:",
             &self.version.to_le_bytes(),
             &self.height.to_le_bytes(),
             &self.timestamp.to_le_bytes(),

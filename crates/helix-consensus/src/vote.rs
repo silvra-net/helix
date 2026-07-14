@@ -36,6 +36,10 @@ impl Vote {
     /// than the one it was actually signed with.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+        // Domain separation: a signature over a vote can never be reinterpreted as a
+        // signature over a block header or transaction (which carry their own distinct
+        // domain tags), even if the remaining bytes happened to line up.
+        bytes.extend_from_slice(b"helix-vote-v1:");
         bytes.extend_from_slice(match self.vote_type {
             VoteType::Prevote => b"prevote:",
             VoteType::Precommit => b"precommit:",

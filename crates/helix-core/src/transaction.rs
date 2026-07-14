@@ -154,7 +154,10 @@ impl Transaction {
             crypto_version: self.crypto_version,
         })
         .expect("serialization is infallible for fixed types");
-        Hash::digest(&payload)
+        // Domain tag separates a transaction signature from a block-header or vote
+        // signature. The payload itself is canonical bincode (length-prefixed), so the
+        // tag + payload has no cross-encoding ambiguity.
+        Hash::digest_many(&[b"helix-tx-v1:", &payload])
     }
 
     /// Full transaction hash (includes signature — unique tx identifier)
