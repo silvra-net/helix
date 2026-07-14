@@ -134,6 +134,32 @@ impl HelixDb {
                 guardians.insert(addr.as_str(), encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // Recovery requests are the one persisted collection whose entries are *removed*
+            // as well as added (a request is cleared on cancel/completion — see
+            // `ChainState::clear_recovery_request`). Insert-only persistence would leave the
+            // cleared row in the table, so on the next node restart the request would
+            // resurrect and re-lock the account (re-introducing exactly the lockout that
+            // `CancelRecoveryRequest` was added to fix). Prune any DB key no longer present in
+            // state before re-inserting the current set. All other tables here are add/update-
+            // only, so they don't need this.
+            {
+                let current: std::collections::HashSet<String> =
+                    state.recovery_requests.keys().cloned().collect();
+                let stale: Vec<String> = recovery_requests
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!current.contains(&key)).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    recovery_requests
+                        .remove(key.as_str())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
             for (addr, request) in &state.recovery_requests {
                 let encoded = bincode::serialize(request)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -797,6 +823,35 @@ mod tests {
         let db = HelixDb::open(&path).unwrap();
         let refs = db.address_transactions(alice.to_string().as_str(), 10, 0).unwrap();
         assert_eq!(refs, vec![(0, 0)]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cleared_recovery_request_does_not_resurrect_after_reopening() {
+        use helix_identity::RecoveryRequest;
+        let (db, path) = fresh_db();
+        let owner = addr(1);
+        let new_key = helix_crypto::KeyPair::generate().public;
+
+        // Save state with an active recovery request for `owner`.
+        let mut state = ChainState::new(1_000_000);
+        state.set_recovery_request(&owner, RecoveryRequest::new(new_key));
+        db.save_chain_state(&state).unwrap();
+
+        // The request is cancelled/completed → removed from state → persisted again.
+        state.clear_recovery_request(&owner);
+        db.save_chain_state(&state).unwrap();
+
+        // Reopen (like a node restart) and reload: the cleared request must NOT come back —
+        // otherwise it would re-lock the account, re-introducing the CancelRecovery-era bug.
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+        assert!(
+            loaded.recovery_request(&owner).is_none(),
+            "a cleared recovery request resurrected from the DB after reopening"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

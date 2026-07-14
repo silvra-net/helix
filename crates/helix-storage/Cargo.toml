@@ -15,3 +15,6 @@ bincode.workspace = true
 thiserror.workspace = true
 redb.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+helix-identity.workspace = true
