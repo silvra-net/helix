@@ -15,6 +15,48 @@ This README is a practical guide: install it, run a node, use the CLI, stake —
 operator or as a regular holder. Deeper reference material (REST API, wire formats, crate
 layout) lives further down for when you need it.
 
+**New here? Pick your path:**
+
+- 🧑‍💻 **Just want to try it?** → [Quick Start](#quick-start) gets you from clone to first
+  transaction in five commands.
+- 💰 **Holding HLX / want to earn rewards?** → [Using the CLI](#using-the-cli-hlx) and
+  [Staking](#staking) (you can delegate without running a node).
+- 🖥️ **Running a validator?** → [Installation](#installation) → [Running a Node](#running-a-node).
+- 🔬 **Here for the internals?** → [Consensus](#consensus), [Cryptography](#cryptography--determinism),
+  and the [Reference](#reference).
+
+<details>
+<summary><b>📖 Full table of contents</b></summary>
+
+**Getting started**
+- [Why Helix?](#why-helix) — the one-table pitch
+- [Quick Start](#quick-start) — clone → node → first transaction
+- [Installation](#installation) — prerequisites, release download, build from source
+
+**Running & operating a node**
+- [Running a Node](#running-a-node) — config file, environment variables, chain data
+- [Joining an existing network](#joining-an-existing-network)
+- [Bootstrapping a multi-validator network](#bootstrapping-a-multi-validator-network)
+- [Docker deployment](#docker-deployment)
+
+**Using Helix**
+- [Using the CLI (`hlx`)](#using-the-cli-hlx) — wallets, sending, names, contracts, personhood, recovery
+- [Staking](#staking) — run a validator, or delegate to one
+- [Governance](#governance) — propose and vote on protocol parameters
+
+**How it works**
+- [Consensus](#consensus) — Proof-of-Stake + BFT finality
+- [Architecture](#architecture) — the crate stack
+- [Cryptography & Determinism](#cryptography--determinism) — the quantum-safety picture
+- [Token Economics](#token-economics) — supply, emission, fees
+
+**Reference**
+- [REST API](#rest-api) — endpoints your CLI and apps talk to
+- [Transaction / Address formats](#reference) — wire-level detail
+- [Security](#security) — hardening notes and current limitations
+
+</details>
+
 ---
 
 ## Why Helix?
@@ -611,13 +653,22 @@ Helix uses Tendermint-style BFT finality on top of a Proof-of-Stake validator se
 3. **Precommit** — validators precommit (2/3+ = instant finality)
 4. **Commit** — block is final, no reorganizations possible
 
-**Block time:** 2 seconds. A stalled round (no quorum within 3 block-time ticks — e.g. the
+**Block time:** 2 seconds. A stalled round (no quorum within 15 block-time ticks — e.g. the
 proposer is offline) automatically advances to the next round-robin proposer instead of
 halting the chain.
 
 **Proof of Personhood** caps how much voting power a single identity can accumulate:
 - Without verification: voting power capped at 0.5% of the network
 - With verification: voting power capped at 1% of the network
+
+> **Maturity note (please read before relying on it).** Helix currently runs as a single- to
+> few-validator devnet. The vote-counting, equivocation detection, and double-sign slashing are
+> in place and tested, but the engine does **not yet implement Tendermint's cross-round vote
+> *locking* (`locked_value` / proof-of-lock)** — the safety mechanism that prevents two
+> different blocks from finalizing at the same height across rounds under a network partition or
+> a ⅓-Byzantine validator set. This is safe for the single-/few-validator devnet it runs as
+> today, but Byzantine-fault-tolerant safety with an untrusted **≥4-validator** set is
+> deliberately still on the roadmap, not a finished guarantee. See [Security](#security).
 
 ---
 
@@ -844,6 +895,8 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 
 ## Security
 
+**Hardening that's in place:**
+
 - **Persistent validator key** is stored unencrypted in `validator-key.bin` by default —
   protect this file, or encrypt it (`HELIX_VALIDATOR_KEY_PASSPHRASE` / `hlx wallet encrypt`)
 - The P2P transport uses libp2p's classical Noise (X25519) encryption; this is fine because all
@@ -852,7 +905,24 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 - Per-IP rate limiting and connection limits protect the public RPC and P2P surface from
   simple flood/spam abuse
 - Minimum fee (1,000 nano-HLX) prevents zero-cost transaction spam
-- Report security issues privately before public disclosure
+- Transactions are signature-bound to their sender address, replay-protected by per-account
+  nonces, and money-path arithmetic is overflow-checked; delegation uses shares-based accounting
+  hardened against rounding/inflation loss
+- Double-signing is provable on-chain and slashed; misbehaving peers are scored and banned
+
+**Known limitations (honest status, not finished guarantees):**
+
+- **BFT cross-round vote locking is not implemented yet.** The engine finalizes on a
+  Precommit supermajority but has no Tendermint-style `locked_value`/proof-of-lock, so
+  Byzantine-fault-tolerant *safety* against an untrusted **≥4-validator** set (partition or
+  ⅓-Byzantine scenarios) is still on the roadmap. Fine for the single-/few-validator devnet
+  Helix runs as today — see the [Consensus](#consensus) maturity note. Do not run this as an
+  open, adversarial multi-validator network expecting fork-safety yet.
+- The personhood *authority* is a trust anchor: any one configured authority can vouch for a
+  human. This removes a single point of failure for availability, but is not (yet) M-of-N
+  threshold issuance.
+
+Report security issues privately before public disclosure.
 
 ---
 

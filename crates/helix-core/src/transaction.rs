@@ -105,11 +105,33 @@ pub struct PersonhoodProofPayload {
     pub commitment: [u8; 16],
     /// Serialized winterfell STARK proof bytes.
     pub proof_bytes: Vec<u8>,
-    /// The personhood authority's signature over `commitment` (its raw 16 bytes).
+    /// The personhood authority's signature over `personhood_authority_preimage(commitment,
+    /// claimant)` — i.e. bound to the claiming address (`Transaction::from`), not the bare
+    /// commitment. The binding is what stops front-running: `commitment`, `proof_bytes` and
+    /// this signature all become public the moment the tx hits the mempool, and the STARK
+    /// circuit never ties them to any address, so if the authority signed only the commitment,
+    /// a bystander could lift the whole payload out of a pending tx and submit it from their
+    /// own address first, stealing the verification. Signing over the address instead means an
+    /// authority-issued payload is usable only from the exact address it was issued to.
     pub authority_signature: Signature,
     /// Which scheme the authority signed with — mirrors `BlockHeader::crypto_version`/
     /// `Vote::crypto_version`, supports migration.
     pub authority_crypto_version: CryptoScheme,
+}
+
+/// The exact bytes a personhood authority signs to vouch that `commitment` was issued to the
+/// unique human who controls `claimant`. Binding the signature to the claiming address (rather
+/// than the bare 16-byte commitment) is what prevents a mempool observer from copying an
+/// authority-signed payload out of someone else's pending `ProvePersonhood` transaction and
+/// claiming the verification from their own address first. The domain tag keeps this preimage
+/// from ever colliding with a transaction, block-header, or vote signing preimage.
+pub fn personhood_authority_preimage(commitment: &[u8; 16], claimant: &Address) -> Vec<u8> {
+    let addr = claimant.as_str().as_bytes();
+    let mut msg = Vec::with_capacity(b"helix-personhood-authority-v1:".len() + commitment.len() + addr.len());
+    msg.extend_from_slice(b"helix-personhood-authority-v1:");
+    msg.extend_from_slice(commitment);
+    msg.extend_from_slice(addr);
+    msg
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

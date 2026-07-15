@@ -9,6 +9,8 @@ pub enum NameError {
     TooLong,
     #[error("Invalid character '{0}' — only lowercase letters, digits, hyphens allowed")]
     InvalidChar(char),
+    #[error("Name must not start or end with a hyphen")]
+    LeadingOrTrailingHyphen,
     #[error("Name already registered")]
     AlreadyTaken,
 }
@@ -32,6 +34,13 @@ impl HelixName {
             if !matches!(c, 'a'..='z' | '0'..='9' | '-') {
                 return Err(NameError::InvalidChar(c));
             }
+        }
+        // Enforce the documented "no leading/trailing hyphen" rule (the char-set loop above
+        // alone would happily accept `-alice`, `alice-`, or even an all-hyphen `---`). Rejecting
+        // boundary hyphens keeps registered names from being visually confusable with a bare
+        // neighbour (`alice` vs `alice-`) and rules out degenerate all-hyphen names.
+        if name.starts_with('-') || name.ends_with('-') {
+            return Err(NameError::LeadingOrTrailingHyphen);
         }
 
         Ok(HelixName(name.to_string()))
@@ -70,6 +79,16 @@ mod tests {
         assert!(HelixName::new("ab").is_err()); // too short
         assert!(HelixName::new("Alice").is_err()); // uppercase
         assert!(HelixName::new("hello world").is_err()); // space
+    }
+
+    #[test]
+    fn test_rejects_leading_or_trailing_hyphen() {
+        // The documented rule forbids boundary hyphens; the char-set check alone doesn't.
+        assert!(matches!(HelixName::new("-alice"), Err(NameError::LeadingOrTrailingHyphen)));
+        assert!(matches!(HelixName::new("alice-"), Err(NameError::LeadingOrTrailingHyphen)));
+        assert!(matches!(HelixName::new("---"), Err(NameError::LeadingOrTrailingHyphen)));
+        // An interior hyphen is still fine.
+        assert!(HelixName::new("my-wallet").is_ok());
     }
 
     #[test]

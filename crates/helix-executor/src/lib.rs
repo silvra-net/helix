@@ -13,7 +13,7 @@ pub use state::{
 
 use helix_consensus::DoubleSignEvidence;
 use helix_core::{
-    transaction::{PersonhoodProofPayload, TxType},
+    transaction::{personhood_authority_preimage, PersonhoodProofPayload, TxType},
     Block, Transaction,
 };
 use helix_crypto::{Address, Hash, PublicKey};
@@ -153,6 +153,13 @@ fn execute_transfer(
     if tx.amount == 0 {
         return Receipt::failure(tx_hash, "transfer amount must be greater than zero", 0, 0);
     }
+    // A transfer must name a recipient. Without this, a `Transfer` with `to: None` debits the
+    // sender by `amount + fee` (below) but credits nobody, silently destroying `amount` — a
+    // footgun that only ever burns the sender's own funds, but there is no legitimate reason
+    // to route value into the void through the transfer path.
+    let Some(recipient) = tx.to.clone() else {
+        return Receipt::failure(tx_hash, "transfer requires a recipient address (tx.to)", 0, 0);
+    };
 
     let sender = state.get_or_default(&tx.from);
 
@@ -185,11 +192,9 @@ fn execute_transfer(
     });
 
     // Credit receiver
-    if let Some(to) = &tx.to {
-        state.update_account(to, |acc| {
-            acc.balance += tx.amount;
-        });
-    }
+    state.update_account(&recipient, |acc| {
+        acc.balance += tx.amount;
+    });
 
     distribute_fee(state, validator, tx.fee)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
@@ -202,6 +207,10 @@ fn execute_stake(
     validator: &Address,
     tx_hash: Hash,
 ) -> Receipt {
+    if tx.amount == 0 {
+        return Receipt::failure(tx_hash, "stake amount must be greater than zero", 0, 0);
+    }
+
     let sender = state.get_or_default(&tx.from);
 
     if tx.nonce != sender.nonce {
@@ -418,6 +427,21 @@ fn execute_delegate(
     } else {
         (tx.amount as u128 * pool.total_shares as u128 / pool.total_delegated_stake as u128) as u64
     };
+    // Reject a delegation too small to mint even one share against the pool's current
+    // value-per-share. Once rewards have compounded the pool above 1:1 (value per share > 1),
+    // an amount below that per-share value floors to zero shares — and without this guard the
+    // stake would still be added to `total_delegated_stake`, silently handing the delegator's
+    // funds to the existing shareholders (the classic share-rounding / vault-inflation loss).
+    // Failing closed keeps the would-be delegator's balance intact; they simply need to
+    // delegate at least one share's worth.
+    if shares_to_mint == 0 {
+        return Receipt::failure(
+            tx_hash,
+            "delegation amount is too small to mint any pool shares at the current share price",
+            0,
+            0,
+        );
+    }
     pool.total_shares += shares_to_mint;
     pool.total_delegated_stake += tx.amount;
 
@@ -1301,11 +1325,17 @@ fn execute_prove_personhood(
     if state.personhood_authorities.is_empty() {
         return Receipt::failure(tx_hash, "no personhood authority configured", 0, 0);
     }
+    // The authority signs over the commitment *bound to the claiming address* (`tx.from`),
+    // not the bare commitment — otherwise a mempool observer could lift this whole payload
+    // out of the pending tx and claim the verification from their own address first. Binding
+    // it here means an authority-issued payload is only ever usable from the exact address it
+    // was issued to (see `personhood_authority_preimage`).
+    let signed_preimage = personhood_authority_preimage(&payload.commitment, &tx.from);
     let authority_sig_valid = state.personhood_authorities.iter().any(|authority| {
         helix_crypto::verify_with_scheme(
             payload.authority_crypto_version,
             authority,
-            &payload.commitment,
+            &signed_preimage,
             &payload.authority_signature,
         )
         .is_ok()
@@ -2988,11 +3018,15 @@ mod tests {
         authority_kp: &KeyPair,
         commitment: [u8; 16],
         proof_bytes: Vec<u8>,
+        claimant: &Address,
     ) -> PersonhoodProofPayload {
+        // The authority signs the commitment bound to the claiming address, matching what
+        // `execute_prove_personhood` verifies (see `personhood_authority_preimage`).
+        let preimage = personhood_authority_preimage(&commitment, claimant);
         PersonhoodProofPayload {
             commitment,
             proof_bytes,
-            authority_signature: authority_kp.sign(&commitment).unwrap(),
+            authority_signature: authority_kp.sign(&preimage).unwrap(),
             authority_crypto_version: authority_kp.scheme,
         }
     }
@@ -3009,7 +3043,7 @@ mod tests {
         state.personhood_authorities.push(authority_kp.public.clone());
 
         let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
-        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());
+        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr);
         let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
 
         let receipt = execute_transaction(&mut state, &tx, &validator, 0);
@@ -3031,7 +3065,7 @@ mod tests {
         state.personhood_authorities.push(authority_kp.public.clone());
 
         let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
-        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());
+        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr);
         let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
 
         let receipt = execute_transaction(&mut state, &tx, &validator, 0);
@@ -3050,7 +3084,7 @@ mod tests {
         state.update_account(&addr, |acc| acc.balance = 1_000_000);
 
         let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
-        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());
+        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr);
         let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
 
         let receipt = execute_transaction(&mut state, &tx, &validator, 0);
@@ -3075,7 +3109,7 @@ mod tests {
         state.personhood_authorities.push(real_authority_kp.public.clone());
 
         let (proof, commitment) = helix_zkp::prove_personhood([1u8; 16]);
-        let payload = personhood_payload(&attacker_pretending_to_be_authority, commitment, proof.as_bytes().to_vec());
+        let payload = personhood_payload(&attacker_pretending_to_be_authority, commitment, proof.as_bytes().to_vec(), &addr);
         let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
 
         let receipt = execute_transaction(&mut state, &tx, &validator, 0);
@@ -3084,12 +3118,12 @@ mod tests {
     }
 
     #[test]
-    fn prove_personhood_rejects_replayed_commitment_from_different_address() {
-        // `commitment`+`proof_bytes` become public the moment the first tx lands
-        // on-chain. The STARK circuit never binds them to `tx.from`, so without
-        // the commitment-reuse check, a second address copying the exact same
-        // payload would get personhood-verified for free — no secret knowledge of
-        // their own, defeating Sybil resistance entirely.
+    fn prove_personhood_rejects_reused_commitment_even_with_a_valid_second_binding() {
+        // A commitment may only ever be claimed once. Here the authority mistakenly (or
+        // maliciously) issues a *correctly bound* payload for the same commitment to two
+        // different addresses — the address binding alone wouldn't stop the second one, so the
+        // `used_personhood_commitments` dedup must: the first claim consumes the commitment,
+        // and the second — despite carrying its own valid authority signature — is rejected.
         let kp1 = KeyPair::generate();
         let addr1 = Address::from_public_key(&kp1.public);
         let kp2 = KeyPair::generate();
@@ -3103,20 +3137,57 @@ mod tests {
         state.personhood_authorities.push(authority_kp.public.clone());
 
         let (proof, commitment) = helix_zkp::prove_personhood([9u8; 16]);
-        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec());
+        let payload1 = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr1);
+        let payload2 = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr2);
 
-        let tx1 = signed_personhood_tx(&kp1, &addr1, &payload, 0, 10_000);
+        let tx1 = signed_personhood_tx(&kp1, &addr1, &payload1, 0, 10_000);
         assert!(execute_transaction(&mut state, &tx1, &validator, 0).success);
         assert!(state.has_personhood(&addr1));
 
-        // Same exact payload (commitment + proof_bytes), different address/signature.
-        let tx2 = signed_personhood_tx(&kp2, &addr2, &payload, 0, 10_000);
+        // Second address has its OWN valid authority binding, but the commitment is spent.
+        let tx2 = signed_personhood_tx(&kp2, &addr2, &payload2, 0, 10_000);
         let receipt = execute_transaction(&mut state, &tx2, &validator, 1);
 
-        assert!(!receipt.success, "replayed commitment must be rejected");
-        assert!(!state.has_personhood(&addr2), "copying address must not gain personhood");
-        // Original claimant is unaffected.
+        assert!(!receipt.success, "a commitment claimed once must never be claimed again");
+        assert!(!state.has_personhood(&addr2), "reusing a spent commitment must not gain personhood");
         assert!(state.has_personhood(&addr1));
+    }
+
+    #[test]
+    fn prove_personhood_rejects_front_run_payload_bound_to_another_address() {
+        // The front-running defense: an authority issues a payload to the victim (addr1). It
+        // is public in the mempool, so an attacker (addr2) copies commitment + proof_bytes +
+        // authority_signature verbatim and races to submit it from their own address first.
+        // Because the authority signed over the commitment bound to addr1, the signature check
+        // fails for addr2 — the attacker gains nothing, AND the commitment is NOT consumed, so
+        // the victim can still claim their verification afterward.
+        let victim_kp = KeyPair::generate();
+        let victim = Address::from_public_key(&victim_kp.public);
+        let attacker_kp = KeyPair::generate();
+        let attacker = Address::from_public_key(&attacker_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let authority_kp = KeyPair::generate();
+
+        let mut state = ChainState::new(0);
+        state.update_account(&victim, |acc| acc.balance = 1_000_000);
+        state.update_account(&attacker, |acc| acc.balance = 1_000_000);
+        state.personhood_authorities.push(authority_kp.public.clone());
+
+        let (proof, commitment) = helix_zkp::prove_personhood([7u8; 16]);
+        // Authority-issued payload, bound to the victim's address.
+        let victim_payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &victim);
+
+        // Attacker submits the victim's exact payload from their own address, front-running.
+        let attack_tx = signed_personhood_tx(&attacker_kp, &attacker, &victim_payload, 0, 10_000);
+        let attack_receipt = execute_transaction(&mut state, &attack_tx, &validator, 0);
+        assert!(!attack_receipt.success, "a payload bound to another address must be rejected");
+        assert!(!state.has_personhood(&attacker), "front-runner must not gain personhood");
+
+        // The commitment was never consumed, so the real victim can still claim it.
+        let victim_tx = signed_personhood_tx(&victim_kp, &victim, &victim_payload, 0, 10_000);
+        let victim_receipt = execute_transaction(&mut state, &victim_tx, &validator, 1);
+        assert!(victim_receipt.success, "victim's own claim must still succeed, got: {:?}", victim_receipt.error);
+        assert!(state.has_personhood(&victim));
     }
 
     fn signed_vote(
@@ -3513,6 +3584,84 @@ mod tests {
         let d2_shares = *state.delegator_shares.get(&target.to_string()).unwrap().get(&d2.to_string()).unwrap();
         // d2 paid the same HLX as d1 but into a pool worth 10x per share, so gets ~1/10th the shares.
         assert_eq!(d2_shares, 100_000_000, "buying into an appreciated pool must mint proportionally fewer shares");
+    }
+
+    #[test]
+    fn delegate_rejects_amount_too_small_to_mint_a_share() {
+        // Share-rounding / vault-inflation guard: once a pool's value-per-share exceeds 1
+        // (here 10x after compounded rewards), a delegation below that per-share value floors
+        // to zero shares. Without the guard the stake would still be swallowed into the pool
+        // for the existing shareholders' benefit, silently losing the delegator's funds.
+        let d1_kp = KeyPair::generate();
+        let d1 = Address::from_public_key(&d1_kp.public);
+        let victim_kp = KeyPair::generate();
+        let victim = Address::from_public_key(&victim_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&d1, |acc| acc.balance = 1_000_000_000_000);
+        state.update_account(&victim, |acc| acc.balance = 1_000_000_000_000);
+        state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
+
+        let tx1 = signed_tx(&d1_kp, &d1, TxType::Delegate, Some(target.clone()), 1_000_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx1, &validator, 0).success);
+        // Pool appreciates 10x (compounded rewards) → value-per-share = 10 nHLX.
+        state.validator_pools.get_mut(&target.to_string()).unwrap().total_delegated_stake = 10_000_000_000;
+
+        let victim_balance_before = state.get(&victim).unwrap().balance;
+        // 5 nHLX < 10 nHLX per share → would mint floor(5 * 1e9 / 10e9) = 0 shares.
+        let tx2 = signed_tx(&victim_kp, &victim, TxType::Delegate, Some(target.clone()), 5, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx2, &validator, 0);
+
+        assert!(!receipt.success, "a delegation that would mint zero shares must be rejected");
+        // Victim keeps every nano — no funds absorbed, no fee charged on the rejected tx.
+        assert_eq!(state.get(&victim).unwrap().balance, victim_balance_before, "victim's balance must be untouched");
+        assert_eq!(state.get(&victim).unwrap().nonce, 0, "rejected delegation must not advance the nonce");
+        let pool = state.validator_pools.get(&target.to_string()).unwrap();
+        assert_eq!(pool.total_delegated_stake, 10_000_000_000, "pool value must be untouched");
+        assert_eq!(pool.total_shares, 1_000_000_000, "pool shares must be untouched");
+        assert!(
+            state.delegator_shares.get(&target.to_string()).and_then(|m| m.get(&victim.to_string())).is_none(),
+            "no zero-share position may be recorded for the victim"
+        );
+    }
+
+    #[test]
+    fn transfer_without_recipient_is_rejected_and_burns_nothing() {
+        // A `Transfer` with `to: None` used to debit `amount + fee` from the sender and credit
+        // nobody, silently destroying `amount`. It must be rejected outright instead.
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let tx = signed_tx(&kp, &addr, TxType::Transfer, None, 100_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success, "a recipient-less transfer must be rejected");
+        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000, "no funds may be debited or burned");
+        assert_eq!(state.get(&addr).unwrap().nonce, 0, "rejected transfer must not advance the nonce");
+    }
+
+    #[test]
+    fn stake_zero_amount_is_rejected() {
+        // Consistency with transfer/delegate/undelegate, which all reject a zero amount — a
+        // zero-value stake is a pure no-op that would otherwise still charge a fee.
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let tx = signed_tx(&kp, &addr, TxType::Stake, None, 0, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+
+        assert!(!receipt.success, "a zero-amount stake must be rejected");
+        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000, "no fee may be charged on a rejected zero stake");
     }
 
     #[test]
