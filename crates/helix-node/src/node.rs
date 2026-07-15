@@ -54,6 +54,27 @@ const DEFAULT_VALIDATOR_KEY_FILE: &str = "validator-key.json";
 /// silently generating a brand-new validator identity.
 const LEGACY_VALIDATOR_KEY_FILE: &str = "validator-key.bin";
 
+/// The public production network's RPC endpoint. When a node has no local chain and no
+/// `sync_peer`/`HELIX_SYNC_PEER` configured, it seeds from here by default — so a freshly
+/// downloaded release joins the live Helix chain out of the box, with no manual peer setup.
+/// This one HTTPS endpoint supplies everything a joiner needs: the real genesis block, the
+/// full historical block download, an attempted direct P2P dial, and the target of the
+/// periodic RPC catch-up ([`rpc_sync_loop`]) that keeps a follower current even when the raw
+/// P2P port isn't publicly reachable (it runs behind a Cloudflare HTTPS tunnel). Opt out with
+/// `HELIX_NEW_CHAIN=1` to run a standalone chain instead (the production origin node and any
+/// local devnet do this). Override the endpoint itself with `HELIX_SYNC_PEER`.
+pub const DEFAULT_SEED_PEER: &str = "https://helix.silvra.net";
+
+/// Interval between periodic RPC catch-up polls of the sync peer (see [`rpc_sync_loop`]).
+const RPC_SYNC_POLL_SECS: u64 = 4;
+
+/// True for the truthy env/config spellings `1`/`true`/`yes`/`on` (case-insensitive) — the
+/// same set already accepted for `HELIX_P2P_DISABLE_MDNS`, factored out so the new
+/// `HELIX_NEW_CHAIN` flag reads identically.
+fn flag_is_truthy(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
 /// Decide which file the validator keypair lives in (see [`choose_validator_key_path`] for
 /// the rules), logging a one-line nudge when it falls back to the legacy `.bin` name.
 fn resolve_validator_key_path(cfg: &config::NodeConfig) -> PathBuf {
@@ -399,7 +420,29 @@ impl HelixNode {
         // `sync_peer = "http://seed:8545"` in helix.toml, or HELIX_SYNC_PEER — resolved here
         // (rather than after genesis, as before) because a node with no local chain yet needs
         // it to decide *which* genesis it starts from.
-        let sync_peer = config::resolve("HELIX_SYNC_PEER", &cfg.sync_peer);
+        //
+        // Default seed: if no sync peer is configured, fall back to the public production
+        // endpoint (DEFAULT_SEED_PEER) so a freshly downloaded release joins the live chain
+        // with zero configuration. Opt out with HELIX_NEW_CHAIN=1 (or `new_chain` in the
+        // config) to run a standalone chain — the production origin node and every local devnet
+        // set this, so they self-sign their own genesis instead of trying to seed from
+        // (potentially themselves) the public network.
+        let new_chain = config::resolve("HELIX_NEW_CHAIN", &cfg.new_chain)
+            .as_deref()
+            .map(flag_is_truthy)
+            .unwrap_or(false);
+        let sync_peer = config::resolve("HELIX_SYNC_PEER", &cfg.sync_peer).or_else(|| {
+            if new_chain {
+                None
+            } else {
+                info!(
+                    seed = DEFAULT_SEED_PEER,
+                    "No sync peer configured — joining the public Helix network by default \
+                     (set HELIX_NEW_CHAIN=1 to run a standalone chain instead)"
+                );
+                Some(DEFAULT_SEED_PEER.to_string())
+            }
+        });
 
         let mut chain_state = if store.get_block_by_height(0).is_ok() {
             info!("Loaded existing chain state from {}", db_path.display());
@@ -513,7 +556,7 @@ impl HelixNode {
         // live production node), where mDNS would otherwise cross-wire the two and drown
         // each in the other's incompatible-height gossip. See `P2PConfig::enable_mdns`.
         if let Some(v) = config::resolve("HELIX_P2P_DISABLE_MDNS", &cfg.p2p_disable_mdns) {
-            if matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") {
+            if flag_is_truthy(&v) {
                 info!("mDNS LAN discovery disabled — relying on seed peers + peer exchange only");
                 p2p_config.enable_mdns = false;
             }
@@ -662,6 +705,18 @@ impl HelixNode {
                 .await;
             }
         });
+
+        // Periodic RPC catch-up loop — keeps a follower current over the sync peer's HTTP RPC
+        // even when the peer's raw P2P port isn't publicly reachable (production runs behind a
+        // Cloudflare HTTPS tunnel that only exposes RPC). No-op for a standalone chain (no sync
+        // peer) or when P2P already keeps us current (each tick is then just a cheap probe).
+        tokio::spawn(rpc_sync_loop(
+            self.sync_peer.clone(),
+            self.store.clone(),
+            self.chain_state.clone(),
+            engine.clone(),
+            last_applied_height.clone(),
+        ));
 
         // Block production loop
         let block_loop = tokio::spawn(block_production_loop(
@@ -1353,6 +1408,113 @@ async fn resolve_seed_peer_multiaddr(peer_url: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("peer's /status has no p2p_port field (older version?)"))?;
 
     Ok(format!("/{}/{host}/tcp/{p2p_port}", multiaddr_kind(&host)))
+}
+
+/// Ask a peer (`GET /status`) for its current chain height. Cheap, lock-free probe used by
+/// [`rpc_sync_loop`] to decide whether the peer is ahead before taking any write locks.
+async fn fetch_peer_height(client: &reqwest::Client, peer_url: &str) -> Result<u64> {
+    let status: serde_json::Value = client
+        .get(format!("{}/status", peer_url.trim_end_matches('/')))
+        .send()
+        .await?
+        .json()
+        .await?;
+    status
+        .get("height")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("peer's /status has no height field"))
+}
+
+/// Periodic RPC catch-up: pull any blocks the sync peer has beyond our tip over plain HTTP,
+/// on a fixed interval, independent of P2P gossip.
+///
+/// libp2p gossip is the primary way a node stays current, but it needs the peer's raw P2P
+/// port to be reachable. The production node is served through a Cloudflare HTTPS tunnel that
+/// only exposes its RPC (not the raw libp2p TCP port), so a freshly downloaded follower would
+/// otherwise fetch history once at startup and then never see another block. This loop closes
+/// that gap over the one channel that *is* publicly reachable — the same RPC endpoint used for
+/// startup sync — so "download a node → it follows the live chain" holds even with no P2P
+/// connectivity at all. When P2P *is* reachable, gossip keeps the node current between polls
+/// and each tick is just one cheap height probe that finds nothing new.
+///
+/// Race-safe with the P2P/BFT apply path: it claims the shared `last_applied_height` guard
+/// (the same one `apply_finalized_block` uses) across the whole apply, so the two never
+/// double-apply a height — see `apply_finalized_block`'s doc comment for that race.
+async fn rpc_sync_loop(
+    sync_peer: Option<String>,
+    store: Arc<RwLock<HelixDb>>,
+    chain_state: Arc<RwLock<ChainState>>,
+    engine: Arc<RwLock<BftEngine>>,
+    last_applied_height: Arc<Mutex<u64>>,
+) {
+    let Some(peer_url) = sync_peer else {
+        return; // standalone chain (HELIX_NEW_CHAIN) — nothing to catch up from
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Could not build RPC sync client — periodic catch-up disabled: {e}");
+            return;
+        }
+    };
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(RPC_SYNC_POLL_SECS));
+    // The first tick fires immediately; skip missed ticks rather than bursting to catch up.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+
+        // Lock-free pre-check: is the peer actually ahead of us? When caught up (the common
+        // case) this is the only work a tick does — no locks taken, no state touched.
+        let peer_height = match fetch_peer_height(&client, &peer_url).await {
+            Ok(h) => h,
+            Err(e) => {
+                debug!("Periodic RPC sync: peer height probe failed: {e}");
+                continue;
+            }
+        };
+        if peer_height <= store.read().await.latest_height() {
+            continue;
+        }
+
+        // Peer is ahead — apply under the shared height guard so a concurrent P2P/BFT apply
+        // for the same height can't double-execute it.
+        let mut last = last_applied_height.lock().await;
+        let base = store.read().await.latest_height();
+        if peer_height <= base {
+            continue; // another path already caught us up while we waited for the lock
+        }
+
+        let result = {
+            let mut s = store.write().await;
+            let mut cs = chain_state.write().await;
+            sync_blocks_from_peer(&peer_url, base, &mut s, &mut cs)
+                .await
+                .map(|n| (n, s.latest_height(), s.latest_hash()))
+        };
+        match result {
+            Ok((applied, new_height, new_hash)) if applied > 0 => {
+                *last = new_height;
+                // Keep the BFT engine's own height tracking in step — this apply bypassed
+                // receive_proposal/add_vote, exactly like the NewCommittedBlock fast path.
+                engine
+                    .write()
+                    .await
+                    .sync_to_externally_finalized_block(new_height, new_hash);
+                info!(
+                    applied,
+                    height = new_height,
+                    "Periodic RPC catch-up: pulled new blocks from the sync peer"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Periodic RPC catch-up failed: {e}"),
+        }
+    }
 }
 
 /// Distinguishes literal IPs from hostnames/domains so a `sync_peer` set to a real domain

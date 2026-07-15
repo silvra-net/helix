@@ -35,7 +35,7 @@ layout) lives further down for when you need it.
 
 **Running & operating a node**
 - [Running a Node](#running-a-node) — config file, environment variables, chain data
-- [Joining an existing network](#joining-an-existing-network)
+- [Joining the network](#joining-the-network) — automatic by default; how to join a different one or run standalone
 - [Bootstrapping a multi-validator network](#bootstrapping-a-multi-validator-network)
 - [Docker deployment](#docker-deployment)
 
@@ -74,60 +74,70 @@ layout) lives further down for when you need it.
 
 ## Quick Start
 
-The fastest path from a clean checkout to a running node and your first transaction.
+**You don't need to run a node to use Helix.** Download the `hlx` CLI and it talks to the
+live public Helix network out of the box — no setup, no config, no local chain to sync.
 
 ```bash
-# 1. Build
-git clone https://github.com/silvra-net/helix.git
-cd helix
-cargo build --release
-# binaries: target/release/helix (the node), target/release/hlx (the CLI)
+HLX=./hlx     # or ./target/release/hlx if you built from source
 
-# 2. Run a node (starts a fresh devnet genesis on first launch)
-./target/release/helix
-# leave this running in its own terminal — everything below talks to it over
-# its REST API at http://127.0.0.1:8545
-```
-
-In a second terminal:
-
-```bash
-HLX=./target/release/hlx
-
-# 3. Create a wallet
+# 1. Create a wallet (a wallet is just a keypair)
 $HLX wallet new -o alice.json
 #   Address    : hlx...
 #   Saved to   : alice.json
 
-# 4. Check the chain
+# 2. Look at the live chain — this already talks to the public network
 $HLX chain status
+$HLX account <some-address>
 
-# 5. Fund it — the node's own validator key already holds the genesis stake, so to move
-#    real HLX around you'll first need a funded key (see "Funding a wallet on your own
-#    devnet" below). Once alice.json has a balance:
+# 3. Once alice.json has a balance, send some HLX
 $HLX tx send hlx... 10 --key alice.json     # send 10 HLX to another address
 $HLX tx status <hash>                        # check it landed
-$HLX account hlx...                          # see the resulting balance
 ```
 
-That's the whole loop: a wallet is just a keypair, a transaction is a signed JSON object,
-and the node is the thing that executes and gossips it. Everything past this point is detail
-on top of these five commands.
+Every `hlx` command targets `https://helix.silvra.net` (the public network) by default. Point
+it somewhere else any time with `--node <url>` or `HELIX_NODE=<url>` — e.g. at your own local
+node (below).
 
-### Funding a wallet on your own devnet
+### Running your own node
 
-A freshly started node's genesis allocates stake only to the validator's own address — there
-is no faucet. To get spendable HLX to a new wallet on your own devnet, send from the
-validator key itself:
+Want to run infrastructure rather than just use the chain? A node also **joins the public
+network by default** — on first start it fetches the real genesis and syncs the chain, no
+peer to configure:
 
 ```bash
-# The node's own signing key lives at ./validator-key.json and is already a valid
-# CLI wallet file (same JSON format `hlx wallet` produces) — use it directly:
-$HLX tx send hlx... 100 --key validator-key.json
+./helix          # or ./target/release/helix
+# fetches genesis from the public network, syncs history, then follows the live chain
+# REST API on http://127.0.0.1:8545, P2P on 0.0.0.0:8546
 ```
 
-If you're connecting to someone else's running network instead of starting your own, ask
-them for testnet funds the same way — there's no protocol-level faucet.
+Point your CLI at it with `hlx --node http://127.0.0.1:8545 ...`.
+
+### Running your own private devnet
+
+For development or testing you'll want an isolated chain that doesn't touch the public
+network. Set `HELIX_NEW_CHAIN=1` — the node self-signs its own genesis and runs standalone:
+
+```bash
+HELIX_NEW_CHAIN=1 ./helix
+```
+
+Its genesis allocates stake only to the validator's own address (there's no faucet), so to
+get spendable HLX to a new wallet, send from the validator key itself — it lives at
+`./validator-key.json` and is already a valid CLI wallet (same JSON format `hlx wallet`
+produces):
+
+```bash
+$HLX --node http://127.0.0.1:8545 tx send hlx... 100 --key validator-key.json
+```
+
+### Building from source
+
+```bash
+git clone https://github.com/silvra-net/helix.git
+cd helix
+cargo build --release
+# binaries: target/release/helix (the node), target/release/hlx (the CLI)
+```
 
 ---
 
@@ -174,10 +184,11 @@ Binaries are placed in `target/release/`:
 
 On first start, the node:
 - Loads or generates a persistent ML-DSA keypair (`validator-key.json`)
-- Creates the genesis block with the configured HLX allocation (or, if `sync_peer`/
-  `HELIX_SYNC_PEER` is set and no local chain exists yet, fetches the *real* genesis from
-  that peer instead — see "Joining an Existing Network" below)
-- Starts producing blocks every 2 seconds
+- **Joins the public Helix network by default** — fetches the real genesis from the built-in
+  seed (`https://helix.silvra.net`), downloads and verifies the chain history, then follows
+  the live chain. No peer to configure. (Override the seed with `HELIX_SYNC_PEER`, or set
+  `HELIX_NEW_CHAIN=1` to start a standalone chain instead — see "Joining the network" below.)
+- Follows/produces blocks every 2 seconds
 - Exposes REST API on `http://127.0.0.1:8545`
 - Listens for P2P peers on `0.0.0.0:8546`
 
@@ -196,7 +207,10 @@ existing env-var-only setups keep working unchanged:
 rpc_bind = "0.0.0.0:8545"
 p2p_listen_addr = "0.0.0.0:8546"
 reward_address = "hlx..."
+# By default the node joins the public network via the built-in seed. Override the seed:
 sync_peer = "http://seed-host:8545"
+# ...or run a standalone chain instead (private devnet / a brand-new network's origin node):
+# new_chain = true
 validator_crypto_scheme = "ml-dsa"
 mempool_tx_ttl_secs = 1800
 p2p_public_addr = "helix.example.com"
@@ -214,7 +228,8 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_REWARD_ADDRESS` | (validator address) | Address that receives the 50% validator fee reward. Set this to your app wallet address so fees land there instead of the signing key. Overrides `reward_address` in `helix.toml`. |
 | `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). Overrides `rpc_bind` in `helix.toml`. |
 | `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address. Overrides `p2p_listen_addr` in `helix.toml`. |
-| `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks. Overrides `sync_peer` in `helix.toml`. Both the one-off startup sync and the live mid-run gap-fill fallback (triggered when a gossiped block arrives ahead of our tip) honor this. |
+| `HELIX_SYNC_PEER` | `https://helix.silvra.net` | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks, and is the target of the periodic RPC catch-up that keeps a follower current when the peer's raw P2P port isn't reachable. Defaults to the public network's seed; override to point at a different network, or set `HELIX_NEW_CHAIN=1` to disable seeding entirely. Overrides `sync_peer` in `helix.toml`. |
+| `HELIX_NEW_CHAIN` | (off) | Set truthy (`1`/`true`) to run a **standalone chain** — the node self-signs its own genesis instead of joining the public network via the default seed. Set this for a private devnet, or for the origin node of a brand-new network. Ignored if a sync peer is explicitly configured. Overrides `new_chain` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY` | `validator-key.json` | Path to the validator key file (unified `KeyFile` JSON, same as `hlx wallet`). If unset and the default is absent, a legacy `validator-key.bin` is auto-detected. Overrides `validator_key_path` in `helix.toml`. |
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.json` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.json` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
@@ -254,30 +269,34 @@ database:
   builds/fetches genesis on first run (see above)
 - **Back this file up** alongside `validator-key.json` — losing it loses chain history
 
-### Joining an Existing Network
+### Joining the network
 
-To sync a new node against an already-running network instead of starting a fresh devnet:
+**A node joins the public Helix network by default** — no configuration needed. On first
+start (no local `helix-data.redb` yet) it fetches the built-in seed's real genesis block and
+governance parameters, adopts them as its own, then downloads every historical block in
+order, verifying each one's signature, validator legitimacy, and chain continuity before
+applying it. If sync stops partway (e.g. the network is briefly unreachable), whatever was
+already applied stays persisted — just restart to resume.
+
+To join a *different* network instead, point `sync_peer` at one of its nodes:
 
 ```toml
 # helix.toml
 sync_peer = "http://seed-host:8545"
 ```
 
-or `HELIX_SYNC_PEER=http://seed-host:8545 ./target/release/helix`. On first start (no local
-`helix-data.redb` yet) the node fetches the peer's real genesis block and governance
-parameters, adopts them as its own, then downloads every historical block in order,
-verifying each one's signature, validator legitimacy, and chain continuity before applying
-it. If sync stops partway (e.g. the peer becomes unreachable), whatever was already applied
-stays persisted — just restart with the same `sync_peer` to resume.
+or `HELIX_SYNC_PEER=http://seed-host:8545 ./helix`. To not join any network — a private
+devnet or the origin node of a brand-new network — set `HELIX_NEW_CHAIN=1` (or `new_chain =
+true`) and the node self-signs its own genesis instead.
 
-Beyond that one-time historical sync, the node also asks `sync_peer` (via `GET /status`)
-which port it listens on for P2P and dials it directly for live gossip — this matters
-because the P2P layer's other discovery mechanism, mDNS, only ever finds peers on the same
-local multicast segment and never works across the open internet, so a `sync_peer` reachable
-only over a real network needs this explicit dial to receive any block after the one it
-synced at startup. This is best-effort: if it fails (e.g. the peer is running an older
-version without `p2p_port` in its `/status`), the node still starts and falls back to
-mDNS-only discovery.
+**Staying current.** A joined node stays up to date two ways: live P2P gossip (the primary
+path), plus a periodic RPC catch-up that polls the sync peer for any new blocks every few
+seconds. The RPC fallback matters because a node's raw P2P port isn't always publicly
+reachable — the public seed, for instance, is served through an HTTPS tunnel that only
+exposes its RPC — so gossip alone would leave a fresh follower stuck at the height it synced
+at startup. The periodic RPC pull closes that gap over the one channel that's always
+reachable. (The node also asks the seed via `GET /status` which port it listens on for P2P
+and dials it directly when it can, for lower-latency gossip on top.)
 
 ### Network Resilience (Peer Exchange)
 
@@ -319,6 +338,7 @@ voting) from block 0, with no staking transactions or epoch rotation needed:
 
 ```toml
 # helix.toml, on the node that will self-sign the fresh genesis
+new_chain = true     # this is a brand-new standalone network, not the public one
 genesis_extra_validators = "hlx1bob...:100000,hlx1carol...:100000"
 ```
 
@@ -378,8 +398,9 @@ Notes:
   there so `validator-key.json` and `helix-data.redb` survive container recreation/upgrades.
 - `HELIX_RPC_BIND=0.0.0.0:8545` is required for the REST API to be reachable from outside
   the container — the compiled-in default only binds `127.0.0.1`.
-- To join an existing network instead of starting a fresh devnet genesis, set
-  `HELIX_SYNC_PEER=http://<seed-host>:8545` and expose peer `8546/tcp` to the outside
+- By default the container joins the public network (fetches genesis from the built-in seed).
+  To join a *different* network, set `HELIX_SYNC_PEER=http://<seed-host>:8545`; to run a
+  standalone chain, set `HELIX_NEW_CHAIN=1`. Either way, expose peer `8546/tcp` to the outside
   world (P2P is TCP-only, no UDP/QUIC in the current transport). If this container has a
   reachable public host/IP, also set `HELIX_P2P_PUBLIC_ADDR` so other nodes can find it
   through peer exchange (see "Network Resilience" above) even if the seed peer later goes
@@ -390,9 +411,10 @@ Notes:
 
 ## Using the CLI (`hlx`)
 
-Every `hlx` command talks to a node over its REST API (`--node http://host:8545`, defaults
-to `127.0.0.1:8545`) — the CLI itself holds no state beyond whatever wallet file you point
-it at.
+Every `hlx` command talks to a node over its REST API. It targets the public network
+(`https://helix.silvra.net`) by default; point it at your own node with `--node
+http://127.0.0.1:8545` (or `HELIX_NODE=...`). The CLI itself holds no state beyond whatever
+wallet file you point it at.
 
 ### Wallets
 
@@ -676,8 +698,8 @@ halting the chain.
 - Without verification: voting power capped at 0.5% of the network
 - With verification: voting power capped at 1% of the network
 
-> **Maturity note (please read before relying on it).** Helix currently runs as a single- to
-> few-validator devnet. The vote-counting, equivocation detection, double-sign slashing, and
+> **Maturity note (please read before relying on it).** The public Helix network currently
+> runs a small validator set. The vote-counting, equivocation detection, double-sign slashing, and
 > Tendermint-style **cross-round vote locking** (`locked_value` / proof-of-lock — the safety
 > mechanism that stops two different blocks from finalizing at the same height across rounds
 > under a network partition or a ⅓-Byzantine validator set) are all in place and unit-tested.
@@ -792,7 +814,8 @@ advances, since real compute was spent either way.
 
 ## REST API
 
-Base URL: `http://127.0.0.1:8545` (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
+Base URL: `https://helix.silvra.net` for the public network, or `http://127.0.0.1:8545` for
+your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 
 | Method | Path | Description |
 |---|---|---|

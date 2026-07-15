@@ -15,6 +15,14 @@ pub struct NodeConfig {
     pub p2p_listen_addr: Option<String>,
     pub reward_address: Option<String>,
     pub sync_peer: Option<String>,
+    /// Set truthy (`1`/`true`/`yes`/`on`) to start/run a **standalone chain** instead of
+    /// auto-joining the public Helix network. When neither `sync_peer` nor `HELIX_SYNC_PEER`
+    /// is set, a node defaults to seeding from the built-in production endpoint
+    /// (`node::DEFAULT_SEED_PEER`) — a freshly downloaded release joins the live chain out of
+    /// the box. This flag opts out of that: the node self-signs its own genesis and runs its
+    /// own network. Set it for the production origin node itself and for any local devnet.
+    /// Overridable via `HELIX_NEW_CHAIN`. Ignored if a sync peer is explicitly configured.
+    pub new_chain: Option<String>,
     /// Path to this node's validator key file (the unified KeyFile JSON format `hlx wallet`
     /// also produces). Defaults to `validator-key.json` in the working directory; a legacy
     /// `validator-key.bin` from before the rename is auto-detected if the default is absent.

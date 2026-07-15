@@ -12,8 +12,10 @@ use clap::{Parser, Subcommand};
     long_about = "Interact with the Helix quantum-secure blockchain.\nManage wallets, query the chain, and submit transactions."
 )]
 struct Cli {
-    /// Node RPC endpoint
-    #[arg(long, global = true, default_value = "http://127.0.0.1:8545")]
+    /// Node RPC endpoint. Defaults to the public Helix network, so a freshly downloaded CLI
+    /// works against the live chain out of the box. Point it at `http://127.0.0.1:8545` (or set
+    /// `HELIX_NODE`) to talk to your own local node instead.
+    #[arg(long, global = true, env = "HELIX_NODE", default_value = "https://helix.silvra.net")]
     node: String,
 
     #[command(subcommand)]

@@ -113,6 +113,11 @@ fn spawn_node_with(
         // observed to stall the testnet near height 1-2 and make this test flaky. See
         // helix_p2p::P2PConfig::enable_mdns.
         .env("HELIX_P2P_DISABLE_MDNS", "1")
+        // Standalone test chain: without this, a node with no explicit HELIX_SYNC_PEER (the
+        // genesis node A) would default to seeding from the public production endpoint instead
+        // of self-signing its own genesis. Followers set HELIX_SYNC_PEER explicitly, which
+        // overrides this anyway — but setting it on every node keeps the intent unambiguous.
+        .env("HELIX_NEW_CHAIN", "1")
         // Quiet by default; uncomment locally when debugging a failure.
         .env("RUST_LOG", "error")
         .stdout(Stdio::null())

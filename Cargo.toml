@@ -76,7 +76,7 @@ redb = "2.1"
 wasmi = "0.31"
 
 # CLI
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 # Internal crates
