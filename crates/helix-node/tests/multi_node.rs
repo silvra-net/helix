@@ -63,6 +63,17 @@ const VAL_B_P2P: u16 = 29_586;
 const VAL_C_RPC: u16 = 29_595;
 const VAL_C_P2P: u16 = 29_596;
 
+/// Third port range, for the fault-tolerance test (4 validators, one killed mid-run). Same
+/// concurrency reason as the range above — all three `#[tokio::test]`s share this binary.
+const FT_A_RPC: u16 = 29_605;
+const FT_A_P2P: u16 = 29_606;
+const FT_B_RPC: u16 = 29_615;
+const FT_B_P2P: u16 = 29_616;
+const FT_C_RPC: u16 = 29_625;
+const FT_C_P2P: u16 = 29_626;
+const FT_D_RPC: u16 = 29_635;
+const FT_D_P2P: u16 = 29_636;
+
 /// Owns a spawned node's child process and its temp working directory. Killing the process
 /// on drop (even if the test panics or an assertion fails partway through) is the whole point
 /// — without it, a failing run leaks `helix` processes still bound to these ports, and every
@@ -322,6 +333,70 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
         "node A and C agree on the block hash at height {} but computed different state from it",
         a["height"]
     );
+}
+
+/// Fault tolerance: a 4-validator BFT set must survive one validator going offline, because
+/// `2/3 + 1` of four equal-capped voters is three — a quorum the remaining three still meet.
+/// This is the whole reason to run ≥4 validators (`3f + 1` tolerates `f` down), and the case a
+/// 3-validator set (where 2 of 3 fall one short of quorum) structurally cannot pass. It also
+/// pins the dead-proposer-recovery fix: before it, killing one validator halted the chain
+/// forever, because the round-timeout clock only ran on the node holding an active round (the
+/// proposer), so a dead proposer left every other validator waiting on a proposal that never
+/// came, with nothing advancing them to the next round's live proposer.
+#[tokio::test]
+#[ignore = "spawns 4 real validator processes, kills one, and waits out several round timeouts (~60-90s wall-clock) — run explicitly with --ignored, not on every CI push"]
+async fn four_validators_survive_one_going_offline() {
+    let kp_b = KeyPair::generate();
+    let kp_c = KeyPair::generate();
+    let kp_d = KeyPair::generate();
+    let addr_b = Address::from_public_key(&kp_b.public);
+    let addr_c = Address::from_public_key(&kp_c.public);
+    let addr_d = Address::from_public_key(&kp_d.public);
+
+    let ma = |port: u16| format!("/ip4/127.0.0.1/tcp/{port}");
+    let seeds_a = format!("{},{},{}", ma(FT_B_P2P), ma(FT_C_P2P), ma(FT_D_P2P));
+    let seeds_b = format!("{},{},{}", ma(FT_A_P2P), ma(FT_C_P2P), ma(FT_D_P2P));
+    let seeds_c = format!("{},{},{}", ma(FT_A_P2P), ma(FT_B_P2P), ma(FT_D_P2P));
+    let seeds_d = format!("{},{},{}", ma(FT_A_P2P), ma(FT_B_P2P), ma(FT_C_P2P));
+
+    let extra = format!("{addr_b}:100000,{addr_c}:100000,{addr_d}:100000");
+    let _node_a = spawn_node_with(
+        FT_A_RPC,
+        FT_A_P2P,
+        None,
+        &[("HELIX_GENESIS_EXTRA_VALIDATORS", &extra), ("HELIX_P2P_SEED_PEERS", &seeds_a)],
+        None,
+    );
+    wait_until_reachable(FT_A_RPC, Duration::from_secs(15)).await;
+    let _node_b = spawn_node_with(FT_B_RPC, FT_B_P2P, Some(FT_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_b)], Some(&kp_b));
+    let _node_c = spawn_node_with(FT_C_RPC, FT_C_P2P, Some(FT_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_c)], Some(&kp_c));
+    let node_d = spawn_node_with(FT_D_RPC, FT_D_P2P, Some(FT_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_d)], Some(&kp_d));
+    wait_until_reachable(FT_B_RPC, Duration::from_secs(15)).await;
+    wait_until_reachable(FT_C_RPC, Duration::from_secs(15)).await;
+    wait_until_reachable(FT_D_RPC, Duration::from_secs(15)).await;
+
+    // All four finalize an initial run of blocks together.
+    let before = wait_for_height(FT_A_RPC, 8, Duration::from_secs(180)).await;
+    let height_at_kill = before["height"].as_u64().unwrap();
+
+    // Take D offline (Drop kills its process). The remaining three are still a quorum, so
+    // finalization must continue — just slower, since each round D would have proposed now
+    // times out before the next proposer steps up.
+    drop(node_d);
+
+    // Progress past the kill is the core assertion: before the dead-proposer fix this hung
+    // here forever. Timeout is generous for several ~round-timeout-long dead-proposer slots
+    // on a loaded machine.
+    let target = height_at_kill + 6;
+    wait_for_height(FT_A_RPC, target, Duration::from_secs(240)).await;
+
+    // The three survivors must also stay in agreement — identical height, block hash, AND
+    // state hash — i.e. the outage caused no fork or execution divergence.
+    let (a, b, c) = wait_for_matching_snapshot([FT_A_RPC, FT_B_RPC, FT_C_RPC], target, Duration::from_secs(90)).await;
+    assert_eq!(a["best_hash"], b["best_hash"], "survivors A and B disagree on the block hash at height {}", a["height"]);
+    assert_eq!(a["best_hash"], c["best_hash"], "survivors A and C disagree on the block hash at height {}", a["height"]);
+    assert_eq!(a["state_hash"], b["state_hash"], "survivors A and B computed different state at height {}", a["height"]);
+    assert_eq!(a["state_hash"], c["state_hash"], "survivors A and C computed different state at height {}", a["height"]);
 }
 
 /// Polls all three nodes together until one round observes the *identical* height on all
