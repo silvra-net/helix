@@ -230,7 +230,7 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address. Overrides `p2p_listen_addr` in `helix.toml`. |
 | `HELIX_SYNC_PEER` | `https://helix.silvra.net` | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks, and is the target of the periodic RPC catch-up that keeps a follower current when the peer's raw P2P port isn't reachable. Defaults to the public network's seed; override to point at a different network, or set `HELIX_NEW_CHAIN=1` to disable seeding entirely. Overrides `sync_peer` in `helix.toml`. |
 | `HELIX_NEW_CHAIN` | (off) | Set truthy (`1`/`true`) to run a **standalone chain** — the node self-signs its own genesis instead of joining the public network via the default seed. Set this for a private devnet, or for the origin node of a brand-new network. Ignored if a sync peer is explicitly configured. Overrides `new_chain` in `helix.toml`. |
-| `HELIX_VALIDATOR_KEY` | `validator-key.json` | Path to the validator key file (unified `KeyFile` JSON, same as `hlx wallet`). If unset and the default is absent, a legacy `validator-key.bin` is auto-detected. Overrides `validator_key_path` in `helix.toml`. |
+| `HELIX_VALIDATOR_KEY` | `validator-key.json` | Path to the validator key file (unified `KeyFile` JSON, same format as `hlx wallet`). Overrides `validator_key_path` in `helix.toml`. |
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.json` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.json` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
 | `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` (30 min) | How long an unconfirmed transaction may sit in the mempool before it's evicted, freeing its (sender, nonce) slot. Overrides `mempool_tx_ttl_secs` in `helix.toml`. |
@@ -255,9 +255,6 @@ or wherever `HELIX_VALIDATOR_KEY` / `validator_key_path` points):
 - Generated once on first start (plaintext); reused on every subsequent restart, so the
   validator address stays the same
 - **Back this file up** — losing it means losing your validator identity
-- *Legacy note:* nodes from before 2026-07-05 wrote a raw-binary `validator-key.bin`. If
-  only that file is present it's still loaded automatically; convert it to the JSON format
-  with `hlx wallet import-node-key` at your convenience
 
 ### Persistent Chain Data
 
@@ -435,17 +432,12 @@ hlx wallet encrypt "" --key alice.json               # remove passphrase encrypt
 directly with any command: `hlx tx send ... --key validator-key.json`. There is no
 per-use conversion step.
 
-The only converter, `hlx wallet import-node-key`, exists purely for *legacy* key files:
-nodes from before 2026-07-05 stored the key as a raw binary blob (hence the old
-`validator-key.bin` name). If — and only if — you have one of those old raw files, convert
-it once:
-
-```bash
-hlx wallet import-node-key --from old-validator-key.bin -o validator-key.json
-```
-
 A wallet file is portable — it's just JSON. Anyone with the file (and its passphrase, if
 encrypted) can sign as that address, so treat it like a private key, because it is one.
+
+*(A converter, `hlx wallet import-node-key`, exists only for the pre-2026-07 raw-binary key
+format some very old nodes wrote. You almost certainly don't have one — modern keys are
+already the JSON format.)*
 
 ### Sending HLX
 

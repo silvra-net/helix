@@ -5,7 +5,6 @@ builds/
 
 # Secrets / runtime data — never bake these into an image layer.
 validator-key.json
-validator-key.bin
 validator-wallet.json
 helix-data.redb
 

@@ -24,9 +24,8 @@ pub struct NodeConfig {
     /// Overridable via `HELIX_NEW_CHAIN`. Ignored if a sync peer is explicitly configured.
     pub new_chain: Option<String>,
     /// Path to this node's validator key file (the unified KeyFile JSON format `hlx wallet`
-    /// also produces). Defaults to `validator-key.json` in the working directory; a legacy
-    /// `validator-key.bin` from before the rename is auto-detected if the default is absent.
-    /// Overridable via `HELIX_VALIDATOR_KEY`.
+    /// also produces). Defaults to `validator-key.json` in the working directory. Overridable
+    /// via `HELIX_VALIDATOR_KEY`.
     pub validator_key_path: Option<String>,
     pub validator_crypto_scheme: Option<String>,
     pub mempool_tx_ttl_secs: Option<u64>,
