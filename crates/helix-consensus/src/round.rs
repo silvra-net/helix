@@ -29,6 +29,13 @@ pub struct RoundState {
     pub phase: RoundPhase,
     /// The proposed block for this round (set when proposer broadcasts)
     pub proposal: Option<Block>,
+    /// If the proposal is a re-proposal (Tendermint proof-of-lock), the earlier round its
+    /// value was locked in, and the prevote certificate proving that lock. Kept alongside
+    /// the proposal so this node can faithfully re-broadcast the same envelope
+    /// (`Proposal { valid_round, pol, .. }`), not just the bare block. `None`/empty for a
+    /// fresh proposal.
+    pub proposal_valid_round: Option<u32>,
+    pub proposal_pol: Vec<Vote>,
     pub prevotes: VoteSet,
     pub precommits: VoteSet,
     /// Double-sign evidence detected during this round
@@ -45,6 +52,8 @@ impl RoundState {
             round,
             phase: RoundPhase::Propose,
             proposal: None,
+            proposal_valid_round: None,
+            proposal_pol: Vec::new(),
             prevotes: VoteSet::new(height, round, VoteType::Prevote, validator_set.clone()),
             precommits: VoteSet::new(height, round, VoteType::Precommit, validator_set),
             evidence: Vec::new(),
@@ -52,8 +61,14 @@ impl RoundState {
         }
     }
 
-    /// Set the proposed block. Advances phase from Propose → Prevote.
-    pub fn set_proposal(&mut self, block: Block) -> ConsensusResult<()> {
+    /// Set the proposed block along with its proof-of-lock metadata (empty for a fresh
+    /// proposal). Advances phase from Propose → Prevote.
+    pub fn set_proposal(
+        &mut self,
+        block: Block,
+        valid_round: Option<u32>,
+        pol: Vec<Vote>,
+    ) -> ConsensusResult<()> {
         if self.phase != RoundPhase::Propose {
             return Err(ConsensusError::InvalidVote {
                 reason: format!("proposal received in phase {:?}", self.phase),
@@ -66,6 +81,8 @@ impl RoundState {
             });
         }
         self.proposal = Some(block);
+        self.proposal_valid_round = valid_round;
+        self.proposal_pol = pol;
         self.phase = RoundPhase::Prevote;
         Ok(())
     }

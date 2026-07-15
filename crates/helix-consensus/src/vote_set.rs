@@ -95,6 +95,23 @@ impl VoteSet {
         self.quorum_hash().is_some()
     }
 
+    /// The individual votes backing the block hash that has currently reached quorum — the
+    /// raw material for a proof-of-lock certificate (see `Proposal::pol`). Empty if no hash
+    /// has reached quorum yet. Each returned vote is one already validated by `add` (correct
+    /// height/round/type, in-set validator, verified signature), so the certificate they form
+    /// is self-verifying to any receiver.
+    pub fn quorum_votes(&self) -> Vec<Vote> {
+        let Some(hash) = self.quorum_hash() else {
+            return Vec::new();
+        };
+        let key = *hash.as_bytes();
+        self.votes
+            .values()
+            .filter(|v| *v.block_hash.as_bytes() == key)
+            .cloned()
+            .collect()
+    }
+
     pub fn total_power_seen(&self) -> u64 {
         self.power_by_hash.values().sum()
     }

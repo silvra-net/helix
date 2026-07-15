@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use helix_core::{Block, BlockHeader, Transaction};
@@ -6,7 +7,8 @@ use tracing::info;
 
 use crate::{
     round::{RoundPhase, RoundState},
-    ConsensusError, ConsensusResult, DoubleSignEvidence, Validator, ValidatorSet, Vote, VoteType,
+    ConsensusError, ConsensusResult, DoubleSignEvidence, Proposal, Validator, ValidatorSet, Vote,
+    VoteType,
 };
 
 /// Number of block-production ticks a round may sit without reaching
@@ -67,6 +69,20 @@ pub struct BftEngine {
     /// and replayed the moment the matching round is created (see
     /// `apply_buffered_votes`); cleared when the height advances.
     buffered_votes: Vec<Vote>,
+    /// Tendermint locking state for the *current height* (all `None`/empty between heights).
+    /// Set when this node observes a prevote-quorum for a value: `locked_round` is the round
+    /// it locked in, `locked_block` is the value, and `locked_pol` is the 2/3+ prevote
+    /// certificate that formed the quorum. While locked, this node re-proposes `locked_block`
+    /// (with the POL) whenever it's the proposer of a later round, and refuses to prevote any
+    /// *different* value unless it sees a proof-of-lock from a round at least as new as
+    /// `locked_round`. This is the safety mechanism that stops two different blocks from both
+    /// reaching quorum at the same height across rounds (a fork): once 2/3 of the power locks
+    /// on a value, the >1/3 that hold the lock withhold their prevotes from any conflicting
+    /// value, so no conflicting value can ever reach a prevote-quorum. Reset every time the
+    /// height advances (`finalize`/`sync_to_externally_finalized_block`).
+    locked_round: Option<u32>,
+    locked_block: Option<Block>,
+    locked_pol: Vec<Vote>,
 }
 
 impl BftEngine {
@@ -82,6 +98,9 @@ impl BftEngine {
             last_committed_round: None,
             round_ticks: 0,
             buffered_votes: Vec::new(),
+            locked_round: None,
+            locked_block: None,
+            locked_pol: Vec::new(),
         }
     }
 
@@ -122,31 +141,21 @@ impl BftEngine {
         self.buffered_votes = keep;
 
         for v in matching {
-            let was_prevote = round.phase == RoundPhase::Prevote;
             let _ = match v.vote_type {
                 VoteType::Prevote => round.add_prevote(v),
                 VoteType::Precommit => round.add_precommit(v),
             };
-            // Mirror add_vote: if a replayed prevote just tipped prevote quorum,
-            // cast our own precommit so the round can progress to commit.
-            if was_prevote
-                && round.phase == RoundPhase::Precommit
-                && !round.precommits.has_voted(&self.address)
-            {
-                if let Some(block_hash) = round.proposal.as_ref().map(|b| b.hash()) {
-                    if let Ok(precommit) = cast_vote(
-                        &self.address,
-                        keypair,
-                        VoteType::Precommit,
-                        height,
-                        round_num,
-                        block_hash,
-                    ) {
-                        self.outbound_votes.push(precommit.clone());
-                        let _ = round.add_precommit(precommit);
-                    }
-                }
-            }
+            // If a replayed prevote just tipped prevote quorum, lock on the value and cast
+            // our own precommit so the round can progress to commit.
+            lock_and_precommit(
+                &self.address,
+                keypair,
+                round,
+                &mut self.outbound_votes,
+                &mut self.locked_round,
+                &mut self.locked_block,
+                &mut self.locked_pol,
+            );
         }
     }
 
@@ -280,24 +289,40 @@ impl BftEngine {
     ) -> ConsensusResult<Block> {
         self.round_ticks = 0;
 
-        let block = self.build_signed_block(keypair, height, prev_hash, transactions)?;
+        // If we're locked on a value from an earlier round of this height, re-propose that
+        // exact value (with its proof-of-lock certificate) instead of building a fresh block.
+        // Abandoning a value a prevote-quorum already formed on is precisely how two different
+        // blocks could each reach quorum across rounds — the fork this prevents.
+        let (block, valid_round, pol) = match (self.locked_round, self.locked_block.clone()) {
+            (Some(lr), Some(locked_block)) => (locked_block, Some(lr), self.locked_pol.clone()),
+            _ => (
+                self.build_signed_block(keypair, height, prev_hash, transactions)?,
+                None,
+                Vec::new(),
+            ),
+        };
         let block_hash = block.hash();
 
         // Start round: Propose → Prevote
         let mut round = RoundState::new(height, round_num, self.validator_set.clone());
-        round.set_proposal(block.clone())?;
+        round.set_proposal(block.clone(), valid_round, pol)?;
 
-        // Cast own prevote
+        // Cast own prevote for our proposal.
         let prevote = cast_vote(&self.address, keypair, VoteType::Prevote, height, round_num, block_hash.clone())?;
         round.add_prevote(prevote.clone())?;
         self.outbound_votes.push(prevote);
 
-        // Cast own precommit (only valid if we just moved to Precommit phase)
-        if round.phase == RoundPhase::Precommit {
-            let precommit = cast_vote(&self.address, keypair, VoteType::Precommit, height, round_num, block_hash.clone())?;
-            round.add_precommit(precommit.clone())?;
-            self.outbound_votes.push(precommit);
-        }
+        // If our own prevote alone already reached quorum (single-validator devnet), lock on
+        // the value and cast our own precommit.
+        lock_and_precommit(
+            &self.address,
+            keypair,
+            &mut round,
+            &mut self.outbound_votes,
+            &mut self.locked_round,
+            &mut self.locked_block,
+            &mut self.locked_pol,
+        );
 
         // Fold in any votes that arrived before this round existed.
         self.apply_buffered_votes(keypair, &mut round);
@@ -353,25 +378,23 @@ impl BftEngine {
             .as_mut()
             .ok_or(ConsensusError::NoActiveRound)?;
 
-        let was_prevote_phase = round.phase == RoundPhase::Prevote;
         match vote.vote_type {
             VoteType::Prevote => round.add_prevote(vote)?,
             VoteType::Precommit => round.add_precommit(vote)?,
         };
 
-        if was_prevote_phase
-            && round.phase == RoundPhase::Precommit
-            && !round.precommits.has_voted(&self.address)
-        {
-            let height = round.height;
-            let round_num = round.round;
-            if let Some(block_hash) = round.proposal.as_ref().map(|b| b.hash()) {
-                let precommit =
-                    cast_vote(&self.address, keypair, VoteType::Precommit, height, round_num, block_hash)?;
-                self.outbound_votes.push(precommit.clone());
-                round.add_precommit(precommit)?;
-            }
-        }
+        // If this vote just tipped prevote quorum, lock on the agreed value (capturing the
+        // prevote certificate) and cast our own precommit — otherwise a round could stall
+        // forever waiting on a precommit nobody sends when quorum is reached step-by-step.
+        lock_and_precommit(
+            &self.address,
+            keypair,
+            round,
+            &mut self.outbound_votes,
+            &mut self.locked_round,
+            &mut self.locked_block,
+            &mut self.locked_pol,
+        );
 
         if !round.is_committed() {
             return Ok(None);
@@ -404,13 +427,15 @@ impl BftEngine {
     /// older than one we're already tracking (or have already advanced past
     /// via `advance_round`) is stale and ignored rather than clobbering
     /// newer round state.
-    pub fn receive_proposal(&mut self, keypair: &KeyPair, round_num: u32, block: Block) -> ConsensusResult<Option<Block>> {
+    pub fn receive_proposal(&mut self, keypair: &KeyPair, proposal: Proposal) -> ConsensusResult<Option<Block>> {
+        let Proposal { round: round_num, valid_round, block, pol } = proposal;
+
         if block.height() <= self.current_height {
             return Ok(None);
         }
 
         self.assert_is_validator()?;
-        self.validate_block(&block, round_num)?;
+        self.validate_block(&block, round_num, valid_round, &pol)?;
 
         let height = block.height();
 
@@ -423,17 +448,30 @@ impl BftEngine {
 
         let block_hash = block.hash();
         let mut round = RoundState::new(height, round_num, self.validator_set.clone());
-        round.set_proposal(block)?;
+        round.set_proposal(block, valid_round, pol)?;
         self.round_ticks = 0;
 
-        let prevote = cast_vote(&self.address, keypair, VoteType::Prevote, height, round_num, block_hash.clone())?;
-        round.add_prevote(prevote.clone())?;
-        self.outbound_votes.push(prevote);
+        // Tendermint prevote gate: prevote this value only if we hold no conflicting lock
+        // (or the proposal's proof-of-lock, already verified by `validate_block`, justifies
+        // unlocking). If we're locked on a different value without a new-enough POL, abstain
+        // — still track the round to tally peers' votes, but withhold our own prevote. That
+        // withholding is exactly what stops a value conflicting with a 2/3 lock from ever
+        // reaching a prevote-quorum.
+        if self.should_prevote(&block_hash, valid_round) {
+            let prevote = cast_vote(&self.address, keypair, VoteType::Prevote, height, round_num, block_hash)?;
+            round.add_prevote(prevote.clone())?;
+            self.outbound_votes.push(prevote);
 
-        if round.phase == RoundPhase::Precommit {
-            let precommit = cast_vote(&self.address, keypair, VoteType::Precommit, height, round_num, block_hash)?;
-            round.add_precommit(precommit.clone())?;
-            self.outbound_votes.push(precommit);
+            // If our own prevote alone already reached quorum, lock and precommit.
+            lock_and_precommit(
+                &self.address,
+                keypair,
+                &mut round,
+                &mut self.outbound_votes,
+                &mut self.locked_round,
+                &mut self.locked_block,
+                &mut self.locked_pol,
+            );
         }
 
         // Fold in any votes for this round that arrived before the proposal did.
@@ -478,8 +516,92 @@ impl BftEngine {
         self.round.as_ref().and_then(|r| r.proposal.as_ref())
     }
 
+    /// The full proposal envelope this node is currently tracking — the block plus its
+    /// proof-of-lock metadata (`valid_round`/`pol`) — for (re)broadcast to peers. Callers
+    /// must broadcast this rather than reconstructing `Proposal { round, block }`, or a
+    /// re-proposed (locked) value would lose the POL certificate that lets locked peers
+    /// accept it. `None` when there's no active proposal.
+    pub fn pending_proposal_envelope(&self) -> Option<Proposal> {
+        let r = self.round.as_ref()?;
+        let block = r.proposal.clone()?;
+        Some(Proposal {
+            round: r.round,
+            valid_round: r.proposal_valid_round,
+            block,
+            pol: r.proposal_pol.clone(),
+        })
+    }
+
+    /// Tendermint prevote gate. `valid_round` is the proposal's proof-of-lock round (already
+    /// verified against the block by `validate_block` when `Some`). Prevote the value iff we
+    /// hold no lock, our lock is already on this exact value, or the proposal proves a lock
+    /// from a round at least as new as ours (the network has demonstrably moved on). Otherwise
+    /// abstain — withholding the prevote is what makes a value conflicting with a 2/3 lock
+    /// unable to ever reach quorum.
+    fn should_prevote(&self, block_hash: &Hash, valid_round: Option<u32>) -> bool {
+        match (self.locked_round, self.locked_block.as_ref()) {
+            (None, _) => true,
+            (Some(_), Some(locked)) if &locked.hash() == block_hash => true,
+            (Some(locked_round), _) => valid_round.is_some_and(|vr| vr >= locked_round),
+        }
+    }
+
+    /// Verify a proof-of-lock certificate: `pol` must be prevotes from distinct validators in
+    /// the active set, every one for `block_hash` at (`height`, `valid_round`), with a
+    /// verified signature, whose combined voting power reaches the quorum threshold. This is
+    /// what lets any node safely accept a re-proposal's unlock claim without having itself
+    /// witnessed round `valid_round` — the certificate proves the network genuinely reached a
+    /// prevote-quorum on the value there.
+    fn verify_pol(
+        &self,
+        pol: &[Vote],
+        block_hash: &Hash,
+        height: u64,
+        valid_round: u32,
+    ) -> ConsensusResult<()> {
+        let mut counted: HashSet<String> = HashSet::new();
+        let mut power: u64 = 0;
+        for vote in pol {
+            if vote.vote_type != VoteType::Prevote
+                || vote.height != height
+                || vote.round != valid_round
+                || &vote.block_hash != block_hash
+            {
+                return Err(ConsensusError::InvalidVote {
+                    reason: "proof-of-lock vote does not match the re-proposed value/round".into(),
+                });
+            }
+            let validator = self
+                .validator_set
+                .get(&vote.validator)
+                .ok_or_else(|| ConsensusError::UnknownValidator(vote.validator.clone()))?;
+            vote.verify_signature()?;
+            if counted.insert(vote.validator.to_string()) {
+                power += validator.voting_power;
+            }
+        }
+        let quorum = self.validator_set.quorum_threshold();
+        if power < quorum {
+            return Err(ConsensusError::InsufficientVotingPower { got: power, need: quorum });
+        }
+        Ok(())
+    }
+
     /// Validate a block proposed by another validator (used when receiving from peers).
-    pub fn validate_block(&self, block: &Block, round: u32) -> ConsensusResult<()> {
+    ///
+    /// `valid_round`/`pol` carry a re-proposal's proof-of-lock (see `Proposal`). For a fresh
+    /// proposal both are `None`/empty and the proposer is checked against the current `round`.
+    /// For a re-proposal the block is the one originally proposed in `valid_round` (its header
+    /// still carries that round's proposer's signature), so the proposer is checked against
+    /// `valid_round` instead — and the POL certificate is verified to prove the network really
+    /// reached a prevote-quorum on this value there.
+    pub fn validate_block(
+        &self,
+        block: &Block,
+        round: u32,
+        valid_round: Option<u32>,
+        pol: &[Vote],
+    ) -> ConsensusResult<()> {
         let h = block.height();
 
         if h != self.current_height + 1 {
@@ -534,18 +656,28 @@ impl BftEngine {
             .get(&block.header.validator)
             .ok_or_else(|| ConsensusError::UnknownValidator(block.header.validator.clone()))?;
 
-        // Verify the proposer is correct for this height/round
+        // Verify the proposer is correct. A fresh proposal is checked against the current
+        // round; a re-proposal carries the block originally proposed in `valid_round`, whose
+        // header is signed by that round's proposer — so check against `valid_round`.
+        let proposer_round = valid_round.unwrap_or(round);
         if !self
             .validator_set
-            .is_proposer(&block.header.validator, h, round)
+            .is_proposer(&block.header.validator, h, proposer_round)
         {
             return Err(ConsensusError::InvalidBlock {
                 height: h,
                 reason: format!(
                     "{} is not the proposer for height {} round {}",
-                    block.header.validator, h, round
+                    block.header.validator, h, proposer_round
                 ),
             });
+        }
+
+        // A re-proposal must carry a valid proof-of-lock: a prevote-quorum for exactly this
+        // value at `valid_round`. This is what lets a locked peer safely unlock and prevote it
+        // without having itself witnessed that round.
+        if let Some(vr) = valid_round {
+            self.verify_pol(pol, &block.hash(), h, vr)?;
         }
 
         Ok(())
@@ -626,6 +758,9 @@ impl BftEngine {
         self.round_ticks = 0;
         // Buffered votes were for the height we just finalized — now stale.
         self.buffered_votes.clear();
+        // Locks are per-height: the value for this height is committed, so release the lock
+        // before the next height's rounds begin.
+        self.clear_locks();
     }
 
     /// Sync bookkeeping to a block that was finalized *without* going through this
@@ -658,6 +793,16 @@ impl BftEngine {
         self.round = None;
         self.round_ticks = 0;
         self.buffered_votes.clear();
+        self.clear_locks();
+    }
+
+    /// Release the per-height Tendermint lock. Called whenever the height advances (either
+    /// through our own `finalize` or an externally finalized block) — the value for the old
+    /// height is settled, so nothing carries over to constrain the next height's prevotes.
+    fn clear_locks(&mut self) {
+        self.locked_round = None;
+        self.locked_block = None;
+        self.locked_pol.clear();
     }
 
     /// Seed `last_committed` with the real chain tip's hash right after construction,
@@ -675,6 +820,51 @@ impl BftEngine {
             .get(&self.address)
             .ok_or_else(|| ConsensusError::UnknownValidator(self.address.clone()))?;
         Ok(())
+    }
+}
+
+/// Shared "prevote quorum reached" handling, applied everywhere a round can cross into
+/// `Precommit` phase. Two effects, both idempotent:
+///  1. Capture the lock — record the value behind the prevote quorum and the prevote
+///     certificate (`quorum_votes`) so a later round re-proposes it and this node refuses
+///     conflicting values (see `BftEngine::locked_round`). The lock only advances forward
+///     (never to an older round).
+///  2. Cast this node's own precommit for the agreed value, unless it already has.
+///
+/// A free function taking the engine's fields by disjoint `&mut` so it can run while `round`
+/// (borrowed from `self.round`) is live — the same reason `cast_vote` is free-standing.
+#[allow(clippy::too_many_arguments)]
+fn lock_and_precommit(
+    address: &Address,
+    keypair: &KeyPair,
+    round: &mut RoundState,
+    outbound: &mut Vec<Vote>,
+    locked_round: &mut Option<u32>,
+    locked_block: &mut Option<Block>,
+    locked_pol: &mut Vec<Vote>,
+) {
+    if round.phase != RoundPhase::Precommit {
+        return;
+    }
+    let Some(hash) = round.prevotes.quorum_hash() else {
+        return;
+    };
+    // Lock on the value behind the prevote quorum (only ever advancing the lock forward).
+    if locked_round.is_none_or(|lr| round.round >= lr) {
+        if let Some(block) = round.proposal.as_ref().filter(|b| b.hash() == hash) {
+            *locked_round = Some(round.round);
+            *locked_block = Some(block.clone());
+            *locked_pol = round.prevotes.quorum_votes();
+        }
+    }
+    // Cast our own precommit for the agreed value if we haven't already.
+    if !round.precommits.has_voted(address) {
+        if let Ok(precommit) =
+            cast_vote(address, keypair, VoteType::Precommit, round.height, round.round, hash)
+        {
+            outbound.push(precommit.clone());
+            let _ = round.add_precommit(precommit);
+        }
     }
 }
 
@@ -886,7 +1076,7 @@ mod tests {
 
         // Now the proposal arrives: the round starts, this node casts its own prevote,
         // and the buffered a-prevote is replayed — giving 2 of 4 (self + a).
-        assert_eq!(engine.receive_proposal(&v.self_kp, 0, block).unwrap(), None);
+        assert_eq!(engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap(), None);
 
         // b's prevote is the third (self + a[buffered] + b) → prevote quorum, which
         // makes this node cast its own precommit. That precommit only appears if the
@@ -924,7 +1114,7 @@ mod tests {
         let b_prevote = proposer_engine.take_outbound_votes().into_iter().next().unwrap();
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        let result = engine.receive_proposal(&v.self_kp, 0, block).unwrap();
+        let result = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
         assert_eq!(result, None, "a single prevote shouldn't reach quorum yet");
         let outbound = engine.take_outbound_votes();
         assert_eq!(outbound.len(), 1, "receiving the proposal casts our own prevote");
@@ -980,7 +1170,7 @@ mod tests {
         let _ = proposer_engine.produce_block(&v.c_kp, Hash::digest(b"a-different-sibling"), vec![]);
         let block = proposer_engine.pending_proposal().unwrap().clone();
 
-        let result = engine.receive_proposal(&v.self_kp, 0, block);
+        let result = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block));
         assert!(
             matches!(
                 &result,
@@ -1003,7 +1193,7 @@ mod tests {
 
         // Already past height 1.
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        assert_eq!(engine.receive_proposal(&v.self_kp, 0, block).unwrap(), None);
+        assert_eq!(engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap(), None);
         assert!(!engine.has_active_round());
     }
 
@@ -1033,7 +1223,7 @@ mod tests {
         let block = proposer_engine.pending_proposal().unwrap().clone();
 
         // Before the fix this failed with InvalidBlock { reason: "expected height 2, got 3" }.
-        let result = engine.receive_proposal(&v.self_kp, 0, block);
+        let result = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block));
         assert!(result.is_ok(), "the next real proposal must not be rejected: {result:?}");
     }
 
@@ -1053,7 +1243,7 @@ mod tests {
         block.header.validator = Address::from_public_key(&v.a_kp.public);
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        let err = engine.receive_proposal(&v.self_kp, 0, block).unwrap_err();
+        let err = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap_err();
         assert!(matches!(err, ConsensusError::InvalidBlock { height: 2, .. }));
     }
 
@@ -1112,7 +1302,7 @@ mod tests {
         // re-proposes with a fresh block.
         let b_addr = Address::from_public_key(&v.b_kp.public);
         let mut b_engine = BftEngine::new(v.validator_set.clone(), b_addr, 0);
-        b_engine.receive_proposal(&v.b_kp, 0, round0_block).unwrap();
+        b_engine.receive_proposal(&v.b_kp, Proposal::fresh(0, round0_block)).unwrap();
         b_engine.take_outbound_votes();
         for _ in 0..ROUND_TIMEOUT_TICKS {
             b_engine.note_round_tick();
@@ -1128,7 +1318,7 @@ mod tests {
 
         // self picks up b's round-1 proposal, joins the round, and votes it
         // to finality exactly like any ordinary (non-timed-out) round.
-        let result = self_engine.receive_proposal(&v.self_kp, 1, round1_block).unwrap();
+        let result = self_engine.receive_proposal(&v.self_kp, Proposal::fresh(1, round1_block)).unwrap();
         assert_eq!(result, None);
         let outbound = self_engine.take_outbound_votes();
         assert_eq!(outbound.len(), 1);
@@ -1177,7 +1367,7 @@ mod tests {
 
         let b_addr = Address::from_public_key(&v.b_kp.public);
         let mut b_engine = BftEngine::new(v.validator_set, b_addr, 0);
-        b_engine.receive_proposal(&v.b_kp, 0, round0_block.clone()).unwrap();
+        b_engine.receive_proposal(&v.b_kp, Proposal::fresh(0, round0_block.clone())).unwrap();
         for _ in 0..ROUND_TIMEOUT_TICKS {
             b_engine.note_round_tick();
         }
@@ -1186,17 +1376,187 @@ mod tests {
             .unwrap_err();
         let round1_block = b_engine.pending_proposal().unwrap().clone();
 
-        self_engine.receive_proposal(&v.self_kp, 1, round1_block).unwrap();
+        self_engine.receive_proposal(&v.self_kp, Proposal::fresh(1, round1_block)).unwrap();
         self_engine.take_outbound_votes();
         assert_eq!(self_engine.pending_proposal().map(|b| b.height()), Some(1));
 
         // Re-deliver the stale round-0 proposal.
-        let result = self_engine.receive_proposal(&v.self_kp, 0, round0_block).unwrap();
+        let result = self_engine.receive_proposal(&v.self_kp, Proposal::fresh(0, round0_block)).unwrap();
         assert_eq!(result, None);
         assert_eq!(
             self_engine.take_outbound_votes().len(),
             0,
             "stale round-0 proposal must not cast a new vote or reset round-1 state"
         );
+    }
+
+    // ── Tendermint cross-round vote locking ─────────────────────────────────
+    //
+    // These exercise the safety mechanism that prevents two different blocks
+    // from both reaching quorum at the same height across rounds (a fork). Once
+    // a node sees a prevote-quorum for value A it *locks* on A: it re-proposes A
+    // (with the proof-of-lock) when it proposes a later round, and refuses to
+    // prevote any *conflicting* value B unless the proposal carries a POL from a
+    // round at least as new as its lock. The withheld prevotes are exactly what
+    // keep B from ever reaching a prevote-quorum against a 2/3 lock.
+
+    /// Drive `self` (the height-1/round-0 proposer) to a prevote quorum on its
+    /// own block, so it locks on that value in round 0. Returns the engine, the
+    /// locked block, and its hash.
+    fn locked_self_engine(v: &FourValidators) -> (BftEngine, Block, Hash) {
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        engine
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        engine.take_outbound_votes();
+        let block = engine.pending_proposal().unwrap().clone();
+        let hash = block.hash();
+
+        // Two peer prevotes tip prevote quorum (self + a + b = 3 of 4) — this is
+        // where lock_and_precommit captures the lock.
+        engine
+            .add_vote(&v.self_kp, peer_vote(&v.a_kp, VoteType::Prevote, 1, 0, hash.clone()))
+            .unwrap();
+        engine
+            .add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Prevote, 1, 0, hash.clone()))
+            .unwrap();
+        engine.take_outbound_votes();
+
+        assert_eq!(engine.locked_round, Some(0), "reaching prevote quorum must lock the round");
+        assert!(engine.locked_block.is_some());
+        assert!(!engine.locked_pol.is_empty(), "the lock must capture the prevote certificate");
+        (engine, block, hash)
+    }
+
+    /// Build a *different* block for height 1, round 1 (proposed by `b`), so we
+    /// have a value that conflicts with the one `self` is locked on.
+    fn conflicting_round1_block(v: &FourValidators) -> Block {
+        // self ((1 + 0) % 4 == 1) is round 0's proposer — build its block first.
+        let mut self_engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        self_engine
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        let round0 = self_engine.pending_proposal().unwrap().clone();
+
+        // b joins round 0, then times it out so it — round 1's proposer
+        // ((1 + 1) % 4 == 2, b's index) — builds a fresh, conflicting round-1 block.
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        let mut b_engine = BftEngine::new(v.validator_set.clone(), b_addr, 0);
+        b_engine
+            .receive_proposal(&v.b_kp, Proposal::fresh(0, round0))
+            .unwrap();
+        b_engine.take_outbound_votes();
+        for _ in 0..ROUND_TIMEOUT_TICKS {
+            b_engine.note_round_tick();
+        }
+        b_engine
+            .advance_round(&v.b_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        b_engine.pending_proposal().unwrap().clone()
+    }
+
+    /// The core safety property: a node locked on value A withholds its prevote
+    /// from a *fresh* (no proof-of-lock) proposal of a conflicting value B. That
+    /// withheld prevote is what stops B from reaching a prevote-quorum against
+    /// the lock — without it, two values could each reach quorum and fork.
+    #[test]
+    fn locked_node_abstains_from_prevoting_a_conflicting_fresh_proposal() {
+        let v = four_validators();
+        let (mut engine, _block_a, hash_a) = locked_self_engine(&v);
+
+        let block_b = conflicting_round1_block(&v);
+        assert_ne!(block_b.hash(), hash_a, "the round-1 block must genuinely conflict");
+
+        // b's round-1 proposal is fresh (valid_round = None). self is locked on A,
+        // so it must abstain — join the round to tally peers, but cast no prevote.
+        let result = engine
+            .receive_proposal(&v.self_kp, Proposal::fresh(1, block_b.clone()))
+            .unwrap();
+        assert_eq!(result, None);
+        assert!(
+            engine.take_outbound_votes().is_empty(),
+            "a locked node must not prevote a conflicting value that carries no proof-of-lock"
+        );
+        // The lock is unchanged — still on A from round 0.
+        assert_eq!(engine.locked_round, Some(0));
+        assert_eq!(engine.locked_block.as_ref().map(|b| b.hash()), Some(hash_a));
+    }
+
+    /// The controlled unlock: a node locked on A *does* prevote a conflicting
+    /// value B when the proposal proves a prevote-quorum (POL) formed on B in a
+    /// round at least as new as the lock. The certificate is what makes this
+    /// safe — it shows the network genuinely moved on to B.
+    #[test]
+    fn locked_node_unlocks_and_prevotes_a_reproposal_with_a_valid_pol() {
+        let v = four_validators();
+        let (mut engine, _block_a, hash_a) = locked_self_engine(&v);
+
+        let block_b = conflicting_round1_block(&v);
+        let hash_b = block_b.hash();
+        assert_ne!(hash_b, hash_a);
+
+        // A genuine prevote-quorum for B at round 1 (a + b + c = 3 of 4).
+        let pol = vec![
+            peer_vote(&v.a_kp, VoteType::Prevote, 1, 1, hash_b.clone()),
+            peer_vote(&v.b_kp, VoteType::Prevote, 1, 1, hash_b.clone()),
+            peer_vote(&v.c_kp, VoteType::Prevote, 1, 1, hash_b.clone()),
+        ];
+
+        // c re-proposes B in round 2 carrying B's round-1 POL. self, locked on A
+        // from round 0, must unlock (1 >= 0) and prevote B.
+        let proposal = Proposal::reproposal(2, 1, block_b.clone(), pol);
+        let result = engine.receive_proposal(&v.self_kp, proposal).unwrap();
+        assert_eq!(result, None);
+
+        let outbound = engine.take_outbound_votes();
+        assert_eq!(outbound.len(), 1, "a valid POL must let the locked node prevote the re-proposed value");
+        assert_eq!(outbound[0].vote_type, VoteType::Prevote);
+        assert_eq!(outbound[0].block_hash, hash_b);
+    }
+
+    /// A re-proposal whose proof-of-lock doesn't actually carry a quorum must be
+    /// rejected outright — a locked node can't be tricked into unlocking by a
+    /// forged/insufficient certificate.
+    #[test]
+    fn reproposal_with_insufficient_pol_is_rejected() {
+        let v = four_validators();
+        let engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let block_b = conflicting_round1_block(&v);
+        let hash_b = block_b.hash();
+
+        // Only two prevotes — one short of the 3-of-4 quorum.
+        let pol = vec![
+            peer_vote(&v.a_kp, VoteType::Prevote, 1, 1, hash_b.clone()),
+            peer_vote(&v.b_kp, VoteType::Prevote, 1, 1, hash_b.clone()),
+        ];
+        let err = engine.verify_pol(&pol, &hash_b, 1, 1).unwrap_err();
+        assert!(matches!(err, ConsensusError::InsufficientVotingPower { .. }));
+
+        // And the same shortfall makes the whole re-proposal fail validation.
+        let err = engine
+            .validate_block(&block_b, 2, Some(1), &pol)
+            .unwrap_err();
+        assert!(matches!(err, ConsensusError::InsufficientVotingPower { .. }));
+    }
+
+    /// When a locked node is the proposer of a later round, it re-proposes the
+    /// exact value it locked on, carrying the proof-of-lock — never a fresh
+    /// block that would abandon the value a prevote-quorum already formed on.
+    #[test]
+    fn locked_proposer_reproposes_its_locked_value_with_the_pol() {
+        let v = four_validators();
+        let (mut engine, _block_a, hash_a) = locked_self_engine(&v);
+
+        // self is the proposer for round 4 too ((1 + 4) % 4 == 1). Proposing there
+        // while locked must re-propose A, not build a fresh block.
+        let err = engine
+            .propose(&v.self_kp, 1, 4, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        assert!(matches!(err, ConsensusError::AwaitingVotes { round: 4, .. }));
+
+        let envelope = engine.pending_proposal_envelope().unwrap();
+        assert_eq!(envelope.valid_round, Some(0), "a re-proposal must tag the round it locked in");
+        assert_eq!(envelope.block.hash(), hash_a, "the locked value must be re-proposed unchanged");
+        assert!(!envelope.pol.is_empty(), "the re-proposal must carry the proof-of-lock certificate");
     }
 }

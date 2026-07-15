@@ -713,7 +713,7 @@ async fn handle_p2p_event(
             }
         }
         P2PEvent::NewProposal(proposal) => {
-            let result = { engine.write().await.receive_proposal(keypair, proposal.round, proposal.block) };
+            let result = { engine.write().await.receive_proposal(keypair, proposal) };
 
             // receive_proposal() may have cast our prevote (and possibly a
             // follow-up precommit) for the received proposal — broadcast
@@ -1089,7 +1089,7 @@ async fn apply_finalized_block(
     // via NewCommittedBlock skip re-broadcasting to avoid flooding with wrong round tags.
     if should_broadcast {
         let round = engine.read().await.last_committed_round().unwrap_or(0);
-        let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal { round, block: block.clone() }));
+        let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal::fresh(round, block.clone())));
         let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone()));
     }
 
@@ -1171,12 +1171,9 @@ async fn block_production_loop(
             // without this they'd never see the one proposal that was sent once,
             // before they connected. Idempotent: a peer already tracking this
             // round ignores the duplicate (see `receive_proposal`).
-            let pending = {
-                let e = engine.read().await;
-                e.active_round_num().zip(e.pending_proposal().cloned())
-            };
-            if let Some((round, block)) = pending {
-                let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal { round, block }));
+            let pending = { engine.read().await.pending_proposal_envelope() };
+            if let Some(proposal) = pending {
+                let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(proposal));
             }
 
             // Hold the round instead of advancing while fewer than a quorum's
@@ -1214,14 +1211,14 @@ async fn block_production_loop(
                 apply_finalized_block(block, true, &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone(), &last_applied_height)
                     .await;
             }
-            Err(ConsensusError::AwaitingVotes { round, .. }) => {
+            Err(ConsensusError::AwaitingVotes { .. }) => {
                 // Multi-validator: our proposal + own votes are cast, round is
                 // stored in the engine. Broadcast the proposal itself so
                 // peers can validate it and cast their own votes — the votes
                 // below only cover this node's own prevote/precommit.
-                let block = { engine.read().await.pending_proposal().cloned() };
-                if let Some(block) = block {
-                    let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal { round, block }));
+                let proposal = { engine.read().await.pending_proposal_envelope() };
+                if let Some(proposal) = proposal {
+                    let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(proposal));
                 }
             }
             Err(ConsensusError::NotProposer { .. }) => {

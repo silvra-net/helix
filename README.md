@@ -677,13 +677,13 @@ halting the chain.
 - With verification: voting power capped at 1% of the network
 
 > **Maturity note (please read before relying on it).** Helix currently runs as a single- to
-> few-validator devnet. The vote-counting, equivocation detection, and double-sign slashing are
-> in place and tested, but the engine does **not yet implement Tendermint's cross-round vote
-> *locking* (`locked_value` / proof-of-lock)** — the safety mechanism that prevents two
-> different blocks from finalizing at the same height across rounds under a network partition or
-> a ⅓-Byzantine validator set. This is safe for the single-/few-validator devnet it runs as
-> today, but Byzantine-fault-tolerant safety with an untrusted **≥4-validator** set is
-> deliberately still on the roadmap, not a finished guarantee. See [Security](#security).
+> few-validator devnet. The vote-counting, equivocation detection, double-sign slashing, and
+> Tendermint-style **cross-round vote locking** (`locked_value` / proof-of-lock — the safety
+> mechanism that stops two different blocks from finalizing at the same height across rounds
+> under a network partition or a ⅓-Byzantine validator set) are all in place and unit-tested.
+> What is *not* yet proven is behaviour under a large, genuinely adversarial, untrusted
+> **≥4-validator** network — that needs real-world partition and Byzantine testing before the
+> BFT-safety guarantee should be relied on in production. See [Security](#security).
 
 ---
 
@@ -927,12 +927,16 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 
 **Known limitations (honest status, not finished guarantees):**
 
-- **BFT cross-round vote locking is not implemented yet.** The engine finalizes on a
-  Precommit supermajority but has no Tendermint-style `locked_value`/proof-of-lock, so
-  Byzantine-fault-tolerant *safety* against an untrusted **≥4-validator** set (partition or
-  ⅓-Byzantine scenarios) is still on the roadmap. Fine for the single-/few-validator devnet
-  Helix runs as today — see the [Consensus](#consensus) maturity note. Do not run this as an
-  open, adversarial multi-validator network expecting fork-safety yet.
+- **BFT cross-round vote locking is implemented but not yet battle-tested at scale.** The
+  engine now does Tendermint-style locking: once a validator sees a prevote-quorum for a value
+  it locks on it (`locked_value`/`locked_round`), re-proposes that value with a proof-of-lock
+  certificate when it proposes a later round, and withholds its prevote from any conflicting
+  value that isn't backed by a new-enough POL — the mechanism that prevents two different blocks
+  from finalizing at the same height across rounds. This is unit-tested (abstention, controlled
+  unlock, POL verification, re-proposal) and the multi-validator integration test passes, but it
+  has **not** yet been exercised against a large, genuinely adversarial ≥4-validator network with
+  real partitions. Treat fork-safety as implemented-and-tested, not yet independently audited —
+  see the [Consensus](#consensus) maturity note.
 - The personhood *authority* is a trust anchor: any one configured authority can vouch for a
   human. This removes a single point of failure for availability, but is not (yet) M-of-N
   threshold issuance.
