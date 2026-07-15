@@ -1250,7 +1250,23 @@ async fn block_production_loop(
             }
             true
         } else {
-            false
+            // No active round: either we're this round's proposer (produce_block below makes
+            // the round) or we're a non-proposer waiting for someone else's proposal. In the
+            // latter case nothing else runs the round clock — so if that round's proposer is
+            // dead/offline the height would stall forever. Run the timeout here too and, when
+            // it fires, advance to the next round (a different, hopefully live proposer). Only
+            // meaningful in a multi-validator set; a sole validator (peers_needed == 0) always
+            // proposes and never waits, so it skips this and produce_block finalizes as before.
+            let needed = engine.read().await.peers_needed_for_quorum();
+            if needed == 0 {
+                false
+            } else if peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed {
+                // Under-connected — don't burn rounds getting ahead of validators still
+                // joining at round 0 (the same guard the active-round branch applies).
+                continue;
+            } else {
+                engine.write().await.note_round_tick()
+            }
         };
 
         let txs = { mempool.write().await.take(MAX_TXS_PER_BLOCK) };

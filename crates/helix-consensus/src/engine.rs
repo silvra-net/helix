@@ -83,6 +83,15 @@ pub struct BftEngine {
     locked_round: Option<u32>,
     locked_block: Option<Block>,
     locked_pol: Vec<Vote>,
+    /// The round this node currently considers active for the pending height
+    /// (`current_height + 1`), tracked **even when no `RoundState` exists** — i.e. while a
+    /// non-proposer waits for someone else's proposal. Without this, the round clock only ran
+    /// for the node that actually proposed (the only one with an active round), so a
+    /// dead/offline proposer stalled the height forever: every other validator waited for a
+    /// proposal that never came, with nothing advancing them to the next round's (live)
+    /// proposer. `advance_round` now bumps this and re-elects a proposer even from a
+    /// no-active-round wait. Reset to 0 each time the height advances.
+    pending_round: u32,
 }
 
 impl BftEngine {
@@ -101,6 +110,7 @@ impl BftEngine {
             locked_round: None,
             locked_block: None,
             locked_pol: Vec::new(),
+            pending_round: 0,
         }
     }
 
@@ -243,30 +253,41 @@ impl BftEngine {
         self.round_ticks >= ROUND_TIMEOUT_TICKS
     }
 
-    /// Force a stalled round to advance to round+1 — e.g. the proposer was
-    /// offline, or its block failed validation for enough peers that quorum
-    /// could never be reached. Drops the stalled round's accumulated votes
-    /// (they're bucketed under the old round number and don't carry over).
+    /// Advance the pending height to its next round — e.g. the round's proposer was offline,
+    /// or its block failed validation for enough peers that quorum could never be reached.
     ///
-    /// If this node is the proposer for the new round, builds and signs a
-    /// fresh proposal (fresh timestamp — the old one is stale) and casts its
-    /// own votes exactly as `produce_block` does, returning
-    /// `AwaitingVotes`/`Ok` the same way. If some other validator is the new
-    /// proposer, returns `NotProposer` — the caller should just wait for that
-    /// validator's `Proposal` to arrive over P2P and hit `receive_proposal`.
+    /// Works in **both** states this can happen from:
+    ///  - We have an active (stalled) round we proposed/joined: drop it (its votes are bucketed
+    ///    under the old round and don't carry over) and advance from `stalled.round + 1`.
+    ///  - We have *no* active round — a non-proposer that's been waiting for a proposal that
+    ///    never arrived (its round's proposer is dead/offline): advance from
+    ///    `pending_round + 1`. This is the case that used to stall the height forever, since
+    ///    only the proposer ever held a round and thus ran the round clock at all.
+    ///
+    /// If this node is the proposer for the new round, builds and signs a fresh proposal
+    /// (re-proposing a locked value with its proof-of-lock if held — see `propose`) and casts
+    /// its own votes, returning `AwaitingVotes`/`Ok`. Otherwise returns `NotProposer` and
+    /// records the new round as pending, so the caller waits for that round's proposer's
+    /// `Proposal` (and `receive_proposal` accepts it rather than rejecting it as stale).
     pub fn advance_round(
         &mut self,
         keypair: &KeyPair,
         prev_hash: Hash,
         transactions: Vec<Transaction>,
     ) -> ConsensusResult<Block> {
-        let stalled = self.round.take().ok_or(ConsensusError::NoActiveRound)?;
-        let height = stalled.height;
-        let round_num = stalled.round + 1;
-        self.pending_evidence.extend(stalled.evidence);
+        let height = self.current_height + 1;
+        let from_round = match self.round.take() {
+            Some(stalled) => {
+                self.pending_evidence.extend(stalled.evidence);
+                stalled.round
+            }
+            None => self.pending_round,
+        };
+        let round_num = from_round + 1;
+        self.pending_round = round_num;
+        self.round_ticks = 0;
 
         if !self.validator_set.is_proposer(&self.address, height, round_num) {
-            self.round_ticks = 0;
             return Err(ConsensusError::NotProposer { height, round: round_num });
         }
 
@@ -288,6 +309,7 @@ impl BftEngine {
         transactions: Vec<Transaction>,
     ) -> ConsensusResult<Block> {
         self.round_ticks = 0;
+        self.pending_round = round_num;
 
         // If we're locked on a value from an earlier round of this height, re-propose that
         // exact value (with its proof-of-lock certificate) instead of building a fresh block.
@@ -446,10 +468,21 @@ impl BftEngine {
             return Ok(None);
         }
 
+        // Stale round for the pending height: we've already advanced past it via a round
+        // timeout (`advance_round` bumped `pending_round`) even though we never held a
+        // `RoundState` for it — a non-proposer that timed out waiting. Without this a
+        // late-arriving proposal for the abandoned round would restart it.
+        if height == self.current_height + 1 && round_num < self.pending_round {
+            return Ok(None);
+        }
+
         let block_hash = block.hash();
         let mut round = RoundState::new(height, round_num, self.validator_set.clone());
         round.set_proposal(block, valid_round, pol)?;
         self.round_ticks = 0;
+        // Adopt this round as the pending one — a proposal for a *newer* round than we'd
+        // reached pulls us forward onto it (round synchronization via the proposal itself).
+        self.pending_round = round_num;
 
         // Tendermint prevote gate: prevote this value only if we hold no conflicting lock
         // (or the proposal's proof-of-lock, already verified by `validate_block`, justifies
@@ -796,13 +829,15 @@ impl BftEngine {
         self.clear_locks();
     }
 
-    /// Release the per-height Tendermint lock. Called whenever the height advances (either
-    /// through our own `finalize` or an externally finalized block) — the value for the old
-    /// height is settled, so nothing carries over to constrain the next height's prevotes.
+    /// Release the per-height Tendermint lock and reset the round counter. Called whenever the
+    /// height advances (either through our own `finalize` or an externally finalized block) —
+    /// the value for the old height is settled, so nothing carries over to constrain the next
+    /// height's prevotes, and the next height starts fresh at round 0.
     fn clear_locks(&mut self) {
         self.locked_round = None;
         self.locked_block = None;
         self.locked_pol.clear();
+        self.pending_round = 0;
     }
 
     /// Seed `last_committed` with the real chain tip's hash right after construction,
@@ -1558,5 +1593,71 @@ mod tests {
         assert_eq!(envelope.valid_round, Some(0), "a re-proposal must tag the round it locked in");
         assert_eq!(envelope.block.hash(), hash_a, "the locked value must be re-proposed unchanged");
         assert!(!envelope.pol.is_empty(), "the re-proposal must carry the proof-of-lock certificate");
+    }
+
+    // ── Dead-proposer round recovery ────────────────────────────────────────
+    //
+    // A non-proposer holds no `RoundState` while it waits for the round's proposer to
+    // broadcast — so if that proposer is dead/offline, nothing on the waiting node runs the
+    // round clock, and the height would stall forever. `advance_round` must therefore work
+    // even with no active round: bump the pending round and let the next round's (live)
+    // proposer step up. Without this a single offline validator halts the whole chain, which
+    // defeats the point of running ≥4 validators for fault tolerance.
+
+    /// self (index 1) is NOT height-4 round-0's proposer (that's index 0) — so it's waiting
+    /// with no active round. If that proposer never delivers, timing out and calling
+    /// `advance_round` must promote self into round 1 (whose proposer *is* self: (4+1)%4==1)
+    /// and have it propose, rather than erroring `NoActiveRound` and stalling.
+    #[test]
+    fn a_waiting_non_proposer_advances_the_round_when_the_proposer_is_dead() {
+        let v = four_validators();
+        // genesis_height 3 → pending height 4. Round 0 proposer = (4+0)%4 = 0 (not self).
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 3);
+        assert!(!engine.has_active_round(), "a non-proposer starts with no round to run");
+
+        // The round-0 proposer is dead — no proposal ever arrives. Time out and advance.
+        let err = engine
+            .advance_round(&v.self_kp, Hash::digest(b"tip-3"), vec![])
+            .unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::AwaitingVotes { height: 4, round: 1 }),
+            "self is round 1's proposer and must step up from a no-active-round wait, got {err:?}"
+        );
+        let envelope = engine.pending_proposal_envelope().expect("self should now have proposed");
+        assert_eq!(envelope.round, 1, "the recovered proposal must be for round 1");
+        assert_eq!(envelope.block.height(), 4);
+    }
+
+    /// When the node advancing isn't the *new* round's proposer either, it defers (records the
+    /// new pending round and waits) rather than erroring — and a late proposal for the round it
+    /// already abandoned is rejected as stale instead of restarting it.
+    #[test]
+    fn advance_round_from_no_active_round_defers_to_the_new_proposer_and_rejects_stale() {
+        let v = four_validators();
+        // genesis_height 1 → pending height 2. Round 1 proposer = (2+1)%4 = 3 (not self, idx 1).
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 1);
+
+        let err = engine
+            .advance_round(&v.self_kp, Hash::digest(b"tip-1"), vec![])
+            .unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::NotProposer { height: 2, round: 1 }),
+            "self isn't round 1's proposer here, so it must defer, got {err:?}"
+        );
+        assert!(!engine.has_active_round(), "deferring must not leave a phantom round");
+
+        // A now-stale round-0 proposal (from the dead proposer, finally relayed) must not
+        // restart the abandoned round. b is height-2 round-0's proposer ((2+0)%4==2).
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        let mut b_engine = BftEngine::new(v.validator_set, b_addr, 1);
+        b_engine.produce_block(&v.b_kp, Hash::digest(b"tip-1"), vec![]).unwrap_err();
+        let stale_round0 = b_engine.pending_proposal().unwrap().clone();
+
+        assert_eq!(
+            engine.receive_proposal(&v.self_kp, Proposal::fresh(0, stale_round0)).unwrap(),
+            None,
+            "a proposal for the round we already advanced past must be ignored"
+        );
+        assert!(!engine.has_active_round());
     }
 }
