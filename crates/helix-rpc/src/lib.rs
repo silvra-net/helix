@@ -28,6 +28,8 @@ pub struct BlockResponse {
     pub validator: String,
     pub prev_hash: String,
     pub merkle_root: String,
+    /// EIP-1559 base fee for this block, in nano-HLX per transaction byte.
+    pub base_fee_per_byte: u64,
     pub transactions: Vec<TxResponse>,
 }
 
@@ -54,6 +56,7 @@ impl From<Block> for BlockResponse {
             validator: block.header.validator.to_string(),
             prev_hash: block.header.prev_hash.to_hex(),
             merkle_root: block.header.merkle_root.to_hex(),
+            base_fee_per_byte: block.header.base_fee_per_byte,
             transactions,
         }
     }
@@ -70,6 +73,8 @@ pub struct HeaderResponse {
     pub validator: String,
     pub prev_hash: String,
     pub merkle_root: String,
+    /// EIP-1559 base fee for this block, in nano-HLX per transaction byte.
+    pub base_fee_per_byte: u64,
 }
 
 impl From<&Block> for HeaderResponse {
@@ -81,6 +86,7 @@ impl From<&Block> for HeaderResponse {
             validator: block.header.validator.to_string(),
             prev_hash: block.header.prev_hash.to_hex(),
             merkle_root: block.header.merkle_root.to_hex(),
+            base_fee_per_byte: block.header.base_fee_per_byte,
         }
     }
 }
