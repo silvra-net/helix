@@ -582,7 +582,7 @@ mutually exclusive:
 
 1. **Get a node running** (see [Running a Node](#running-a-node)) — its `validator-key.json`
    is the identity that will stake and produce blocks.
-2. **Stake at least the minimum** (100,000 HLX — 0.1% of the total supply) using that same
+2. **Stake at least the minimum** (100,000 HLX — ~0.3% of the total supply) using that same
    key:
    ```bash
    hlx tx stake 100000 --key validator-key.json
@@ -779,19 +779,21 @@ advances, since real compute was spent either way.
 
 ## Token Economics
 
-- **Hard cap:** 100,000,000 HLX — never more, forever. This is an asymptotic ceiling the
-  emission schedule approaches, not an amount handed out at genesis — the same shape as
-  Bitcoin's 21M cap.
+- **Hard cap:** 33,000,000 HLX — never more, forever. This is an *honest* ceiling: it sits
+  just above what the emission schedule actually pays out (the 1 HLX halving subsidy converges
+  to ~31.5M emitted, plus the 1M genesis stake ≈ 32.5M real max supply), not an aspirational
+  round number the chain could never reach. The same asymptotic shape as Bitcoin's 21M cap —
+  approached over time, not handed out at genesis.
 - **Denomination:** 1 HLX = 1,000,000,000 nano-HLX
 - **Fee split:** 50% burned (deflationary) / 50% to block validator
 - **Block reward:** a halving issuance schedule mints new HLX every block (independent of
   transaction volume), so validator income doesn't depend on fee revenue alone. Starts at
   1 HLX/block, halves every 15,768,000 blocks (~1 year at the 2s block time) — the same
   geometric-decay shape as Bitcoin's coinbase subsidy, always clamped so cumulative issuance
-  never crosses the 100M cap regardless of what the schedule alone would pay out.
-- **Minimum validator stake:** 100,000 HLX (0.1% of supply) — runtime-adjustable via
-  governance, floored at 0.001% of supply so it can never be pushed low enough to let
-  unstaked accounts flood the validator set.
+  never crosses the 33M cap regardless of what the schedule alone would pay out.
+- **Minimum validator stake:** 100,000 HLX (~0.3% of supply) — runtime-adjustable via
+  governance, floored at 1,000 HLX so it can never be pushed low enough to let unstaked
+  accounts flood the validator set.
 - **Unbonding period:** 7 days from `tx unstake` to claimable — stake stays slashable the
   whole time.
 - **Slashing:** 5% of staked HLX burned, plus immediate exclusion from BFT rounds, on

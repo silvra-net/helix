@@ -20,7 +20,7 @@ schedule — the two are deliberately decoupled.
 
 | Quantity | Value |
 |---|---|
-| Nominal supply cap (`TOTAL_SUPPLY_HLX`) | 100,000,000 HLX |
+| Hard supply cap (`TOTAL_SUPPLY_HLX`) | 33,000,000 HLX |
 | Genesis stake (bootstrap validator, non-liquid) | 1,000,000 HLX |
 | Initial block reward | 1 HLX/block |
 | Halving interval | 15,768,000 blocks (~1 year at 2 s blocks) |
@@ -35,15 +35,17 @@ halves once per ~year and integer-divides to **zero after ~30 years** (era 30: `
 ```
 
 So the **real asymptotic max supply is ≈ 32.5M HLX** (1M genesis + ~31.5M emitted), *minus*
-cumulative burns — not 100M.
+cumulative burns.
 
-> ⚠️ **Known issue — phantom cap.** `TOTAL_SUPPLY_HLX = 100M` is a ceiling the chain can
-> never reach: ~67.5M HLX is unreachable headroom. The cap is enforced (mints clamp to
-> `mintable_headroom`) but it never binds. This is honest-numbers debt: the stated cap and
-> the real max supply disagree by 3×. Two clean resolutions (a monetary decision, see
-> backlog): (a) lower the stated cap to the true asymptote (~32.5M) so the number is
-> truthful, or (b) raise the initial reward / lengthen the tail so emission actually
-> approaches 100M. Not hot-patched here because it is a consensus change to a live chain.
+> ✅ **Honest cap (decided & shipped 2026-07-15).** `TOTAL_SUPPLY_HLX` was 100M — a ceiling
+> the schedule could never reach (~67M / two-thirds phantom headroom), which reads as
+> dishonest to anyone who does the arithmetic. It is now **33M**, sized to clear the ~32.5M
+> real asymptote with a small (~1.4%) margin so it never binds prematurely but is a genuine
+> ceiling. Decision (Vistos, full monetary authority): keep the supply scarce — hold the 1 HLX
+> reward and correct the *cap* down to the truth, rather than inflating the reward to make a
+> round 100M real. Applied by lowering the constant + resetting the (single-account, zero
+> external-holder) prod chain so its genesis reflects the honest cap; `total_supply` is
+> reconstructed from the binary constant on join, so all nodes now agree on 33M.
 
 ## Fees
 
@@ -97,18 +99,20 @@ real, and is answered by two mechanisms that already exist, *not* by an automati
 ## Is the long-term model sound?
 
 Mostly yes, with a coherent philosophy (no pre-mine, fair earned emission, deflationary
-burn, PoS security decoupled from monetary policy). Three genuine open questions remain — all
-tracked in the dev-loop backlog, none hot-patched because they touch a live chain's
-consensus economics:
+burn, PoS security decoupled from monetary policy).
 
-1. **Phantom supply cap** (100M nominal vs ~32.5M real). Credibility debt; pick an honest cap
-   or a real one.
-2. **No automatic fee market.** Fine today; a major L1 wants base-fee/congestion pricing and
-   a consensus-level min fee, not just a per-node mempool floor.
-3. **Post-emission security budget** (the Bitcoin problem). After ~year 30 validators live on
-   *50 %* of fees only. Whether that sustains a decentralized set depends entirely on fee
-   demand; the burn share is itself a lever (it could taper post-emission to fund security).
-   Deflation from the burn should raise the fiat value of that fee share, partially
-   self-correcting — but this must be modeled, not assumed.
+- ✅ **Phantom supply cap — resolved 2026-07-15.** Cap corrected from 100M to an honest 33M
+  (see the Supply section). This was the one credibility issue with a clear-cut fix.
 
-*Last reviewed: 2026-07-15 (chain at ~height 27.8k).*
+Two open questions remain — both touch consensus economics, so they belong in deliberate
+design/governance rather than a hotfix, and are tracked in the dev-loop backlog:
+
+1. **No automatic fee market** (backlog #80). Fine today; a major L1 wants base-fee/congestion
+   pricing and a consensus-level min fee, not just a per-node mempool floor.
+2. **Post-emission security budget** (backlog #81, the Bitcoin problem). After ~year 30
+   validators live on *50 %* of fees only. Whether that sustains a decentralized set depends
+   entirely on fee demand; the burn share is itself a lever (it could taper post-emission to
+   fund security). Deflation from the burn should raise the fiat value of that fee share,
+   partially self-correcting — but this must be modeled, not assumed.
+
+*Last reviewed: 2026-07-15.*

@@ -4,11 +4,20 @@ use crate::state::ChainState;
 
 pub const NANO_PER_HLX: u64 = 1_000_000_000;
 
-/// Hard cap — never more than 100 M HLX will ever exist, full stop. Unlike a chain that
-/// dumps its entire supply into circulation at genesis, this is an asymptotic ceiling: see
-/// `scheduled_block_reward` and `ChainState::total_issued`. Supply also only ever decreases
-/// relative to whatever has been issued, as 50 % of every fee is burned.
-pub const TOTAL_SUPPLY_HLX: u64 = 100_000_000;
+/// Hard cap — never more than 33 M HLX will ever exist, full stop. This is an *honest* cap
+/// (decision 2026-07-15): it is sized to sit just above what the emission schedule actually
+/// pays out, not at an aspirational round number the chain could never reach. The 1 HLX
+/// halving subsidy (`scheduled_block_reward`) emits a geometric series that converges to
+/// `2 × INITIAL_BLOCK_REWARD_HLX × HALVING_INTERVAL_BLOCKS ≈ 31.5 M HLX`; plus the 1 M genesis
+/// validator stake that is the real asymptotic max supply ≈ 32.5 M. The cap is set to 33 M so
+/// it clears that asymptote with a small (~1.4 %) margin and never binds prematurely — but it
+/// is a genuine ceiling, not the ~67 M of phantom headroom the old 100 M value carried (a
+/// cap 3× larger than anything the schedule could mint reads as dishonest to anyone who does
+/// the arithmetic). Unlike a chain that dumps its whole supply into circulation at genesis,
+/// this ceiling is approached asymptotically via `scheduled_block_reward` /
+/// `ChainState::total_issued`; supply only ever *decreases* relative to what's been issued,
+/// as 50 % of every fee is burned.
+pub const TOTAL_SUPPLY_HLX: u64 = 33_000_000;
 
 /// Minimum stake required to enter the active validator set.
 /// 100 k HLX = 0.1 % of total supply — enough skin-in-the-game for slashing to hurt,
@@ -25,7 +34,7 @@ const VALIDATOR_GENESIS_STAKE_HLX: u64 = 1_000_000; // 1 M HLX
 /// Empty by design (decision 2026-07-15, superseding the 2026-07-05 decision to liquid-dump
 /// the entire remaining ~99 M HLX supply to the validator at genesis): a chain that hands its
 /// founder the whole supply on day one isn't meaningfully different from a pre-mined coin,
-/// regardless of what the whitepaper says about caps. The 99 M HLX difference between
+/// regardless of what the whitepaper says about caps. The ~31.5 M HLX difference between
 /// `TOTAL_SUPPLY_HLX` and the genesis stake is instead released gradually, earned by
 /// whoever actually produces blocks, via `scheduled_block_reward` — the same shape as
 /// Bitcoin's coinbase subsidy. Nothing stops an operator from prefunding specific wallets
@@ -42,10 +51,11 @@ pub const INITIAL_BLOCK_REWARD_HLX: u64 = 1;
 /// (365 days × 86 400 s ÷ 2 s per block = 15 768 000 blocks). Chosen to be Bitcoin-shaped —
 /// geometric decay toward an asymptote rather than a cliff-edge cutoff or perpetual flat
 /// issuance that inflates forever. The schedule's total eventual emission converges to
-/// `2 × INITIAL_BLOCK_REWARD_HLX × HALVING_INTERVAL_BLOCKS` ≈ 31.5 M HLX — comfortably inside
-/// the 99 M HLX of headroom under `TOTAL_SUPPLY_HLX`, so in practice the reward decays to
-/// economically-irrelevant amounts (and eventually to exactly 0 via integer division) long
-/// before the cap could ever bind. The cap is still enforced explicitly wherever the reward
+/// `2 × INITIAL_BLOCK_REWARD_HLX × HALVING_INTERVAL_BLOCKS` ≈ 31.5 M HLX — which, plus the 1 M
+/// genesis stake, is exactly why `TOTAL_SUPPLY_HLX` is set to 33 M (a tight, honest ceiling
+/// just above that asymptote), so in practice the reward decays to economically-irrelevant
+/// amounts (and eventually to exactly 0 via integer division) just as the cap is approached
+/// but before it could ever bind. The cap is still enforced explicitly wherever the reward
 /// is actually minted (see `ChainState::mintable_headroom`) — this margin is a design
 /// comfort, not the safety mechanism itself.
 pub const HALVING_INTERVAL_BLOCKS: u64 = 15_768_000;
@@ -112,9 +122,9 @@ impl GenesisConfig {
     }
 
     /// Build the initial ChainState.
-    /// - `total_supply` (the hard cap) = 100 M HLX, set once and never changed afterward.
+    /// - `total_supply` (the hard cap) = 33 M HLX, set once and never changed afterward.
     /// - `total_issued` (what's actually in circulation) starts at just the validator's 1 M
-    ///   HLX bootstrap stake plus any `GENESIS_PREFUND` allocations — the remaining ~99 M HLX
+    ///   HLX bootstrap stake plus any `GENESIS_PREFUND` allocations — the remaining ~32 M HLX
     ///   of headroom is minted gradually via `scheduled_block_reward`, not handed out here.
     /// - circulating_supply = total_issued − total_burned (starts at ~1 M, grows with block
     ///   rewards, shrinks with burns)
