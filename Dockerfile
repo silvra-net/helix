@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/helix /usr/local/bin/helix
 
-# The node writes validator-key.bin and helix-data.redb into its working
+# The node writes validator-key.json and helix-data.redb into its working
 # directory — mount a volume here to persist validator identity + chain state
 # across container restarts/upgrades.
 WORKDIR /data

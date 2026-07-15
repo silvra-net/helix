@@ -15,6 +15,11 @@ pub struct NodeConfig {
     pub p2p_listen_addr: Option<String>,
     pub reward_address: Option<String>,
     pub sync_peer: Option<String>,
+    /// Path to this node's validator key file (the unified KeyFile JSON format `hlx wallet`
+    /// also produces). Defaults to `validator-key.json` in the working directory; a legacy
+    /// `validator-key.bin` from before the rename is auto-detected if the default is absent.
+    /// Overridable via `HELIX_VALIDATOR_KEY`.
+    pub validator_key_path: Option<String>,
     pub validator_crypto_scheme: Option<String>,
     pub mempool_tx_ttl_secs: Option<u64>,
     /// Comma-separated hex-encoded public keys of the network's personhood-issuing

@@ -38,10 +38,55 @@ use crate::config::{self, NodeConfig};
 /// or untagged legacy ML-DSA `secret || public`) was removed once no known key file
 /// still used it — convert an old file first with `hlx wallet import-node-key`.
 ///
-/// Passphrase used to decrypt an encrypted `validator-key.bin` (KeyFile format with
+/// Passphrase used to decrypt an encrypted validator key file (KeyFile format with
 /// `encryption = "aes256gcm-argon2id"`, e.g. produced by `hlx wallet encrypt`). There
 /// is no interactive prompt at node startup, so this is the only way to unlock one.
 const VALIDATOR_KEY_PASSPHRASE_ENV: &str = "HELIX_VALIDATOR_KEY_PASSPHRASE";
+
+/// Unified validator key filename. It's the exact same KeyFile JSON format `hlx wallet`
+/// produces — a validator key *is* a wallet, usable directly with `hlx --key`, with no
+/// conversion step. Overridable via `HELIX_VALIDATOR_KEY` / `validator_key_path`.
+const DEFAULT_VALIDATOR_KEY_FILE: &str = "validator-key.json";
+
+/// Legacy filename from before the rename (the format is identical — only the extension
+/// differed, a holdover from the pre-2026-07-05 raw-bytes format). Auto-detected as a
+/// fallback so a node that predates the rename keeps loading its existing key instead of
+/// silently generating a brand-new validator identity.
+const LEGACY_VALIDATOR_KEY_FILE: &str = "validator-key.bin";
+
+/// Decide which file the validator keypair lives in (see [`choose_validator_key_path`] for
+/// the rules), logging a one-line nudge when it falls back to the legacy `.bin` name.
+fn resolve_validator_key_path(cfg: &config::NodeConfig) -> PathBuf {
+    let explicit = config::resolve("HELIX_VALIDATOR_KEY", &cfg.validator_key_path);
+    let default_exists = std::path::Path::new(DEFAULT_VALIDATOR_KEY_FILE).exists();
+    let legacy_exists = std::path::Path::new(LEGACY_VALIDATOR_KEY_FILE).exists();
+    let (path, is_legacy_fallback) = choose_validator_key_path(explicit, default_exists, legacy_exists);
+    if is_legacy_fallback {
+        info!(
+            "Using legacy validator key file {LEGACY_VALIDATOR_KEY_FILE} — it's the same KeyFile JSON \
+             format as {DEFAULT_VALIDATOR_KEY_FILE}; rename it at your convenience"
+        );
+    }
+    path
+}
+
+/// Pure path-selection logic (no filesystem access, so it's unit-testable): an explicit
+/// override wins; otherwise the unified `validator-key.json` is used, except that a legacy
+/// `validator-key.bin` is preferred when the unified file doesn't exist yet. Returns the
+/// chosen path plus whether it's the legacy fallback (for logging).
+fn choose_validator_key_path(
+    explicit: Option<String>,
+    default_exists: bool,
+    legacy_exists: bool,
+) -> (PathBuf, bool) {
+    if let Some(p) = explicit {
+        return (PathBuf::from(p), false);
+    }
+    if !default_exists && legacy_exists {
+        return (PathBuf::from(LEGACY_VALIDATOR_KEY_FILE), true);
+    }
+    (PathBuf::from(DEFAULT_VALIDATOR_KEY_FILE), false)
+}
 
 fn load_or_create_keypair(path: &PathBuf, scheme_for_new: CryptoScheme) -> Result<KeyPair> {
     load_or_create_keypair_with(path, scheme_for_new, std::env::var(VALIDATOR_KEY_PASSPHRASE_ENV).ok())
@@ -83,6 +128,35 @@ fn load_or_create_keypair_with(
 #[cfg(test)]
 mod keypair_file_tests {
     use super::*;
+
+    #[test]
+    fn key_path_defaults_to_json_and_falls_back_to_legacy_bin() {
+        // Fresh node (neither file present): the unified .json name.
+        assert_eq!(
+            choose_validator_key_path(None, false, false),
+            (PathBuf::from("validator-key.json"), false)
+        );
+        // Unified file already present: use it.
+        assert_eq!(
+            choose_validator_key_path(None, true, false),
+            (PathBuf::from("validator-key.json"), false)
+        );
+        // Only the legacy .bin present (a node predating the rename): keep loading it.
+        assert_eq!(
+            choose_validator_key_path(None, false, true),
+            (PathBuf::from("validator-key.bin"), true)
+        );
+        // Both present: prefer the unified name, no legacy fallback.
+        assert_eq!(
+            choose_validator_key_path(None, true, true),
+            (PathBuf::from("validator-key.json"), false)
+        );
+        // Explicit override always wins verbatim, regardless of what's on disk.
+        assert_eq!(
+            choose_validator_key_path(Some("/keys/my-validator.json".into()), false, true),
+            (PathBuf::from("/keys/my-validator.json"), false)
+        );
+    }
 
     #[test]
     fn generates_and_reloads_a_tagged_keypair() {
@@ -238,7 +312,7 @@ impl HelixNode {
         // `config::resolve`.
         let cfg = config::load_node_config()?;
 
-        let key_path = PathBuf::from("validator-key.bin");
+        let key_path = resolve_validator_key_path(&cfg);
         let scheme_for_new = match config::resolve("HELIX_VALIDATOR_CRYPTO_SCHEME", &cfg.validator_crypto_scheme).as_deref() {
             Some("sphincs-plus") | Some("sphincsplus") => CryptoScheme::SphincsPlus,
             _ => CryptoScheme::MlDsa,

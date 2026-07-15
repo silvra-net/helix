@@ -28,7 +28,7 @@
 //! via block rewards (1 HLX/block) or transfers — economically real, but far too slow for an
 //! automated test (literally weeks). Instead it uses `HELIX_GENESIS_EXTRA_VALIDATORS` (see
 //! `GenesisConfig::extra_validators`'s doc comment) to pre-stake two more validators — with
-//! known keypairs, so the spawned follower processes can be given matching `validator-key.bin`
+//! known keypairs, so the spawned follower processes can be given matching `validator-key.json`
 //! files — directly at genesis, so all three are active BFT participants from block 0.
 //!
 //! That second test is marked `#[ignore]`: it spawns three real validator processes and waits
@@ -85,7 +85,7 @@ fn spawn_node(rpc_port: u16, p2p_port: u16, sync_peer_rpc_port: Option<u16>) -> 
 
 /// `extra_env` — additional env vars beyond the standard bind/listen/sync-peer ones (e.g.
 /// `HELIX_GENESIS_EXTRA_VALIDATORS` on the genesis node). `keypair` — if set, pre-writes
-/// `validator-key.bin` into the node's work dir so it starts with this exact validator
+/// `validator-key.json` into the node's work dir so it starts with this exact validator
 /// identity instead of generating a random one, so a follower's address can be pre-staked in
 /// another node's genesis ahead of time and the follower still ends up controlling it.
 fn spawn_node_with(
@@ -98,7 +98,7 @@ fn spawn_node_with(
     let work_dir = tempdir::TempDir::new().expect("create temp work dir for node");
     if let Some(kp) = keypair {
         KeyFile::from_keypair_plain(kp)
-            .save(&work_dir.path().join("validator-key.bin"))
+            .save(&work_dir.path().join("validator-key.json"))
             .expect("pre-write validator key file");
     }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_helix"));
@@ -242,7 +242,7 @@ async fn three_nodes_converge_on_identical_height_hash_and_state() {
 async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
     // B and C's validator identities are generated up front so their addresses can be
     // pre-staked in A's genesis, and their own processes can later be started with a
-    // matching `validator-key.bin` so they actually control the stake genesis gave them.
+    // matching `validator-key.json` so they actually control the stake genesis gave them.
     let kp_b = KeyPair::generate();
     let kp_c = KeyPair::generate();
     let addr_b = Address::from_public_key(&kp_b.public);

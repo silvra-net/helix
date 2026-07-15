@@ -121,9 +121,9 @@ is no faucet. To get spendable HLX to a new wallet on your own devnet, send from
 validator key itself:
 
 ```bash
-# The node's own signing key lives at ./validator-key.bin and is already a valid
+# The node's own signing key lives at ./validator-key.json and is already a valid
 # CLI wallet file (same JSON format `hlx wallet` produces) — use it directly:
-$HLX tx send hlx... 100 --key validator-key.bin
+$HLX tx send hlx... 100 --key validator-key.json
 ```
 
 If you're connecting to someone else's running network instead of starting your own, ask
@@ -173,7 +173,7 @@ Binaries are placed in `target/release/`:
 ```
 
 On first start, the node:
-- Loads or generates a persistent ML-DSA keypair (`validator-key.bin`)
+- Loads or generates a persistent ML-DSA keypair (`validator-key.json`)
 - Creates the genesis block with the configured HLX allocation (or, if `sync_peer`/
   `HELIX_SYNC_PEER` is set and no local chain exists yet, fetches the *real* genesis from
   that peer instead — see "Joining an Existing Network" below)
@@ -215,8 +215,9 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). Overrides `rpc_bind` in `helix.toml`. |
 | `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address. Overrides `p2p_listen_addr` in `helix.toml`. |
 | `HELIX_SYNC_PEER` | (none) | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks. Overrides `sync_peer` in `helix.toml`. Both the one-off startup sync and the live mid-run gap-fill fallback (triggered when a gossiped block arrives ahead of our tip) honor this. |
-| `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.bin` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
-| `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.bin` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
+| `HELIX_VALIDATOR_KEY` | `validator-key.json` | Path to the validator key file (unified `KeyFile` JSON, same as `hlx wallet`). If unset and the default is absent, a legacy `validator-key.bin` is auto-detected. Overrides `validator_key_path` in `helix.toml`. |
+| `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.json` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
+| `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.json` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
 | `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` (30 min) | How long an unconfirmed transaction may sit in the mempool before it's evicted, freeing its (sender, nonce) slot. Overrides `mempool_tx_ttl_secs` in `helix.toml`. |
 | `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable host (a domain or public IP, no scheme/port — the configured P2P port is appended automatically). Set this on any node reachable from the outside so it can announce itself to peers via peer exchange (see "Network Resilience" below). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
 | `HELIX_GENESIS_EXTRA_VALIDATORS` | (none) | Comma-separated `address:stake_hlx` pairs — additional validators to pre-stake directly at genesis, beyond the one bootstrap validator every chain has always had. Only takes effect for a fresh chain (same caveat as `HELIX_PERSONHOOD_AUTHORITIES`). See "Bootstrapping a Multi-Validator Network" below. Overrides `genesis_extra_validators` in `helix.toml`. |
@@ -229,15 +230,19 @@ HELIX_REWARD_ADDRESS=hlx... ./target/release/helix
 
 ### Persistent Validator Key
 
-The node stores its validator keypair in `validator-key.bin` (in the working directory):
-- File format: unified `KeyFile` JSON (the same format used by `hlx wallet`) — fields
-  `address`, `public_key`, `algo`, `encryption` (`plaintext` or `aes256gcm-argon2id`),
-  `secret_key`, plus `kdf_salt`/`nonce` when encrypted
-- Generated once on first start (plaintext); reused on every subsequent restart
-- Validator address stays the same across restarts
+The node stores its validator keypair in `validator-key.json` (in the working directory,
+or wherever `HELIX_VALIDATOR_KEY` / `validator_key_path` points):
+- **Same format as a CLI wallet.** It's the unified `KeyFile` JSON that `hlx wallet`
+  produces — a validator key *is* a wallet. Use it directly as `--key validator-key.json`
+  with any `hlx` command (see the Quick Start's funding step); there is no conversion step.
+- Fields: `address`, `public_key`, `algo`, `encryption` (`plaintext` or
+  `aes256gcm-argon2id`), `secret_key`, plus `kdf_salt`/`nonce` when encrypted
+- Generated once on first start (plaintext); reused on every subsequent restart, so the
+  validator address stays the same
 - **Back this file up** — losing it means losing your validator identity
-- Because it's the same format as a CLI wallet, you can use it directly as `--key
-  validator-key.bin` with any `hlx` command — see the Quick Start's funding step above
+- *Legacy note:* nodes from before 2026-07-05 wrote a raw-binary `validator-key.bin`. If
+  only that file is present it's still loaded automatically; convert it to the JSON format
+  with `hlx wallet import-node-key` at your convenience
 
 ### Persistent Chain Data
 
@@ -247,7 +252,7 @@ database:
 - Written on every finalized block — survives node restarts and crashes
 - On startup, the node loads existing state from this file if present, or
   builds/fetches genesis on first run (see above)
-- **Back this file up** alongside `validator-key.bin` — losing it loses chain history
+- **Back this file up** alongside `validator-key.json` — losing it loses chain history
 
 ### Joining an Existing Network
 
@@ -322,7 +327,7 @@ startup on an empty `helix-data.redb`, exactly like `HELIX_PERSONHOOD_AUTHORITIE
 that later joins via `sync_peer` automatically adopts the same pre-staked validators as part of
 genesis adoption (`GET /genesis` carries the list along), so the whole fleet agrees on the same
 validator set without needing this variable set anywhere else. Bob and Carol still need their
-own node processes running with the matching `validator-key.bin` (the key whose address you
+own node processes running with the matching `validator-key.json` (the key whose address you
 staked) to actually participate — genesis only grants the stake, it doesn't run their nodes for
 them.
 
@@ -370,7 +375,7 @@ docker run -d --name helix \
 
 Notes:
 - The container's working directory is `/data` — mount a named volume (or bind mount)
-  there so `validator-key.bin` and `helix-data.redb` survive container recreation/upgrades.
+  there so `validator-key.json` and `helix-data.redb` survive container recreation/upgrades.
 - `HELIX_RPC_BIND=0.0.0.0:8545` is required for the REST API to be reachable from outside
   the container — the compiled-in default only binds `127.0.0.1`.
 - To join an existing network instead of starting a fresh devnet genesis, set
@@ -401,10 +406,20 @@ hlx wallet address --key alice.json                 # just the address (for scri
 hlx wallet encrypt "newpass" --key alice.json        # add/change passphrase on an existing wallet
 hlx wallet encrypt "" --key alice.json               # remove passphrase encryption
 
-# A current validator-key.bin already works directly as --key (see "Persistent
-# Validator Key" below) — this is only needed for older raw-byte key files from
-# before the node switched to the JSON wallet format:
-hlx wallet import-node-key --from old-validator-key.bin -o alice.json
+```
+
+**A validator key is already a wallet — no conversion needed.** The node's
+`validator-key.json` is the exact same file format `hlx wallet` produces, so you use it
+directly with any command: `hlx tx send ... --key validator-key.json`. There is no
+per-use conversion step.
+
+The only converter, `hlx wallet import-node-key`, exists purely for *legacy* key files:
+nodes from before 2026-07-05 stored the key as a raw binary blob (hence the old
+`validator-key.bin` name). If — and only if — you have one of those old raw files, convert
+it once:
+
+```bash
+hlx wallet import-node-key --from old-validator-key.bin -o validator-key.json
 ```
 
 A wallet file is portable — it's just JSON. Anyone with the file (and its passphrase, if
@@ -551,12 +566,12 @@ mutually exclusive:
 
 ### Staking as a Node Operator (Validator)
 
-1. **Get a node running** (see [Running a Node](#running-a-node)) — its `validator-key.bin`
+1. **Get a node running** (see [Running a Node](#running-a-node)) — its `validator-key.json`
    is the identity that will stake and produce blocks.
 2. **Stake at least the minimum** (100,000 HLX — 0.1% of the total supply) using that same
    key:
    ```bash
-   hlx tx stake 100000 --key validator-key.bin
+   hlx tx stake 100000 --key validator-key.json
    ```
 3. **Wait for the next epoch rotation** (every 100 blocks — at most a few minutes at the 2s
    block time). The validator set is rebuilt from every account meeting the minimum stake —
@@ -567,19 +582,19 @@ mutually exclusive:
    yearly — see [Token Economics](#token-economics)), paid even on empty blocks. If you have
    delegators, your share is proportional to your self-stake versus their delegated total,
    plus a commission cut of theirs (see below) — with none, you keep 100% exactly as before.
-5. **Unstaking**: `hlx tx unstake <amount> --key validator-key.bin` moves stake into a
+5. **Unstaking**: `hlx tx unstake <amount> --key validator-key.json` moves stake into a
    7-day unbonding period (still slashable during this window) before it's claimable:
    ```bash
-   hlx tx unstake 50000 --key validator-key.bin
+   hlx tx unstake 50000 --key validator-key.json
    # ... 7 days later ...
-   hlx tx claim-unbonded --key validator-key.bin
+   hlx tx claim-unbonded --key validator-key.json
    ```
    You can't unstake below the minimum if you're currently the *only* account meeting it —
    that would empty the validator set and halt the chain, so it's rejected outright rather
    than allowed and left to fail later.
 6. **Set your commission** (optional, before or after you have delegators):
    ```bash
-   hlx tx set-commission 1000 --key validator-key.bin   # 1000 bps = 10% (the default)
+   hlx tx set-commission 1000 --key validator-key.json   # 1000 bps = 10% (the default)
    ```
    Capped at 5000 bps (50%) — not to stop you from legitimately charging more, but to bound
    the "advertise a low rate, raise it once delegators are locked in" rug-pull: even a
@@ -897,7 +912,7 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 
 **Hardening that's in place:**
 
-- **Persistent validator key** is stored unencrypted in `validator-key.bin` by default —
+- **Persistent validator key** is stored unencrypted in `validator-key.json` by default —
   protect this file, or encrypt it (`HELIX_VALIDATOR_KEY_PASSPHRASE` / `hlx wallet encrypt`)
 - The P2P transport uses libp2p's classical Noise (X25519) encryption; this is fine because all
   P2P traffic is public ledger data — see [Cryptography](#cryptography--determinism) for the full
