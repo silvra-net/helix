@@ -1,0 +1,114 @@
+# Helix Tokenomics
+
+Authoritative description of HLX monetary policy, the security model, and the open
+questions. Written to be honest about limitations rather than to market — a coin that
+wants to stand next to BTC/ETH/SOL is bought by people who read the emission curve.
+
+All values below are the genesis defaults in `helix-executor/src/genesis.rs` /
+`governance.rs`. Parameters marked *(governance-adjustable)* can be changed on the live
+chain by a 2/3-of-stake governance proposal; everything else is fixed at genesis.
+
+## The one-paragraph version
+
+No pre-mine. 1,000,000 HLX is staked (not liquid) by the bootstrap validator at genesis so
+the chain can produce blocks at all; every other coin is *earned* by producing blocks, via a
+Bitcoin-shaped halving emission. Half of every transaction fee is burned, half pays the
+block's validator. Security comes from staked HLX (Proof-of-Stake), not from the emission
+schedule — the two are deliberately decoupled.
+
+## Supply
+
+| Quantity | Value |
+|---|---|
+| Nominal supply cap (`TOTAL_SUPPLY_HLX`) | 100,000,000 HLX |
+| Genesis stake (bootstrap validator, non-liquid) | 1,000,000 HLX |
+| Initial block reward | 1 HLX/block |
+| Halving interval | 15,768,000 blocks (~1 year at 2 s blocks) |
+| Liquid pre-mine | none |
+
+**Emission curve.** The reward is `1 HLX >> era`, where `era = height / 15,768,000`. It
+halves once per ~year and integer-divides to **zero after ~30 years** (era 30: `1e9 nano >> 30
+== 0`). Summed, total emission converges to:
+
+```
+Σ (1 HLX >> era) × 15,768,000 blocks  ≈  2 × 15,768,000  ≈  31,536,000 HLX
+```
+
+So the **real asymptotic max supply is ≈ 32.5M HLX** (1M genesis + ~31.5M emitted), *minus*
+cumulative burns — not 100M.
+
+> ⚠️ **Known issue — phantom cap.** `TOTAL_SUPPLY_HLX = 100M` is a ceiling the chain can
+> never reach: ~67.5M HLX is unreachable headroom. The cap is enforced (mints clamp to
+> `mintable_headroom`) but it never binds. This is honest-numbers debt: the stated cap and
+> the real max supply disagree by 3×. Two clean resolutions (a monetary decision, see
+> backlog): (a) lower the stated cap to the true asymptote (~32.5M) so the number is
+> truthful, or (b) raise the initial reward / lengthen the tail so emission actually
+> approaches 100M. Not hot-patched here because it is a consensus change to a live chain.
+
+## Fees
+
+- Fee is a **user-set field** on each transaction (`tx.fee`, in nano-HLX), floored by a
+  local mempool anti-spam minimum (`DEFAULT_MIN_FEE = 1000 nano`, per-node, *not* consensus).
+- `fuel_limit = tx.fee × fuel_per_fee_unit` *(governance-adjustable, default 1)* — the fee
+  buys execution fuel at a governance-set price.
+- **50 % of every fee is burned, 50 % pays the block validator** (`distribute_fee`).
+- Block ordering is a **bid market** (highest fee included first) but there is **no
+  EIP-1559-style floating base fee** — nominal per-fuel cost is constant unless governance
+  moves `fuel_per_fee_unit`.
+
+**Do fees stay constant forever?** Nominally yes — the per-fuel price is fixed until a
+governance vote changes it. That is fine while blocks are near-empty, but it means fees do
+*not* automatically respond to congestion or to a large change in HLX's fiat price. A serious
+L1 eventually wants an automatic base-fee mechanism (or at least a consensus-level, not
+per-node, min fee). See backlog.
+
+## Validator economics & the stake requirement
+
+| Parameter | Value |
+|---|---|
+| Minimum validator stake | 100,000 HLX *(governance-adjustable, floor 1,000 HLX)* |
+| Voting-power cap per validator | 1 % of total |
+| Slashing (equivocation) | 5 % of stake (`SLASH_FRACTION_BPS = 500`) |
+| Delegated staking | implemented (pool shares, auto-compounding, slashable) |
+
+**Should the stake requirement halve as the block reward halves?** — **No, and it would be
+actively harmful.** The two knobs answer different questions:
+
+- The **halving** is *monetary policy*: how fast new supply enters.
+- The **stake minimum** is *security policy*: how much skin-in-the-game a validator posts.
+
+Coupling them would make security decay exponentially — a network that secures *more* value
+over time while requiring *less* collateral to attack it. That is backwards. Note also that
+the barrier already falls on its own in the way that matters: 100k HLX is **10 % of the
+entire genesis supply** on day one (very hard to acquire early), but a shrinking fraction of
+the money supply as ~31.5M HLX is emitted and distributed. Measured as a share of all coins,
+the entry barrier *decreases* automatically with a fixed nominal stake.
+
+The legitimate worry inside the question — "what if HLX appreciates so much that 100k HLX
+prices everyone out and the validator set centralizes?" (Ethereum's 32-ETH debate) — is
+real, and is answered by two mechanisms that already exist, *not* by an automatic schedule:
+
+1. **Governance-adjustable minimum** — a deliberate 2/3-stake vote can lower it (floor 1k),
+   so the network chooses when the bar moves instead of it decaying on a hardcoded curve.
+2. **Delegated staking** — small holders pool stake behind a validator without each needing
+   100k. This is the real decentralization lever: you lower participation cost by *pooling*,
+   not by weakening every validator's individual collateral.
+
+## Is the long-term model sound?
+
+Mostly yes, with a coherent philosophy (no pre-mine, fair earned emission, deflationary
+burn, PoS security decoupled from monetary policy). Three genuine open questions remain — all
+tracked in the dev-loop backlog, none hot-patched because they touch a live chain's
+consensus economics:
+
+1. **Phantom supply cap** (100M nominal vs ~32.5M real). Credibility debt; pick an honest cap
+   or a real one.
+2. **No automatic fee market.** Fine today; a major L1 wants base-fee/congestion pricing and
+   a consensus-level min fee, not just a per-node mempool floor.
+3. **Post-emission security budget** (the Bitcoin problem). After ~year 30 validators live on
+   *50 %* of fees only. Whether that sustains a decentralized set depends entirely on fee
+   demand; the burn share is itself a lever (it could taper post-emission to fund security).
+   Deflation from the burn should raise the fiat value of that fee share, partially
+   self-correcting — but this must be modeled, not assumed.
+
+*Last reviewed: 2026-07-15 (chain at ~height 27.8k).*
