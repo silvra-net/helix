@@ -92,6 +92,14 @@ pub struct BftEngine {
     /// proposer. `advance_round` now bumps this and re-elects a proposer even from a
     /// no-active-round wait. Reset to 0 each time the height advances.
     pending_round: u32,
+    /// EIP-1559 base fee (nano-HLX per tx byte) that the *next* block to be produced or
+    /// accepted must carry (see `helix_core::fee`). It is not consensus state the engine
+    /// derives itself — the node, which holds the store, recomputes it from each committed
+    /// block via `set_base_fee_per_byte()` (deterministically, `fee::next_base_fee_per_byte`
+    /// of the parent's fee and byte-usage). Production stamps it into the header; a received
+    /// proposal is rejected unless its header carries exactly this value, so a proposer can't
+    /// pick an arbitrary base fee.
+    current_base_fee_per_byte: u64,
 }
 
 impl BftEngine {
@@ -111,7 +119,21 @@ impl BftEngine {
             locked_block: None,
             locked_pol: Vec::new(),
             pending_round: 0,
+            current_base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
         }
+    }
+
+    /// The base fee (nano-HLX per tx byte) the next block must carry. Exposed so the node can
+    /// initialize/refresh it from the persisted chain tip after a restart.
+    pub fn base_fee_per_byte(&self) -> u64 {
+        self.current_base_fee_per_byte
+    }
+
+    /// Set the base fee the next produced/accepted block must carry. The node calls this after
+    /// each commit (and once at startup) with `fee::next_base_fee_per_byte` of the chain tip —
+    /// keeping the value out of the engine's own state, since only the node holds the blocks.
+    pub fn set_base_fee_per_byte(&mut self, base_fee_per_byte: u64) {
+        self.current_base_fee_per_byte = base_fee_per_byte;
     }
 
     /// Hold a vote that couldn't be applied to the current round yet (it's for a
@@ -685,6 +707,21 @@ impl BftEngine {
             });
         }
 
+        // EIP-1559: the base fee is not the proposer's to choose — it's deterministically
+        // derived from the parent block (the node refreshes `current_base_fee_per_byte` after
+        // every commit). Reject any header that doesn't carry exactly the expected value, so a
+        // proposer can't lower it to cheapen its own spam or raise it to grief others. Same
+        // value for a re-proposal, since the base fee is per-height, not per-round.
+        if block.header.base_fee_per_byte != self.current_base_fee_per_byte {
+            return Err(ConsensusError::InvalidBlock {
+                height: h,
+                reason: format!(
+                    "base_fee_per_byte mismatch: expected {}, got {}",
+                    self.current_base_fee_per_byte, block.header.base_fee_per_byte
+                ),
+            });
+        }
+
         self.validator_set
             .get(&block.header.validator)
             .ok_or_else(|| ConsensusError::UnknownValidator(block.header.validator.clone()))?;
@@ -771,6 +808,7 @@ impl BftEngine {
             validator: self.address.clone(),
             public_key: keypair.public.clone(),
             crypto_version: keypair.scheme,
+            base_fee_per_byte: self.current_base_fee_per_byte,
             signature: Signature::from_bytes(vec![]),
         };
 

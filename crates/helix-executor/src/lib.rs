@@ -58,8 +58,9 @@ pub fn execute_block(
     let mut total_validator_reward = 0u64;
 
     let height = block.height();
+    let base_fee_per_byte = block.header.base_fee_per_byte;
     for tx in &block.transactions {
-        let receipt = execute_transaction(state, tx, fee_recipient, height);
+        let receipt = execute_transaction(state, tx, fee_recipient, height, base_fee_per_byte);
         total_burned += receipt.fee_burned;
         total_validator_reward += receipt.fee_to_validator;
         receipts.push(receipt);
@@ -86,12 +87,16 @@ pub fn execute_block(
     }
 }
 
-/// Execute a single transaction against the current chain state.
+/// Execute a single transaction against the current chain state. `base_fee_per_byte` is this
+/// block's EIP-1559 base fee (`block.header.base_fee_per_byte`); the base-fee portion of the
+/// transaction's fee (`base_fee_per_byte × tx.size_bytes()`) is burned and the rest tips the
+/// validator (see [`distribute_fee`]).
 pub fn execute_transaction(
     state: &mut ChainState,
     tx: &Transaction,
     validator: &Address,
     height: u64,
+    base_fee_per_byte: u64,
 ) -> Receipt {
     let tx_hash = tx.hash();
 
@@ -100,26 +105,46 @@ pub fn execute_transaction(
         return Receipt::failure(tx_hash, "invalid signature", 0, 0);
     }
 
-    match tx.tx_type {
-        TxType::Transfer => execute_transfer(state, tx, validator, tx_hash),
-        TxType::Stake => execute_stake(state, tx, validator, tx_hash),
-        TxType::Unstake => execute_unstake(state, tx, validator, tx_hash, height),
+    // EIP-1559: the transaction must be able to pay this block's base fee for its size, and
+    // that portion of its fee is burned. A transaction that can't pay is not includable —
+    // reject it with no state change (a correct proposer never packs one, and block validation
+    // independently re-derives base_fee_per_byte).
+    //
+    // Slashing evidence (`SubmitDoubleSignEvidence`) is exempt: it is a consensus-safety public
+    // good that proves itself (both conflicting votes are signed), is deduplicated on-chain, and
+    // cannot be spammed profitably. Its ~16 KB two-vote payload already exceeds the flat reporter
+    // fee at the *floor* base fee, so subjecting it to the fee market would price slashing reports
+    // out of every block and silently disable slashing — the exact failure class fixed once before
+    // when the evidence tx paid fee 0. Every other transaction pays the base fee for its size.
+    let base_fee_amount = if tx.tx_type == TxType::SubmitDoubleSignEvidence {
+        0
+    } else {
+        base_fee_per_byte.saturating_mul(tx.size_bytes())
+    };
+    if tx.fee < base_fee_amount {
+        return Receipt::failure(tx_hash, "fee below block base fee", 0, 0);
+    }
 
-        TxType::RegisterName => execute_register_name(state, tx, validator, tx_hash),
-        TxType::RegisterIdentity => execute_register_identity(state, tx, tx_hash),
-        TxType::RegisterGuardians => execute_register_guardians(state, tx, validator, tx_hash),
-        TxType::ApproveRecovery => execute_approve_recovery(state, tx, validator, tx_hash),
-        TxType::DeployContract => execute_deploy_contract(state, tx, validator, tx_hash),
-        TxType::CallContract => execute_call_contract(state, tx, validator, tx_hash, height),
-        TxType::CreateProposal => execute_create_proposal(state, tx, validator, tx_hash, height),
-        TxType::VoteProposal => execute_vote_proposal(state, tx, validator, tx_hash, height),
-        TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash),
-        TxType::ClaimUnbonded => execute_claim_unbonded(state, tx, validator, tx_hash, height),
-        TxType::CancelRecoveryRequest => execute_cancel_recovery_request(state, tx, validator, tx_hash),
-        TxType::SubmitDoubleSignEvidence => execute_submit_double_sign_evidence(state, tx, validator, tx_hash),
-        TxType::Delegate => execute_delegate(state, tx, validator, tx_hash),
-        TxType::Undelegate => execute_undelegate(state, tx, validator, tx_hash, height),
-        TxType::SetCommission => execute_set_commission(state, tx, validator, tx_hash),
+    match tx.tx_type {
+        TxType::Transfer => execute_transfer(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::Stake => execute_stake(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::Unstake => execute_unstake(state, tx, validator, tx_hash, height, base_fee_amount),
+
+        TxType::RegisterName => execute_register_name(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::RegisterIdentity => execute_register_identity(state, tx, tx_hash, base_fee_amount),
+        TxType::RegisterGuardians => execute_register_guardians(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::ApproveRecovery => execute_approve_recovery(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::DeployContract => execute_deploy_contract(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::CallContract => execute_call_contract(state, tx, validator, tx_hash, height, base_fee_amount),
+        TxType::CreateProposal => execute_create_proposal(state, tx, validator, tx_hash, height, base_fee_amount),
+        TxType::VoteProposal => execute_vote_proposal(state, tx, validator, tx_hash, height, base_fee_amount),
+        TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::ClaimUnbonded => execute_claim_unbonded(state, tx, validator, tx_hash, height, base_fee_amount),
+        TxType::CancelRecoveryRequest => execute_cancel_recovery_request(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::SubmitDoubleSignEvidence => execute_submit_double_sign_evidence(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::Delegate => execute_delegate(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::Undelegate => execute_undelegate(state, tx, validator, tx_hash, height, base_fee_amount),
+        TxType::SetCommission => execute_set_commission(state, tx, validator, tx_hash, base_fee_amount),
     }
 }
 
@@ -149,6 +174,7 @@ fn execute_transfer(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     if tx.amount == 0 {
         return Receipt::failure(tx_hash, "transfer amount must be greater than zero", 0, 0);
@@ -196,7 +222,7 @@ fn execute_transfer(
         acc.balance += tx.amount;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -206,6 +232,7 @@ fn execute_stake(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     if tx.amount == 0 {
         return Receipt::failure(tx_hash, "stake amount must be greater than zero", 0, 0);
@@ -228,7 +255,7 @@ fn execute_stake(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -239,6 +266,7 @@ fn execute_unstake(
     validator: &Address,
     tx_hash: Hash,
     height: u64,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -311,7 +339,7 @@ fn execute_unstake(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -322,6 +350,7 @@ fn execute_claim_unbonded(
     validator: &Address,
     tx_hash: Hash,
     height: u64,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -354,7 +383,7 @@ fn execute_claim_unbonded(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -369,6 +398,7 @@ fn execute_delegate(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -457,7 +487,7 @@ fn execute_delegate(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -476,6 +506,7 @@ fn execute_undelegate(
     validator: &Address,
     tx_hash: Hash,
     height: u64,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -551,7 +582,7 @@ fn execute_undelegate(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -565,6 +596,7 @@ fn execute_set_commission(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -602,7 +634,7 @@ fn execute_set_commission(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -612,6 +644,7 @@ fn execute_register_name(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -641,7 +674,7 @@ fn execute_register_name(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -656,7 +689,7 @@ fn execute_register_name(
 /// 0.5%) validator voting-power cap for a fully self-issued identity. Disabled outright,
 /// failing closed like the no-authority-configured branch of `execute_prove_personhood` — the
 /// only sanctioned path to `Verified` is now the authority-gated ZK proof.
-fn execute_register_identity(_state: &mut ChainState, _tx: &Transaction, tx_hash: Hash) -> Receipt {
+fn execute_register_identity(_state: &mut ChainState, _tx: &Transaction, tx_hash: Hash, _base_fee_amount: u64) -> Receipt {
     Receipt::failure(
         tx_hash,
         "RegisterIdentity (social-graph attestation) is disabled; personhood verification \
@@ -674,6 +707,7 @@ fn execute_register_guardians(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -717,7 +751,7 @@ fn execute_register_guardians(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -732,6 +766,7 @@ fn execute_approve_recovery(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -792,7 +827,7 @@ fn execute_approve_recovery(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -807,6 +842,7 @@ fn execute_cancel_recovery_request(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -827,7 +863,7 @@ fn execute_cancel_recovery_request(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -842,6 +878,7 @@ fn execute_submit_double_sign_evidence(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -886,7 +923,7 @@ fn execute_submit_double_sign_evidence(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -899,6 +936,7 @@ fn execute_deploy_contract(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -938,7 +976,7 @@ fn execute_deploy_contract(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -1070,6 +1108,7 @@ fn execute_call_contract(
     validator: &Address,
     tx_hash: Hash,
     height: u64,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -1113,7 +1152,7 @@ fn execute_call_contract(
             acc.balance -= tx.fee;
             acc.nonce += 1;
         });
-        return distribute_fee(state, validator, tx.fee)
+        return distribute_fee(state, validator, tx.fee, base_fee_amount)
             .map(|_| Receipt::failure(tx_hash, &format!("contract call failed: {e}"), 0, 0))
             .unwrap_or_else(|de| Receipt::failure(tx_hash, &de.to_string(), 0, 0));
     }
@@ -1137,7 +1176,7 @@ fn execute_call_contract(
         state.update_account(&to, |acc| acc.balance += amount);
     }
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -1150,6 +1189,7 @@ fn execute_create_proposal(
     validator: &Address,
     tx_hash: Hash,
     height: u64,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -1215,7 +1255,7 @@ fn execute_create_proposal(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -1229,6 +1269,7 @@ fn execute_vote_proposal(
     validator: &Address,
     tx_hash: Hash,
     height: u64,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -1284,7 +1325,7 @@ fn execute_vote_proposal(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -1294,6 +1335,7 @@ fn execute_prove_personhood(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    base_fee_amount: u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -1362,7 +1404,7 @@ fn execute_prove_personhood(
         acc.nonce += 1;
     });
 
-    distribute_fee(state, validator, tx.fee)
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
@@ -1405,15 +1447,19 @@ fn credit_validator_reward(state: &mut ChainState, recipient: &Address, amount: 
     }
 }
 
-/// 50% of fee is burned (deflationary), 50% goes to the block validator (split with its
-/// delegation pool, if any — see `credit_validator_reward`).
+/// EIP-1559 fee split: the **base fee** portion (`base_fee_amount = block base_fee_per_byte ×
+/// tx size`, computed by the caller) is burned; the remainder of the fee is the validator's
+/// **tip** (split with its delegation pool, if any — see `credit_validator_reward`). Callers
+/// guarantee `fee >= base_fee_amount` (underpaying transactions are rejected up front in
+/// `execute_transaction`), but this clamps defensively so it can never over-burn.
 fn distribute_fee(
     state: &mut ChainState,
     validator: &Address,
     fee: u64,
+    base_fee_amount: u64,
 ) -> ExecutionResult<(u64, u64)> {
-    let burned = fee / 2;      // 50% deflationary burn
-    let reward = fee - burned; // 50% to block validator
+    let burned = base_fee_amount.min(fee); // base fee is burned
+    let reward = fee - burned;             // tip goes to the block validator
     credit_validator_reward(state, validator, reward);
     Ok((burned, reward))
 }
@@ -1466,13 +1512,44 @@ mod tests {
         state.update_account(&addr, |acc| acc.balance = 1_000_000);
 
         let tx = signed_register_name_tx(&kp, &addr, "alice", 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.resolve_name("alice"), Some(addr.to_string().as_str()));
         assert_eq!(state.name_of(&addr), Some("alice"));
         assert_eq!(state.get(&addr).unwrap().balance, 1_000_000 - 10_000);
         assert_eq!(state.get(&addr).unwrap().nonce, 1);
+    }
+
+    #[test]
+    fn tx_below_block_base_fee_is_rejected_then_base_fee_is_burned_and_rest_tips() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let to = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        // A transfer whose flat fee (10) can't cover base_fee_per_byte(1) × its size (hundreds
+        // of bytes) is not includable — rejected up front with no state change.
+        let tx = signed_tx(&kp, &addr, TxType::Transfer, Some(to.clone()), 1, vec![], 0, 10);
+        assert!(tx.size_bytes() > 10, "tx must be larger than its fee for this to test the gate");
+        let rejected = execute_transaction(&mut state, &tx, &validator, 0, 1);
+        assert!(!rejected.success);
+        assert_eq!(rejected.error.as_deref(), Some("fee below block base fee"));
+        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000, "rejected tx must not touch balance");
+        assert_eq!(state.get(&addr).unwrap().nonce, 0, "rejected tx must not advance nonce");
+
+        // With a fee it can afford, exactly base_fee_per_byte × size is burned; the rest tips
+        // the validator (EIP-1559 split, replacing the old flat 50/50).
+        let base_fee_per_byte = 1u64;
+        let tx2 = signed_tx(&kp, &addr, TxType::Transfer, Some(to.clone()), 1, vec![], 0, 100_000);
+        let expected_burn = base_fee_per_byte * tx2.size_bytes();
+        let ok = execute_transaction(&mut state, &tx2, &validator, 0, base_fee_per_byte);
+        assert!(ok.success, "expected success, got: {:?}", ok.error);
+        assert_eq!(ok.fee_burned, expected_burn);
+        assert_eq!(ok.fee_to_validator, 100_000 - expected_burn);
     }
 
     #[test]
@@ -1488,10 +1565,10 @@ mod tests {
         state.update_account(&addr_b, |acc| acc.balance = 1_000_000);
 
         let tx_a = signed_register_name_tx(&kp_a, &addr_a, "alice", 0, 10_000);
-        assert!(execute_transaction(&mut state, &tx_a, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &tx_a, &validator, 0, 0).success);
 
         let tx_b = signed_register_name_tx(&kp_b, &addr_b, "alice", 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx_b, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx_b, &validator, 0, 0);
         assert!(!receipt.success);
         assert_eq!(state.resolve_name("alice"), Some(addr_a.to_string().as_str()));
     }
@@ -1506,7 +1583,7 @@ mod tests {
         state.update_account(&addr, |acc| acc.balance = 1_000_000);
 
         let tx = signed_register_name_tx(&kp, &addr, "AB", 0, 10_000); // too short + uppercase
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(!receipt.success);
         assert!(state.resolve_name("ab").is_none());
     }
@@ -1550,7 +1627,7 @@ mod tests {
             state.update_account(&attester, |acc| acc.balance = 1_000_000);
 
             let tx = signed_attest_tx(&attester_kp, &attester, &attestee, 0, 10_000);
-            let receipt = execute_transaction(&mut state, &tx, &validator, 50 + i as u64);
+            let receipt = execute_transaction(&mut state, &tx, &validator, 50 + i as u64, 0);
             assert!(!receipt.success, "attestation {i} unexpectedly succeeded");
         }
 
@@ -1627,7 +1704,7 @@ mod tests {
             .map(|_| Address::from_public_key(&KeyPair::generate().public))
             .collect();
         let tx = signed_register_guardians_tx(&owner_kp, &owner, &guardians, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.guardians(&owner).unwrap().guardians.len(), 5);
@@ -1647,7 +1724,7 @@ mod tests {
             .map(|_| Address::from_public_key(&KeyPair::generate().public))
             .collect();
         let tx = signed_register_guardians_tx(&owner_kp, &owner, &guardians, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
         assert!(state.guardians(&owner).is_none());
@@ -1672,7 +1749,7 @@ mod tests {
         }
 
         let reg_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 0, 10_000);
-        assert!(execute_transaction(&mut state, &reg_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &reg_tx, &validator, 0, 0).success);
 
         // Owner loses their key; guardians agree on a new one.
         let new_kp = KeyPair::generate();
@@ -1687,7 +1764,7 @@ mod tests {
                 0,
                 10_000,
             );
-            let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+            let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
             assert!(receipt.success, "approval {i} failed: {:?}", receipt.error);
         }
         assert!(state.recovery_key(&owner).is_none());
@@ -1701,12 +1778,12 @@ mod tests {
             0,
             10_000,
         );
-        assert!(execute_transaction(&mut state, &tx, &validator, 1).success);
+        assert!(execute_transaction(&mut state, &tx, &validator, 1, 0).success);
         assert!(state.recovery_key(&owner).is_some());
 
         // Old key can no longer sign for this address.
         let old_key_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 1, 10_000);
-        let receipt = execute_transaction(&mut state, &old_key_tx, &validator, 2);
+        let receipt = execute_transaction(&mut state, &old_key_tx, &validator, 2, 0);
         assert!(!receipt.success, "old key should no longer control the account");
 
         // New key now controls the address.
@@ -1725,7 +1802,7 @@ mod tests {
             public_key: new_kp.public.clone(),
         };
         transfer_tx.signature = new_kp.sign(transfer_tx.signing_hash().as_bytes()).unwrap();
-        let receipt = execute_transaction(&mut state, &transfer_tx, &validator, 3);
+        let receipt = execute_transaction(&mut state, &transfer_tx, &validator, 3, 0);
         assert!(receipt.success, "new key should control the account: {:?}", receipt.error);
     }
 
@@ -1742,7 +1819,7 @@ mod tests {
             .map(|_| Address::from_public_key(&KeyPair::generate().public))
             .collect();
         let reg_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 0, 10_000);
-        assert!(execute_transaction(&mut state, &reg_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &reg_tx, &validator, 0, 0).success);
 
         let outsider_kp = KeyPair::generate();
         let outsider = Address::from_public_key(&outsider_kp.public);
@@ -1750,7 +1827,7 @@ mod tests {
 
         let new_kp = KeyPair::generate();
         let tx = signed_approve_recovery_tx(&outsider_kp, &outsider, &owner, &new_kp.public, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
         assert!(!receipt.success);
         assert!(state.recovery_key(&owner).is_none());
     }
@@ -1795,7 +1872,7 @@ mod tests {
         }
 
         let reg_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 0, 10_000);
-        assert!(execute_transaction(&mut state, &reg_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &reg_tx, &validator, 0, 0).success);
 
         // One malicious/careless guardian approves a bogus key — 1 of 5, nowhere near
         // the 3-of-5 threshold, and never will be (the other guardians simply never act).
@@ -1808,24 +1885,24 @@ mod tests {
             0,
             10_000,
         );
-        assert!(execute_transaction(&mut state, &approve_tx, &validator, 1).success);
+        assert!(execute_transaction(&mut state, &approve_tx, &validator, 1, 0).success);
         assert!(state.recovery_request(&owner).is_some());
 
         // Owner is now locked out of changing guardians...
         let blocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 1, 10_000);
-        let receipt = execute_transaction(&mut state, &blocked_tx, &validator, 2);
+        let receipt = execute_transaction(&mut state, &blocked_tx, &validator, 2, 0);
         assert!(!receipt.success, "guardian changes should be blocked while a request is pending");
 
         // ...until they cancel the stuck request themselves, still with their original key
         // (recovery never finalized, so no override key was ever set).
         let cancel_tx = signed_cancel_recovery_request_tx(&owner_kp, &owner, 1, 10_000);
-        let receipt = execute_transaction(&mut state, &cancel_tx, &validator, 2);
+        let receipt = execute_transaction(&mut state, &cancel_tx, &validator, 2, 0);
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert!(state.recovery_request(&owner).is_none());
 
         // Guardian changes work again.
         let unblocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 2, 10_000);
-        let receipt = execute_transaction(&mut state, &unblocked_tx, &validator, 3);
+        let receipt = execute_transaction(&mut state, &unblocked_tx, &validator, 3, 0);
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
     }
 
@@ -1839,7 +1916,7 @@ mod tests {
         state.update_account(&owner, |acc| acc.balance = 1_000_000);
 
         let tx = signed_cancel_recovery_request_tx(&owner_kp, &owner, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(!receipt.success);
     }
 
@@ -1895,7 +1972,7 @@ mod tests {
             0,
             10_000,
         );
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert!(state.get(&addr).unwrap().code.is_some());
@@ -1921,7 +1998,7 @@ mod tests {
             0,
             10_000,
         );
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
         assert!(state.get(&addr).unwrap().code.is_none());
@@ -1949,7 +2026,7 @@ mod tests {
             0,
             10_000,
         );
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success, "oversized deploy must fail");
         assert!(state.get(&addr).unwrap().code.is_none(), "no code may be stored");
@@ -1977,7 +2054,7 @@ mod tests {
             0,
             10_000,
         );
-        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0, 0).success);
 
         let call_tx = signed_contract_tx(
             &caller_kp,
@@ -1989,7 +2066,7 @@ mod tests {
             0,
             10_000,
         );
-        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.get(&caller).unwrap().balance, 1_000_000 - 5_000 - 10_000);
@@ -2019,7 +2096,7 @@ mod tests {
             0,
             10_000,
         );
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(!receipt.success);
     }
 
@@ -2046,7 +2123,7 @@ mod tests {
             0,
             10_000,
         );
-        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0, 0).success);
 
         let call_tx = signed_contract_tx(
             &caller_kp,
@@ -2058,7 +2135,7 @@ mod tests {
             0,
             1, // 1 fuel unit — nowhere near enough to complete the loop
         );
-        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
 
         // The call itself still fails (ran out of fuel) ...
         assert!(!receipt.success);
@@ -2107,12 +2184,12 @@ mod tests {
         state.update_account(&caller, |acc| acc.balance = 1_000_000);
 
         let deploy_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, storage_writer_wasm(), 0, 10_000);
-        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0, 0).success);
 
         assert_eq!(state.contract_storage_read(&deployer, b"greeting"), None, "nothing written yet");
 
         let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.contract_storage_read(&deployer, b"greeting"), Some(b"hello".to_vec()));
@@ -2134,11 +2211,11 @@ mod tests {
         // by two different addresses, so two different contract accounts.
         let deploy_a = signed_contract_tx(&deployer_a_kp, &deployer_a, TxType::DeployContract, None, 0, storage_writer_wasm(), 0, 10_000);
         let deploy_b = signed_contract_tx(&deployer_b_kp, &deployer_b, TxType::DeployContract, None, 0, storage_writer_wasm(), 0, 10_000);
-        assert!(execute_transaction(&mut state, &deploy_a, &validator, 0).success);
-        assert!(execute_transaction(&mut state, &deploy_b, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &deploy_a, &validator, 0, 0).success);
+        assert!(execute_transaction(&mut state, &deploy_b, &validator, 0, 0).success);
 
         let call_a = signed_contract_tx(&deployer_a_kp, &deployer_a, TxType::CallContract, Some(deployer_a.clone()), 0, vec![], 1, 10_000);
-        assert!(execute_transaction(&mut state, &call_a, &validator, 1).success);
+        assert!(execute_transaction(&mut state, &call_a, &validator, 1, 0).success);
 
         // B never called its own contract — its storage must still be untouched, even though
         // A's identical contract just wrote the exact same key.
@@ -2184,13 +2261,13 @@ mod tests {
 
         let wasm = transfer_wasm(&recipient, 300);
         let deploy_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, wasm, 0, 10_000);
-        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0, 0).success);
 
         // Send 1000 along with the call — the contract's available balance during execution
         // is its real balance (0) plus this value, so the 300 transfer only succeeds because
         // of it (proves `value()` is credited before host calls run, not only after).
         let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 1_000, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.get(&recipient).unwrap().balance, 300);
@@ -2238,10 +2315,10 @@ mod tests {
         .unwrap();
 
         let deploy_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, wasm, 0, 10_000);
-        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0, 0).success);
 
         let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 1_000, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
 
         assert!(!receipt.success, "a trapped call must fail");
         assert_eq!(state.contract_storage_read(&deployer, b"greeting"), None, "the storage write before the trap must be rolled back");
@@ -2289,10 +2366,10 @@ mod tests {
         )
         .unwrap();
         let deploy_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, wasm, 0, 10_000);
-        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &deploy_tx, &validator, 0, 0).success);
 
         let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, b"pass-through".to_vec(), 0, 10_000);
-        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.contract_storage_read(&deployer, b"in"), Some(b"pass-through".to_vec()));
@@ -2335,7 +2412,7 @@ mod tests {
 
         let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 5);
         let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
         assert!(state.proposals.is_empty());
@@ -2355,7 +2432,7 @@ mod tests {
 
         let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 5);
         let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 100);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 100, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         let proposal = state.proposal(0).expect("proposal 0 should exist");
@@ -2381,7 +2458,7 @@ mod tests {
         // `stakers()` filter, exploding the validator set / stalling BFT quorum.
         let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, 0);
         let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
         assert!(state.proposals.is_empty());
@@ -2406,7 +2483,7 @@ mod tests {
         // bricking all contract calls network-wide.
         let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 0);
         let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
         assert!(state.proposals.is_empty());
@@ -2429,7 +2506,7 @@ mod tests {
 
         let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, 1);
         let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
         assert!(state.proposals.is_empty());
@@ -2452,7 +2529,7 @@ mod tests {
         });
         let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, floor);
         let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.proposal(0).unwrap().new_value, floor);
@@ -2460,7 +2537,7 @@ mod tests {
         // One nano below the floor must still fail — confirms the boundary is exact.
         let data2 = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, floor - 1);
         let tx2 = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data2, 1, 10_000);
-        assert!(!execute_transaction(&mut state, &tx2, &validator, 1).success);
+        assert!(!execute_transaction(&mut state, &tx2, &validator, 1, 0).success);
     }
 
     #[test]
@@ -2489,7 +2566,7 @@ mod tests {
             largest_stake + 1,
         );
         let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success, "proposal exceeding every current stake must be rejected");
         assert!(state.proposals.is_empty());
@@ -2515,7 +2592,7 @@ mod tests {
         let data =
             governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, largest_stake);
         let tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
     }
@@ -2542,7 +2619,7 @@ mod tests {
         let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 99);
         let create_tx =
             signed_governance_tx(&proposer_kp, &proposer, TxType::CreateProposal, data, 0, 10_000);
-        assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &create_tx, &validator, 0, 0).success);
         assert_eq!(state.governance_params.fuel_per_fee_unit, governance::DEFAULT_FUEL_PER_FEE_UNIT);
 
         // Proposer's own vote (50%) isn't enough for 2/3 quorum yet.
@@ -2554,7 +2631,7 @@ mod tests {
             1,
             10_000,
         );
-        assert!(execute_transaction(&mut state, &self_vote, &validator, 1).success);
+        assert!(execute_transaction(&mut state, &self_vote, &validator, 1, 0).success);
         assert!(!state.proposal(0).unwrap().executed);
 
         // Second staker's vote pushes yes-stake to 100% — crosses the 2/3 threshold.
@@ -2566,7 +2643,7 @@ mod tests {
             0,
             10_000,
         );
-        let receipt = execute_transaction(&mut state, &second_vote, &validator, 2);
+        let receipt = execute_transaction(&mut state, &second_vote, &validator, 2, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert!(state.proposal(0).unwrap().executed);
@@ -2587,15 +2664,15 @@ mod tests {
 
         let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 1);
         let create_tx = signed_governance_tx(&kp, &addr, TxType::CreateProposal, data, 0, 10_000);
-        assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &create_tx, &validator, 0, 0).success);
 
         let vote_tx =
             signed_governance_tx(&kp, &addr, TxType::VoteProposal, governance::encode_vote(0), 1, 10_000);
-        assert!(execute_transaction(&mut state, &vote_tx, &validator, 1).success);
+        assert!(execute_transaction(&mut state, &vote_tx, &validator, 1, 0).success);
 
         let repeat_vote_tx =
             signed_governance_tx(&kp, &addr, TxType::VoteProposal, governance::encode_vote(0), 2, 10_000);
-        let receipt = execute_transaction(&mut state, &repeat_vote_tx, &validator, 2);
+        let receipt = execute_transaction(&mut state, &repeat_vote_tx, &validator, 2, 0);
         assert!(!receipt.success);
     }
 
@@ -2632,7 +2709,7 @@ mod tests {
         let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 42);
         let create_tx =
             signed_governance_tx(&attacker_kp, &attacker, TxType::CreateProposal, data, 0, 1);
-        assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &create_tx, &validator, 0, 0).success);
         // Frozen denominator: 200 (attacker) + 150 (honest) = 350 -> quorum 234.
         assert_eq!(state.proposal(0).unwrap().total_staked_at_creation, 350);
         assert_eq!(governance::quorum_threshold(350), 234);
@@ -2645,7 +2722,7 @@ mod tests {
             1,
             1,
         );
-        assert!(execute_transaction(&mut state, &attacker_vote, &validator, 1).success);
+        assert!(execute_transaction(&mut state, &attacker_vote, &validator, 1, 0).success);
         // 200 alone is comfortably short of the 234 quorum — not a boundary fluke.
         assert!(!state.proposal(0).unwrap().executed);
         assert_eq!(state.proposal(0).unwrap().yes_stake, 200);
@@ -2653,7 +2730,7 @@ mod tests {
         // Attacker fully unstakes right after voting — their already-counted
         // yes_stake contribution is now backed by nothing.
         let unstake_tx = signed_unstake_tx(&attacker_kp, &attacker, 200, 2, 1);
-        assert!(execute_transaction(&mut state, &unstake_tx, &validator, 2).success);
+        assert!(execute_transaction(&mut state, &unstake_tx, &validator, 2, 0).success);
         assert_eq!(state.get(&attacker).unwrap().staked, 0);
         // Live total shrank to 150 (honest only) -- the old bug's quorum_threshold(150) is 101.
         assert_eq!(state.total_staked(), 150);
@@ -2672,7 +2749,7 @@ mod tests {
             0,
             1,
         );
-        let receipt = execute_transaction(&mut state, &tiny_vote, &validator, 3);
+        let receipt = execute_transaction(&mut state, &tiny_vote, &validator, 3, 0);
         assert!(receipt.success, "vote tx itself should still succeed: {:?}", receipt.error);
         assert_eq!(state.proposal(0).unwrap().yes_stake, 201);
         assert!(
@@ -2702,12 +2779,12 @@ mod tests {
 
         let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 1);
         let create_tx = signed_governance_tx(&proposer_kp, &proposer, TxType::CreateProposal, data, 0, 10_000);
-        assert!(execute_transaction(&mut state, &create_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &create_tx, &validator, 0, 0).success);
 
         let expired_height = governance::VOTING_PERIOD_BLOCKS + 1;
         let vote_tx =
             signed_governance_tx(&voter_kp, &voter, TxType::VoteProposal, governance::encode_vote(0), 0, 10_000);
-        let receipt = execute_transaction(&mut state, &vote_tx, &validator, expired_height);
+        let receipt = execute_transaction(&mut state, &vote_tx, &validator, expired_height, 0);
         assert!(!receipt.success);
     }
 
@@ -2761,7 +2838,7 @@ mod tests {
         });
 
         let tx = signed_unstake_tx(&kp, &addr, 200_000, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
         assert!(receipt.success, "{:?}", receipt.error);
 
         let acc = state.get(&addr).unwrap();
@@ -2783,11 +2860,11 @@ mod tests {
         });
 
         let unstake_tx = signed_unstake_tx(&kp, &addr, 200_000, 0, 10_000);
-        execute_transaction(&mut state, &unstake_tx, &validator, 1);
+        execute_transaction(&mut state, &unstake_tx, &validator, 1, 0);
 
         // Try to claim one block before unlock
         let claim_tx = signed_tx_simple(&kp, &addr, TxType::ClaimUnbonded, 1, 10_000);
-        let receipt = execute_transaction(&mut state, &claim_tx, &validator, UNBONDING_PERIOD);
+        let receipt = execute_transaction(&mut state, &claim_tx, &validator, UNBONDING_PERIOD, 0);
         assert!(!receipt.success, "should fail: unlock height is 1 + UNBONDING_PERIOD");
     }
 
@@ -2803,12 +2880,12 @@ mod tests {
         });
 
         let unstake_tx = signed_unstake_tx(&kp, &addr, 200_000, 0, 10_000);
-        execute_transaction(&mut state, &unstake_tx, &validator, 1);
+        execute_transaction(&mut state, &unstake_tx, &validator, 1, 0);
 
         // Claim exactly at unlock height
         let unlock = 1 + UNBONDING_PERIOD;
         let claim_tx = signed_tx_simple(&kp, &addr, TxType::ClaimUnbonded, 1, 10_000);
-        let receipt = execute_transaction(&mut state, &claim_tx, &validator, unlock);
+        let receipt = execute_transaction(&mut state, &claim_tx, &validator, unlock, 0);
         assert!(receipt.success, "{:?}", receipt.error);
 
         let acc = state.get(&addr).unwrap();
@@ -2847,10 +2924,10 @@ mod tests {
         });
 
         let tx1 = signed_unstake_tx(&kp, &addr, 300_000, 0, 10_000);
-        assert!(execute_transaction(&mut state, &tx1, &validator, 1).success);
+        assert!(execute_transaction(&mut state, &tx1, &validator, 1, 0).success);
 
         let tx2 = signed_unstake_tx(&kp, &addr, 100_000, 1, 10_000);
-        let receipt = execute_transaction(&mut state, &tx2, &validator, 2);
+        let receipt = execute_transaction(&mut state, &tx2, &validator, 2, 0);
         assert!(!receipt.success, "second unstake while first is unbonding should fail");
     }
 
@@ -2874,7 +2951,7 @@ mod tests {
 
         // Would drop staked to min_stake - 1, below the threshold.
         let tx = signed_unstake_tx(&kp, &addr, 1, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
 
         assert!(!receipt.success, "last validator must not be able to unstake below the minimum");
         assert_eq!(state.get(&addr).unwrap().staked, min_stake, "stake must be untouched");
@@ -2902,7 +2979,7 @@ mod tests {
 
         // addr1 can fully exit — addr2 still meets the minimum afterward.
         let tx = signed_unstake_tx(&kp1, &addr1, min_stake, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.get(&addr1).unwrap().staked, 0);
@@ -2925,7 +3002,7 @@ mod tests {
         });
 
         let tx = signed_unstake_tx(&kp, &addr, min_stake, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.get(&addr).unwrap().staked, min_stake);
@@ -2958,7 +3035,7 @@ mod tests {
         );
 
         let tx = signed_unstake_tx(&kp, &addr, 1, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
 
         assert!(!receipt.success, "unstake must be rejected: self-bond ratio would drop below the minimum");
         assert_eq!(state.get(&addr).unwrap().staked, 100_000, "stake must be untouched");
@@ -2984,7 +3061,7 @@ mod tests {
         state.update_account(&other_validator, |acc| acc.staked = min_stake);
 
         let tx = signed_unstake_tx(&kp, &addr, 1, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 1);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         let _ = other_validator_kp;
@@ -3046,7 +3123,7 @@ mod tests {
         let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr);
         let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
 
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert!(state.has_personhood(&addr));
     }
@@ -3068,7 +3145,7 @@ mod tests {
         let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr);
         let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
 
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(receipt.success, "signature from any configured authority must be accepted, got: {:?}", receipt.error);
         assert!(state.has_personhood(&addr));
     }
@@ -3087,7 +3164,7 @@ mod tests {
         let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr);
         let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
 
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(!receipt.success, "must fail closed with no authority configured");
         assert!(!state.has_personhood(&addr));
     }
@@ -3112,7 +3189,7 @@ mod tests {
         let payload = personhood_payload(&attacker_pretending_to_be_authority, commitment, proof.as_bytes().to_vec(), &addr);
         let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
 
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(!receipt.success, "self-issued commitment without the real authority's signature must be rejected");
         assert!(!state.has_personhood(&addr));
     }
@@ -3141,12 +3218,12 @@ mod tests {
         let payload2 = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr2);
 
         let tx1 = signed_personhood_tx(&kp1, &addr1, &payload1, 0, 10_000);
-        assert!(execute_transaction(&mut state, &tx1, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &tx1, &validator, 0, 0).success);
         assert!(state.has_personhood(&addr1));
 
         // Second address has its OWN valid authority binding, but the commitment is spent.
         let tx2 = signed_personhood_tx(&kp2, &addr2, &payload2, 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx2, &validator, 1);
+        let receipt = execute_transaction(&mut state, &tx2, &validator, 1, 0);
 
         assert!(!receipt.success, "a commitment claimed once must never be claimed again");
         assert!(!state.has_personhood(&addr2), "reusing a spent commitment must not gain personhood");
@@ -3179,13 +3256,13 @@ mod tests {
 
         // Attacker submits the victim's exact payload from their own address, front-running.
         let attack_tx = signed_personhood_tx(&attacker_kp, &attacker, &victim_payload, 0, 10_000);
-        let attack_receipt = execute_transaction(&mut state, &attack_tx, &validator, 0);
+        let attack_receipt = execute_transaction(&mut state, &attack_tx, &validator, 0, 0);
         assert!(!attack_receipt.success, "a payload bound to another address must be rejected");
         assert!(!state.has_personhood(&attacker), "front-runner must not gain personhood");
 
         // The commitment was never consumed, so the real victim can still claim it.
         let victim_tx = signed_personhood_tx(&victim_kp, &victim, &victim_payload, 0, 10_000);
-        let victim_receipt = execute_transaction(&mut state, &victim_tx, &validator, 1);
+        let victim_receipt = execute_transaction(&mut state, &victim_tx, &validator, 1, 0);
         assert!(victim_receipt.success, "victim's own claim must still succeed, got: {:?}", victim_receipt.error);
         assert!(state.has_personhood(&victim));
     }
@@ -3272,7 +3349,7 @@ mod tests {
         };
 
         let tx = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 0);
-        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         let expected_slash = 1_000_000 * helix_consensus::SLASH_FRACTION_BPS / 10_000;
@@ -3317,13 +3394,13 @@ mod tests {
         };
 
         let tx1 = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 0);
-        assert!(execute_transaction(&mut state, &tx1, &block_validator, 0).success);
+        assert!(execute_transaction(&mut state, &tx1, &block_validator, 0, 0).success);
         let staked_after_first_slash = state.get(&validator_addr).unwrap().staked;
 
         // Same incident reported again (could be a different reporter in practice) — must
         // not slash a second time for the same (validator, height, round).
         let tx2 = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 1);
-        let receipt = execute_transaction(&mut state, &tx2, &block_validator, 1);
+        let receipt = execute_transaction(&mut state, &tx2, &block_validator, 1, 0);
         assert!(!receipt.success);
         assert_eq!(state.get(&validator_addr).unwrap().staked, staked_after_first_slash);
     }
@@ -3353,7 +3430,7 @@ mod tests {
         };
 
         let tx = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 0);
-        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0, 0);
         assert!(!receipt.success);
         assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000);
     }
@@ -3398,7 +3475,7 @@ mod tests {
         };
 
         let tx = signed_evidence_tx(&attacker_kp, &reporter, &evidence, 0);
-        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0, 0);
         assert!(!receipt.success, "forged vote signature must be rejected");
         assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000);
     }
@@ -3414,6 +3491,7 @@ mod tests {
                 validator: validator.clone(),
                 public_key: KeyPair::generate().public,
                 crypto_version: CryptoVersion::MlDsa,
+                base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
                 signature: Signature::from_bytes(vec![]),
             },
             transactions: vec![],
@@ -3524,7 +3602,7 @@ mod tests {
         state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
 
         let tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target), 500_000_000, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
         assert!(state.validator_pools.is_empty());
@@ -3543,7 +3621,7 @@ mod tests {
         state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
 
         let tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 500_000_000, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(receipt.success, "{:?}", receipt);
         let pool = state.validator_pools.get(&target.to_string()).unwrap();
@@ -3573,13 +3651,13 @@ mod tests {
         state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
 
         let tx1 = signed_tx(&d1_kp, &d1, TxType::Delegate, Some(target.clone()), 1_000_000_000, vec![], 0, 10_000);
-        assert!(execute_transaction(&mut state, &tx1, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &tx1, &validator, 0, 0).success);
 
         // Pool appreciates 10x (simulating compounded rewards) without any new shares minted.
         state.validator_pools.get_mut(&target.to_string()).unwrap().total_delegated_stake = 10_000_000_000;
 
         let tx2 = signed_tx(&d2_kp, &d2, TxType::Delegate, Some(target.clone()), 1_000_000_000, vec![], 0, 10_000);
-        assert!(execute_transaction(&mut state, &tx2, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &tx2, &validator, 0, 0).success);
 
         let d2_shares = *state.delegator_shares.get(&target.to_string()).unwrap().get(&d2.to_string()).unwrap();
         // d2 paid the same HLX as d1 but into a pool worth 10x per share, so gets ~1/10th the shares.
@@ -3605,14 +3683,14 @@ mod tests {
         state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
 
         let tx1 = signed_tx(&d1_kp, &d1, TxType::Delegate, Some(target.clone()), 1_000_000_000, vec![], 0, 10_000);
-        assert!(execute_transaction(&mut state, &tx1, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &tx1, &validator, 0, 0).success);
         // Pool appreciates 10x (compounded rewards) → value-per-share = 10 nHLX.
         state.validator_pools.get_mut(&target.to_string()).unwrap().total_delegated_stake = 10_000_000_000;
 
         let victim_balance_before = state.get(&victim).unwrap().balance;
         // 5 nHLX < 10 nHLX per share → would mint floor(5 * 1e9 / 10e9) = 0 shares.
         let tx2 = signed_tx(&victim_kp, &victim, TxType::Delegate, Some(target.clone()), 5, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx2, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx2, &validator, 0, 0);
 
         assert!(!receipt.success, "a delegation that would mint zero shares must be rejected");
         // Victim keeps every nano — no funds absorbed, no fee charged on the rejected tx.
@@ -3639,7 +3717,7 @@ mod tests {
         state.update_account(&addr, |acc| acc.balance = 1_000_000);
 
         let tx = signed_tx(&kp, &addr, TxType::Transfer, None, 100_000, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success, "a recipient-less transfer must be rejected");
         assert_eq!(state.get(&addr).unwrap().balance, 1_000_000, "no funds may be debited or burned");
@@ -3658,7 +3736,7 @@ mod tests {
         state.update_account(&addr, |acc| acc.balance = 1_000_000);
 
         let tx = signed_tx(&kp, &addr, TxType::Stake, None, 0, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success, "a zero-amount stake must be rejected");
         assert_eq!(state.get(&addr).unwrap().balance, 1_000_000, "no fee may be charged on a rejected zero stake");
@@ -3683,7 +3761,7 @@ mod tests {
         );
 
         let tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 1, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success, "delegation must be rejected: would push self-bond ratio below the minimum");
         assert_eq!(state.validator_pools.get(&target.to_string()).unwrap().total_delegated_stake, 900_000, "pool must be untouched");
@@ -3704,7 +3782,7 @@ mod tests {
         state.update_account(&target, |acc| acc.staked = 100_000);
 
         let tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 900_000, vec![], 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.validator_pools.get(&target.to_string()).unwrap().total_delegated_stake, 900_000);
@@ -3722,10 +3800,10 @@ mod tests {
         state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
 
         let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 500_000_000, vec![], 0, 10_000);
-        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0, 0).success);
 
         let undelegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 200_000_000, vec![], 1, 10_000);
-        let receipt = execute_transaction(&mut state, &undelegate_tx, &validator, 10);
+        let receipt = execute_transaction(&mut state, &undelegate_tx, &validator, 10, 0);
         assert!(receipt.success, "{:?}", receipt);
 
         let acc = state.get(&delegator).unwrap();
@@ -3750,10 +3828,10 @@ mod tests {
         state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
 
         let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 500_000_000, vec![], 0, 10_000);
-        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0, 0).success);
 
         let undelegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 999_999_999, vec![], 1, 10_000);
-        let receipt = execute_transaction(&mut state, &undelegate_tx, &validator, 10);
+        let receipt = execute_transaction(&mut state, &undelegate_tx, &validator, 10, 0);
         assert!(!receipt.success);
     }
 
@@ -3769,13 +3847,13 @@ mod tests {
         state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
 
         let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 500_000_000, vec![], 0, 10_000);
-        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0, 0).success);
 
         let u1 = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 100_000_000, vec![], 1, 10_000);
-        assert!(execute_transaction(&mut state, &u1, &validator, 10).success);
+        assert!(execute_transaction(&mut state, &u1, &validator, 10, 0).success);
 
         let u2 = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 100_000_000, vec![], 2, 10_000);
-        let receipt = execute_transaction(&mut state, &u2, &validator, 11);
+        let receipt = execute_transaction(&mut state, &u2, &validator, 11, 0);
         assert!(!receipt.success, "a second concurrent unbonding must be rejected, same as self-unstake");
     }
 
@@ -3790,7 +3868,7 @@ mod tests {
 
         let over_max = MAX_COMMISSION_BPS + 1;
         let tx = signed_tx(&kp, &from, TxType::SetCommission, None, 0, over_max.to_le_bytes().to_vec(), 0, 10_000);
-        let receipt = execute_transaction(&mut state, &tx, &validator, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(!receipt.success);
     }
 
@@ -3804,7 +3882,7 @@ mod tests {
         state.update_account(&from, |acc| acc.balance = 1_000_000);
 
         let tx = signed_tx(&kp, &from, TxType::SetCommission, None, 0, 2_500u16.to_le_bytes().to_vec(), 0, 10_000);
-        assert!(execute_transaction(&mut state, &tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &tx, &validator, 0, 0).success);
 
         let delegator_kp = KeyPair::generate();
         let delegator = Address::from_public_key(&delegator_kp.public);
@@ -3812,7 +3890,7 @@ mod tests {
         state.update_account(&from, |acc| acc.staked += 100_000 * 1_000_000_000);
 
         let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(from.clone()), 500_000_000, vec![], 0, 10_000);
-        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0).success);
+        assert!(execute_transaction(&mut state, &delegate_tx, &validator, 0, 0).success);
 
         assert_eq!(state.validator_pools.get(&from.to_string()).unwrap().commission_bps, 2_500);
     }
@@ -3830,7 +3908,7 @@ mod tests {
         state.update_account(&target, |acc| acc.staked = 100 * 1_000_000_000);
         state.update_account(&delegator, |acc| acc.balance = 1_000_000_000_000);
         let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 300 * 1_000_000_000, vec![], 0, 10_000);
-        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0).success);
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0, 0).success);
         // Commission 10% (default) on the delegated 75% share.
         let pool_before = state.validator_pools.get(&target.to_string()).unwrap().total_delegated_stake;
         let validator_balance_before = state.get(&target).unwrap().balance;
@@ -3875,7 +3953,7 @@ mod tests {
         state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
         state.update_account(&delegator, |acc| acc.balance = 1_000_000_000_000);
         let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 100_000_000_000, vec![], 0, 10_000);
-        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0).success);
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0, 0).success);
 
         let shares_before = *state.delegator_shares.get(&target.to_string()).unwrap().get(&delegator.to_string()).unwrap();
 
@@ -3910,7 +3988,7 @@ mod tests {
             &delegator_kp, &delegator, TxType::Delegate, Some(target.clone()),
             90_000 * 1_000_000_000, vec![], 0, 10_000,
         );
-        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0).success);
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0, 0).success);
 
         let stakers = state.stakers();
         assert_eq!(stakers.len(), 1, "effective (self + delegated) stake now clears the minimum");

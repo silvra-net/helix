@@ -188,6 +188,13 @@ impl Transaction {
         Hash::digest(&payload)
     }
 
+    /// Serialized on-wire size in bytes — the unit the EIP-1559 base fee is charged against
+    /// (`fee::base_fee_per_byte × size_bytes` is burned; see `crate::fee`). Deterministic
+    /// canonical bincode, identical on every node, so it is safe to use in consensus.
+    pub fn size_bytes(&self) -> u64 {
+        bincode::serialized_size(self).expect("serialization is infallible")
+    }
+
     pub fn verify_signature(&self) -> CryptoResult<()> {
         self.verify_signature_with_recovery_key(None)
     }

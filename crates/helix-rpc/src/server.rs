@@ -899,6 +899,7 @@ mod tests {
                 validator: validator.clone(),
                 public_key: helix_crypto::PublicKey::from_bytes(vec![]),
                 crypto_version: CryptoVersion::MlDsa,
+                base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
                 signature: Signature::from_bytes(vec![]),
             },
             transactions,

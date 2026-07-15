@@ -28,6 +28,13 @@ pub struct BlockHeader {
     pub public_key: PublicKey,
     /// Which crypto scheme the validator used — supports migration
     pub crypto_version: CryptoVersion,
+    /// EIP-1559-style base fee for this block, in nano-HLX **per transaction byte**. Every
+    /// transaction in the block must pay at least `base_fee_per_byte × its_serialized_size`,
+    /// and exactly that portion of its fee is burned (the remainder is the validator's tip).
+    /// Deterministically derived from the parent block's fullness (`fee::next_base_fee_per_byte`)
+    /// so every node computes the same value — it is part of the signed header and re-checked
+    /// on validation, not something the proposer may pick freely.
+    pub base_fee_per_byte: u64,
     /// Signature over the canonical signing hash (excludes `signature` itself)
     pub signature: Signature,
 }
@@ -38,8 +45,9 @@ impl BlockHeader {
         // The leading domain tag separates a block-header signature from a vote or
         // transaction signature (each has its own tag). The field layout stays
         // unambiguous — every field is fixed-length except `validator`, which is the
-        // only variable-length field and is followed by exactly one fixed byte, so the
-        // concatenation has a single possible parse.
+        // only variable-length field and is followed only by fixed-length fields
+        // (crypto_version byte + base_fee_per_byte), so the concatenation has a single
+        // possible parse.
         Hash::digest_many(&[
             b"helix-block-header-v1:",
             &self.version.to_le_bytes(),
@@ -49,6 +57,7 @@ impl BlockHeader {
             self.merkle_root.as_bytes(),
             self.validator.as_str().as_bytes(),
             &[self.crypto_version as u8],
+            &self.base_fee_per_byte.to_le_bytes(),
         ])
     }
 
@@ -122,6 +131,7 @@ pub fn genesis_block(validator: Address, public_key: PublicKey, signature: Signa
         validator,
         public_key,
         crypto_version: CryptoVersion::MlDsa,
+        base_fee_per_byte: crate::fee::INITIAL_BASE_FEE_PER_BYTE,
         signature,
     };
     Block {
@@ -171,6 +181,7 @@ mod tests {
                 validator: Address::from_public_key(&PublicKey::from_bytes(vec![9])),
                 public_key: PublicKey::from_bytes(vec![9]),
                 crypto_version: CryptoVersion::MlDsa,
+                base_fee_per_byte: crate::fee::INITIAL_BASE_FEE_PER_BYTE,
                 signature: Sig::from_bytes(vec![]),
             },
             transactions,

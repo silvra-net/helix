@@ -603,6 +603,14 @@ impl HelixNode {
             let tip_hash = self.store.read().await.latest_hash();
             engine.write().await.seed_last_committed(tip_hash);
         }
+        // Seed the EIP-1559 base fee the next block must carry, deterministically derived from
+        // the persisted chain tip — otherwise a restart resumes at `INITIAL_BASE_FEE_PER_BYTE`
+        // and would stamp/expect the wrong base fee for its first produced/validated block,
+        // diverging from peers that never restarted. The engine keeps this value out of its own
+        // consensus state; the node (which holds the blocks) is the source of truth for it.
+        if let Ok(tip) = self.store.read().await.get_block_by_height(genesis_height) {
+            engine.write().await.set_base_fee_per_byte(base_fee_for_next_block(&tip));
+        }
 
         // Guards against a genuine race between this node's two independent block-ingestion
         // paths — its own BFT engine reaching quorum (NewProposal/NewVote, in the P2P event
@@ -935,6 +943,20 @@ async fn report_double_sign_evidence(
 /// (it knows the correct committed round). Set to `false` when applying a block
 /// received via `NewCommittedBlock` — the block has already been broadcast by the
 /// proposer, and re-broadcasting with a wrong round tag would confuse other nodes.
+/// Deterministically compute the EIP-1559 base fee (nano-HLX per tx byte) the block *after*
+/// `block` must carry, from that block's own base fee and total serialized transaction bytes.
+/// The floor is `fee::INITIAL_BASE_FEE_PER_BYTE` — empty blocks decay the base fee back down to
+/// it. Pure integer arithmetic (see `helix_core::fee::next_base_fee_per_byte`), so every node
+/// derives the identical value from the same tip.
+fn base_fee_for_next_block(block: &Block) -> u64 {
+    let bytes_used: u64 = block.transactions.iter().map(|t| t.size_bytes()).sum();
+    helix_core::fee::next_base_fee_per_byte(
+        block.header.base_fee_per_byte,
+        bytes_used,
+        helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_finalized_block(
     block: Block,
@@ -950,6 +972,10 @@ async fn apply_finalized_block(
     let tx_hashes: Vec<_> = block.transactions.iter().map(|t| t.hash()).collect();
     let height = block.height();
     let tx_count = block.tx_count();
+    // EIP-1559: the base fee the *next* block must carry, derived from this one's fullness.
+    // Captured here while `block` is still owned (it's moved into `put_block` below); applied to
+    // the engine only after the block actually persists, so a failed persist never advances it.
+    let next_base_fee = base_fee_for_next_block(&block);
 
     // Atomically claim this height before doing anything else. This node's own BFT engine
     // reaching quorum (NewProposal/NewVote) and a `NewCommittedBlock` gossip arrival for the
@@ -1102,6 +1128,11 @@ async fn apply_finalized_block(
             error!("Failed to persist chain state at height {}: {}", height, e);
         }
     }
+
+    // Advance the EIP-1559 base fee now that this block is committed: the next block produced
+    // or validated by this node must carry `next_base_fee`. Both ingestion paths funnel through
+    // here, so the engine's expected base fee stays in lockstep with the persisted tip.
+    engine.write().await.set_base_fee_per_byte(next_base_fee);
 
     { mempool.write().await.remove_committed(&tx_hashes); }
 
@@ -1463,6 +1494,12 @@ async fn rpc_sync_loop(
                     .write()
                     .await
                     .sync_to_externally_finalized_block(new_height, new_hash);
+                // Refresh the EIP-1559 base fee from the freshly-synced tip too — this apply
+                // bypassed apply_finalized_block, so without this the engine would keep a stale
+                // base fee and stamp/validate the wrong value for its next block.
+                if let Ok(tip) = store.read().await.get_block_by_height(new_height) {
+                    engine.write().await.set_base_fee_per_byte(base_fee_for_next_block(&tip));
+                }
                 info!(
                     applied,
                     height = new_height,
