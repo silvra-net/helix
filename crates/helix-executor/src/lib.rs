@@ -332,9 +332,12 @@ fn execute_unstake(
     let unlock_height = height + state::UNBONDING_PERIOD;
     state.update_account(&tx.from, |acc| {
         acc.staked -= tx.amount;
-        // Stake moves to the unbonding queue — still slashable during this period.
+        // Stake moves to the unbonding queue — still slashable during this period. `None`
+        // marks it as this account's own self-bond, so `ChainState::slash` on this address
+        // reaches it (rather than some other validator's slash, as with `Undelegate`).
         acc.unbonding_stake = tx.amount;
         acc.unbonding_unlock_height = unlock_height;
+        acc.unbonding_source = None;
         acc.balance -= tx.fee;
         acc.nonce += 1;
     });
@@ -379,6 +382,12 @@ fn execute_claim_unbonded(
         acc.balance += acc.unbonding_stake;
         acc.unbonding_stake = 0;
         acc.unbonding_unlock_height = 0;
+        // The unbonding period is over: these funds have left every slashing window they were
+        // in, so the source validator is no longer meaningful. Harmless to leave set today
+        // (`slash` scales `unbonding_stake`, now 0, and both writers set the source
+        // explicitly), but an empty queue that still names a validator is a lie about the
+        // account's state and exactly the kind of thing a later reader would trust.
+        acc.unbonding_source = None;
         acc.balance -= tx.fee;
         acc.nonce += 1;
     });
@@ -578,6 +587,11 @@ fn execute_undelegate(
     state.update_account(&tx.from, |acc| {
         acc.unbonding_stake = tx.amount;
         acc.unbonding_unlock_height = unlock_height;
+        // Remember which pool this capital came out of: it is no longer in
+        // `validator_pools[target]` for that validator's pool slash to reach, but it was
+        // backing `target` right up to this transaction and stays slashable for `target`'s
+        // misbehavior until the unbonding period ends. See `ChainState::slash`.
+        acc.unbonding_source = Some(target.to_string());
         acc.balance -= tx.fee;
         acc.nonce += 1;
     });
@@ -3789,6 +3803,70 @@ mod tests {
     }
 
     #[test]
+    fn delegate_does_not_count_the_targets_unbonding_stake_as_self_bond() {
+        // The target has 100_000 in the unbonding queue on top of 100_000 active self-stake.
+        // That unbonding capital is still slashable, but it is on its way out and nothing
+        // re-checks the ratio once `ClaimUnbonded` pays it out — so it must NOT buy the target
+        // extra delegation headroom. With only the active 100_000 counting, a 900_000 pool is
+        // already exactly at the floor and this further delegation has to be rejected; if
+        // `unbonding_stake` were (wrongly) counted, 200_000 self-bond would leave room for it.
+        // See `state::self_bond_ratio_ok`'s doc comment.
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000);
+        state.update_account(&target, |acc| {
+            acc.staked = 100_000;
+            acc.unbonding_stake = 100_000;
+            acc.unbonding_unlock_height = UNBONDING_PERIOD;
+        });
+        state.validator_pools.insert(
+            target.to_string(),
+            DelegationPool { total_shares: 900_000, total_delegated_stake: 900_000, commission_bps: DEFAULT_COMMISSION_BPS },
+        );
+
+        let tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 100_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+        assert!(!receipt.success, "unbonding stake must not count toward the self-bond ratio");
+        assert_eq!(state.validator_pools.get(&target.to_string()).unwrap().total_delegated_stake, 900_000, "pool must be untouched");
+    }
+
+    #[test]
+    fn unstake_ratio_check_never_sees_an_active_unbonding_queue() {
+        // Guards the invariant that makes the delegate-side decision above the ONLY place
+        // `unbonding_stake` could matter for the self-bond ratio: `execute_unstake` rejects any
+        // sender that already has an unbonding in progress, before the ratio check is reached.
+        // So `sender.unbonding_stake` is always 0 at that check by construction, and there is
+        // no "unstake twice to game the ratio" path to defend against.
+        let kp = KeyPair::generate();
+        let staker = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&staker, |acc| {
+            acc.balance = 1_000_000_000;
+            acc.staked = 500_000;
+            acc.unbonding_stake = 100_000;
+            acc.unbonding_unlock_height = UNBONDING_PERIOD;
+        });
+
+        let tx = signed_tx(&kp, &staker, TxType::Unstake, None, 50_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+        assert!(!receipt.success, "a second unstake while unbonding must be rejected");
+        assert!(
+            receipt.error.as_deref().unwrap_or_default().contains("unbonding is already in progress"),
+            "expected the single-slot unbonding rejection, got: {:?}",
+            receipt.error
+        );
+        assert_eq!(state.get(&staker).unwrap().staked, 500_000, "stake must be untouched");
+    }
+
+    #[test]
     fn undelegate_redeems_value_and_moves_to_own_unbonding_queue() {
         let delegator_kp = KeyPair::generate();
         let delegator = Address::from_public_key(&delegator_kp.public);
@@ -3965,6 +4043,125 @@ mod tests {
         assert_eq!(shares_after, shares_before, "shares outstanding must not change — only the pool's value per share does");
         // Self-stake also slashed 5%, exactly as before delegation existed.
         assert_eq!(state.get(&target).unwrap().staked, 100_000 * 1_000_000_000 * 95 / 100);
+    }
+
+    #[test]
+    fn undelegating_before_the_slash_lands_does_not_escape_it() {
+        // The evasion CTO Backlog #84 was about: double-sign evidence travels as a transaction,
+        // so it necessarily lands after the misbehavior it proves. A delegator watching for it
+        // undelegates first, moving their capital out of the pool the slash reaches. Their funds
+        // are still inside the unbonding period, so they must still be slashed — this is the
+        // delegated-stake counterpart of the rule that already stopped a validator from
+        // double-signing and immediately queueing an unstake to escape punishment.
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let fee_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000_000);
+
+        let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 100_000_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0, 0).success);
+
+        // Target double-signs here. Evidence is in flight but has not been executed yet — the
+        // delegator (or anyone watching the mempool) gets to act first.
+        let undelegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 100_000_000_000, vec![], 1, 10_000);
+        assert!(execute_transaction(&mut state, &undelegate_tx, &fee_validator, 0, 0).success);
+        assert_eq!(
+            state.get(&delegator).unwrap().unbonding_source.as_deref(),
+            Some(target.to_string().as_str()),
+            "the unbonding must remember the pool it came out of"
+        );
+
+        // Now the evidence lands and the 5% double-sign slash is applied to the target.
+        let burned = state.slash(&target, 500);
+
+        assert_eq!(
+            state.get(&delegator).unwrap().unbonding_stake,
+            95_000_000_000,
+            "the escaped delegation must still take the full 5% slash"
+        );
+        assert_eq!(
+            burned,
+            5_000_000_000 + 100_000 * 1_000_000_000 * 5 / 100,
+            "burn must cover the delegator's 5% plus the validator's own 5%"
+        );
+    }
+
+    #[test]
+    fn slash_does_not_reach_stake_unbonding_out_of_a_different_validators_pool() {
+        // The mirror image of the test above, and the reason `unbonding_source` is an
+        // `Option<validator>` rather than a bool: a validator may itself be someone else's
+        // delegator. Here `slashed` had delegated to `other` and undelegated; that capital sits
+        // in `slashed`'s unbonding queue but was backing `other`, not `slashed`. Slashing
+        // `slashed` for its own double-sign must leave it alone — it is `other`'s pool capital
+        // and only `other`'s misbehavior can reach it.
+        let slashed_kp = KeyPair::generate();
+        let slashed = Address::from_public_key(&slashed_kp.public);
+        let other = Address::from_public_key(&KeyPair::generate().public);
+        let fee_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&other, |acc| acc.staked = 100_000 * 1_000_000_000);
+        state.update_account(&slashed, |acc| {
+            acc.staked = 100_000 * 1_000_000_000;
+            acc.balance = 1_000_000_000_000;
+        });
+
+        let delegate_tx = signed_tx(&slashed_kp, &slashed, TxType::Delegate, Some(other.clone()), 100_000_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0, 0).success);
+        let undelegate_tx = signed_tx(&slashed_kp, &slashed, TxType::Undelegate, Some(other.clone()), 100_000_000_000, vec![], 1, 10_000);
+        assert!(execute_transaction(&mut state, &undelegate_tx, &fee_validator, 0, 0).success);
+
+        state.slash(&slashed, 500);
+
+        assert_eq!(
+            state.get(&slashed).unwrap().unbonding_stake,
+            100_000_000_000,
+            "capital unbonding out of another validator's pool must not be slashed here"
+        );
+        assert_eq!(
+            state.get(&slashed).unwrap().staked,
+            100_000 * 1_000_000_000 * 95 / 100,
+            "its own self-bond must still take the 5%"
+        );
+    }
+
+    #[test]
+    fn claiming_unbonded_delegation_clears_its_source_validator() {
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let target = Address::from_public_key(&KeyPair::generate().public);
+        let fee_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&target, |acc| acc.staked = 100_000 * 1_000_000_000);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000_000);
+
+        let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(target.clone()), 100_000_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0, 0).success);
+        let undelegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Undelegate, Some(target.clone()), 100_000_000_000, vec![], 1, 10_000);
+        assert!(execute_transaction(&mut state, &undelegate_tx, &fee_validator, 0, 0).success);
+
+        let claim_tx = signed_tx(&delegator_kp, &delegator, TxType::ClaimUnbonded, None, 0, vec![], 2, 10_000);
+        let receipt = execute_transaction(&mut state, &claim_tx, &fee_validator, UNBONDING_PERIOD, 0);
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+
+        let acc = state.get(&delegator).unwrap();
+        assert_eq!(acc.unbonding_stake, 0);
+        assert_eq!(acc.unbonding_source, None, "an empty queue must not still name a validator");
+
+        // Once claimed, the funds are liquid and beyond every slashing window — a later slash of
+        // the validator they used to back must not touch them.
+        let balance_before = acc.balance;
+        state.slash(&target, 500);
+        assert_eq!(
+            state.get(&delegator).unwrap().balance,
+            balance_before,
+            "claimed funds are out of reach of the source validator's slash"
+        );
     }
 
     #[test]

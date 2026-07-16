@@ -29,6 +29,16 @@ pub struct AccountState {
     /// 0 means there is no active unbonding.
     #[serde(default)]
     pub unbonding_unlock_height: u64,
+    /// Which validator's misbehavior `unbonding_stake` is still slashable for: `None` when it
+    /// is this account's own unstaked self-bond (`TxType::Unstake`), `Some(validator)` when it
+    /// was redeemed out of that validator's delegation pool (`TxType::Undelegate`).
+    ///
+    /// Without this, unbonding capital is untraceable once it leaves a pool, and `slash` can
+    /// only reach a validator's own account and its live pool — so a delegator who undelegated
+    /// after the misbehavior but before the evidence transaction landed kept everything, which
+    /// is precisely what the unbonding period exists to prevent (see `ChainState::slash`).
+    #[serde(default)]
+    pub unbonding_source: Option<String>,
     /// Next expected nonce — prevents replay attacks
     pub nonce: u64,
     /// Deployed WASM contract bytecode, if this account is a contract.
@@ -44,6 +54,7 @@ impl AccountState {
             staked: 0,
             unbonding_stake: 0,
             unbonding_unlock_height: 0,
+            unbonding_source: None,
             nonce: 0,
             code: None,
         }
@@ -92,6 +103,15 @@ pub const MIN_SELF_BOND_RATIO_BPS: u64 = 1_000;
 /// Whether `self_staked` alone satisfies `MIN_SELF_BOND_RATIO_BPS` against an effective stake of
 /// `self_staked + delegated`. An empty pool (`delegated == 0`) always passes trivially — the
 /// ratio only bites once a validator actually has delegators to be under-collateralized against.
+///
+/// `self_staked` is deliberately the validator's active `AccountState::staked` only, never
+/// `staked + unbonding_stake`, even though unbonding capital is still slashable for the rest of
+/// `UNBONDING_PERIOD` and so is arguably still "at risk". Counting it would let a validator
+/// attract fresh delegations on the strength of capital whose withdrawal it has already
+/// announced: nothing re-checks the ratio when `TxType::ClaimUnbonded` later pays that capital
+/// out, so the pool would silently end up under-collateralized with no transaction to reject.
+/// Measuring only capital that is still committed keeps the check conservative in the direction
+/// that protects delegators, which is the direction to err in.
 pub fn self_bond_ratio_ok(self_staked: u64, delegated: u64) -> bool {
     let effective = self_staked as u128 + delegated as u128;
     if effective == 0 {
@@ -316,24 +336,63 @@ impl ChainState {
     /// count: shares outstanding don't change, only the pool's total value does, so every
     /// delegator's share is instantly worth proportionally less without visiting any of
     /// their individual records (see `DelegationPool`'s doc comment).
+    ///
+    /// Finally, slashes every account still unbonding *out of* this validator's pool
+    /// (`AccountState::unbonding_source == Some(address)`). Those funds already left
+    /// `validator_pools[address]` and so are out of reach of the pool slash above, but they were
+    /// backing this validator when it misbehaved and stay slashable until their unbonding period
+    /// ends — the same rule the validator's own unstaked self-bond has always followed. Skipping
+    /// them let any delegator escape a slash in full simply by undelegating between the
+    /// misbehavior and the (transaction-carried, so necessarily later) evidence landing.
+    ///
+    /// This last pass is linear in the number of accounts rather than indexed. Deliberate: a
+    /// reverse validator→unbonding-delegators index would be derived consensus state that has to
+    /// be kept in lockstep with the accounts it mirrors, and an index that silently drifts out of
+    /// sync corrupts `state_hash` on some nodes and not others — a far worse failure than a scan.
+    /// The scan cannot be used to grief the network either: slashing only ever runs on distinct,
+    /// deduplicated double-sign incidents (see `slashed_double_sign_incidents`), so its frequency
+    /// is bounded by real misbehavior, not by anything an attacker can pay to repeat.
     pub fn slash(&mut self, address: &Address, fraction_bps: u64) -> u64 {
         let key = address.to_string();
-        let Some(acc) = self.accounts.get_mut(&key) else {
+        if !self.accounts.contains_key(&key) {
             return 0;
-        };
-        // Slash from both active stake and unbonding stake — misbehavior during the
-        // unbonding period must still carry consequences, otherwise a validator could
-        // double-sign and immediately queue an unstake to escape punishment.
-        let slash_staked = (acc.staked as u128 * fraction_bps as u128 / 10_000) as u64;
-        let slash_unbonding = (acc.unbonding_stake as u128 * fraction_bps as u128 / 10_000) as u64;
-        acc.staked -= slash_staked;
-        acc.unbonding_stake -= slash_unbonding;
-        let mut total = slash_staked + slash_unbonding;
+        }
+        let mut total: u64 = 0;
+
+        {
+            let acc = self.accounts.get_mut(&key).expect("checked above");
+            // Slash from both active stake and unbonding stake — misbehavior during the
+            // unbonding period must still carry consequences, otherwise a validator could
+            // double-sign and immediately queue an unstake to escape punishment. Only this
+            // account's OWN unstaked self-bond counts here (`unbonding_source == None`): if it
+            // is unbonding out of some *other* validator's pool, that capital was never backing
+            // this validator's misbehavior and is slashed by that validator's own slash instead.
+            let slash_staked = (acc.staked as u128 * fraction_bps as u128 / 10_000) as u64;
+            acc.staked -= slash_staked;
+            total += slash_staked;
+
+            if acc.unbonding_source.is_none() {
+                let slash_unbonding =
+                    (acc.unbonding_stake as u128 * fraction_bps as u128 / 10_000) as u64;
+                acc.unbonding_stake -= slash_unbonding;
+                total += slash_unbonding;
+            }
+        }
 
         if let Some(pool) = self.validator_pools.get_mut(&key) {
             let slash_pool = (pool.total_delegated_stake as u128 * fraction_bps as u128 / 10_000) as u64;
             pool.total_delegated_stake -= slash_pool;
             total += slash_pool;
+        }
+
+        // Delegated capital that has left the pool but is still inside its unbonding window.
+        for acc in self.accounts.values_mut() {
+            if acc.unbonding_source.as_deref() == Some(key.as_str()) {
+                let slash_unbonding =
+                    (acc.unbonding_stake as u128 * fraction_bps as u128 / 10_000) as u64;
+                acc.unbonding_stake -= slash_unbonding;
+                total += slash_unbonding;
+            }
         }
 
         self.total_burned += total;

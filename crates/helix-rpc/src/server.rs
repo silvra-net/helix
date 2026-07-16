@@ -366,6 +366,7 @@ async fn get_account(
                 staked_hlx: acc.staked_hlx(),
                 unbonding_stake_hlx: acc.unbonding_stake as f64 / 1_000_000_000.0,
                 unbonding_unlock_height: acc.unbonding_unlock_height,
+                unbonding_source: acc.unbonding_source.clone(),
                 nonce: acc.nonce,
                 has_code: acc.code.is_some(),
             })),

@@ -144,6 +144,11 @@ pub struct AccountResponse {
     pub unbonding_stake_hlx: f64,
     /// Block height at which `unbonding_stake` becomes claimable (0 = no active unbonding)
     pub unbonding_unlock_height: u64,
+    /// Whose misbehavior `unbonding_stake` is still slashable for: the validator it was
+    /// undelegated from, or `null` when it is this account's own unstaked self-bond. Material
+    /// to anyone reading `unbonding_stake_hlx` — that balance is not merely illiquid, it can
+    /// still shrink, and this says who can shrink it.
+    pub unbonding_source: Option<String>,
     pub nonce: u64,
     pub has_code: bool,
 }

@@ -657,6 +657,12 @@ convert internally. A few things worth knowing:
   value drops by the same 5% its own self-stake does — this is deliberate, not a bug: it's
   what gives delegators a real reason to pick a reliable validator instead of just the lowest
   commission rate.
+- **Undelegating does not outrun a slash.** Double-sign evidence travels as a transaction, so
+  it always lands some blocks after the misbehavior it proves. Undelegating in that window
+  does not save you: redeemed stake stays slashable for the validator you left, for the whole
+  7-day unbonding period, exactly as if it were still in the pool. `helix account` names the
+  validator your unbonding stake is still exposed to. Only `tx claim-unbonded`, after the
+  period ends, puts the funds beyond reach.
 - **Only one unbonding slot at a time**, same as self-staking — claim a pending unbonding
   before starting another (whether from undelegating or unstaking).
 
@@ -798,9 +804,12 @@ advances, since real compute was spent either way.
   governance, floored at 1,000 HLX so it can never be pushed low enough to let unstaked
   accounts flood the validator set.
 - **Unbonding period:** 7 days from `tx unstake` to claimable — stake stays slashable the
-  whole time.
+  whole time. Same for delegated stake redeemed via `tx undelegate`: it remains slashable for
+  the validator it was withdrawn from until the period ends.
 - **Slashing:** 5% of staked HLX burned, plus immediate exclusion from BFT rounds, on
-  confirmed double-sign.
+  confirmed double-sign. Reaches the validator's own stake, its delegation pool, and any stake
+  still unbonding out of either — so neither unstaking nor undelegating ahead of the evidence
+  escapes it.
 - **Circulating supply** = total issued − total burned. Total issued starts small (just the
   genesis validator stake) and grows block by block via the emission schedule above.
 - No liquid HLX is pre-mined to any wallet at genesis — the genesis validator receives only

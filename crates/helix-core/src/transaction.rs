@@ -80,7 +80,10 @@ pub enum TxType {
     /// auto-compounded rewards, minus any slashing since delegating) moves into `tx.from`'s
     /// own `unbonding_stake` — the same unbonding queue and `TxType::ClaimUnbonded` used by
     /// self-staking, so delegated funds are just as slashable during the wait and claimed the
-    /// same way.
+    /// same way. "Just as slashable" is enforced, not aspirational: the queue records which
+    /// pool the capital came out of (`AccountState::unbonding_source`) precisely so that
+    /// undelegating between a validator's double-sign and the evidence transaction that proves
+    /// it cannot escape the slash.
     Undelegate,
     /// `tx.from` (a validator with an existing or new delegation pool) sets the commission
     /// rate it keeps from delegator rewards. `tx.data` carries the new rate as 2

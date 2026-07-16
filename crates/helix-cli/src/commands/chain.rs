@@ -72,6 +72,12 @@ pub async fn show_account(address: &str, node: &str) -> Result<()> {
     let unbonding = res["unbonding_stake_hlx"].as_f64().unwrap_or(0.0);
     if unbonding > 0.0 {
         println!("  Unbonding: {} HLX (unlocks at block #{})", unbonding, res["unbonding_unlock_height"]);
+        // Unbonding funds can still shrink until they unlock, so name who can shrink them
+        // rather than letting the amount read as merely illiquid.
+        match res["unbonding_source"].as_str() {
+            Some(validator) => println!("             still slashable if {} double-signs", validator),
+            None => println!("             still slashable if you double-sign"),
+        }
     }
     println!("  Nonce    : {}", res["nonce"]);
 
