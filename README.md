@@ -324,10 +324,24 @@ that nobody could actually reach.
 A chain with exactly one validator has a hard liveness ceiling no amount of peer exchange or
 gossip resilience can fix: if that one validator's node goes down, block production stops
 completely, full stop — every other node can still relay and store blocks, none of them can
-propose or vote on new ones. Growing organically from one validator to several means each new
-validator accumulating `MIN_VALIDATOR_STAKE` (100,000 HLX) via block rewards or transfers —
-economically real, but on a 1 HLX/block schedule that's weeks to months, far too slow to stand
-up a genuinely fault-tolerant network in any reasonable timeframe.
+propose or vote on new ones.
+
+**How many validators you actually need.** BFT tolerates `f` simultaneous failures only at
+`3f+1` validators: 4 to survive one, 7 to survive two. Three is not a middle ground — with three
+of equal weight, any two together land exactly one voting unit below the `2/3 + 1` threshold, so
+every block needs all three and the network tolerates *zero* failures, same as running one.
+
+**They also have to be big enough to matter.** Voting power is capped at 1% of total stake per
+validator (see [Consensus](#consensus)), and that cap is what equalizes validators of unequal
+stake — but only once it actually binds them. Adding validators too small to reach the cap
+leaves the largest one holding a quorum by itself, so killing it still halts the chain and the
+small ones are decoration. As a rule of thumb, a new validator needs more than `total_stake/50`
+staked for the cap to bind it (`total_stake/100` if it has verified personhood).
+
+Growing organically means funding each new validator with `MIN_VALIDATOR_STAKE` (100,000 HLX)
+via transfers, or waiting for the existing validator's block rewards to accumulate it — at 1
+HLX/block and 2s blocks that is ~43,200 HLX/day, so roughly two days per validator. Real, but
+slow if you want a fault-tolerant network standing up today.
 
 `HELIX_GENESIS_EXTRA_VALIDATORS` (or `genesis_extra_validators` in `helix.toml`) skips that
 wait: it pre-stakes additional validators — by address, at whatever stake you choose — directly
@@ -984,6 +998,14 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 - Double-signing is provable on-chain and slashed; misbehaving peers are scored and banned
 
 **Known limitations (honest status, not finished guarantees):**
+
+- **The public network runs a single validator today, so it tolerates zero faults.** The BFT
+  machinery is real and tested against a 4-validator set (including killing one mid-flight), but
+  the live chain at `helix.silvra.net` is operated by one node: if it goes down, block production
+  stops until it returns. Fault tolerance is a property of the deployed validator set, not of the
+  code — it starts at 4 independent validators (`3f+1`), on separate machines and ideally separate
+  operators. Until then, treat the public chain's liveness as depending on one operator. See
+  [Bootstrapping a Multi-Validator Network](#bootstrapping-a-multi-validator-network).
 
 - **BFT cross-round vote locking is implemented but not yet battle-tested at scale.** The
   engine now does Tendermint-style locking: once a validator sees a prevote-quorum for a value
