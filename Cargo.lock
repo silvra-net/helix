@@ -1167,7 +1167,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helix-cli"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "helix-consensus"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "helix-core",
  "helix-crypto",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "helix-core"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "bincode",
  "helix-crypto",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "helix-crypto"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "helix-executor"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "bincode",
  "helix-consensus",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "helix-identity"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "helix-crypto",
  "serde",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "helix-mempool"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "helix-core",
  "helix-crypto",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "helix-node"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "helix-p2p"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "bincode",
  "helix-consensus",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "helix-rpc"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "helix-core",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "helix-storage"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "bincode",
  "helix-core",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "helix-vm"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "thiserror 1.0.69",
  "wasmi",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "helix-zkp"
-version = "1.4.0"
+version = "0.5.0"
 dependencies = [
  "bincode",
  "serde",

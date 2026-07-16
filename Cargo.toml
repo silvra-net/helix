@@ -19,7 +19,14 @@ resolver = "2"
 [workspace.package]
 # Kept in lockstep with the released git tag: the release workflow refuses to build a
 # `vX.Y.Z` tag whose version does not match this line.
-version = "1.4.0"
+#
+# 0.x on purpose. This shipped as v1.0.0 eleven days into the project and climbed to v1.4.0
+# within the week, which told anyone reading semver that the API was stable — while the chain
+# was being reset from genesis every few days, ran on a single validator, and changed its block
+# format three times. 1.0 is a promise about stability that nothing here can keep yet. It costs
+# nothing to say so, and claiming otherwise cost credibility that the rest of the project works
+# hard to earn.
+version = "0.5.0"
 edition = "2021"
 authors = ["SILVRA"]
 license = "MIT"

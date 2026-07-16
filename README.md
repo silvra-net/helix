@@ -4,12 +4,19 @@
 [![Release](https://github.com/silvra-net/helix/actions/workflows/release.yml/badge.svg)](https://github.com/silvra-net/helix/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> The quantum-secure, human-centric blockchain for everyone.
+> A Layer-1 blockchain signed with real post-quantum cryptography. Early development.
 
-Helix is a Layer-1 blockchain built from the ground up for the post-quantum era. It uses
-NIST-standardized post-quantum cryptography, delivers instant BFT finality, and makes
-blockchain accessible to everyday users through human-readable names and social wallet
-recovery.
+Helix is built from the ground up for the post-quantum era: every signature is NIST
+ML-DSA-65 (FIPS 204), not a classical curve with a roadmap. On top of that sit
+Tendermint-style BFT finality, human-readable names, and social wallet recovery.
+
+**Where it actually stands.** The project is weeks old. One validator runs the public
+network, so it tolerates zero faults; the chain is reset from genesis whenever the format
+changes, taking every balance with it; and no one outside this repository has audited the
+consensus or the cryptography. The engineering is real and the code is honest about its
+gaps — see [Security](#security) for the full list — but this is a working prototype
+looking for its first independent node operators, not a network to hold value on. The
+ambition is a chain people can rely on. That is a goal here, not a description.
 
 This README is a practical guide: install it, run a node, use the CLI, stake — as an
 operator or as a regular holder. Deeper reference material (REST API, wire formats, crate
