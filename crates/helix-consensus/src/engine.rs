@@ -344,22 +344,20 @@ impl BftEngine {
         let height = self.current_height + 1;
         let round_num = self.round.as_ref().map_or(self.pending_round, |r| r.round);
 
-        let round = self.round.get_or_insert_with(|| {
-            RoundState::new(height, round_num, self.validator_set.clone())
-        });
-
-        // A proposal did arrive (this round is past `Propose`) — nothing to abandon, and our
-        // prevote for the real value is already cast or deliberately withheld by the lock rule.
-        if round.phase != RoundPhase::Propose {
-            return;
-        }
-        if round.prevotes.has_voted(&self.address) {
-            return;
-        }
-        if round.open_for_nil_prevote().is_err() {
-            return;
+        // Inspect any existing round before touching `self.round`. A proposal that did arrive
+        // (phase past `Propose`) means there is nothing to abandon — our prevote for the real
+        // value is already cast, or deliberately withheld by the lock rule.
+        if let Some(round) = self.round.as_ref() {
+            if round.phase != RoundPhase::Propose || round.prevotes.has_voted(&self.address) {
+                return;
+            }
         }
 
+        // Sign before creating anything. Doing it the other way round leaves a round behind on
+        // a signing failure — opened for nil, holding neither a vote nor a proposal — and
+        // `receive_proposal` then turns away this round's real proposal on the grounds that we
+        // are already tracking it. Self-healing via the backstop timeout, but only after
+        // throwing away a round for no reason.
         let Ok(vote) = cast_vote(
             &self.address,
             keypair,
@@ -370,6 +368,13 @@ impl BftEngine {
         ) else {
             return;
         };
+
+        let round = self.round.get_or_insert_with(|| {
+            RoundState::new(height, round_num, self.validator_set.clone())
+        });
+        if round.open_for_nil_prevote().is_err() {
+            return;
+        }
         let _ = round.add_prevote(vote.clone());
         self.outbound_votes.push(vote);
         // Peers' nil prevotes for this round may already be buffered (they hit their own
