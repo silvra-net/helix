@@ -6,12 +6,12 @@ pub mod validator;
 pub mod vote;
 pub mod vote_set;
 
-pub use engine::{BftEngine, ROUND_TIMEOUT_TICKS};
+pub use engine::{BftEngine, PROPOSAL_TIMEOUT_TICKS, ROUND_TIMEOUT_TICKS};
 pub use evidence::DoubleSignEvidence;
 pub use proposal::Proposal;
 pub use round::{RoundPhase, RoundState};
 pub use validator::{Validator, ValidatorSet};
-pub use vote::{Vote, VoteType};
+pub use vote::{Vote, VoteType, NIL_BLOCK_HASH};
 pub use vote_set::VoteSet;
 
 use helix_core::Block;

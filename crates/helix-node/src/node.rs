@@ -1217,7 +1217,12 @@ async fn block_production_loop(
                 continue;
             }
 
-            let timed_out = { engine.write().await.note_round_tick() };
+            let timed_out = { engine.write().await.note_round_tick(&keypair) };
+            // This tick may have cast a nil prevote (`PROPOSAL_TIMEOUT_TICKS`). Send it now:
+            // the drain at the end of the loop body is unreachable from the `continue` below,
+            // and a nil prevote that never leaves this node can't be tallied by anyone, so
+            // nil quorum — the whole point of casting it — could never form.
+            broadcast_outbound_votes(&engine, &p2p_tx).await;
             if !timed_out {
                 continue;
             }
@@ -1238,7 +1243,12 @@ async fn block_production_loop(
                 // joining at round 0 (the same guard the active-round branch applies).
                 continue;
             } else {
-                engine.write().await.note_round_tick()
+                let timed_out = { engine.write().await.note_round_tick(&keypair) };
+                // Same reason as the active-round branch: a nil prevote cast here has to go
+                // out this tick. (This branch falls through to the end-of-body drain rather
+                // than `continue`ing, but draining twice is free — the second is empty.)
+                broadcast_outbound_votes(&engine, &p2p_tx).await;
+                timed_out
             }
         };
 
@@ -1281,16 +1291,25 @@ async fn block_production_loop(
         // Broadcast any votes this node cast this tick (own prevote/precommit
         // from produce_block) so other validators can fold them into their
         // VoteSets.
-        let outbound = { engine.write().await.take_outbound_votes() };
-        for vote in outbound {
-            let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(vote));
-        }
+        broadcast_outbound_votes(&engine, &p2p_tx).await;
         // Report any double-sign evidence this tick's produce_block/advance_round
         // turned up (e.g. a stalled round's accumulated evidence).
         let evidence = { engine.write().await.take_evidence() };
         for ev in evidence {
             report_double_sign_evidence(ev, &keypair, &chain_state, &mempool, &p2p_tx).await;
         }
+    }
+}
+
+/// Drain the votes this node has cast but not yet sent, and gossip them to the other
+/// validators. Safe to call more than once per tick — the second call finds an empty queue.
+async fn broadcast_outbound_votes(
+    engine: &Arc<RwLock<BftEngine>>,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
+) {
+    let outbound = { engine.write().await.take_outbound_votes() };
+    for vote in outbound {
+        let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(vote));
     }
 }
 

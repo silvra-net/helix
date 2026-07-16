@@ -4,6 +4,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ConsensusError, ConsensusResult};
 
+/// The `block_hash` a **nil prevote** carries: "I have no proposal for this round".
+///
+/// Tendermint models this as a distinct `nil` value; Helix reuses the `block_hash` field with an
+/// all-zero sentinel instead, so nil votes tally through the very same `VoteSet::power_by_hash`
+/// machinery as real ones and reach quorum by the same rule. No real block can collide with it:
+/// `Block::hash()` is BLAKE3, so producing a block hashing to all-zeros means finding a BLAKE3
+/// preimage of a chosen 32-byte output.
+///
+/// Only ever legal on a **prevote**. A precommit for nil is rejected outright
+/// (`BftEngine::add_vote`) — Helix advances a dead round on prevote-nil quorum and never
+/// precommits nil, which keeps "precommit quorum" meaning exactly one thing: a real block is
+/// final. See `BftEngine::note_round_tick` for the full argument.
+pub const NIL_BLOCK_HASH: Hash = Hash::ZERO;
+
 /// BFT vote phase (Tendermint-style two-phase commit)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoteType {

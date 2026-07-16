@@ -8,7 +8,7 @@ use tracing::info;
 use crate::{
     round::{RoundPhase, RoundState},
     ConsensusError, ConsensusResult, DoubleSignEvidence, Proposal, Validator, ValidatorSet, Vote,
-    VoteType,
+    VoteType, NIL_BLOCK_HASH,
 };
 
 /// Number of block-production ticks a round may sit without reaching
@@ -26,6 +26,23 @@ use crate::{
 /// enough for prevotes *and* precommits to both propagate. Only faulty-proposer
 /// recovery pays the cost, never the common case.
 pub const ROUND_TIMEOUT_TICKS: u32 = 15;
+
+/// Block-production ticks a validator waits for its round's proposal before giving up on it and
+/// prevoting **nil** (`NIL_BLOCK_HASH`) — see `note_round_tick`.
+///
+/// This is the knob that decides how fast a dead proposer is routed around, and it can be short
+/// precisely *because* it doesn't decide when the round ends: a nil prevote is a claim about
+/// this node ("no proposal reached me"), not a unilateral move to the next round. The round only
+/// advances once 2/3+ of the power says the same thing, so validators leave together and the
+/// per-node timer skew that forces `ROUND_TIMEOUT_TICKS` to be so generous cannot pull them
+/// apart here. Being early merely costs a nil prevote that fails to reach quorum.
+pub const PROPOSAL_TIMEOUT_TICKS: u32 = 2;
+
+/// The nil prevote has to be cast strictly before the round it belongs to can time out,
+/// otherwise the backstop fires first and no nil quorum ever forms — the dead-proposer latency
+/// would silently regress to the old behavior while every test still passed. Compile-time so
+/// tuning either constant can't quietly break the ordering they depend on.
+const _: () = assert!(PROPOSAL_TIMEOUT_TICKS < ROUND_TIMEOUT_TICKS);
 
 /// Cap on votes buffered ahead of the round they belong to (see
 /// `BftEngine::buffered_votes`). Bounds the memory a peer can make us hold by
@@ -266,13 +283,101 @@ impl BftEngine {
         self.propose(keypair, height, round_num, prev_hash, transactions)
     }
 
-    /// Called once per block-production tick while a round is active but not
-    /// yet finalized. Increments the stall counter and reports whether the
-    /// round has now been active long enough (`ROUND_TIMEOUT_TICKS`) to be
-    /// considered stalled and advanced via `advance_round`.
-    pub fn note_round_tick(&mut self) -> bool {
+    /// Called once per block-production tick while this height is unfinalized. Drives both
+    /// timeouts and reports whether the caller should now `advance_round`.
+    ///
+    /// Two clocks, doing different jobs:
+    ///
+    /// * `PROPOSAL_TIMEOUT_TICKS` (short) — no proposal arrived, so cast a **nil prevote** and
+    ///   broadcast it. This does not end the round; it publishes this node's view so the
+    ///   network can form an opinion. Cast at most once per round (a second, conflicting
+    ///   prevote from us would be equivocation).
+    /// * `ROUND_TIMEOUT_TICKS` (long) — backstop. If nil never reaches quorum either (say too
+    ///   much of the power is down to form *any* 2/3 majority), the round still has to end
+    ///   eventually, or the height stalls forever. This is the pre-nil-vote behavior, kept.
+    ///
+    /// The fast path is neither of these: `should_advance_round` fires as soon as prevotes
+    /// reach quorum on nil, typically one tick after the nil prevotes go out.
+    ///
+    /// **Why abandoning a round on prevote-nil quorum is safe.** Advancing the round commits
+    /// nothing, so it cannot fork the chain; the only real question is whether it could
+    /// abandon a round in which some honest validator had already precommitted a block. It
+    /// cannot: a precommit requires a prevote quorum for that block, and prevote quorums for
+    /// nil and for a block are mutually exclusive. Each needs `2N/3 + 1` of the power, so both
+    /// together need more than `4N/3` — over `N/3` of the power would have to prevote both,
+    /// i.e. equivocate, which exceeds the `f < N/3` fault budget BFT assumes (and is
+    /// individually slashable, see `VoteSet::add`). For the same reason no lock can have formed
+    /// in a round that reaches nil quorum, so `locked_round`/`locked_block` are untouched and
+    /// Tendermint's cross-round safety argument (`should_prevote`) carries over unchanged.
+    pub fn note_round_tick(&mut self, keypair: &KeyPair) -> bool {
         self.round_ticks += 1;
+
+        if self.round_ticks == PROPOSAL_TIMEOUT_TICKS {
+            self.prevote_nil(keypair);
+        }
+
+        if self.should_advance_round() {
+            return true;
+        }
+
         self.round_ticks >= ROUND_TIMEOUT_TICKS
+    }
+
+    /// Whether the network has agreed (2/3+ prevotes for `NIL_BLOCK_HASH`) that the active
+    /// round has nothing to commit, so the caller should `advance_round` to the next proposer
+    /// immediately rather than sitting out the rest of `ROUND_TIMEOUT_TICKS`.
+    pub fn should_advance_round(&self) -> bool {
+        self.round
+            .as_ref()
+            .is_some_and(|r| r.prevotes.quorum_hash() == Some(NIL_BLOCK_HASH))
+    }
+
+    /// Cast this node's nil prevote for the round it is currently waiting on, creating the
+    /// `RoundState` if the wait never had one (the dead-proposer case: a non-proposer holds no
+    /// round until a proposal arrives). Silent no-op if we already hold a proposal for this
+    /// round, already prevoted in it, or aren't in the validator set — all cases where a nil
+    /// prevote would be either wrong or a self-inflicted double-sign.
+    fn prevote_nil(&mut self, keypair: &KeyPair) {
+        if self.assert_is_validator().is_err() {
+            return;
+        }
+        let height = self.current_height + 1;
+        let round_num = self.round.as_ref().map_or(self.pending_round, |r| r.round);
+
+        let round = self.round.get_or_insert_with(|| {
+            RoundState::new(height, round_num, self.validator_set.clone())
+        });
+
+        // A proposal did arrive (this round is past `Propose`) — nothing to abandon, and our
+        // prevote for the real value is already cast or deliberately withheld by the lock rule.
+        if round.phase != RoundPhase::Propose {
+            return;
+        }
+        if round.prevotes.has_voted(&self.address) {
+            return;
+        }
+        if round.open_for_nil_prevote().is_err() {
+            return;
+        }
+
+        let Ok(vote) = cast_vote(
+            &self.address,
+            keypair,
+            VoteType::Prevote,
+            height,
+            round_num,
+            NIL_BLOCK_HASH,
+        ) else {
+            return;
+        };
+        let _ = round.add_prevote(vote.clone());
+        self.outbound_votes.push(vote);
+        // Peers' nil prevotes for this round may already be buffered (they hit their own
+        // proposal timeout first) — fold them in now that a round exists to hold them, so
+        // quorum can be reached without waiting for a re-send that gossipsub never makes.
+        let mut round = self.round.take().expect("just inserted above");
+        self.apply_buffered_votes(keypair, &mut round);
+        self.round = Some(round);
     }
 
     /// Advance the pending height to its next round — e.g. the round's proposer was offline,
@@ -399,6 +504,18 @@ impl BftEngine {
     /// a precommit nobody ever sends when quorum is only reached step-by-step
     /// over the network instead of all at once.
     pub fn add_vote(&mut self, keypair: &KeyPair, vote: Vote) -> ConsensusResult<Option<Block>> {
+        // Helix never precommits nil (see `note_round_tick`), so a precommit carrying
+        // `NIL_BLOCK_HASH` is not something an honest validator produces. Refuse it at the
+        // boundary rather than letting it accumulate power behind the nil key, where enough of
+        // it would drive a round to `Commit(NIL)` and finalize a height with no block.
+        if vote.vote_type == VoteType::Precommit && vote.block_hash == NIL_BLOCK_HASH {
+            return Err(ConsensusError::InvalidVote {
+                reason: "precommit for nil — Helix advances rounds on prevote-nil quorum and \
+                         never precommits nil"
+                    .into(),
+            });
+        }
+
         // A vote for the next height but a round we're not currently running
         // (ahead of our active round, or arriving before we have any round for
         // this height) isn't a protocol violation — it's a vote we simply can't
@@ -922,6 +1039,22 @@ fn lock_and_precommit(
     let Some(hash) = round.prevotes.quorum_hash() else {
         return;
     };
+    // A prevote quorum on *nil* means the network agreed there is nothing to commit here — it
+    // is the signal to abandon the round (`should_advance_round`), never to precommit. Casting
+    // a precommit for `NIL_BLOCK_HASH` would let precommits reach quorum on nil, drive the
+    // round to `Commit(NIL)`, and finalize a height with no block behind it.
+    if hash == NIL_BLOCK_HASH {
+        return;
+    }
+    // Never precommit a value we don't hold. A round opened for a nil prevote carries no
+    // proposal, yet still tallies peers' prevotes — so peers who *did* receive the proposal can
+    // carry it to a prevote quorum here. Precommitting off the back of that would mean pledging
+    // to a block this node has never seen, let alone validated. (In a round we joined via
+    // `receive_proposal` the proposal is always present and matches, so this changes nothing
+    // about the common path.)
+    if !round.proposal.as_ref().is_some_and(|b| b.hash() == hash) {
+        return;
+    }
     // Lock on the value behind the prevote quorum (only ever advancing the lock forward).
     if locked_round.is_none_or(|lr| round.round >= lr) {
         if let Some(block) = round.proposal.as_ref().filter(|b| b.hash() == hash) {
@@ -1013,6 +1146,184 @@ mod tests {
     fn peer_vote(kp: &KeyPair, vote_type: VoteType, height: u64, round: u32, hash: Hash) -> Vote {
         let addr = Address::from_public_key(&kp.public);
         cast_vote(&addr, kp, vote_type, height, round, hash).unwrap()
+    }
+
+    /// The point of #78: a validator waiting on a dead proposer prevotes nil after the short
+    /// `PROPOSAL_TIMEOUT_TICKS`, not the long `ROUND_TIMEOUT_TICKS`. Discriminates against the
+    /// old behavior, where nothing at all was cast until the round timed out.
+    #[test]
+    fn a_missing_proposal_draws_a_nil_prevote_after_the_short_proposal_timeout() {
+        let v = four_validators();
+        // Height 2, round 0's proposer is b ((2 + 0) % 4 == 2) — self just waits.
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+
+        for _ in 0..PROPOSAL_TIMEOUT_TICKS - 1 {
+            assert!(!engine.note_round_tick(&v.self_kp));
+            assert!(
+                engine.take_outbound_votes().is_empty(),
+                "must not give up on the proposer before PROPOSAL_TIMEOUT_TICKS"
+            );
+        }
+        assert!(
+            !engine.note_round_tick(&v.self_kp),
+            "a nil prevote alone is not quorum — the round must not end here"
+        );
+
+        let outbound = engine.take_outbound_votes();
+        assert_eq!(outbound.len(), 1, "the proposal timeout must cast exactly one vote");
+        assert_eq!(outbound[0].vote_type, VoteType::Prevote);
+        assert_eq!(outbound[0].block_hash, NIL_BLOCK_HASH);
+        assert_eq!(outbound[0].validator, v.self_addr);
+    }
+
+    /// The nil prevote is cast at most once per round. A second one for the same round would be
+    /// a different `block_hash` from the same validator — indistinguishable from equivocation.
+    #[test]
+    fn the_nil_prevote_is_cast_only_once_however_long_the_round_drags_on() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+
+        for _ in 0..ROUND_TIMEOUT_TICKS {
+            engine.note_round_tick(&v.self_kp);
+        }
+
+        let outbound = engine.take_outbound_votes();
+        assert_eq!(outbound.len(), 1, "one nil prevote per round, not one per tick: {outbound:?}");
+    }
+
+    /// Once 2/3+ of the power has prevoted nil, the round is abandoned immediately — this is
+    /// the mechanism that replaces waiting out `ROUND_TIMEOUT_TICKS`, and it is what makes a
+    /// dead proposer cost seconds instead of half a minute.
+    #[test]
+    fn nil_prevote_quorum_ends_the_round_without_waiting_for_the_full_timeout() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+
+        for _ in 0..PROPOSAL_TIMEOUT_TICKS {
+            engine.note_round_tick(&v.self_kp);
+        }
+        assert!(!engine.should_advance_round(), "one nil prevote (ours) is not a quorum");
+
+        // Two peers hit the same dead proposer and say so. 3 of 4 == quorum.
+        for kp in [&v.a_kp, &v.c_kp] {
+            let nil = peer_vote(kp, VoteType::Prevote, 2, 0, NIL_BLOCK_HASH);
+            engine.add_vote(&v.self_kp, nil).unwrap();
+        }
+
+        assert!(engine.should_advance_round(), "nil quorum must end the round at once");
+        assert!(
+            engine.note_round_tick(&v.self_kp),
+            "the tick loop must be told to advance now, not at ROUND_TIMEOUT_TICKS"
+        );
+        // Round 1's proposer is c ((2 + 1) % 4 == 3), so self defers rather than proposing.
+        let err = engine.advance_round(&v.self_kp, Hash::digest(b"tip-1"), vec![]).unwrap_err();
+        assert!(matches!(err, ConsensusError::NotProposer { height: 2, round: 1 }), "{err:?}");
+    }
+
+    /// **The self-slash guard.** A validator that prevoted nil, then finally receives the
+    /// proposal it gave up on, must not prevote a second time in that round: `VoteSet::add`
+    /// reads two different hashes from one validator in one round as equivocation, and that
+    /// costs a 5% slash. Nil voting must never be able to punish an honest, merely slow node.
+    #[test]
+    fn a_late_proposal_after_our_nil_prevote_does_not_make_us_double_sign() {
+        let v = four_validators();
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        let mut proposer = BftEngine::new(v.validator_set.clone(), b_addr, 1);
+        let _ = proposer.produce_block(&v.b_kp, Hash::digest(b"tip-1"), vec![]);
+        let late_block = proposer.pending_proposal().unwrap().clone();
+
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        for _ in 0..PROPOSAL_TIMEOUT_TICKS {
+            engine.note_round_tick(&v.self_kp);
+        }
+        assert_eq!(engine.take_outbound_votes().len(), 1, "nil prevote is cast");
+
+        // b's proposal finally arrives — slow, not malicious.
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, late_block)).unwrap();
+
+        assert!(
+            engine.take_outbound_votes().is_empty(),
+            "a second prevote here would be self-inflicted equivocation"
+        );
+        assert!(
+            engine.take_evidence().is_empty(),
+            "and it must not manufacture double-sign evidence against ourselves"
+        );
+    }
+
+    /// A nil round holds no proposal, but still tallies peers' prevotes — including prevotes
+    /// for the real block, from peers that did receive it. This node must not precommit that
+    /// block: it has never seen the bytes, let alone validated them.
+    #[test]
+    fn we_never_precommit_a_block_we_do_not_hold() {
+        let v = four_validators();
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        let mut proposer = BftEngine::new(v.validator_set.clone(), b_addr, 1);
+        let _ = proposer.produce_block(&v.b_kp, Hash::digest(b"tip-1"), vec![]);
+        let block_hash = proposer.pending_proposal().unwrap().hash();
+
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        for _ in 0..PROPOSAL_TIMEOUT_TICKS {
+            engine.note_round_tick(&v.self_kp);
+        }
+        engine.take_outbound_votes();
+
+        // The other three did get the proposal and carry it to a prevote quorum in our round.
+        for kp in [&v.a_kp, &v.b_kp, &v.c_kp] {
+            let pv = peer_vote(kp, VoteType::Prevote, 2, 0, block_hash);
+            engine.add_vote(&v.self_kp, pv).unwrap();
+        }
+
+        assert!(
+            engine.take_outbound_votes().is_empty(),
+            "precommitting a block we never received would be pledging to unvalidated bytes"
+        );
+    }
+
+    /// Helix advances rounds on prevote-nil quorum and never precommits nil, so a precommit
+    /// for nil can only come from a faulty or hostile peer. Accepting it would let power pile
+    /// up behind the nil key and drive a round to `Commit(NIL)` — finalizing a height with no
+    /// block behind it.
+    #[test]
+    fn a_precommit_for_nil_is_rejected_outright() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        for _ in 0..PROPOSAL_TIMEOUT_TICKS {
+            engine.note_round_tick(&v.self_kp);
+        }
+
+        let nil_precommit = peer_vote(&v.a_kp, VoteType::Precommit, 2, 0, NIL_BLOCK_HASH);
+        let err = engine.add_vote(&v.self_kp, nil_precommit).unwrap_err();
+        assert!(
+            matches!(&err, ConsensusError::InvalidVote { reason } if reason.contains("nil")),
+            "{err:?}"
+        );
+    }
+
+    /// A validator that *did* get the proposal prevotes the real value on the same tick the
+    /// proposal timeout would otherwise fire — the timeout must not talk it out of a healthy
+    /// round. Guards against a nil vote stomping the common path.
+    #[test]
+    fn a_round_with_a_proposal_never_draws_a_nil_prevote() {
+        let v = four_validators();
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        let mut proposer = BftEngine::new(v.validator_set.clone(), b_addr, 1);
+        let _ = proposer.produce_block(&v.b_kp, Hash::digest(b"tip-1"), vec![]);
+        let block = proposer.pending_proposal().unwrap().clone();
+        let block_hash = block.hash();
+
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
+        let prevote = engine.take_outbound_votes();
+        assert_eq!(prevote[0].block_hash, block_hash, "prevoted the real value");
+
+        for _ in 0..ROUND_TIMEOUT_TICKS {
+            engine.note_round_tick(&v.self_kp);
+        }
+        assert!(
+            engine.take_outbound_votes().iter().all(|vote| vote.block_hash != NIL_BLOCK_HASH),
+            "a round that has its proposal must never nil-vote against it"
+        );
     }
 
     /// Reproduces the exact scenario Phase 5c wires up: this node proposes,
@@ -1337,9 +1648,9 @@ mod tests {
 
         // No peer votes ever arrive for round 0 — it stalls.
         for _ in 0..ROUND_TIMEOUT_TICKS - 1 {
-            assert!(!engine.note_round_tick(), "must not time out early");
+            assert!(!engine.note_round_tick(&v.self_kp), "must not time out early");
         }
-        assert!(engine.note_round_tick(), "must time out after ROUND_TIMEOUT_TICKS");
+        assert!(engine.note_round_tick(&v.self_kp), "must time out after ROUND_TIMEOUT_TICKS");
 
         let err = engine
             .advance_round(&v.self_kp, Hash::digest(b"genesis"), vec![])
@@ -1363,7 +1674,7 @@ mod tests {
         let round0_block = self_engine.pending_proposal().unwrap().clone();
         self_engine.take_outbound_votes();
         for _ in 0..ROUND_TIMEOUT_TICKS {
-            self_engine.note_round_tick();
+            self_engine.note_round_tick(&v.self_kp);
         }
         let err = self_engine
             .advance_round(&v.self_kp, Hash::digest(b"genesis"), vec![])
@@ -1378,7 +1689,7 @@ mod tests {
         b_engine.receive_proposal(&v.b_kp, Proposal::fresh(0, round0_block)).unwrap();
         b_engine.take_outbound_votes();
         for _ in 0..ROUND_TIMEOUT_TICKS {
-            b_engine.note_round_tick();
+            b_engine.note_round_tick(&v.b_kp);
         }
         let err = b_engine
             .advance_round(&v.b_kp, Hash::digest(b"genesis"), vec![])
@@ -1432,7 +1743,7 @@ mod tests {
         let round0_block = self_engine.pending_proposal().unwrap().clone();
         self_engine.take_outbound_votes();
         for _ in 0..ROUND_TIMEOUT_TICKS {
-            self_engine.note_round_tick();
+            self_engine.note_round_tick(&v.self_kp);
         }
         self_engine
             .advance_round(&v.self_kp, Hash::digest(b"genesis"), vec![])
@@ -1442,7 +1753,7 @@ mod tests {
         let mut b_engine = BftEngine::new(v.validator_set, b_addr, 0);
         b_engine.receive_proposal(&v.b_kp, Proposal::fresh(0, round0_block.clone())).unwrap();
         for _ in 0..ROUND_TIMEOUT_TICKS {
-            b_engine.note_round_tick();
+            b_engine.note_round_tick(&v.b_kp);
         }
         b_engine
             .advance_round(&v.b_kp, Hash::digest(b"genesis"), vec![])
@@ -1520,7 +1831,7 @@ mod tests {
             .unwrap();
         b_engine.take_outbound_votes();
         for _ in 0..ROUND_TIMEOUT_TICKS {
-            b_engine.note_round_tick();
+            b_engine.note_round_tick(&v.b_kp);
         }
         b_engine
             .advance_round(&v.b_kp, Hash::digest(b"genesis"), vec![])

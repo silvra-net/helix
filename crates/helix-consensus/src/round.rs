@@ -61,6 +61,27 @@ impl RoundState {
         }
     }
 
+    /// Open this round for prevoting **without** a proposal — the round's proposer never
+    /// delivered one within `PROPOSAL_TIMEOUT_TICKS` and this node is about to prevote nil
+    /// (`NIL_BLOCK_HASH`). Advances phase Propose → Prevote so `add_prevote` tallies and can
+    /// reach quorum, exactly as it would for a real value.
+    ///
+    /// Deliberately one-way: once a round is open for nil, `set_proposal` can no longer run
+    /// (it requires `Propose`), so a proposal that finally shows up cannot retroactively turn
+    /// this into a normal round and make us cast a *second*, conflicting prevote — which
+    /// `VoteSet::add` would (correctly) read as equivocation and punish with a 5% slash.
+    /// `BftEngine::receive_proposal` rejects that late proposal a step earlier anyway; this is
+    /// the second lock on the same door.
+    pub fn open_for_nil_prevote(&mut self) -> ConsensusResult<()> {
+        if self.phase != RoundPhase::Propose {
+            return Err(ConsensusError::InvalidVote {
+                reason: format!("cannot open for nil prevote in phase {:?}", self.phase),
+            });
+        }
+        self.phase = RoundPhase::Prevote;
+        Ok(())
+    }
+
     /// Set the proposed block along with its proof-of-lock metadata (empty for a fresh
     /// proposal). Advances phase from Propose → Prevote.
     pub fn set_proposal(

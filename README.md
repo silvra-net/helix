@@ -709,9 +709,18 @@ Helix uses Tendermint-style BFT finality on top of a Proof-of-Stake validator se
 3. **Precommit** — validators precommit (2/3+ = instant finality)
 4. **Commit** — block is final, no reorganizations possible
 
-**Block time:** 2 seconds. A stalled round (no quorum within 15 block-time ticks — e.g. the
-proposer is offline) automatically advances to the next round-robin proposer instead of
-halting the chain.
+**Block time:** 2 seconds.
+
+**When a proposer is offline,** the chain routes around it rather than halting. A validator that
+receives no proposal within 2 ticks (~4s) prevotes **nil** — "nothing reached me" — and once 2/3+
+of the voting power has said the same, every validator moves to the next round-robin proposer
+together. Because that hand-off is agreed by quorum rather than decided by each node's own clock,
+validators can't drift onto different rounds, which is what lets the wait be short. A 15-tick
+round timeout remains as a backstop for the case where even nil never reaches quorum (e.g. too
+much of the validator set is down to form any majority).
+
+Nil is only ever a prevote. Helix never *precommits* nil, so "precommit quorum" keeps meaning
+exactly one thing: a real block is final.
 
 **Proof of Personhood** caps how much voting power a single identity can accumulate:
 - Without verification: voting power capped at 0.5% of the network
