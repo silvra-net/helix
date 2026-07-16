@@ -74,9 +74,22 @@ layout) lives further down for when you need it.
 
 ## Quick Start
 
+> **Helix is a development network today. The chain gets wiped, and everything on it with it.**
+>
+> `helix.silvra.net` is public and live, but it is not a mainnet. It is reset from genesis
+> whenever the chain format changes — five times in the past week. Every reset destroys all
+> balances, all history, all of it. HLX on this chain is a test token: it has no value, it is
+> not an investment, and it will not survive to whatever launches later.
+>
+> Point a node at it, send transactions, break things — that is what it is for. Just don't hold
+> anything you'd mind losing, because you will lose it. The first chain meant to last will start
+> with at least four independent validators (see
+> [Bootstrapping a Multi-Validator Network](#bootstrapping-a-multi-validator-network)); until
+> that launch is announced, assume every chain is temporary.
+
 **One binary does everything.** `helix` is both the node and the client: `helix start` runs a
 node, every other subcommand (`helix wallet`, `helix tx`, …) is a thin RPC client. **You don't
-need to run a node to use Helix** — the client talks to the live public network out of the box,
+need to run a node to use Helix** — the client talks to the live network out of the box,
 no setup, no config, no local chain to sync.
 
 ```bash
@@ -96,9 +109,9 @@ helix tx send hlx... 10 --key alice.json     # send 10 HLX to another address
 helix tx status <hash>                        # check it landed
 ```
 
-Every client command targets `https://helix.silvra.net` (the public network) by default. Point
-it somewhere else any time with `--node <url>` or `HELIX_NODE=<url>` — e.g. at your own local
-node (below).
+Every client command targets `https://helix.silvra.net` (the public development network) by
+default. Point it somewhere else any time with `--node <url>` or `HELIX_NODE=<url>` — e.g. at
+your own local node (below).
 
 ### Running your own node
 
@@ -998,6 +1011,16 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 - Double-signing is provable on-chain and slashed; misbehaving peers are scored and banned
 
 **Known limitations (honest status, not finished guarantees):**
+
+- **The live chain is a development network and is reset from genesis without warning.** Any
+  time the chain format changes — a new transaction type, a new state field, a signature or
+  hash change — the public chain is wiped and restarted. That has happened five times in the
+  past week, and will keep happening until the format settles. Balances do not survive it.
+  Nothing on this chain is money. This is a deliberate trade while the protocol is still moving:
+  a format change is cheap to make now because there is exactly one account and no external
+  holders, and expensive to make once there are. The chain that is meant to persist will be
+  launched explicitly, with at least four independent validators; treat every chain before that
+  as disposable.
 
 - **The public network runs a single validator today, so it tolerates zero faults.** The BFT
   machinery is real and tested against a 4-validator set (including killing one mid-flight), but
