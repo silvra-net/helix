@@ -113,6 +113,7 @@ fn spawn_node_with(
             .expect("pre-write validator key file");
     }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_helix"));
+    cmd.arg("start");
     cmd.current_dir(work_dir.path())
         .env("HELIX_RPC_BIND", format!("127.0.0.1:{rpc_port}"))
         .env("HELIX_P2P_LISTEN", format!("127.0.0.1:{p2p_port}"))

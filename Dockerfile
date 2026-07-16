@@ -27,4 +27,4 @@ WORKDIR /data
 
 EXPOSE 8545 8546
 
-ENTRYPOINT ["/usr/local/bin/helix"]
+ENTRYPOINT ["/usr/local/bin/helix", "start"]

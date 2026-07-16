@@ -19,7 +19,7 @@ layout) lives further down for when you need it.
 
 - 🧑‍💻 **Just want to try it?** → [Quick Start](#quick-start) gets you from clone to first
   transaction in five commands.
-- 💰 **Holding HLX / want to earn rewards?** → [Using the CLI](#using-the-cli-hlx) and
+- 💰 **Holding HLX / want to earn rewards?** → [Using the CLI](#using-the-cli-helix) and
   [Staking](#staking) (you can delegate without running a node).
 - 🖥️ **Running a validator?** → [Installation](#installation) → [Running a Node](#running-a-node).
 - 🔬 **Here for the internals?** → [Consensus](#consensus), [Cryptography](#cryptography--determinism),
@@ -40,7 +40,7 @@ layout) lives further down for when you need it.
 - [Docker deployment](#docker-deployment)
 
 **Using Helix**
-- [Using the CLI (`hlx`)](#using-the-cli-hlx) — wallets, sending, names, contracts, personhood, recovery
+- [Using the CLI (`helix`)](#using-the-cli-helix) — wallets, sending, names, contracts, personhood, recovery
 - [Staking](#staking) — run a validator, or delegate to one
 - [Governance](#governance) — propose and vote on protocol parameters
 
@@ -74,27 +74,29 @@ layout) lives further down for when you need it.
 
 ## Quick Start
 
-**You don't need to run a node to use Helix.** Download the `hlx` CLI and it talks to the
-live public Helix network out of the box — no setup, no config, no local chain to sync.
+**One binary does everything.** `helix` is both the node and the client: `helix start` runs a
+node, every other subcommand (`helix wallet`, `helix tx`, …) is a thin RPC client. **You don't
+need to run a node to use Helix** — the client talks to the live public network out of the box,
+no setup, no config, no local chain to sync.
 
 ```bash
-HLX=./hlx     # or ./target/release/hlx if you built from source
+# (assumes `helix` is on your PATH — otherwise use ./target/release/helix)
 
 # 1. Create a wallet (a wallet is just a keypair)
-$HLX wallet new -o alice.json
+helix wallet new -o alice.json
 #   Address    : hlx...
 #   Saved to   : alice.json
 
 # 2. Look at the live chain — this already talks to the public network
-$HLX chain status
-$HLX account <some-address>
+helix chain status
+helix account <some-address>
 
 # 3. Once alice.json has a balance, send some HLX
-$HLX tx send hlx... 10 --key alice.json     # send 10 HLX to another address
-$HLX tx status <hash>                        # check it landed
+helix tx send hlx... 10 --key alice.json     # send 10 HLX to another address
+helix tx status <hash>                        # check it landed
 ```
 
-Every `hlx` command targets `https://helix.silvra.net` (the public network) by default. Point
+Every client command targets `https://helix.silvra.net` (the public network) by default. Point
 it somewhere else any time with `--node <url>` or `HELIX_NODE=<url>` — e.g. at your own local
 node (below).
 
@@ -105,12 +107,12 @@ network by default** — on first start it fetches the real genesis and syncs th
 peer to configure:
 
 ```bash
-./helix          # or ./target/release/helix
+helix start          # or ./target/release/helix start
 # fetches genesis from the public network, syncs history, then follows the live chain
 # REST API on http://127.0.0.1:8545, P2P on 0.0.0.0:8546
 ```
 
-Point your CLI at it with `hlx --node http://127.0.0.1:8545 ...`.
+Point your client at it with `helix --node http://127.0.0.1:8545 <command>`.
 
 ### Running your own private devnet
 
@@ -118,16 +120,16 @@ For development or testing you'll want an isolated chain that doesn't touch the 
 network. Set `HELIX_NEW_CHAIN=1` — the node self-signs its own genesis and runs standalone:
 
 ```bash
-HELIX_NEW_CHAIN=1 ./helix
+HELIX_NEW_CHAIN=1 helix start
 ```
 
 Its genesis allocates stake only to the validator's own address (there's no faucet), so to
 get spendable HLX to a new wallet, send from the validator key itself — it lives at
-`./validator-key.json` and is already a valid CLI wallet (same JSON format `hlx wallet`
+`./validator-key.json` and is already a valid CLI wallet (same JSON format `helix wallet`
 produces):
 
 ```bash
-$HLX --node http://127.0.0.1:8545 tx send hlx... 100 --key validator-key.json
+helix --node http://127.0.0.1:8545 tx send hlx... 100 --key validator-key.json
 ```
 
 ### Building from source
@@ -136,7 +138,7 @@ $HLX --node http://127.0.0.1:8545 tx send hlx... 100 --key validator-key.json
 git clone https://github.com/silvra-net/helix.git
 cd helix
 cargo build --release
-# binaries: target/release/helix (the node), target/release/hlx (the CLI)
+# single binary: target/release/helix (node + client)
 ```
 
 ---
@@ -159,7 +161,7 @@ sudo apt-get install pkg-config libssl-dev
 Prebuilt binaries for Linux, macOS (Apple Silicon), and Windows are published on the
 [Releases page](https://github.com/silvra-net/helix/releases) for every tagged version
 (built automatically by [CI](.github/workflows/release.yml) on every tag push). Download the
-archive for your platform, extract it, and you have `helix` and `hlx` ready to run — no Rust
+archive for your platform, extract it, and you have `helix` ready to run — no Rust
 toolchain needed.
 
 ### Option B: Build From Source
@@ -170,16 +172,15 @@ cd helix
 cargo build --release
 ```
 
-Binaries are placed in `target/release/`:
-- `helix` — the node
-- `hlx` — the CLI
+A single binary is placed in `target/release/`:
+- `helix` — the node (`helix start`) **and** the client (`helix wallet`, `helix tx`, …)
 
 ---
 
 ## Running a Node
 
 ```bash
-./target/release/helix
+./target/release/helix start
 ```
 
 On first start, the node:
@@ -230,9 +231,9 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address. Overrides `p2p_listen_addr` in `helix.toml`. |
 | `HELIX_SYNC_PEER` | `https://helix.silvra.net` | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks, and is the target of the periodic RPC catch-up that keeps a follower current when the peer's raw P2P port isn't reachable. Defaults to the public network's seed; override to point at a different network, or set `HELIX_NEW_CHAIN=1` to disable seeding entirely. Overrides `sync_peer` in `helix.toml`. |
 | `HELIX_NEW_CHAIN` | (off) | Set truthy (`1`/`true`) to run a **standalone chain** — the node self-signs its own genesis instead of joining the public network via the default seed. Set this for a private devnet, or for the origin node of a brand-new network. Ignored if a sync peer is explicitly configured. Overrides `new_chain` in `helix.toml`. |
-| `HELIX_VALIDATOR_KEY` | `validator-key.json` | Path to the validator key file (unified `KeyFile` JSON, same format as `hlx wallet`). Overrides `validator_key_path` in `helix.toml`. |
+| `HELIX_VALIDATOR_KEY` | `validator-key.json` | Path to the validator key file (unified `KeyFile` JSON, same format as `helix wallet`). Overrides `validator_key_path` in `helix.toml`. |
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.json` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
-| `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.json` if it was encrypted (e.g. via `hlx wallet encrypt`). Not needed for the default plaintext key file. |
+| `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.json` if it was encrypted (e.g. via `helix wallet encrypt`). Not needed for the default plaintext key file. |
 | `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` (30 min) | How long an unconfirmed transaction may sit in the mempool before it's evicted, freeing its (sender, nonce) slot. Overrides `mempool_tx_ttl_secs` in `helix.toml`. |
 | `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable host (a domain or public IP, no scheme/port — the configured P2P port is appended automatically). Set this on any node reachable from the outside so it can announce itself to peers via peer exchange (see "Network Resilience" below). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
 | `HELIX_GENESIS_EXTRA_VALIDATORS` | (none) | Comma-separated `address:stake_hlx` pairs — additional validators to pre-stake directly at genesis, beyond the one bootstrap validator every chain has always had. Only takes effect for a fresh chain (same caveat as `HELIX_PERSONHOOD_AUTHORITIES`). See "Bootstrapping a Multi-Validator Network" below. Overrides `genesis_extra_validators` in `helix.toml`. |
@@ -240,16 +241,16 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_P2P_DISABLE_MDNS` | (off) | Set truthy (`1`/`true`) to turn off mDNS LAN auto-discovery, leaving only seed peers + peer exchange. Needed only when two independent Helix networks share a LAN (mDNS would otherwise cross-wire them). Overrides `p2p_disable_mdns` in `helix.toml`. |
 
 ```bash
-HELIX_REWARD_ADDRESS=hlx... ./target/release/helix
+HELIX_REWARD_ADDRESS=hlx... ./target/release/helix start
 ```
 
 ### Persistent Validator Key
 
 The node stores its validator keypair in `validator-key.json` (in the working directory,
 or wherever `HELIX_VALIDATOR_KEY` / `validator_key_path` points):
-- **Same format as a CLI wallet.** It's the unified `KeyFile` JSON that `hlx wallet`
+- **Same format as a CLI wallet.** It's the unified `KeyFile` JSON that `helix wallet`
   produces — a validator key *is* a wallet. Use it directly as `--key validator-key.json`
-  with any `hlx` command (see the Quick Start's funding step); there is no conversion step.
+  with any `helix` client command (see the Quick Start's funding step); there is no conversion step.
 - Fields: `address`, `public_key`, `algo`, `encryption` (`plaintext` or
   `aes256gcm-argon2id`), `secret_key`, plus `kdf_salt`/`nonce` when encrypted
 - Generated once on first start (plaintext); reused on every subsequent restart, so the
@@ -282,7 +283,7 @@ To join a *different* network instead, point `sync_peer` at one of its nodes:
 sync_peer = "http://seed-host:8545"
 ```
 
-or `HELIX_SYNC_PEER=http://seed-host:8545 ./helix`. To not join any network — a private
+or `HELIX_SYNC_PEER=http://seed-host:8545 helix start`. To not join any network — a private
 devnet or the origin node of a brand-new network — set `HELIX_NEW_CHAIN=1` (or `new_chain =
 true`) and the node self-signs its own genesis instead.
 
@@ -378,7 +379,7 @@ accordingly for how much simultaneous downtime the network actually needs to sur
 
 A `Dockerfile` is provided for running a validator node without a local Rust toolchain.
 It's a multi-stage build (Rust builder → `debian:bookworm-slim` runtime) that produces
-a small image containing only the `helix` node binary.
+a small image containing only the `helix` binary (node + client; the container runs `helix start`).
 
 ```bash
 docker build -t helix-node .
@@ -406,54 +407,56 @@ Notes:
 
 ---
 
-## Using the CLI (`hlx`)
+## Using the CLI (`helix`)
 
-Every `hlx` command talks to a node over its REST API. It targets the public network
-(`https://helix.silvra.net`) by default; point it at your own node with `--node
-http://127.0.0.1:8545` (or `HELIX_NODE=...`). The CLI itself holds no state beyond whatever
+The client subcommands of the `helix` binary (`helix wallet`, `helix tx`, `helix chain`, …)
+talk to a node over its REST API — the same binary that runs the node with `helix start`, but
+these commands never boot a node or open the chain database. They target the public network
+(`https://helix.silvra.net`) by default; point them at your own node with `--node
+http://127.0.0.1:8545` (or `HELIX_NODE=...`). The client itself holds no state beyond whatever
 wallet file you point it at.
 
 ### Wallets
 
 ```bash
-hlx wallet new -o alice.json                       # generate a new ML-DSA keypair
-hlx wallet new -o alice.json --passphrase "..."     # ...encrypted at rest (AES-256-GCM + Argon2id)
-hlx wallet new -o alice.json --scheme sphincs-plus  # ...using SPHINCS+ instead of ML-DSA
+helix wallet new -o alice.json                       # generate a new ML-DSA keypair
+helix wallet new -o alice.json --passphrase "..."     # ...encrypted at rest (AES-256-GCM + Argon2id)
+helix wallet new -o alice.json --scheme sphincs-plus  # ...using SPHINCS+ instead of ML-DSA
 
-hlx wallet info --key alice.json                    # address, public key, algorithm
-hlx wallet address --key alice.json                 # just the address (for scripting)
-hlx wallet encrypt "newpass" --key alice.json        # add/change passphrase on an existing wallet
-hlx wallet encrypt "" --key alice.json               # remove passphrase encryption
+helix wallet info --key alice.json                    # address, public key, algorithm
+helix wallet address --key alice.json                 # just the address (for scripting)
+helix wallet encrypt "newpass" --key alice.json        # add/change passphrase on an existing wallet
+helix wallet encrypt "" --key alice.json               # remove passphrase encryption
 
 ```
 
 **A validator key is already a wallet — no conversion needed.** The node's
-`validator-key.json` is the exact same file format `hlx wallet` produces, so you use it
-directly with any command: `hlx tx send ... --key validator-key.json`. There is no
+`validator-key.json` is the exact same file format `helix wallet` produces, so you use it
+directly with any command: `helix tx send ... --key validator-key.json`. There is no
 per-use conversion step.
 
 A wallet file is portable — it's just JSON. Anyone with the file (and its passphrase, if
 encrypted) can sign as that address, so treat it like a private key, because it is one.
 
-*(A converter, `hlx wallet import-node-key`, exists only for the pre-2026-07 raw-binary key
+*(A converter, `helix wallet import-node-key`, exists only for the pre-2026-07 raw-binary key
 format some very old nodes wrote. You almost certainly don't have one — modern keys are
 already the JSON format.)*
 
 ### Sending HLX
 
 ```bash
-hlx tx send hlx... 10.5 --key alice.json            # send 10.5 HLX
-hlx tx send hlx... 10.5 --key alice.json --fee 20000  # custom fee (default: 10000 nano-HLX)
-hlx tx status <hash>                                 # confirmed / pending / not found
+helix tx send hlx... 10.5 --key alice.json            # send 10.5 HLX
+helix tx send hlx... 10.5 --key alice.json --fee 20000  # custom fee (default: 10000 nano-HLX)
+helix tx status <hash>                                 # confirmed / pending / not found
 ```
 
 ### Querying the Chain
 
 ```bash
-hlx chain status               # height, best hash, peer count, mempool size, sync state
-hlx chain latest               # latest block, full transaction list
-hlx chain block 142            # block by height
-hlx account hlx...             # balance, staked amount, nonce
+helix chain status               # height, best hash, peer count, mempool size, sync state
+helix chain latest               # latest block, full transaction list
+helix chain block 142            # block by height
+helix account hlx...             # balance, staked amount, nonce
 ```
 
 ### Human-Readable Names
@@ -461,8 +464,8 @@ hlx account hlx...             # balance, staked amount, nonce
 Register a `name.hlx` alias for your address instead of sharing the raw `hlx...` string:
 
 ```bash
-hlx name register alice --key alice.json     # registers alice.hlx to alice.json's address
-hlx name resolve alice.hlx                   # -> hlx...
+helix name register alice --key alice.json     # registers alice.hlx to alice.json's address
+helix name resolve alice.hlx                   # -> hlx...
 ```
 
 ### Smart Contracts
@@ -477,15 +480,15 @@ closes off reentrancy as an attack surface entirely rather than requiring every 
 author to defend against it.
 
 ```bash
-hlx contract deploy my_contract.wasm --key alice.json
+helix contract deploy my_contract.wasm --key alice.json
 #   Contract address: hlx...   (the deployer's own address — see note below)
 
-hlx contract call hlx... --key alice.json --amount 1.5 --fee 50000 --data "hello"
+helix contract call hlx... --key alice.json --amount 1.5 --fee 50000 --data "hello"
 #   --fee also sets the fuel budget for this call — a call that runs out of fuel still
 #   charges the fee and advances the nonce, exactly like real gas markets do on revert
 #   --data is passed to the contract's call function as raw input bytes (UTF-8 encoded)
 
-hlx contract storage hlx... greeting
+helix contract storage hlx... greeting
 #   Reads back one key from the contract's own storage — a debugging/exploration
 #   tool, since a contract's storage schema is entirely up to its own bytecode
 ```
@@ -500,11 +503,11 @@ compute was spent either way.
 
 ### Proof of Personhood
 
-`hlx identity status <address>` shows an address's verification status
+`helix identity status <address>` shows an address's verification status
 (`Unverified`/`Verified`). Verification itself is intentionally gated behind a network
 personhood authority's signature over a ZK-STARK proof (`ProvePersonhood`), not exposed as a
 plain CLI flow yet — the point is that Sybil resistance can't come from a client-side command
-alone. `hlx identity attest` still exists as a command but always fails on submission: an
+alone. `helix identity attest` still exists as a command but always fails on submission: an
 earlier, unauthenticated "3 peers vouch for you" attestation path existed and was removed
 (the transaction now unconditionally rejects) once it became clear it bypassed the
 authority-gated proof entirely.
@@ -520,10 +523,10 @@ original key or requiring a central recovery authority.
 
 ```bash
 # 1. The account owner registers 3-10 guardians (their addresses, not keys)
-hlx recovery register-guardians hlx... hlx... hlx... --key owner.json
+helix recovery register-guardians hlx... hlx... hlx... --key owner.json
 
 # 2. Check the guardian set and quorum threshold at any time
-hlx recovery status hlx...
+helix recovery status hlx...
 #   Guardians (2 of 3): [...]
 #   Quorum is proportional to however many guardians you register (roughly 2/3, rounded
 #   up) — not a fixed "3-of-5" regardless of set size, despite what the set size range
@@ -531,8 +534,8 @@ hlx recovery status hlx...
 
 # 3. If the owner loses their key: each guardian independently approves rotating
 #    the account to a replacement public key (hex-encoded)
-hlx recovery approve hlx... <new_pubkey_hex> --key guardian1.json
-hlx recovery approve hlx... <new_pubkey_hex> --key guardian2.json
+helix recovery approve hlx... <new_pubkey_hex> --key guardian1.json
+helix recovery approve hlx... <new_pubkey_hex> --key guardian2.json
 #    Once enough guardians approve (quorum, shown by `recovery status`), the account's
 #    controlling key rotates immediately — the old key is permanently locked out, the new
 #    key can now sign for that address. Re-recovery to yet another key later works the same
@@ -542,7 +545,7 @@ hlx recovery approve hlx... <new_pubkey_hex> --key guardian2.json
 A single stuck guardian request that never reaches quorum can be cleared at the protocol
 level (`CancelRecoveryRequest`, signed by the account owner with their still-valid original
 key) so a malicious or unresponsive guardian can't lock you out of ever changing your
-guardian set — but there is no `hlx recovery` CLI subcommand for it yet; it currently
+guardian set — but there is no `helix recovery` CLI subcommand for it yet; it currently
 requires constructing that transaction directly against the REST API.
 
 ### Governance
@@ -552,11 +555,11 @@ validator minimum) can propose and vote on two runtime-adjustable parameters:
 `min-validator-stake` and `fuel-per-fee-unit`.
 
 ```bash
-hlx governance params                          # current values
-hlx governance propose fuel-per-fee-unit 3 --key alice.json
-hlx governance list                            # all proposals
-hlx governance show 0                          # one proposal's vote tally
-hlx governance vote 0 --key alice.json          # cast a stake-weighted yes-vote
+helix governance params                          # current values
+helix governance propose fuel-per-fee-unit 3 --key alice.json
+helix governance list                            # all proposals
+helix governance show 0                          # one proposal's vote tally
+helix governance vote 0 --key alice.json          # cast a stake-weighted yes-vote
 ```
 
 A proposal passes once yes-votes reach a 2/3-plus-one supermajority of the total stake that
@@ -585,7 +588,7 @@ mutually exclusive:
 2. **Stake at least the minimum** (100,000 HLX — ~0.3% of the total supply) using that same
    key:
    ```bash
-   hlx tx stake 100000 --key validator-key.json
+   helix tx stake 100000 --key validator-key.json
    ```
 3. **Wait for the next epoch rotation** (every 100 blocks — at most a few minutes at the 2s
    block time). The validator set is rebuilt from every account meeting the minimum stake —
@@ -596,19 +599,19 @@ mutually exclusive:
    yearly — see [Token Economics](#token-economics)), paid even on empty blocks. If you have
    delegators, your share is proportional to your self-stake versus their delegated total,
    plus a commission cut of theirs (see below) — with none, you keep 100% exactly as before.
-5. **Unstaking**: `hlx tx unstake <amount> --key validator-key.json` moves stake into a
+5. **Unstaking**: `helix tx unstake <amount> --key validator-key.json` moves stake into a
    7-day unbonding period (still slashable during this window) before it's claimable:
    ```bash
-   hlx tx unstake 50000 --key validator-key.json
+   helix tx unstake 50000 --key validator-key.json
    # ... 7 days later ...
-   hlx tx claim-unbonded --key validator-key.json
+   helix tx claim-unbonded --key validator-key.json
    ```
    You can't unstake below the minimum if you're currently the *only* account meeting it —
    that would empty the validator set and halt the chain, so it's rejected outright rather
    than allowed and left to fail later.
 6. **Set your commission** (optional, before or after you have delegators):
    ```bash
-   hlx tx set-commission 1000 --key validator-key.json   # 1000 bps = 10% (the default)
+   helix tx set-commission 1000 --key validator-key.json   # 1000 bps = 10% (the default)
    ```
    Capped at 5000 bps (50%) — not to stop you from legitimately charging more, but to bound
    the "advertise a low rate, raise it once delegators are locked in" rug-pull: even a
@@ -623,10 +626,10 @@ from BFT rounds immediately — not just at the next epoch. Run one node per key
 Earn a share of a validator's block rewards without running any infrastructure:
 
 ```bash
-hlx tx delegate hlxValidatorAddress... 100 --key alice.json    # delegate 100 HLX
-hlx validator show hlxValidatorAddress...                       # see the pool: delegated
+helix tx delegate hlxValidatorAddress... 100 --key alice.json  # delegate 100 HLX
+helix validator show hlxValidatorAddress...                     # see the pool: delegated
                                                                   # total, commission, effective stake
-hlx account alice_address                                       # see your own position's
+helix account alice_address                                     # see your own position's
                                                                   # current value, under "Delegations"
 ```
 
@@ -634,12 +637,12 @@ Delegation uses a share-pool model (the same one Cosmos SDK and liquid-staking p
 Lido use): you receive pool shares priced at the pool's current value per share, and every
 reward the validator earns adds directly to the pool's total value — instantly making every
 existing share worth more, with no separate "claim rewards" step. Your position **auto-
-compounds** for free; check its current value any time with `hlx account`.
+compounds** for free; check its current value any time with `helix account`.
 
 ```bash
-hlx tx undelegate hlxValidatorAddress... 50 --key alice.json   # redeem 50 HLX of current value
+helix tx undelegate hlxValidatorAddress... 50 --key alice.json  # redeem 50 HLX of current value
 # ... 7 days later (same unbonding queue as self-staking) ...
-hlx tx claim-unbonded --key alice.json
+helix tx claim-unbonded --key alice.json
 ```
 
 `undelegate`'s amount is the HLX value you want back (principal plus whatever compounded, or
@@ -647,7 +650,7 @@ minus anything lost to a slash since you delegated), not raw shares — the CLI/
 convert internally. A few things worth knowing:
 
 - **No governance power.** Delegating moves your economic exposure to the validator's
-  performance, not your vote — governance weight stays tied to your own `hlx tx stake`
+  performance, not your vote — governance weight stays tied to your own `helix tx stake`
   balance only (see [Governance](#governance)). Want both? Self-stake for the vote, delegate
   separately (to any validator, including a different one) for the yield.
 - **You share slashing risk.** If the validator you delegated to double-signs, your pool
@@ -663,10 +666,10 @@ If you just want a say in governance without operating infrastructure or picking
 to trust:
 
 ```bash
-hlx tx stake 100 --key alice.json     # any amount above 0 grants voting power
+helix tx stake 100 --key alice.json     # any amount above 0 grants voting power
 ```
 
-Your voting weight in `hlx governance vote` is exactly your staked balance. Unstaking and
+Your voting weight in `helix governance vote` is exactly your staked balance. Unstaking and
 claiming work identically to the validator flow above (same 7-day unbonding window, same
 commands). This path earns nothing — for yield without running a node, delegate instead (see
 above).
@@ -719,7 +722,7 @@ halting the chain.
 │  TxType, etc.  │  Addresses      │  Social Recovery         │
 └─────────────────────────────────────────────────────────────┘
 
-CLI: hlx (helix-cli)   ←→   REST API :8545   ←→   P2P :8546
+CLI: helix <subcommand>   ←→   REST API :8545   ←→   P2P :8546
 ```
 
 ---
@@ -920,8 +923,8 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 | `helix-vm` | WASM contract execution (`wasmi`, fuel-metered, deterministic) |
 | `helix-zkp` | ZK-STARK proof generation/verification for Proof of Personhood |
 | `helix-rpc` | Axum REST API server (`:8545`) |
-| `helix-node` | Node binary — orchestrates all subsystems |
-| `helix-cli` | `hlx` command-line tool |
+| `helix-node` | The `helix` binary — `helix start` orchestrates all subsystems; other subcommands are the CLI client |
+| `helix-cli` | Client subcommand library (wallet, tx, chain, …) linked into the `helix` binary |
 
 ---
 
@@ -930,7 +933,7 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 **Hardening that's in place:**
 
 - **Persistent validator key** is stored unencrypted in `validator-key.json` by default —
-  protect this file, or encrypt it (`HELIX_VALIDATOR_KEY_PASSPHRASE` / `hlx wallet encrypt`)
+  protect this file, or encrypt it (`HELIX_VALIDATOR_KEY_PASSPHRASE` / `helix wallet encrypt`)
 - The P2P transport uses libp2p's classical Noise (X25519) encryption; this is fine because all
   P2P traffic is public ledger data — see [Cryptography](#cryptography--determinism) for the full
   quantum-safety picture

@@ -4,11 +4,10 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Helix blockchain CLI — wallet management, chain queries, transaction submission"
+description = "Helix client commands (wallet, chain queries, transaction submission) — dispatched by the `helix` binary"
 
-[[bin]]
-name = "hlx"
-path = "src/main.rs"
+[lib]
+path = "src/lib.rs"
 
 [dependencies]
 helix-crypto.workspace = true

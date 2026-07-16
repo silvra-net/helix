@@ -39,7 +39,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} --bin helix --bin hlx
+        run: cargo build --release --target ${{ matrix.target }} --bin helix
 
       - name: Package archive (unix)
         if: runner.os != 'Windows'
@@ -48,7 +48,6 @@ jobs:
           staging="helix-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$staging"
           cp target/${{ matrix.target }}/release/helix "$staging/"
-          cp target/${{ matrix.target }}/release/hlx "$staging/"
           cp README.md "$staging/"
           tar czf "$staging.tar.gz" "$staging"
           echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
@@ -60,7 +59,6 @@ jobs:
           $staging = "helix-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/helix.exe" "$staging/"
-          Copy-Item "target/${{ matrix.target }}/release/hlx.exe" "$staging/"
           Copy-Item "README.md" "$staging/"
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
           echo "ASSET=$staging.zip" >> $env:GITHUB_ENV

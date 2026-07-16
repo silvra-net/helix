@@ -91,3 +91,4 @@ helix-mempool = { path = "crates/helix-mempool" }
 helix-rpc = { path = "crates/helix-rpc" }
 helix-vm = { path = "crates/helix-vm" }
 helix-zkp = { path = "crates/helix-zkp" }
+helix-cli = { path = "crates/helix-cli" }
