@@ -1,0 +1,312 @@
+<!--
+  Served by the node itself at `/` to browsers (see `root`). Deliberately one self-contained
+  file with no external requests: a node has to work on a machine that cannot reach a CDN, and
+  an explorer that quietly depends on someone else's font server is not one you can run air-gapped.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Helix Explorer</title>
+<style>
+  :root {
+    --ground: #faf9f7;
+    --panel: #ffffff;
+    --line: #e2ded7;
+    --ink: #1b1d21;
+    --dim: #6f7480;
+    --accent: #9a5b06;
+    --accent-soft: #fdf3e2;
+    --warn-bg: #fdf1ec;
+    --warn-line: #e8c4b4;
+    --warn-ink: #8a3d1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0f1218;
+      --panel: #161a22;
+      --line: #262c38;
+      --ink: #e9e6e0;
+      --dim: #8a909e;
+      --accent: #e0a44a;
+      --accent-soft: #221a0e;
+      --warn-bg: #2a1710;
+      --warn-line: #58301d;
+      --warn-ink: #f0a883;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0f1218; --panel: #161a22; --line: #262c38; --ink: #e9e6e0;
+    --dim: #8a909e; --accent: #e0a44a; --accent-soft: #221a0e;
+    --warn-bg: #2a1710; --warn-line: #58301d; --warn-ink: #f0a883;
+  }
+  :root[data-theme="light"] {
+    --ground: #faf9f7; --panel: #ffffff; --line: #e2ded7; --ink: #1b1d21;
+    --dim: #6f7480; --accent: #9a5b06; --accent-soft: #fdf3e2;
+    --warn-bg: #fdf1ec; --warn-line: #e8c4b4; --warn-ink: #8a3d1c;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  code, .mono, td.num {
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+  .num { font-variant-numeric: tabular-nums; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px 20px 64px; }
+
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+  h1 {
+    font-size: 20px; margin: 0; letter-spacing: .16em; text-transform: uppercase;
+    font-weight: 600;
+  }
+  .sub { color: var(--dim); font-size: 13px; }
+  .sub b { color: var(--accent); font-weight: 600; }
+
+  .warn {
+    margin: 16px 0 26px; padding: 12px 14px;
+    background: var(--warn-bg); border: 1px solid var(--warn-line); border-left-width: 3px;
+    color: var(--warn-ink); font-size: 13.5px; border-radius: 3px;
+  }
+  .warn strong { font-weight: 650; }
+
+  .strip {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 1px; background: var(--line); border: 1px solid var(--line);
+    border-radius: 3px; overflow: hidden; margin-bottom: 28px;
+  }
+  .cell { background: var(--panel); padding: 11px 13px; }
+  .cell .k {
+    font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--dim); margin-bottom: 3px;
+  }
+  .cell .v { font-size: 17px; font-variant-numeric: tabular-nums; font-weight: 550; }
+  .cell .v.small { font-size: 12px; font-weight: 400; word-break: break-all; }
+
+  .cols { display: grid; grid-template-columns: 1.15fr 1fr; gap: 26px; align-items: start; }
+  @media (max-width: 820px) { .cols { grid-template-columns: 1fr; } }
+
+  h2 {
+    font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim);
+    margin: 0 0 9px; font-weight: 600;
+  }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 3px; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th {
+    text-align: left; font-weight: 550; color: var(--dim); font-size: 10.5px;
+    letter-spacing: .08em; text-transform: uppercase; padding: 8px 12px;
+    border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .hash { color: var(--dim); font-size: 12px; }
+
+  form { display: flex; gap: 8px; margin-bottom: 10px; }
+  input {
+    flex: 1; min-width: 0; padding: 9px 11px; font-size: 13px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 3px;
+  }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button {
+    padding: 9px 15px; font-size: 13px; font-weight: 550; cursor: pointer;
+    background: var(--accent); color: var(--ground);
+    border: 1px solid var(--accent); border-radius: 3px;
+  }
+  #result { padding: 13px; font-size: 13px; min-height: 60px; }
+  #result .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
+  #result .row span:first-child { color: var(--dim); }
+  #result .row span:last-child {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums; text-align: right; word-break: break-all;
+  }
+  #result .none { color: var(--dim); }
+  #result .err { color: var(--warn-ink); }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+
+  footer {
+    margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--line);
+    color: var(--dim); font-size: 12.5px;
+  }
+  a { color: var(--accent); }
+</style>
+
+<main>
+  <header>
+    <h1>Helix</h1>
+    <div class="sub">
+      post-quantum layer 1 &middot; every signature <b>ML-DSA-65</b> (NIST FIPS&nbsp;204)
+      &middot; node <b id="ver">…</b>
+    </div>
+  </header>
+
+  <div class="warn">
+    <strong>This is a development network.</strong> The chain is reset from genesis whenever the
+    format changes — every balance goes with it. HLX here is a test token: it has no value and it
+    will not survive to whatever launches later. One validator runs this network, so it tolerates
+    zero faults. Explore it, break it, run a node against it — just don't hold anything you'd mind
+    losing.
+  </div>
+
+  <div class="strip" id="strip"></div>
+
+  <div class="cols">
+    <section>
+      <h2>Latest blocks</h2>
+      <div class="panel scroll">
+        <table>
+          <thead>
+            <tr><th>Height</th><th>Txs</th><th>Proposer</th><th>Hash</th></tr>
+          </thead>
+          <tbody id="blocks">
+            <tr><td colspan="4" class="hash">loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Look up</h2>
+      <form id="lookup">
+        <input id="q" placeholder="address, tx hash, or block height" autocomplete="off"
+               aria-label="address, transaction hash, or block height">
+        <button type="submit">Find</button>
+      </form>
+      <div class="panel" id="result">
+        <div class="none">An <code>hlx…</code> address, a 64-character transaction hash, or a
+        block number.</div>
+      </div>
+      <div class="hint">Amounts are shown in HLX. One HLX is 1,000,000,000 nano-HLX, and the
+      chain counts in nano.</div>
+    </section>
+  </div>
+
+  <footer>
+    Served by the node itself — no external requests, no tracking, nothing to install.
+    <a href="https://github.com/silvra-net/helix">Source</a> &middot;
+    <a href="/status">/status</a> &middot;
+    <a href="/genesis">/genesis</a>
+  </footer>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const NANO = 1e9;
+
+  const fmtHlx = (n) =>
+    (n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 9 });
+  const short = (s, n = 10) => (s && s.length > n * 2 ? s.slice(0, n) + '…' + s.slice(-6) : s || '');
+  const esc = (s) =>
+    String(s).replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  async function api(path) {
+    const r = await fetch(path, { headers: { Accept: 'application/json' } });
+    if (!r.ok) throw new Error(r.status === 404 ? 'not found' : 'HTTP ' + r.status);
+    return r.json();
+  }
+
+  function cell(k, v, small) {
+    return `<div class="cell"><div class="k">${esc(k)}</div>
+            <div class="v${small ? ' small' : ''}">${esc(v)}</div></div>`;
+  }
+
+  async function refresh() {
+    try {
+      const s = await api('/status');
+      $('ver').textContent = 'v' + s.version;
+      $('strip').innerHTML =
+        cell('Height', s.height.toLocaleString()) +
+        cell('Circulating', fmtHlx(s.circulating_supply_hlx) + ' HLX') +
+        cell('Burned', fmtHlx(s.total_burned_hlx) + ' HLX') +
+        cell('Base fee', s.base_fee_per_byte + ' nano/byte') +
+        cell('Accounts', s.total_accounts.toLocaleString()) +
+        cell('Peers', s.peer_count.toLocaleString()) +
+        cell('State hash', short(s.state_hash, 8), true);
+
+      const top = s.height;
+      const heights = [];
+      for (let h = top; h > Math.max(-1, top - 12); h--) heights.push(h);
+      const blocks = await Promise.all(
+        heights.map((h) => api('/blocks/height/' + h).catch(() => null))
+      );
+      $('blocks').innerHTML = blocks
+        .filter(Boolean)
+        .map(
+          (b) => `<tr>
+            <td class="num">${b.height.toLocaleString()}</td>
+            <td class="num">${b.transactions ? b.transactions.length : 0}</td>
+            <td class="hash">${esc(short(b.validator, 8))}</td>
+            <td class="hash">${esc(short(b.hash, 8))}</td>
+          </tr>`
+        )
+        .join('') || '<tr><td colspan="4" class="hash">no blocks yet</td></tr>';
+    } catch (e) {
+      $('strip').innerHTML = cell('Node', 'unreachable', true);
+    }
+  }
+
+  const row = (k, v) => `<div class="row"><span>${esc(k)}</span><span>${esc(v)}</span></div>`;
+
+  async function lookup(q) {
+    const out = $('result');
+    q = q.trim();
+    if (!q) return;
+    out.innerHTML = '<div class="none">looking…</div>';
+    try {
+      if (/^\d+$/.test(q)) {
+        const b = await api('/blocks/height/' + q);
+        out.innerHTML =
+          row('Block', b.height.toLocaleString()) +
+          row('Hash', b.hash) +
+          row('Proposer', b.validator) +
+          row('Transactions', b.transactions ? b.transactions.length : 0) +
+          row('Base fee', b.base_fee_per_byte + ' nano/byte');
+        return;
+      }
+      if (/^[0-9a-fA-F]{64}$/.test(q)) {
+        // A confirmed transaction comes back flat (see TxHistoryEntry); one still in the
+        // mempool has only a hash and a status, so every other row has to tolerate absence.
+        const t = await api('/transactions/' + q);
+        out.innerHTML =
+          row('Status', t.status || 'unknown') +
+          (t.tx_type ? row('Type', t.tx_type) : '') +
+          (t.block_height != null ? row('Block', t.block_height.toLocaleString()) : '') +
+          (t.from ? row('From', t.from) : '') +
+          (t.from ? row('To', t.to || '—') : '') +
+          (t.amount_hlx != null ? row('Amount', fmtHlx(t.amount_hlx) + ' HLX') : '') +
+          (t.fee_hlx != null ? row('Fee', fmtHlx(t.fee_hlx) + ' HLX') : '') +
+          (t.nonce != null ? row('Nonce', t.nonce) : '');
+        return;
+      }
+      const a = await api('/accounts/' + q);
+      out.innerHTML =
+        row('Address', a.address) +
+        row('Balance', fmtHlx(a.balance_hlx) + ' HLX') +
+        row('Staked', fmtHlx(a.staked_hlx) + ' HLX') +
+        (a.unbonding_stake_hlx
+          ? row('Unbonding', fmtHlx(a.unbonding_stake_hlx) + ' HLX until #' + a.unbonding_unlock_height)
+          : '') +
+        (a.unbonding_source ? row('Slashable for', a.unbonding_source) : '') +
+        row('Nonce', a.nonce);
+    } catch (e) {
+      out.innerHTML =
+        `<div class="err">${esc(e.message)}</div>` +
+        '<div class="none" style="margin-top:6px">Nothing on this chain matches that. It may ' +
+        'belong to a chain that has since been reset.</div>';
+    }
+  }
+
+  $('lookup').addEventListener('submit', (e) => {
+    e.preventDefault();
+    lookup($('q').value);
+  });
+
+  refresh();
+  setInterval(refresh, 4000);
+</script>

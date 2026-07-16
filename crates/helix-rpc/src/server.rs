@@ -104,7 +104,33 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
     .unwrap();
 }
 
-async fn root() -> Json<Value> {
+/// The explorer, compiled into the binary. Not read from disk and not fetched from anywhere:
+/// a node must work on a machine that cannot reach a CDN, and shipping it as a file would mean
+/// a node whose explorer silently disappears if the file isn't deployed alongside it.
+const EXPLORER_HTML: &str = include_str!("explorer.html");
+
+/// `GET /` answers a browser with the explorer and everything else with the API index.
+///
+/// Same URL, because it is the one people are handed: `helix.silvra.net` in a browser used to
+/// return raw JSON, which is a poor way to meet a project. Content negotiation rather than a
+/// separate `/explorer` path keeps the link that gets shared and the link that gets curl'd the
+/// same one. Anything that doesn't ask for HTML — curl, a wallet, another node — is unaffected.
+async fn root(headers: axum::http::HeaderMap) -> axum::response::Response {
+    let wants_html = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"));
+    if wants_html {
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            EXPLORER_HTML,
+        )
+            .into_response();
+    }
+    api_index().into_response()
+}
+
+fn api_index() -> Json<Value> {
     Json(json!({
         "name": "Helix Node",
         "version": env!("CARGO_PKG_VERSION"),
@@ -1302,6 +1328,57 @@ mod tests {
         assert_eq!(allocations.len(), 1);
         assert_eq!(allocations[0]["address"].as_str(), Some(treasury.as_str()));
         assert_eq!(allocations[0]["balance_nano"].as_u64(), Some(allocated));
+    }
+
+    /// A browser gets the explorer. Nothing else does — every existing API client, wallet and
+    /// node reads `/` expecting the JSON index, and quietly handing them HTML would break them
+    /// all at once.
+    #[tokio::test]
+    async fn root_serves_the_explorer_to_browsers_and_json_to_everything_else() {
+        use axum::http::{header, HeaderMap, HeaderValue};
+
+        let mut browser = HeaderMap::new();
+        browser.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        );
+        let response = root(browser).await;
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<title>Helix Explorer</title>"));
+        assert!(
+            html.contains("development network"),
+            "the explorer is the first thing most people see — it has to say what this chain is"
+        );
+
+        // curl, wallets, other nodes: no Accept header at all, or a JSON one.
+        for headers in [HeaderMap::new(), {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+            h
+        }] {
+            let response = root(headers).await;
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("must stay JSON");
+            assert_eq!(json["token"], "HLX");
+        }
+    }
+
+    /// The explorer must not reach for anything off the node. A node has to work where there is
+    /// no CDN to reach, and an explorer that fetches a font from someone else's server is both a
+    /// dependency and a tracker.
+    #[test]
+    fn the_explorer_makes_no_external_requests() {
+        for needle in ["//fonts.", "cdn.", "https://unpkg", "https://cdn", "<script src=", "@import"] {
+            assert!(
+                !EXPLORER_HTML.contains(needle),
+                "explorer must be self-contained, found {needle:?}"
+            );
+        }
     }
 
     /// The hash must describe the *genesis* state, not the node's current one. Serving the
