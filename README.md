@@ -865,9 +865,13 @@ advances, since real compute was spent either way.
 
 - **Hard cap:** 33,000,000 HLX — never more, forever. This is an *honest* ceiling: it sits
   just above what the emission schedule actually pays out (the 1 HLX halving subsidy converges
-  to ~31.5M emitted, plus the 1M genesis stake ≈ 32.5M real max supply), not an aspirational
-  round number the chain could never reach. The same asymptotic shape as Bitcoin's 21M cap —
-  approached over time, not handed out at genesis.
+  to ~31.5M emitted, plus the 200k genesis allocation ≈ 31.7M real max supply), not an
+  aspirational round number the chain could never reach. The same asymptotic shape as Bitcoin's
+  21M cap — approached over time, not handed out at genesis.
+- **Genesis allocation:** 200,000 HLX — the bootstrap validator's 100k stake (exactly the
+  minimum the rules demand of any validator) plus a 100k liquid reserve, so a slash that drops
+  it below that minimum is recoverable. That is ~0.6% of the supply the chain eventually
+  reaches; everything else is earned block by block. There is no founder pre-mine beyond this.
 - **Denomination:** 1 HLX = 1,000,000,000 nano-HLX
 - **Fee split:** 50% burned (deflationary) / 50% to block validator
 - **Block reward:** a halving issuance schedule mints new HLX every block (independent of

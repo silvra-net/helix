@@ -34,13 +34,26 @@ halves once per ~year and integer-divides to **zero after ~30 years** (era 30: `
 Σ (1 HLX >> era) × 15,768,000 blocks  ≈  2 × 15,768,000  ≈  31,536,000 HLX
 ```
 
-So the **real asymptotic max supply is ≈ 32.5M HLX** (1M genesis + ~31.5M emitted), *minus*
+So the **real asymptotic max supply is ≈ 31.7M HLX** (200k genesis + ~31.5M emitted), *minus*
 cumulative burns.
+
+> **Genesis allocation cut 1M → 200k (2026-07-16).** The bootstrap validator now starts with
+> 100k staked — exactly `MIN_VALIDATOR_STAKE`, the same bar every other validator must clear —
+> plus 100k liquid so a 5% slash dropping it under that bar is recoverable in one transaction.
+> The old 1M was a leftover from the 100M-cap era, where it read as 1% of the nominal ceiling;
+> against *real* supply it was always ~3.07%, and the 33M honesty fix exposed that without
+> revisiting it. At 200k the founder's genesis share is ~0.6%.
+>
+> Worth stating plainly, since the number invites more weight than it deserves: this is
+> **cosmetic against the real distribution dynamic**. A sole validator collects every block
+> reward — ~15.7M in the first year — so its share trends to ~99% regardless of whether genesis
+> was 200k or 1M. The genesis line is not what concentrates supply; running the only node is.
+> That only changes when other validators start earning (see the `3f+1` note in the README).
 
 > ✅ **Honest cap (decided & shipped 2026-07-15).** `TOTAL_SUPPLY_HLX` was 100M — a ceiling
 > the schedule could never reach (~67M / two-thirds phantom headroom), which reads as
-> dishonest to anyone who does the arithmetic. It is now **33M**, sized to clear the ~32.5M
-> real asymptote with a small (~1.4%) margin so it never binds prematurely but is a genuine
+> dishonest to anyone who does the arithmetic. It is now **33M**, sized to clear the ~31.7M
+> real asymptote with a small (~4%) margin so it never binds prematurely but is a genuine
 > ceiling. Decision (Vistos, full monetary authority): keep the supply scarce — hold the 1 HLX
 > reward and correct the *cap* down to the truth, rather than inflating the reward to make a
 > round 100M real. Applied by lowering the constant + resetting the (single-account, zero

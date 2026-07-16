@@ -8,9 +8,9 @@ pub const NANO_PER_HLX: u64 = 1_000_000_000;
 /// (decision 2026-07-15): it is sized to sit just above what the emission schedule actually
 /// pays out, not at an aspirational round number the chain could never reach. The 1 HLX
 /// halving subsidy (`scheduled_block_reward`) emits a geometric series that converges to
-/// `2 × INITIAL_BLOCK_REWARD_HLX × HALVING_INTERVAL_BLOCKS ≈ 31.5 M HLX`; plus the 1 M genesis
-/// validator stake that is the real asymptotic max supply ≈ 32.5 M. The cap is set to 33 M so
-/// it clears that asymptote with a small (~1.4 %) margin and never binds prematurely — but it
+/// `2 × INITIAL_BLOCK_REWARD_HLX × HALVING_INTERVAL_BLOCKS ≈ 31.5 M HLX`; plus the 200 k genesis
+/// allocation that is the real asymptotic max supply ≈ 31.7 M. The cap is set to 33 M so
+/// it clears that asymptote with a small (~4 %) margin and never binds prematurely — but it
 /// is a genuine ceiling, not the ~67 M of phantom headroom the old 100 M value carried (a
 /// cap 3× larger than anything the schedule could mint reads as dishonest to anyone who does
 /// the arithmetic). Unlike a chain that dumps its whole supply into circulation at genesis,
@@ -33,7 +33,21 @@ pub const MIN_VALIDATOR_STAKE: u64 = 100_000 * NANO_PER_HLX;
 /// `ChainState::genesis_validator_stake` and handed to joining nodes via `GET /genesis`, so
 /// retuning this constant does not retroactively rewrite the genesis of chains already
 /// running under the old value. It applies to new chains only.
-pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 1_000_000; // 1 M HLX
+pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 100_000; // = MIN_VALIDATOR_STAKE
+
+/// Liquid balance the bootstrap validator holds at genesis, on top of its stake.
+///
+/// Exists because `VALIDATOR_GENESIS_STAKE_HLX` sits exactly on `MIN_VALIDATOR_STAKE`: a single
+/// 5% slash (`SLASH_FRACTION_BPS`) leaves 95k and drops the validator out of the set at the next
+/// epoch, and it cannot stake its way back out of thin air. This reserve makes that recoverable
+/// in one transaction — staking takes effect immediately, only *unstaking* waits out the
+/// unbonding period. It doubles as an operator's working balance before block rewards accumulate.
+///
+/// Credited to whoever `GenesisConfig::validator` is, never a hardcoded address: this constant
+/// ships in a public repo, and naming one deployment's wallet here would prefund it on every
+/// chain anyone launches from this source. Deliberately modest — see `GENESIS_PREFUND` on why a
+/// founder allocation stays small; 100k is ~0.3% of the supply this chain eventually reaches.
+pub const VALIDATOR_GENESIS_LIQUID_HLX: u64 = 100_000;
 
 /// Pre-funded genesis wallets beyond the validator's bootstrap stake: (address, balance_HLX).
 /// Empty by design (decision 2026-07-15, superseding the 2026-07-05 decision to liquid-dump
@@ -62,8 +76,8 @@ pub const INITIAL_BLOCK_REWARD_HLX: u64 = 1;
 /// (365 days × 86 400 s ÷ 2 s per block = 15 768 000 blocks). Chosen to be Bitcoin-shaped —
 /// geometric decay toward an asymptote rather than a cliff-edge cutoff or perpetual flat
 /// issuance that inflates forever. The schedule's total eventual emission converges to
-/// `2 × INITIAL_BLOCK_REWARD_HLX × HALVING_INTERVAL_BLOCKS` ≈ 31.5 M HLX — which, plus the 1 M
-/// genesis stake, is exactly why `TOTAL_SUPPLY_HLX` is set to 33 M (a tight, honest ceiling
+/// `2 × INITIAL_BLOCK_REWARD_HLX × HALVING_INTERVAL_BLOCKS` ≈ 31.5 M HLX — which, plus the 200 k
+/// genesis allocation, is exactly why `TOTAL_SUPPLY_HLX` is set to 33 M (a tight, honest ceiling
 /// just above that asymptote), so in practice the reward decays to economically-irrelevant
 /// amounts (and eventually to exactly 0 via integer division) just as the cap is approached
 /// but before it could ever bind. The cap is still enforced explicitly wherever the reward
@@ -139,6 +153,11 @@ impl GenesisConfig {
                 allocations.push((addr, hlx * NANO_PER_HLX));
             }
         }
+        // Routed through `allocations` rather than credited directly in `build_state` so it lands
+        // in `ChainState::genesis_allocations` like any other genesis balance — which is what
+        // carries it to a joining node over `GET /genesis` instead of leaving it to that node's
+        // own constants (see `genesis_allocations`).
+        allocations.push((validator.clone(), VALIDATOR_GENESIS_LIQUID_HLX * NANO_PER_HLX));
         GenesisConfig {
             allocations,
             validator,
@@ -150,10 +169,11 @@ impl GenesisConfig {
 
     /// Build the initial ChainState.
     /// - `total_supply` (the hard cap) = 33 M HLX, set once and never changed afterward.
-    /// - `total_issued` (what's actually in circulation) starts at just the validator's 1 M
-    ///   HLX bootstrap stake plus any `GENESIS_PREFUND` allocations — the remaining ~32 M HLX
-    ///   of headroom is minted gradually via `scheduled_block_reward`, not handed out here.
-    /// - circulating_supply = total_issued − total_burned (starts at ~1 M, grows with block
+    /// - `total_issued` (what's actually in circulation) starts at just the validator's 100 k
+    ///   HLX bootstrap stake, its 100 k liquid reserve, and any `GENESIS_PREFUND` allocations —
+    ///   the remaining ~32.8 M HLX of headroom is minted gradually via `scheduled_block_reward`,
+    ///   not handed out here.
+    /// - circulating_supply = total_issued − total_burned (starts at ~200 k, grows with block
     ///   rewards, shrinks with burns)
     pub fn build_state(&self) -> ChainState {
         let total_supply = TOTAL_SUPPLY_HLX * NANO_PER_HLX;
@@ -263,7 +283,11 @@ mod tests {
 
         assert_eq!(state.accounts[&validator.to_string()].staked, peer_stake);
         assert_eq!(state.genesis_validator_stake, peer_stake);
-        assert_eq!(state.total_issued, peer_stake, "issuance must count what was really staked");
+        assert_eq!(
+            state.total_issued,
+            peer_stake + VALIDATOR_GENESIS_LIQUID_HLX * NANO_PER_HLX,
+            "issuance must count what was really staked, plus the validator's liquid reserve"
+        );
     }
 
     /// The joining path for liquid balances: a node must credit the allocations its peer
@@ -277,12 +301,18 @@ mod tests {
         let peer_allocation = 100_000 * NANO_PER_HLX;
 
         let mut cfg = GenesisConfig::devnet(validator.clone());
-        assert!(cfg.allocations.is_empty(), "the default prefund is empty — the premise here");
+        // A joining node *replaces* the list rather than adding to it — including the local
+        // build's own validator reserve, which belongs to a chain it isn't joining.
         cfg.allocations = vec![(treasury.clone(), peer_allocation)];
         let state = cfg.build_state();
 
         assert_eq!(state.accounts[&treasury.to_string()].balance, peer_allocation);
         assert_eq!(state.genesis_allocations, vec![(treasury, peer_allocation)]);
+        assert_eq!(
+            state.accounts.get(&validator.to_string()).map(|a| a.balance),
+            Some(0),
+            "the local default reserve must not survive being replaced by the peer's list"
+        );
         assert_eq!(
             state.total_issued,
             peer_allocation + VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX,
@@ -333,17 +363,32 @@ mod tests {
         assert_eq!(scheduled_block_reward(u64::MAX), 0);
     }
 
+    /// Genesis hands the founder a bounded, deliberate allocation and nothing more. The 2026-07-15
+    /// version of this test asserted `balance == 0` — no liquid pre-mine at all. That is no longer
+    /// the rule: the validator now also gets `VALIDATOR_GENESIS_LIQUID_HLX` so a slash that drops
+    /// it under `MIN_VALIDATOR_STAKE` is recoverable (see that constant). The principle the old
+    /// assertion protected is unchanged and still enforced here — genesis must stay a rounding
+    /// error against total supply, with everything else earned block by block.
     #[test]
-    fn build_state_no_longer_liquid_dumps_the_full_supply_to_the_validator() {
+    fn genesis_allocates_only_the_bootstrap_stake_and_its_reserve() {
         let validator = Address::from_public_key(&helix_crypto::KeyPair::generate().public);
         let cfg = GenesisConfig::devnet(validator.clone());
         let state = cfg.build_state();
 
         let acc = state.get(&validator).expect("validator account must exist at genesis");
         assert_eq!(acc.staked, VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX);
-        assert_eq!(acc.balance, 0, "no liquid pre-mine — everything beyond the bootstrap stake is earned via block rewards");
-        assert_eq!(state.total_issued, VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX);
+        assert_eq!(acc.balance, VALIDATOR_GENESIS_LIQUID_HLX * NANO_PER_HLX);
+        assert_eq!(
+            state.total_issued,
+            (VALIDATOR_GENESIS_STAKE_HLX + VALIDATOR_GENESIS_LIQUID_HLX) * NANO_PER_HLX,
+            "nothing may be issued at genesis beyond the stake and its reserve"
+        );
         assert_eq!(state.total_supply, TOTAL_SUPPLY_HLX * NANO_PER_HLX);
-        assert!(state.mintable_headroom() > 0, "the vast majority of supply must remain unminted at genesis");
+
+        // The load-bearing claim: this is a bootstrap, not a pre-mine. Anything approaching a
+        // meaningful share of supply here would make the halving schedule decoration.
+        let genesis_share_percent = state.total_issued * 100 / (TOTAL_SUPPLY_HLX * NANO_PER_HLX);
+        assert_eq!(genesis_share_percent, 0, "genesis must round to 0% of total supply");
+        assert!(state.mintable_headroom() > 0, "the vast majority of supply must remain unminted");
     }
 }
