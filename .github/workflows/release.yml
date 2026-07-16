@@ -9,8 +9,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check-version:
+    name: Tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare tag against workspace.package.version
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          cargo_version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "helix-node") | .version')"
+          if [ "$tag" != "v$cargo_version" ]; then
+            echo "::error::Tag $tag does not match workspace version $cargo_version."
+            echo "Bump [workspace.package] version in Cargo.toml to ${tag#v} and re-tag."
+            exit 1
+          fi
+          echo "Tag $tag matches workspace version $cargo_version."
+
   build:
     name: Build (${{ matrix.target }})
+    needs: check-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
