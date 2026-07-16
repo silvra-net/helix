@@ -39,16 +39,21 @@ const DEFAULT_MIN_FEE: Amount = 1_000; // 1000 nano-HLX
 /// fee-based eviction.
 const DEFAULT_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// Fee-prioritized transaction pool.
-/// Higher fee → included in next block first.
+/// Tip-prioritized transaction pool.
+/// Higher tip → included in next block first.
 pub struct Mempool {
-    /// fee (descending) → vec of tx hashes at that fee level
-    by_fee: BTreeMap<std::cmp::Reverse<Amount>, Vec<String>>,
+    /// tip (descending) → vec of tx hashes at that tip level
+    by_tip: BTreeMap<std::cmp::Reverse<Amount>, Vec<String>>,
     /// hash → transaction
     by_hash: HashMap<String, Transaction>,
     /// (sender_address, nonce) → tx hash — prevents two txs with the same nonce
     /// from the same sender clogging the pool (only one can ever succeed)
     by_sender_nonce: HashMap<(String, u64), String>,
+    /// hash → the tip it was filed under in `by_tip`. Kept explicitly because the tip is
+    /// computed from `base_fee_per_byte` as it stood at *admission*, and that moves: recomputing
+    /// the key at removal time would look in the wrong bucket for anything admitted under a
+    /// different base fee, leaving the entry behind forever.
+    tip_of: HashMap<String, Amount>,
     /// hash → time of admission, used for TTL-based expiry
     entered_at: HashMap<String, Instant>,
     max_size: usize,
@@ -70,9 +75,10 @@ pub struct Mempool {
 impl Mempool {
     pub fn new() -> Self {
         Mempool {
-            by_fee: BTreeMap::new(),
+            by_tip: BTreeMap::new(),
             by_hash: HashMap::new(),
             by_sender_nonce: HashMap::new(),
+            tip_of: HashMap::new(),
             entered_at: HashMap::new(),
             max_size: DEFAULT_MAX_SIZE,
             min_fee: DEFAULT_MIN_FEE,
@@ -85,9 +91,10 @@ impl Mempool {
     /// to exercise full-pool behavior without inserting thousands of transactions.
     pub fn with_limits(max_size: usize, min_fee: Amount) -> Self {
         Mempool {
-            by_fee: BTreeMap::new(),
+            by_tip: BTreeMap::new(),
             by_hash: HashMap::new(),
             by_sender_nonce: HashMap::new(),
+            tip_of: HashMap::new(),
             entered_at: HashMap::new(),
             max_size,
             min_fee,
@@ -100,9 +107,10 @@ impl Mempool {
     /// to exercise expiry without waiting `DEFAULT_TTL`.
     pub fn with_limits_and_ttl(max_size: usize, min_fee: Amount, ttl: Duration) -> Self {
         Mempool {
-            by_fee: BTreeMap::new(),
+            by_tip: BTreeMap::new(),
             by_hash: HashMap::new(),
             by_sender_nonce: HashMap::new(),
+            tip_of: HashMap::new(),
             entered_at: HashMap::new(),
             max_size,
             min_fee,
@@ -135,6 +143,48 @@ impl Mempool {
         self.base_fee_per_byte
     }
 
+    /// What including `tx` actually pays the block's validator: its fee minus the base-fee
+    /// portion, which is burned rather than earned (`distribute_fee` in `helix-executor`
+    /// splits it exactly this way).
+    ///
+    /// This — not `tx.fee` — is what the pool prioritizes by. Sorting on the total fee ranked a
+    /// large transaction paying its base fee and nothing more (tip 0, validator earns nothing)
+    /// above a small one tipping well, because the burned part scales with size. That is the
+    /// pool preferring precisely the transactions that don't pay the validator. Ethereum sorts
+    /// by effective priority fee for the same reason.
+    ///
+    /// `SubmitDoubleSignEvidence` is exempt from the base fee at execution, so none of its fee
+    /// is burned and all of it tips — the exemption needs no special case here beyond not
+    /// subtracting a base fee that is never charged. Getting this wrong would sink slashing
+    /// reports to the bottom of every block: their flat reporter fee minus a base fee on ~16 KB
+    /// would saturate to tip 0. Same trap as the admission check above.
+    fn tip(&self, tx: &Transaction) -> Amount {
+        if tx.tx_type == TxType::SubmitDoubleSignEvidence {
+            tx.fee
+        } else {
+            tx.fee
+                .saturating_sub(self.base_fee_per_byte.saturating_mul(tx.size_bytes()))
+        }
+    }
+
+    /// Remove a transaction from every index it appears in. The `by_tip` bucket is found via
+    /// the recorded `tip_of` key rather than a fresh computation — see that field's note.
+    fn detach(&mut self, hash: &str) {
+        self.entered_at.remove(hash);
+        if let Some(tip) = self.tip_of.remove(hash) {
+            let key = std::cmp::Reverse(tip);
+            if let Some(bucket) = self.by_tip.get_mut(&key) {
+                bucket.retain(|h| h != hash);
+                if bucket.is_empty() {
+                    self.by_tip.remove(&key);
+                }
+            }
+        }
+        if let Some(tx) = self.by_hash.remove(hash) {
+            self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
+        }
+    }
+
     /// Drop all transactions that have been sitting in the pool longer than `ttl`.
     /// Called lazily from `add()`/`take()` rather than on a background timer.
     fn evict_expired(&mut self) {
@@ -146,16 +196,7 @@ impl Mempool {
             .map(|(h, _)| h.clone())
             .collect();
         for hash in expired {
-            self.entered_at.remove(&hash);
-            if let Some(tx) = self.by_hash.remove(&hash) {
-                if let Some(bucket) = self.by_fee.get_mut(&std::cmp::Reverse(tx.fee)) {
-                    bucket.retain(|h| h != &hash);
-                    if bucket.is_empty() {
-                        self.by_fee.remove(&std::cmp::Reverse(tx.fee));
-                    }
-                }
-                self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
-            }
+            self.detach(&hash);
         }
     }
 
@@ -236,30 +277,33 @@ impl Mempool {
         tx.verify_signature_with_recovery_key(recovery_key)
             .map_err(|e| MempoolError::Invalid(e.to_string()))?;
 
+        let tip = self.tip(&tx);
+
         if self.by_hash.len() >= self.max_size {
             // Pool is full: only admit this tx if it strictly outbids the cheapest
             // tx currently held, evicting that one to make room. Otherwise a
             // sustained flood of just-above-min-fee spam could permanently lock
             // out legitimate higher-fee transactions.
-            let lowest_fee = self.by_fee.keys().next_back().map(|r| r.0);
-            match lowest_fee {
-                Some(lowest) if tx.fee > lowest => self.evict_lowest_fee(),
+            let lowest_tip = self.by_tip.keys().next_back().map(|r| r.0);
+            match lowest_tip {
+                Some(lowest) if tip > lowest => self.evict_lowest_tip(),
                 _ => return Err(MempoolError::Full(self.max_size)),
             }
         }
 
-        self.by_fee
-            .entry(std::cmp::Reverse(tx.fee))
+        self.by_tip
+            .entry(std::cmp::Reverse(tip))
             .or_default()
             .push(hash.clone());
 
         self.by_sender_nonce.insert(sender_nonce_key, hash.clone());
+        self.tip_of.insert(hash.clone(), tip);
         self.entered_at.insert(hash.clone(), Instant::now());
         self.by_hash.insert(hash, tx);
         Ok(())
     }
 
-    /// Take up to `max_count` highest-fee transactions for block inclusion.
+    /// Take up to `max_count` highest-tip transactions for block inclusion.
     /// Does NOT remove them — call `remove_committed` after the block is finalized.
     ///
     /// TXs are sorted by (sender, nonce) after the fee-priority pass so that a
@@ -268,7 +312,7 @@ impl Mempool {
     pub fn take(&mut self, max_count: usize) -> Vec<Transaction> {
         self.evict_expired();
         let mut result = Vec::with_capacity(max_count);
-        'outer: for hashes in self.by_fee.values() {
+        'outer: for hashes in self.by_tip.values() {
             for hash in hashes {
                 if result.len() >= max_count {
                     break 'outer;
@@ -288,39 +332,22 @@ impl Mempool {
     /// Remove transactions that were committed in a block
     pub fn remove_committed(&mut self, hashes: &[Hash]) {
         for hash in hashes {
-            let key = hash.to_hex();
-            if let Some(tx) = self.by_hash.remove(&key) {
-                let bucket = self.by_fee.get_mut(&std::cmp::Reverse(tx.fee));
-                if let Some(bucket) = bucket {
-                    bucket.retain(|h| h != &key);
-                    if bucket.is_empty() {
-                        self.by_fee.remove(&std::cmp::Reverse(tx.fee));
-                    }
-                }
-                self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
-            }
-            self.entered_at.remove(&key);
+            self.detach(&hash.to_hex());
         }
     }
 
-    /// Remove the single cheapest transaction currently in the pool, making room
+    /// Remove the single lowest-tipping transaction currently in the pool, making room
     /// for one new admission. No-op if the pool is empty.
-    fn evict_lowest_fee(&mut self) {
-        let lowest_key = match self.by_fee.keys().next_back().copied() {
+    fn evict_lowest_tip(&mut self) {
+        let lowest_key = match self.by_tip.keys().next_back().copied() {
             Some(k) => k,
             None => return,
         };
-        let hash = {
-            let bucket = self.by_fee.get_mut(&lowest_key).expect("key just observed to exist");
-            bucket.remove(0)
+        let hash = match self.by_tip.get(&lowest_key).and_then(|b| b.first()).cloned() {
+            Some(h) => h,
+            None => return,
         };
-        if self.by_fee.get(&lowest_key).is_some_and(|b| b.is_empty()) {
-            self.by_fee.remove(&lowest_key);
-        }
-        if let Some(tx) = self.by_hash.remove(&hash) {
-            self.by_sender_nonce.remove(&(tx.from.to_string(), tx.nonce));
-        }
-        self.entered_at.remove(&hash);
+        self.detach(&hash);
     }
 
     pub fn len(&self) -> usize {
@@ -356,6 +383,12 @@ mod tests {
     /// above the floor; a value that only clears `min_fee` describes a transaction that cannot
     /// actually be spent.
     fn make_tx(keypair: &KeyPair, fee: Amount, nonce: u64) -> Transaction {
+        make_tx_with_data(keypair, fee, nonce, 0)
+    }
+
+    /// `data_len` pads the transaction to a chosen size — what the base fee, and so the tip,
+    /// is charged against.
+    fn make_tx_with_data(keypair: &KeyPair, fee: Amount, nonce: u64, data_len: usize) -> Transaction {
         let addr = Address::from_public_key(&keypair.public);
         let mut tx = Transaction {
             version: 1,
@@ -365,7 +398,7 @@ mod tests {
             amount: 1_000_000,
             fee,
             nonce,
-            data: vec![],
+            data: vec![0u8; data_len],
             crypto_version: keypair.scheme,
             signature: Signature::from_bytes(vec![0u8; 32]),
             public_key: keypair.public.clone(),
@@ -373,6 +406,21 @@ mod tests {
         let hash = tx.signing_hash();
         tx.signature = keypair.sign(hash.as_bytes()).unwrap();
         tx
+    }
+
+    /// Price a transaction of `data_len` bytes at exactly its base fee at the floor: the whole
+    /// fee burns and the validator earns nothing by including it.
+    fn make_zero_tip_tx(keypair: &KeyPair, nonce: u64, data_len: usize) -> Transaction {
+        let size = make_tx_with_data(keypair, 0, nonce, data_len).size_bytes();
+        let tx = make_tx_with_data(keypair, size, nonce, data_len);
+        assert_eq!(tx.size_bytes(), size, "fee is fixed-width, so pricing must not resize the tx");
+        tx
+    }
+
+    /// Price a transaction at its base fee at the floor plus `tip`.
+    fn make_tipping_tx(keypair: &KeyPair, nonce: u64, tip: Amount) -> Transaction {
+        let size = make_tx(keypair, 0, nonce).size_bytes();
+        make_tx(keypair, size + tip, nonce)
     }
 
     #[test]
@@ -475,6 +523,109 @@ mod tests {
             matches!(err, MempoolError::BelowBaseFee { need, .. } if need == size * 2),
             "the same fee must stop clearing once the byte price doubles: {err:?}"
         );
+    }
+
+    /// The reason this pool sorts by tip at all. The burned part of a fee scales with the
+    /// transaction's size, so ranking by total fee put a big transaction that pays its base fee
+    /// and nothing more — validator earns zero — ahead of a small one tipping well. The pool
+    /// systematically preferred the transactions that don't pay the validator.
+    #[test]
+    fn a_big_transaction_paying_only_its_base_fee_ranks_below_a_small_one_that_tips() {
+        let big_kp = KeyPair::generate();
+        let small_kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        let big = make_zero_tip_tx(&big_kp, 0, 20_000);
+        let small = make_tipping_tx(&small_kp, 0, 5_000);
+        assert!(
+            big.fee > small.fee,
+            "premise: the zero-tip tx pays the higher TOTAL fee — that's what used to win"
+        );
+        let small_hash = small.hash();
+
+        pool.add(big).unwrap();
+        pool.add(small).unwrap();
+
+        let taken = pool.take(1);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(
+            taken[0].hash(),
+            small_hash,
+            "the block slot must go to the tx that actually pays the validator"
+        );
+    }
+
+    /// Same inversion, on the eviction path: a full pool must keep what earns the validator
+    /// most, not what carries the largest headline fee.
+    #[test]
+    fn a_full_pool_evicts_by_tip_not_by_total_fee() {
+        let big_kp = KeyPair::generate();
+        let small_kp = KeyPair::generate();
+        let mut pool = Mempool::with_limits(1, 1_000);
+
+        let big = make_zero_tip_tx(&big_kp, 0, 20_000);
+        let big_hash = big.hash();
+        pool.add(big).unwrap();
+
+        let small = make_tipping_tx(&small_kp, 0, 5_000);
+        let small_hash = small.hash();
+        pool.add(small).expect("a real tip must outbid a zero tip, whatever the totals say");
+
+        assert!(!pool.contains(&big_hash), "the zero-tip tx should have been evicted");
+        assert!(pool.contains(&small_hash));
+    }
+
+    /// Slashing evidence pays no base fee at execution, so its whole fee tips and its ~16 KB
+    /// must not push it down the queue. Subtracting a base fee that is never charged would
+    /// saturate its tip to 0 and sink every report to the back of the block — the same trap
+    /// that already killed slashing at the fee-0 stage and again at admission.
+    #[test]
+    fn slashing_evidence_tips_its_whole_fee_and_is_not_sunk_by_its_size() {
+        let reporter = KeyPair::generate();
+        let other = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        let mut evidence = make_tx_with_data(&reporter, 10_000, 0, 16_000);
+        evidence.tx_type = TxType::SubmitDoubleSignEvidence;
+        let hash = evidence.signing_hash();
+        evidence.signature = reporter.sign(hash.as_bytes()).unwrap();
+        assert!(
+            evidence.fee < evidence.size_bytes(),
+            "premise: a base fee on this size would wipe out the whole reporter fee"
+        );
+        let evidence_hash = evidence.hash();
+
+        pool.add(evidence).unwrap();
+        pool.add(make_tipping_tx(&other, 0, 5_000)).unwrap();
+
+        let taken = pool.take(1);
+        assert_eq!(
+            taken[0].hash(),
+            evidence_hash,
+            "a slashing report tipping 10k must outrank a transfer tipping 5k"
+        );
+    }
+
+    /// The tip is computed from the base fee as it stood at admission, and the base fee moves.
+    /// Recomputing it at removal time would look in a bucket the tx was never filed under and
+    /// leave the index entry behind forever.
+    #[test]
+    fn a_tx_is_fully_removed_even_after_the_base_fee_moved_under_it() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        let tx = make_tx(&kp, 20_000, 0);
+        let hash = tx.hash();
+        pool.add(tx).unwrap();
+
+        pool.set_base_fee_per_byte(2);
+        pool.remove_committed(&[hash]);
+
+        assert_eq!(pool.len(), 0);
+        assert!(pool.by_tip.is_empty(), "a stale index entry survived the removal");
+        assert!(pool.tip_of.is_empty());
+        assert!(pool.entered_at.is_empty());
+        assert!(pool.by_sender_nonce.is_empty());
     }
 
     #[test]
