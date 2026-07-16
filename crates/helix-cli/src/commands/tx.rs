@@ -5,10 +5,9 @@ use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
-use crate::fee::price_and_sign;
+use crate::fee::{hlx_to_nano, price_and_sign};
 use crate::keyfile::KeyFile;
 
-const NANO_PER_HLX: f64 = 1_000_000_000.0;
 
 #[derive(Subcommand)]
 pub enum TxCmd {
@@ -182,7 +181,7 @@ async fn send(
     let to_addr = Address::from_str(&to)
         .map_err(|e| anyhow::anyhow!("Invalid recipient address: {}", e))?;
 
-    let amount_nano = (amount_hlx * NANO_PER_HLX) as u64;
+    let amount_nano = hlx_to_nano(amount_hlx)?;
 
     // Fetch current nonce from node if not provided
     let nonce = match nonce_override {
@@ -234,7 +233,7 @@ async fn simple_amount_tx(
     };
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
-    let amount_nano = (amount_hlx * NANO_PER_HLX) as u64;
+    let amount_nano = hlx_to_nano(amount_hlx)?;
     let nonce = match nonce_override {
         Some(n) => n,
         None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
@@ -318,7 +317,7 @@ async fn targeted_amount_tx(
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let validator_addr = Address::from_str(&validator)
         .map_err(|e| anyhow::anyhow!("Invalid validator address: {}", e))?;
-    let amount_nano = (amount_hlx * NANO_PER_HLX) as u64;
+    let amount_nano = hlx_to_nano(amount_hlx)?;
     let nonce = match nonce_override {
         Some(n) => n,
         None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
@@ -369,7 +368,7 @@ async fn redelegate(
         .map_err(|e| anyhow::anyhow!("Invalid source validator address: {}", e))?;
     let dst = Address::from_str(&to_validator)
         .map_err(|e| anyhow::anyhow!("Invalid destination validator address: {}", e))?;
-    let amount_nano = (amount_hlx * NANO_PER_HLX) as u64;
+    let amount_nano = hlx_to_nano(amount_hlx)?;
     let nonce = match nonce_override {
         Some(n) => n,
         None => fetch_nonce(node, &kf.address).await.unwrap_or(0),

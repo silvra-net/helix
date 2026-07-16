@@ -5,10 +5,9 @@ use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
-use crate::fee::price_and_sign;
+use crate::fee::{hlx_to_nano, price_and_sign};
 use crate::keyfile::KeyFile;
 
-const NANO_PER_HLX: f64 = 1_000_000_000.0;
 
 #[derive(Subcommand)]
 pub enum ContractCmd {
@@ -144,7 +143,7 @@ async fn call(
     let to_addr = Address::from_str(&address)
         .map_err(|e| anyhow::anyhow!("Invalid contract address: {}", e))?;
 
-    let amount_nano = (amount_hlx * NANO_PER_HLX) as u64;
+    let amount_nano = hlx_to_nano(amount_hlx)?;
     let nonce = match nonce_override {
         Some(n) => n,
         None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
