@@ -263,6 +263,19 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
         .iter()
         .map(|(addr, balance)| json!({ "address": addr.as_str(), "balance_nano": balance }))
         .collect();
+    // Rebuilt from the very fields served above, through the same function a joining node uses —
+    // so this hash answers "what should your reconstruction come out as", not "what does my
+    // chain look like now" (which has moved on since height 0).
+    let genesis_state_hash = helix_executor::genesis::rebuild_genesis_state(
+        block.header.validator.clone(),
+        cs.personhood_authorities.clone(),
+        cs.genesis_extra_validators.clone(),
+        cs.genesis_validator_stake,
+        cs.genesis_allocations.clone(),
+        cs.governance_params.clone(),
+    )
+    .state_hash()
+    .to_hex();
     // This node's *current* governance_params, not necessarily its genesis-time ones — if a
     // proposal changed a param since genesis, a node adopting this as its starting value will
     // (mis)apply the current value retroactively from height 0, rather than the true original
@@ -287,6 +300,16 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
             // two above: `GENESIS_PREFUND` is a compile-time default for new chains, not a
             // description of what this one handed out at height 0.
             "allocations": allocations,
+            // The hash of the genesis state these fields rebuild to, so a joining node can check
+            // that its own reconstruction landed on the same ledger rather than assuming it did.
+            //
+            // Transmitting the inputs is not enough on its own: a node whose binary disagrees
+            // about anything the fields *don't* carry — `TOTAL_SUPPLY_HLX`, or any field added
+            // to genesis after that node was built — silently constructs a different chain and
+            // reports it as fact. That is not hypothetical: the published v1.4.0 binary, syncing
+            // this chain on 2026-07-16, produced a ledger with 800,000 HLX that does not exist,
+            // without erroring. This turns that into a refusal to start.
+            "state_hash": genesis_state_hash,
         })),
     )
 }
@@ -1279,6 +1302,43 @@ mod tests {
         assert_eq!(allocations.len(), 1);
         assert_eq!(allocations[0]["address"].as_str(), Some(treasury.as_str()));
         assert_eq!(allocations[0]["balance_nano"].as_u64(), Some(allocated));
+    }
+
+    /// The hash must describe the *genesis* state, not the node's current one. Serving the
+    /// latter would make every joining node reject the chain the moment a block was produced —
+    /// and worse, would have looked correct in a test against a chain still at height 0.
+    #[tokio::test]
+    async fn get_genesis_reports_the_genesis_state_hash_not_todays() {
+        let state = fresh_test_state();
+        let validator = addr(7);
+        state.store.write().await.put_block(block(0, &validator, vec![])).unwrap();
+        {
+            let mut cs = state.chain_state.write().await;
+            cs.genesis_validator_stake = 100_000 * helix_executor::genesis::NANO_PER_HLX;
+            // Chain state as it looks *now*: someone has since been paid, so it no longer
+            // resembles genesis.
+            cs.update_account(&addr(9), |a| a.balance = 12_345);
+        }
+        let live_hash = state.chain_state.read().await.state_hash().to_hex();
+
+        let response = get_genesis(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let served = json["state_hash"].as_str().unwrap();
+
+        assert_ne!(served, live_hash, "must not serve the chain's current state hash");
+
+        let expected = helix_executor::genesis::rebuild_genesis_state(
+            validator,
+            vec![],
+            vec![],
+            100_000 * helix_executor::genesis::NANO_PER_HLX,
+            vec![],
+            Default::default(),
+        )
+        .state_hash()
+        .to_hex();
+        assert_eq!(served, expected, "must serve what a joining node should rebuild to");
     }
 
     /// `from` near `u64::MAX` used to be added directly to `count`, which overflows.

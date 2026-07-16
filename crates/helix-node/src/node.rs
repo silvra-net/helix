@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use helix_consensus::{BftEngine, ConsensusError, DoubleSignEvidence, Proposal, Validator, ValidatorSet};
 use helix_core::{genesis_block, Block, Transaction, TxType};
 use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair, PublicKey, Signature};
@@ -405,26 +405,27 @@ impl HelixNode {
             // never through this path — this is the first time it's been exercised for real.
             info!("No local chain yet — fetching genesis from sync peer {}", peer_url);
             let peer_genesis = fetch_genesis_from_peer(peer_url).await?;
-            let genesis = peer_genesis.block;
+            let genesis = peer_genesis.block.clone();
+
+            // Rebuild through the same function the peer hashed, taking every field from the
+            // peer rather than from this binary's own defaults — they describe a chain this node
+            // isn't joining. `allocations` in particular is replaced, never merged: adding a
+            // local prefund on top would mint HLX the real chain never issued.
+            let state = helix_executor::genesis::rebuild_genesis_state(
+                genesis.header.validator.clone(),
+                peer_genesis.personhood_authorities.clone(),
+                peer_genesis.extra_validators.clone(),
+                peer_genesis.validator_stake,
+                peer_genesis.allocations.clone(),
+                peer_genesis.governance_params.clone(),
+            );
+
+            // Before anything is written. A wrong genesis persisted is a wrong chain that then
+            // applies every subsequent block perfectly on top of it.
+            verify_genesis_reconstruction(&peer_genesis, &state)?;
+
             store.put_block(genesis.clone())?;
             info!(validator = %genesis.header.validator, "Adopted peer's genesis block (height 0)");
-
-            let mut peer_genesis_cfg = GenesisConfig::devnet_with_personhood_authority(
-                genesis.header.validator.clone(),
-                peer_genesis.personhood_authorities,
-            );
-            peer_genesis_cfg.extra_validators = peer_genesis.extra_validators;
-            // Take the chain's real bootstrap stake from the peer rather than keeping the
-            // default this binary would launch a new chain with. Those are the same number
-            // today and need not stay so: retuning the default must not make this node rebuild
-            // a genesis the chain never had and diverge from every other node on it.
-            peer_genesis_cfg.validator_stake = peer_genesis.validator_stake;
-            // Same for the liquid genesis balances: replace, never merge. This node's own
-            // `GENESIS_PREFUND` describes a chain it isn't joining, and adding those balances on
-            // top would mint HLX out of thin air relative to the real chain.
-            peer_genesis_cfg.allocations = peer_genesis.allocations;
-            let mut state = peer_genesis_cfg.build_state();
-            state.governance_params = peer_genesis.governance_params;
             store.save_chain_state(&state)?;
             state
         } else {
@@ -1378,6 +1379,9 @@ struct PeerGenesis {
     extra_validators: Vec<(Address, u64)>,
     validator_stake: u64,
     allocations: Vec<(Address, u64)>,
+    /// The hash the peer's genesis state has. `None` from a peer too old to report it — see
+    /// `verify_genesis_reconstruction`.
+    state_hash: Option<String>,
 }
 
 async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
@@ -1448,6 +1452,7 @@ async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
                 .collect()
         })
         .unwrap_or_default();
+    let state_hash = resp.get("state_hash").and_then(|v| v.as_str()).map(str::to_string);
     Ok(PeerGenesis {
         block,
         personhood_authorities,
@@ -1455,7 +1460,47 @@ async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
         extra_validators,
         validator_stake,
         allocations,
+        state_hash,
     })
+}
+
+/// Refuse to join a chain whose genesis this node cannot reproduce.
+///
+/// Everything genesis needs that isn't in the genesis block travels over `GET /genesis` — but
+/// only the fields anyone thought to send. Whatever the peer *doesn't* mention, this node fills
+/// in from its own constants: `TOTAL_SUPPLY_HLX`, and any field genesis grows in the future. A
+/// binary that disagrees about one of those builds a different ledger from the same blocks and
+/// has no way to notice.
+///
+/// It is not a theoretical concern. Syncing the live chain on 2026-07-16, the published v1.4.0
+/// binary — which predates the genesis stake being transmitted at all — rebuilt genesis from its
+/// own `VALIDATOR_GENESIS_STAKE_HLX = 1_000_000` against a chain that launched with 100_000. It
+/// applied all 2,253 blocks without an error and then reported 1,002,252 HLX in circulation
+/// where 202,252 exist: 800,000 HLX conjured, served over RPC as fact.
+///
+/// Comparing hashes turns that into a refusal to start. A peer too old to send one leaves us
+/// where we were before it existed — no check possible — so we warn rather than refuse, since
+/// refusing would make a new node unable to join a chain of older ones.
+fn verify_genesis_reconstruction(peer_genesis: &PeerGenesis, local: &ChainState) -> Result<()> {
+    let Some(expected) = peer_genesis.state_hash.as_deref() else {
+        warn!(
+            "Sync peer did not report a genesis state hash — it predates the check. Cannot verify \
+             that this node rebuilt the same genesis; a mismatch would go unnoticed."
+        );
+        return Ok(());
+    };
+    let ours = local.state_hash().to_hex();
+    if ours == expected {
+        info!(genesis_state_hash = %ours, "Genesis reconstruction matches the peer's");
+        return Ok(());
+    }
+    bail!(
+        "refusing to join: this node rebuilt a different genesis than the chain it is joining \
+         (ours {ours}, peer's {expected}). Every block would apply cleanly on top of the wrong \
+         ledger and every balance this node reports would be wrong, silently. This build \
+         disagrees with the chain about something genesis depends on — most likely it is older \
+         than the chain's format. Use a build matching the network."
+    )
 }
 
 /// Resolves a `sync_peer` HTTP URL (e.g. `http://seed:8545`) to a dialable libp2p multiaddr
@@ -2308,5 +2353,85 @@ mod handle_p2p_event_tests {
         let issued_after_second = chain_state.read().await.total_issued;
         assert_eq!(issued_after_second, issued_after_first, "the block reward must not be minted twice for the same height");
         assert_eq!(store.read().await.latest_height(), 1, "the duplicate must not re-touch storage either");
+    }
+}
+
+#[cfg(test)]
+mod genesis_verification_tests {
+    use super::*;
+    use helix_core::genesis_block;
+    use helix_crypto::{KeyPair, Signature};
+
+    fn peer_genesis_with(validator_stake: u64, state_hash: Option<String>) -> PeerGenesis {
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&kp.public);
+        PeerGenesis {
+            block: genesis_block(
+                validator,
+                kp.public.clone(),
+                Signature::from_bytes(vec![0u8; 8]),
+            ),
+            personhood_authorities: vec![],
+            governance_params: GovernanceParams::default(),
+            extra_validators: vec![],
+            validator_stake,
+            allocations: vec![],
+            state_hash,
+        }
+    }
+
+    fn rebuilt(pg: &PeerGenesis) -> ChainState {
+        helix_executor::genesis::rebuild_genesis_state(
+            pg.block.header.validator.clone(),
+            pg.personhood_authorities.clone(),
+            pg.extra_validators.clone(),
+            pg.validator_stake,
+            pg.allocations.clone(),
+            pg.governance_params.clone(),
+        )
+    }
+
+    #[test]
+    fn a_matching_reconstruction_is_accepted() {
+        let mut pg = peer_genesis_with(100_000 * NANO_PER_HLX, None);
+        let state = rebuilt(&pg);
+        pg.state_hash = Some(state.state_hash().to_hex());
+        assert!(verify_genesis_reconstruction(&pg, &state).is_ok());
+    }
+
+    /// The real case, reproduced: the published v1.4.0 binary rebuilt genesis with its own
+    /// `VALIDATOR_GENESIS_STAKE_HLX = 1_000_000` against a chain that launched with 100_000,
+    /// synced every block without complaint, and reported 800,000 HLX that do not exist. Any
+    /// disagreement about genesis produces exactly this shape — a state that is wrong from
+    /// block 0 and stays internally consistent forever after.
+    #[test]
+    fn a_node_that_rebuilds_a_different_genesis_refuses_to_join() {
+        let peer = peer_genesis_with(100_000 * NANO_PER_HLX, None);
+        let peer_state = rebuilt(&peer);
+
+        // What an older build produces from the same peer response.
+        let mut stale = peer_genesis_with(100_000 * NANO_PER_HLX, None);
+        stale.block = peer.block.clone();
+        stale.validator_stake = 1_000_000 * NANO_PER_HLX;
+        let stale_state = rebuilt(&stale);
+
+        assert_ne!(peer_state.state_hash(), stale_state.state_hash(), "premise");
+
+        let mut pg = peer;
+        pg.state_hash = Some(peer_state.state_hash().to_hex());
+        let err = verify_genesis_reconstruction(&pg, &stale_state).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refusing to join"), "{msg}");
+        assert!(msg.contains("silently"), "the message must say why it matters: {msg}");
+    }
+
+    /// A peer older than the check cannot send a hash. Refusing would strand a new node against
+    /// a chain of older ones — so we are back where we were before the check existed, and say so,
+    /// rather than pretending the absence of a mismatch is a match.
+    #[test]
+    fn a_peer_too_old_to_report_a_hash_is_allowed_through() {
+        let pg = peer_genesis_with(100_000 * NANO_PER_HLX, None);
+        let state = rebuilt(&pg);
+        assert!(verify_genesis_reconstruction(&pg, &state).is_ok());
     }
 }

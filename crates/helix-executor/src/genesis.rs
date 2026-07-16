@@ -138,6 +138,35 @@ pub struct GenesisConfig {
     pub validator_stake: u64,
 }
 
+/// Rebuild the genesis `ChainState` a chain started from, given the parts that cannot be
+/// re-derived from its genesis block.
+///
+/// The one function both sides of a join use: the peer calls it to publish the hash its genesis
+/// state has (`GET /genesis`), and the joining node calls it to build the state it will run on.
+/// Same inputs, same code — so if the two disagree, the disagreement can only come from their
+/// *binaries*, which is exactly what the comparison is meant to catch. Two copies of this logic
+/// would defeat the check: they could drift and agree on being wrong.
+///
+/// `governance_params` is the peer's *current* value, not necessarily its genesis-time one — see
+/// `get_genesis`'s doc comment for why that gap is accepted. Both sides use the same value, so it
+/// does not affect the comparison.
+pub fn rebuild_genesis_state(
+    validator: Address,
+    personhood_authorities: Vec<PublicKey>,
+    extra_validators: Vec<(Address, u64)>,
+    validator_stake: u64,
+    allocations: Vec<(Address, u64)>,
+    governance_params: crate::governance::GovernanceParams,
+) -> ChainState {
+    let mut cfg = GenesisConfig::devnet_with_personhood_authority(validator, personhood_authorities);
+    cfg.extra_validators = extra_validators;
+    cfg.validator_stake = validator_stake;
+    cfg.allocations = allocations;
+    let mut state = cfg.build_state();
+    state.governance_params = governance_params;
+    state
+}
+
 impl GenesisConfig {
     pub fn devnet(validator: Address) -> Self {
         Self::devnet_with_personhood_authority(validator, Vec::new())
