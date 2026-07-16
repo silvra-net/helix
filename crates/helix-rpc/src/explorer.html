@@ -127,6 +127,14 @@
   }
   #result .none { color: var(--dim); }
   #result .err { color: var(--warn-ink); }
+  #result .sub-h {
+    font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
+    margin: 12px 0 2px; padding-top: 10px; border-top: 1px solid var(--line);
+  }
+  #result table { font-size: 12.5px; }
+  #result td { padding: 5px 8px 5px 0; }
+  #result td:last-child { padding-right: 0; text-align: right; }
+  .dir { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); }
   .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
 
   footer {
@@ -205,6 +213,15 @@
     String(s).replace(/[&<>"']/g, (c) =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+  // Every hash, height and address on the page is a link to the lookup for it. An explorer is
+  // for following the chain — block to its transactions, transaction to its accounts, account
+  // back to its transactions — and without these it only answers questions you can already
+  // phrase, by copying hex out of one box and into another.
+  //
+  // The target is the URL fragment, not a click handler, so the lookup you are looking at has
+  // an address you can share, bookmark, or reload onto. `hashchange` does the routing.
+  const link = (q, text) => `<a href="#${encodeURIComponent(q)}">${esc(text ?? q)}</a>`;
+
   async function api(path) {
     const r = await fetch(path, { headers: { Accept: 'application/json' } });
     if (!r.ok) throw new Error(r.status === 404 ? 'not found' : 'HTTP ' + r.status);
@@ -239,10 +256,10 @@
         .filter(Boolean)
         .map(
           (b) => `<tr>
-            <td class="num">${b.height.toLocaleString()}</td>
+            <td class="num">${link(b.height, b.height.toLocaleString())}</td>
             <td class="num">${b.transactions ? b.transactions.length : 0}</td>
-            <td class="hash">${esc(short(b.validator, 8))}</td>
-            <td class="hash">${esc(short(b.hash, 8))}</td>
+            <td class="hash">${link(b.validator, short(b.validator, 8))}</td>
+            <td class="hash">${link(b.height, short(b.hash, 8))}</td>
           </tr>`
         )
         .join('') || '<tr><td colspan="4" class="hash">no blocks yet</td></tr>';
@@ -252,6 +269,41 @@
   }
 
   const row = (k, v) => `<div class="row"><span>${esc(k)}</span><span>${esc(v)}</span></div>`;
+  const rowLink = (k, q, text) =>
+    `<div class="row"><span>${esc(k)}</span><span>${link(q, text)}</span></div>`;
+
+  // The transactions in a block, or an account's history. `self` is the address being viewed,
+  // if any: rows are then pointed in/out from it and name the other party, since "who paid whom"
+  // is the question a history is read for.
+  //
+  // The type stays on every row even though it costs a column: this chain's history mixes
+  // Delegate and Undelegate in among the transfers, and direction alone renders a 200 HLX
+  // Undelegate — your own stake coming back — as though someone had just paid you 200 HLX.
+  function txTable(txs, self) {
+    if (!txs.length) return '<div class="none" style="padding-top:6px">No transactions.</div>';
+    return '<div class="scroll"><table>' + txs.map((t) => {
+      const out = self && t.from === self;
+      const other = self ? (out ? t.to : t.from) : t.from;
+      const arrow = self ? (out ? '→ ' : '← ') : '';
+      return `<tr>
+        <td class="hash">${link(t.hash, short(t.hash, 6))}</td>
+        <td class="dir">${esc(t.tx_type || '')}</td>
+        <td class="hash">${other ? esc(arrow) + link(other, short(other, 6)) : '—'}</td>
+        <td class="num">${t.amount_hlx != null ? esc(fmtHlx(t.amount_hlx)) : ''}</td>
+      </tr>`;
+    }).join('') + '</table></div>';
+  }
+
+  function showBlock(b) {
+    const txs = b.transactions || [];
+    $('result').innerHTML =
+      row('Block', b.height.toLocaleString()) +
+      row('Hash', b.hash) +
+      rowLink('Proposer', b.validator, b.validator) +
+      row('Base fee', b.base_fee_per_byte + ' nano/byte') +
+      `<div class="sub-h">Transactions (${txs.length})</div>` +
+      txTable(txs);
+  }
 
   async function lookup(q) {
     const out = $('result');
@@ -260,31 +312,41 @@
     out.innerHTML = '<div class="none">looking…</div>';
     try {
       if (/^\d+$/.test(q)) {
-        const b = await api('/blocks/height/' + q);
-        out.innerHTML =
-          row('Block', b.height.toLocaleString()) +
-          row('Hash', b.hash) +
-          row('Proposer', b.validator) +
-          row('Transactions', b.transactions ? b.transactions.length : 0) +
-          row('Base fee', b.base_fee_per_byte + ' nano/byte');
+        showBlock(await api('/blocks/height/' + q));
         return;
       }
       if (/^[0-9a-fA-F]{64}$/.test(q)) {
+        // 64 hex is either a transaction or a block hash — the shape alone can't say which, and
+        // answering "nothing matches" to a block hash copied off this very page is a dead end
+        // the reader has no way to get out of. Try the transaction first (far commoner), then
+        // the block.
+        let t = null;
+        try {
+          t = await api('/transactions/' + q);
+        } catch (e) {
+          showBlock(await api('/blocks/hash/' + q));
+          return;
+        }
         // A confirmed transaction comes back flat (see TxHistoryEntry); one still in the
         // mempool has only a hash and a status, so every other row has to tolerate absence.
-        const t = await api('/transactions/' + q);
         out.innerHTML =
           row('Status', t.status || 'unknown') +
           (t.tx_type ? row('Type', t.tx_type) : '') +
-          (t.block_height != null ? row('Block', t.block_height.toLocaleString()) : '') +
-          (t.from ? row('From', t.from) : '') +
-          (t.from ? row('To', t.to || '—') : '') +
+          (t.block_height != null ? rowLink('Block', t.block_height, t.block_height.toLocaleString()) : '') +
+          (t.from ? rowLink('From', t.from, t.from) : '') +
+          (t.from ? (t.to ? rowLink('To', t.to, t.to) : row('To', '—')) : '') +
           (t.amount_hlx != null ? row('Amount', fmtHlx(t.amount_hlx) + ' HLX') : '') +
           (t.fee_hlx != null ? row('Fee', fmtHlx(t.fee_hlx) + ' HLX') : '') +
           (t.nonce != null ? row('Nonce', t.nonce) : '');
         return;
       }
       const a = await api('/accounts/' + q);
+      // History is a second call, and a failing one must not take the balance down with it:
+      // the account itself is what was asked for.
+      let hist = [];
+      try {
+        hist = (await api('/accounts/' + q + '/transactions')).transactions || [];
+      } catch (e) { /* leave it empty — the account still renders */ }
       out.innerHTML =
         row('Address', a.address) +
         row('Balance', fmtHlx(a.balance_hlx) + ' HLX') +
@@ -293,7 +355,9 @@
           ? row('Unbonding', fmtHlx(a.unbonding_stake_hlx) + ' HLX until #' + a.unbonding_unlock_height)
           : '') +
         (a.unbonding_source ? row('Slashable for', a.unbonding_source) : '') +
-        row('Nonce', a.nonce);
+        row('Nonce', a.nonce) +
+        `<div class="sub-h">Transactions (${hist.length})</div>` +
+        txTable(hist.slice(0, 15), a.address);
     } catch (e) {
       out.innerHTML =
         `<div class="err">${esc(e.message)}</div>` +
@@ -302,11 +366,28 @@
     }
   }
 
+  // The fragment is the single source of truth for what's on screen, so a link to a block is a
+  // link anyone can open. Submitting the form only sets it; routing happens in one place.
+  function fromHash() {
+    const q = decodeURIComponent(location.hash.slice(1));
+    if (!q) return;
+    $('q').value = q;
+    lookup(q);
+  }
+
   $('lookup').addEventListener('submit', (e) => {
     e.preventDefault();
-    lookup($('q').value);
+    const q = $('q').value.trim();
+    if (!q) return;
+    const target = '#' + encodeURIComponent(q);
+    // Setting an unchanged hash fires no event — searching the same thing twice must still work.
+    if (location.hash === target) lookup(q);
+    else location.hash = target;
   });
+
+  window.addEventListener('hashchange', fromHash);
 
   refresh();
   setInterval(refresh, 4000);
+  fromHash();
 </script>
