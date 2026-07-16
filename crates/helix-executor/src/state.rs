@@ -272,6 +272,21 @@ pub struct ChainState {
     /// changed, validators slashed, etc).
     #[serde(default)]
     pub genesis_extra_validators: Vec<(Address, u64)>,
+    /// The bootstrap stake (nano-HLX) the *primary* genesis validator was given at height 0 —
+    /// the same kind of record as `genesis_extra_validators`, for the one validator that
+    /// predates it.
+    ///
+    /// It has to be recorded rather than re-derived for exactly the reason stated above: today's
+    /// `accounts` may have drifted from genesis by any amount. But it also has to be recorded
+    /// rather than read from a compile-time constant, which is what every joining node did
+    /// before: `GenesisConfig::build_state` used to hardcode `VALIDATOR_GENESIS_STAKE_HLX`, so
+    /// the constant was silently part of consensus — change it, and a node bootstrapping against
+    /// an existing chain rebuilds a *different* genesis and diverges, the same trap
+    /// `total_supply` carries (it is still reconstructed from a constant by
+    /// `HelixDb::load_chain_state`'s caller). Storing it here is what lets the constant be
+    /// retuned later without forking every chain that already launched under the old value.
+    #[serde(default)]
+    pub genesis_validator_stake: u64,
 }
 
 impl ChainState {
@@ -297,6 +312,7 @@ impl ChainState {
             redelegations: HashMap::new(),
             contract_storage: HashMap::new(),
             genesis_extra_validators: Vec::new(),
+            genesis_validator_stake: 0,
         }
     }
 
@@ -710,6 +726,7 @@ impl ChainState {
             // PublicKey above) — Vec<u8> already implements Ord lexicographically.
             contract_storage: BTreeMap<&'a str, BTreeMap<&'a Vec<u8>, &'a Vec<u8>>>,
             genesis_extra_validators: BTreeMap<&'a str, u64>,
+            genesis_validator_stake: u64,
         }
 
         let canonical = Canonical {
@@ -766,6 +783,7 @@ impl ChainState {
                 .iter()
                 .map(|(a, s)| (a.as_str(), *s))
                 .collect(),
+            genesis_validator_stake: self.genesis_validator_stake,
         };
 
         let bytes = bincode::serialize(&canonical).expect("canonical chain state serialization is infallible");

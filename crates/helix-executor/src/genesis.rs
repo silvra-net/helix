@@ -24,11 +24,16 @@ pub const TOTAL_SUPPLY_HLX: u64 = 33_000_000;
 /// low enough that legitimate node operators can participate.
 pub const MIN_VALIDATOR_STAKE: u64 = 100_000 * NANO_PER_HLX;
 
-/// Validator pre-stake at genesis.  The validator needs this staked from block 0 so it
-/// survives the first epoch rotation (which filters by MIN_VALIDATOR_STAKE). This is the
-/// ONLY genesis allocation — see `GENESIS_PREFUND`'s doc comment for why there is
-/// deliberately no liquid pre-mine on top of it.
-const VALIDATOR_GENESIS_STAKE_HLX: u64 = 1_000_000; // 1 M HLX
+/// Default validator pre-stake at genesis, for a chain being launched fresh. The validator
+/// needs this staked from block 0 so it survives the first epoch rotation (which filters by
+/// MIN_VALIDATOR_STAKE). This is the ONLY genesis allocation — see `GENESIS_PREFUND`'s doc
+/// comment for why there is deliberately no liquid pre-mine on top of it.
+///
+/// Only a *default*: the value a chain actually launched with is recorded in
+/// `ChainState::genesis_validator_stake` and handed to joining nodes via `GET /genesis`, so
+/// retuning this constant does not retroactively rewrite the genesis of chains already
+/// running under the old value. It applies to new chains only.
+pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 1_000_000; // 1 M HLX
 
 /// Pre-funded genesis wallets beyond the validator's bootstrap stake: (address, balance_HLX).
 /// Empty by design (decision 2026-07-15, superseding the 2026-07-05 decision to liquid-dump
@@ -101,6 +106,12 @@ pub struct GenesisConfig {
     /// `sync_peer`, from that peer's `GET /genesis` response (`ChainState::genesis_extra_validators`
     /// carries it forward so it can be replayed identically by every later-joining node).
     pub extra_validators: Vec<(Address, u64)>,
+    /// Bootstrap stake (nano-HLX) for `validator`. Defaults to `VALIDATOR_GENESIS_STAKE_HLX`
+    /// for a chain launching fresh; a node joining an existing chain overwrites it with that
+    /// chain's real value from the peer's `GET /genesis`, rather than trusting its own binary's
+    /// constant to still match what the chain launched with years earlier. See
+    /// `ChainState::genesis_validator_stake`.
+    pub validator_stake: u64,
 }
 
 impl GenesisConfig {
@@ -118,7 +129,13 @@ impl GenesisConfig {
                 allocations.push((addr, hlx * NANO_PER_HLX));
             }
         }
-        GenesisConfig { allocations, validator, personhood_authorities, extra_validators: Vec::new() }
+        GenesisConfig {
+            allocations,
+            validator,
+            personhood_authorities,
+            extra_validators: Vec::new(),
+            validator_stake: VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX,
+        }
     }
 
     /// Build the initial ChainState.
@@ -140,8 +157,9 @@ impl GenesisConfig {
         }
 
         // Validator genesis stake — staked directly so it survives epoch 1 rotation
-        let validator_stake = VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX;
+        let validator_stake = self.validator_stake;
         state.set_validator_stake(&self.validator, validator_stake);
+        state.genesis_validator_stake = validator_stake;
         issued += validator_stake;
 
         // Extra genesis validators, if configured — see `extra_validators`'s doc comment.
@@ -200,6 +218,57 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn some_address() -> Address {
+        Address::from_public_key(&helix_crypto::KeyPair::generate().public)
+    }
+
+    /// A fresh chain launches on the compile-time default, and records that it did — the record
+    /// is what later lets the default change without rewriting this chain's genesis.
+    #[test]
+    fn a_fresh_genesis_records_the_stake_it_launched_with() {
+        let validator = some_address();
+        let state = GenesisConfig::devnet(validator.clone()).build_state();
+
+        let expected = VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX;
+        assert_eq!(state.genesis_validator_stake, expected);
+        assert_eq!(state.accounts[&validator.to_string()].staked, expected);
+    }
+
+    /// The path a joining node takes: it overrides `validator_stake` with the value its peer
+    /// reports, and `build_state` must honour that instead of the constant. Without this the
+    /// node would rebuild a genesis the chain never had and diverge from everyone on it.
+    #[test]
+    fn build_state_stakes_the_configured_amount_not_the_compile_time_default() {
+        let validator = some_address();
+        // Deliberately unlike the default, standing in for a chain that launched under a
+        // differently-tuned build.
+        let peer_stake = 330_000 * NANO_PER_HLX;
+        assert_ne!(peer_stake, VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX);
+
+        let mut cfg = GenesisConfig::devnet(validator.clone());
+        cfg.validator_stake = peer_stake;
+        let state = cfg.build_state();
+
+        assert_eq!(state.accounts[&validator.to_string()].staked, peer_stake);
+        assert_eq!(state.genesis_validator_stake, peer_stake);
+        assert_eq!(state.total_issued, peer_stake, "issuance must count what was really staked");
+    }
+
+    /// Two nodes that disagree about the genesis stake must produce different `state_hash`es —
+    /// otherwise the divergence this whole field exists to prevent would go unnoticed by the
+    /// one tool built to detect it.
+    #[test]
+    fn a_different_genesis_stake_shows_up_in_the_state_hash() {
+        let validator = some_address();
+        let default_state = GenesisConfig::devnet(validator.clone()).build_state();
+
+        let mut cfg = GenesisConfig::devnet(validator);
+        cfg.validator_stake = 330_000 * NANO_PER_HLX;
+        let retuned_state = cfg.build_state();
+
+        assert_ne!(default_state.state_hash(), retuned_state.state_hash());
+    }
 
     #[test]
     fn scheduled_block_reward_starts_at_initial_reward() {

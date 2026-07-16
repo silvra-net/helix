@@ -870,7 +870,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 |---|---|---|
 | GET | `/` | Node info & endpoint list |
 | GET | `/status` | Height, hash, mempool size, supply stats |
-| GET | `/genesis` | This chain's genesis block + governance params + any `genesis_extra_validators` (used by fresh nodes joining via `sync_peer`) |
+| GET | `/genesis` | Everything needed to rebuild this chain's exact genesis state: the genesis block, governance params, the bootstrap validator's stake, and any `genesis_extra_validators` (used by fresh nodes joining via `sync_peer`) |
 | GET | `/blocks/latest` | Latest block with full transaction list |
 | GET | `/blocks/height/:n` | Block by height |
 | GET | `/blocks/height/:n/header` | Header only (for light clients) |

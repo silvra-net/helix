@@ -265,6 +265,11 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
             "personhood_authorities": personhood_authorities,
             "governance_params": governance_params,
             "extra_validators": extra_validators,
+            // What the genesis validator was actually staked at height 0. Served for the same
+            // reason as `extra_validators`, and it must come from chain state rather than
+            // `VALIDATOR_GENESIS_STAKE_HLX`: the constant is a default for *new* chains and may
+            // since have been retuned, whereas this chain's genesis is fixed forever.
+            "validator_stake_nano": cs.genesis_validator_stake,
         })),
     )
 }
@@ -1204,6 +1209,32 @@ mod tests {
             p2p_port: 0,
             p2p_command_tx,
         }
+    }
+
+    /// `/genesis` must report the stake *this chain* launched with, taken from chain state —
+    /// not `VALIDATOR_GENESIS_STAKE_HLX`, which only describes how a new chain would launch on
+    /// today's build. A joining node believes this number, so serving the constant would hand
+    /// it a genesis the chain never had the moment the constant is ever retuned.
+    #[tokio::test]
+    async fn get_genesis_reports_the_chains_own_validator_stake_not_the_binarys_default() {
+        let state = fresh_test_state();
+        let validator = addr(7);
+        state.store.write().await.put_block(block(0, &validator, vec![])).unwrap();
+
+        // Deliberately unlike the compile-time default — a chain launched under another build.
+        let launched_with = 330_000 * helix_executor::genesis::NANO_PER_HLX;
+        assert_ne!(
+            launched_with,
+            helix_executor::genesis::VALIDATOR_GENESIS_STAKE_HLX
+                * helix_executor::genesis::NANO_PER_HLX
+        );
+        state.chain_state.write().await.genesis_validator_stake = launched_with;
+
+        let response = get_genesis(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["validator_stake_nano"].as_u64(), Some(launched_with));
     }
 
     /// `from` near `u64::MAX` used to be added directly to `count`, which overflows.

@@ -9,7 +9,7 @@ use helix_core::{genesis_block, Block, Transaction, TxType};
 use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair, PublicKey, Signature};
 use helix_executor::{
     execute_block,
-    genesis::{GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX},
+    genesis::{GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX, VALIDATOR_GENESIS_STAKE_HLX},
     state::ChainState,
     GovernanceParams,
 };
@@ -404,18 +404,23 @@ impl HelixNode {
             // fleet was in fact bootstrapped by copying an already-populated database file,
             // never through this path — this is the first time it's been exercised for real.
             info!("No local chain yet — fetching genesis from sync peer {}", peer_url);
-            let (genesis, personhood_authorities, governance_params, peer_extra_validators) =
-                fetch_genesis_from_peer(peer_url).await?;
+            let peer_genesis = fetch_genesis_from_peer(peer_url).await?;
+            let genesis = peer_genesis.block;
             store.put_block(genesis.clone())?;
             info!(validator = %genesis.header.validator, "Adopted peer's genesis block (height 0)");
 
             let mut peer_genesis_cfg = GenesisConfig::devnet_with_personhood_authority(
                 genesis.header.validator.clone(),
-                personhood_authorities,
+                peer_genesis.personhood_authorities,
             );
-            peer_genesis_cfg.extra_validators = peer_extra_validators;
+            peer_genesis_cfg.extra_validators = peer_genesis.extra_validators;
+            // Take the chain's real bootstrap stake from the peer rather than keeping the
+            // default this binary would launch a new chain with. Those are the same number
+            // today and need not stay so: retuning the default must not make this node rebuild
+            // a genesis the chain never had and diverge from every other node on it.
+            peer_genesis_cfg.validator_stake = peer_genesis.validator_stake;
             let mut state = peer_genesis_cfg.build_state();
-            state.governance_params = governance_params;
+            state.governance_params = peer_genesis.governance_params;
             store.save_chain_state(&state)?;
             state
         } else {
@@ -1338,9 +1343,20 @@ async fn broadcast_outbound_votes(
 /// gap itself: a freshly re-synced node rejecting real historical blocks as coming from an
 /// "unstaked" validator that has, in fact, been staked above the true (lower) threshold since
 /// block 106.
-async fn fetch_genesis_from_peer(
-    peer_url: &str,
-) -> Result<(Block, Vec<PublicKey>, GovernanceParams, Vec<(Address, u64)>)> {
+/// Everything a peer's `GET /genesis` tells us about the chain it launched, i.e. everything
+/// needed to rebuild that exact genesis state locally. Every field here is one that cannot be
+/// re-derived from the genesis block alone, and — just as importantly — must not be taken from
+/// this node's own compile-time defaults, which describe how a *new* chain would launch today,
+/// not how *this* chain launched.
+struct PeerGenesis {
+    block: Block,
+    personhood_authorities: Vec<PublicKey>,
+    governance_params: GovernanceParams,
+    extra_validators: Vec<(Address, u64)>,
+    validator_stake: u64,
+}
+
+async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -1384,7 +1400,21 @@ async fn fetch_genesis_from_peer(
                 .collect()
         })
         .unwrap_or_default();
-    Ok((block, personhood_authorities, governance_params, extra_validators))
+    // A peer too old to report this leaves us no better source than our own default — the same
+    // position every node was in before this field existed. Falling back keeps such a peer
+    // syncable instead of refusing to join it; it is only correct as long as that chain did
+    // launch on the default, which is exactly the case for every chain predating this field.
+    let validator_stake = resp
+        .get("validator_stake_nano")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX);
+    Ok(PeerGenesis {
+        block,
+        personhood_authorities,
+        governance_params,
+        extra_validators,
+        validator_stake,
+    })
 }
 
 /// Resolves a `sync_peer` HTTP URL (e.g. `http://seed:8545`) to a dialable libp2p multiaddr

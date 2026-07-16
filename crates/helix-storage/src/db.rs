@@ -64,6 +64,7 @@ const META_ISSUED: &str = "total_issued";
 const META_MIN_VALIDATOR_STAKE: &str = "gov_min_validator_stake";
 const META_FUEL_PER_FEE_UNIT: &str = "gov_fuel_per_fee_unit";
 const META_NEXT_PROPOSAL_ID: &str = "gov_next_proposal_id";
+const META_GENESIS_VALIDATOR_STAKE: &str = "genesis_validator_stake";
 
 pub struct HelixDb {
     db: Database,
@@ -198,6 +199,11 @@ impl HelixDb {
                 .map_err(|e| StorageError::Db(e.to_string()))?;
             meta.insert(META_ISSUED, &state.total_issued.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
+            meta.insert(
+                META_GENESIS_VALIDATOR_STAKE,
+                &state.genesis_validator_stake.to_le_bytes()[..],
+            )
+            .map_err(|e| StorageError::Db(e.to_string()))?;
             meta.insert(
                 META_MIN_VALIDATOR_STAKE,
                 &state.governance_params.min_validator_stake.to_le_bytes()[..],
@@ -434,6 +440,18 @@ impl HelixDb {
                 .unwrap_or(default_params.fuel_per_fee_unit),
         };
         let next_proposal_id = read_meta_u64(META_NEXT_PROPOSAL_ID).unwrap_or(0);
+        // Absent only for a chain that launched before this key existed, and such a chain can
+        // only have used the compile-time default — so falling back to it recovers the true
+        // historical value rather than guessing. The next `save_chain_state` (i.e. the next
+        // block) writes it down, after which the constant no longer has any say over this
+        // chain's genesis and can be retuned freely. That ordering matters: deploy this while
+        // `VALIDATOR_GENESIS_STAKE_HLX` still holds the value the chain actually launched with,
+        // never together with a change to it, or the migration pins down the wrong number.
+        let genesis_validator_stake = read_meta_u64(META_GENESIS_VALIDATOR_STAKE)
+            .unwrap_or(
+                helix_executor::genesis::VALIDATOR_GENESIS_STAKE_HLX
+                    * helix_executor::genesis::NANO_PER_HLX,
+            );
 
         Ok(ChainState {
             accounts,
@@ -456,6 +474,7 @@ impl HelixDb {
             redelegations,
             contract_storage,
             genesis_extra_validators,
+            genesis_validator_stake,
         })
     }
 
@@ -899,6 +918,67 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn genesis_validator_stake_survives_reopening_the_database() {
+        let (db, path) = fresh_db();
+        // Unlike the compile-time default, standing in for a chain launched under a
+        // differently-tuned build — the case the stored value exists to survive.
+        let launched_with = 330_000 * helix_executor::genesis::NANO_PER_HLX;
+
+        let mut state = ChainState::new(1_000_000);
+        state.genesis_validator_stake = launched_with;
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert_eq!(
+            loaded.genesis_validator_stake, launched_with,
+            "a restart must not quietly swap this chain's genesis stake for the binary's default"
+        );
+    }
+
+    /// A database written before this key existed must come back with the compile-time default,
+    /// because that is provably what such a chain launched with — and the next save writes it
+    /// down, so the constant stops having a say from then on. Get this wrong and the migration
+    /// pins the wrong number into a live chain's genesis forever.
+    #[test]
+    fn a_database_predating_the_genesis_stake_key_falls_back_to_the_default() {
+        let (db, path) = fresh_db();
+
+        // Save normally, then delete the key to reproduce a DB written by an older build.
+        let state = ChainState::new(1_000_000);
+        db.save_chain_state(&state).unwrap();
+        {
+            let tx = db.db.begin_write().unwrap();
+            {
+                let mut meta = tx.open_table(META).unwrap();
+                meta.remove(META_GENESIS_VALIDATOR_STAKE).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        drop(db);
+
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+        assert_eq!(
+            loaded.genesis_validator_stake,
+            helix_executor::genesis::VALIDATOR_GENESIS_STAKE_HLX
+                * helix_executor::genesis::NANO_PER_HLX,
+        );
+
+        // The migration: one save is enough to pin it down permanently.
+        db.save_chain_state(&loaded).unwrap();
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        assert_eq!(
+            db.load_chain_state(1_000_000).unwrap().genesis_validator_stake,
+            helix_executor::genesis::VALIDATOR_GENESIS_STAKE_HLX
+                * helix_executor::genesis::NANO_PER_HLX,
+        );
     }
 
     #[test]
