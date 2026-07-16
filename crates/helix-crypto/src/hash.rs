@@ -29,10 +29,16 @@ impl Hash {
         hex::encode(self.0)
     }
 
+    /// Valid hex of the wrong length is an error, not a panic. `copy_from_slice` asserts on a
+    /// length mismatch, and this parses hashes straight out of URLs: `GET /transactions/abcd`
+    /// was decoding two bytes into a 32-byte array and taking the worker task down with it,
+    /// from anywhere on the internet, no authentication involved.
     pub fn from_hex(s: &str) -> Result<Self, hex::FromHexError> {
         let bytes = hex::decode(s)?;
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| hex::FromHexError::InvalidStringLength)?;
         Ok(Hash(arr))
     }
 
@@ -162,6 +168,18 @@ pub fn verify_merkle_proof(leaf: Hash, proof: &[MerkleProofStep], root: Hash) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GET /transactions/abcd` panicked the RPC worker on the live node: valid hex, wrong
+    /// length, straight into `copy_from_slice`. Hashes are parsed from URLs, so anyone on the
+    /// internet could reach this. Every length that isn't 32 bytes must come back as an error.
+    #[test]
+    fn hex_of_the_wrong_length_is_an_error_and_not_a_panic() {
+        for s in ["abcd", "", "ab", &"00".repeat(31), &"00".repeat(33)] {
+            assert!(Hash::from_hex(s).is_err(), "{s:?} must not parse as a hash");
+        }
+        assert!(Hash::from_hex("zz".repeat(32).as_str()).is_err(), "non-hex must still error");
+        assert!(Hash::from_hex(&"00".repeat(32)).is_ok(), "a real 32-byte hash still parses");
+    }
 
     #[test]
     fn test_hash_digest() {
