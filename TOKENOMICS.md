@@ -10,25 +10,35 @@ chain by a 2/3-of-stake governance proposal; everything else is fixed at genesis
 
 ## The one-paragraph version
 
-No pre-mine. 1,000,000 HLX is staked (not liquid) by the bootstrap validator at genesis so
-the chain can produce blocks at all; every other coin is *earned* by producing blocks, via a
-Bitcoin-shaped halving emission. Half of every transaction fee is burned, half pays the
-block's validator. Security comes from staked HLX (Proof-of-Stake), not from the emission
-schedule — the two are deliberately decoupled.
+No pre-mine. Genesis hands the bootstrap validator 200,000 HLX and nothing else: 100,000
+staked — exactly the minimum the rules demand of any validator — so the chain can produce
+blocks at all, plus 100,000 liquid so a slash that drops it under that minimum is recoverable.
+Every other coin is *earned* by producing blocks, via a Bitcoin-shaped halving emission. Each
+transaction burns a base fee proportional to its size and tips the validator whatever was paid
+above it. Security comes from staked HLX (Proof-of-Stake), not from the emission schedule — the
+two are deliberately decoupled.
 
 ## Supply
 
 | Quantity | Value |
 |---|---|
 | Hard supply cap (`TOTAL_SUPPLY_HLX`) | 33,000,000 HLX |
-| Genesis stake (bootstrap validator, non-liquid) | 1,000,000 HLX |
+| Genesis stake (bootstrap validator, non-liquid) | 100,000 HLX (= `MIN_VALIDATOR_STAKE`) |
+| Genesis liquid reserve (bootstrap validator) | 100,000 HLX (slash recovery — see below) |
+| Genesis total | 200,000 HLX (~0.6 % of what the chain ever reaches) |
 | Initial block reward | 1 HLX/block |
 | Halving interval | 15,768,000 blocks (~1 year at 2 s blocks) |
-| Liquid pre-mine | none |
+| Founder pre-mine beyond the above | none |
 
-**Emission curve.** The reward is `1 HLX >> era`, where `era = height / 15,768,000`. It
-halves once per ~year and integer-divides to **zero after ~30 years** (era 30: `1e9 nano >> 30
-== 0`). Summed, total emission converges to:
+**Emission curve.** The reward is `1 HLX >> era`, where `era = height / 15,768,000`. It halves
+once per ~year and integer-divides to zero at era 30 (`1e9 nano >> 30 == 0`).
+
+"Thirty years" is the arithmetic, not the deadline: halving means the subsidy stops *mattering*
+long before it stops existing. By **year 10** it is ~42 HLX/day across the entire validator set,
+by year 15 about one. Anything that depends on the subsidy — validator income above all — has to
+work by then, not by year 30. See [what pays for security](#the-one-real-open-question-what-pays-for-security-once-emission-stops).
+
+Summed, total emission converges to:
 
 ```
 Σ (1 HLX >> era) × 15,768,000 blocks  ≈  2 × 15,768,000  ≈  31,536,000 HLX
