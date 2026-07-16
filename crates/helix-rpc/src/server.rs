@@ -154,6 +154,10 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
         total_burned_hlx: chain.total_burned as f64 / 1_000_000_000.0,
         state_hash: chain.state_hash().to_hex(),
         p2p_port: state.p2p_port,
+        // Read off the mempool, which the node keeps in lockstep with the consensus engine
+        // (`publish_base_fee`) — the same value admission here charges, so a client that prices
+        // against it gets a transaction this node will actually accept.
+        base_fee_per_byte: mempool.base_fee_per_byte(),
     })
 }
 
@@ -1007,7 +1011,9 @@ mod tests {
         let (state, path) = fresh_app_state();
         let keypair = KeyPair::generate();
         let alice = Address::from_public_key(&keypair.public);
-        let mut pending = Transaction { fee: 1_000, public_key: keypair.public.clone(), ..tx(&alice, &addr(2), 1, 0) };
+        // Clearing the flat min_fee is not enough: a real ML-DSA-signed transfer is ~5.4 KB and
+        // owes ~5410 nano at the base-fee floor alone.
+        let mut pending = Transaction { fee: 10_000, public_key: keypair.public.clone(), ..tx(&alice, &addr(2), 1, 0) };
         pending.signature = keypair.sign(pending.signing_hash().as_bytes()).unwrap();
         let hash = pending.hash();
         state.mempool.write().await.add(pending).unwrap();
@@ -1181,7 +1187,9 @@ mod tests {
         let alice = Address::from_public_key(&keypair.public);
         let bob = addr(2);
         let mut submitted = Transaction {
-            fee: 1_000, // clears Mempool::DEFAULT_MIN_FEE
+            // Clears the base fee for its own size, not merely Mempool's flat min_fee — that
+            // distinction is what this comment used to get wrong, along with the rest of the suite.
+            fee: 10_000,
             public_key: keypair.public.clone(),
             ..tx(&alice, &bob, 1, 0)
         };

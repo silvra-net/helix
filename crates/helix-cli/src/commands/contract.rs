@@ -5,10 +5,10 @@ use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
+use crate::fee::price_and_sign;
 use crate::keyfile::KeyFile;
 
 const NANO_PER_HLX: f64 = 1_000_000_000.0;
-const DEFAULT_FEE_NANO: u64 = 10_000; // 0.00001 HLX
 
 #[derive(Subcommand)]
 pub enum ContractCmd {
@@ -20,8 +20,9 @@ pub enum ContractCmd {
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
         /// Fee in nano-HLX (default: 10000)
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         /// Node nonce override (auto-fetched if omitted)
         #[arg(long)]
         nonce: Option<u64>,
@@ -41,8 +42,9 @@ pub enum ContractCmd {
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
         /// Fee in nano-HLX — also doubles as the WASM execution fuel budget (default: 10000)
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         /// Node nonce override (auto-fetched if omitted)
         #[arg(long)]
         nonce: Option<u64>,
@@ -71,7 +73,7 @@ pub async fn run(cmd: ContractCmd, node: &str) -> Result<()> {
 async fn deploy(
     wasm_path: PathBuf,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
@@ -99,7 +101,7 @@ async fn deploy(
         from: from.clone(),
         to: None,
         amount: 0,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: bytecode,
         crypto_version: kp.scheme,
@@ -107,11 +109,10 @@ async fn deploy(
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("Deploying contract from {}", kf.address);
-    println!("  Fee   : {} nano-HLX", fee);
+    println!("  Fee   : {} nano-HLX", tx.fee);
     println!("  Nonce : {}", nonce);
 
     let res = submit(&tx, node).await?;
@@ -127,7 +128,7 @@ async fn call(
     amount_hlx: f64,
     data: Option<String>,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
@@ -155,7 +156,7 @@ async fn call(
         from: from.clone(),
         to: Some(to_addr),
         amount: amount_nano,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: data.map(|d| d.into_bytes()).unwrap_or_default(),
         crypto_version: kp.scheme,
@@ -163,12 +164,11 @@ async fn call(
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("Calling contract {}", address);
     println!("  Amount: {:.9} HLX", amount_hlx);
-    println!("  Fee   : {} nano-HLX (execution fuel budget)", fee);
+    println!("  Fee   : {} nano-HLX (execution fuel budget)", tx.fee);
     println!("  Nonce : {}", nonce);
 
     let res = submit(&tx, node).await?;

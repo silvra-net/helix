@@ -618,7 +618,7 @@ impl HelixNode {
         // diverging from peers that never restarted. The engine keeps this value out of its own
         // consensus state; the node (which holds the blocks) is the source of truth for it.
         if let Ok(tip) = self.store.read().await.get_block_by_height(genesis_height) {
-            engine.write().await.set_base_fee_per_byte(base_fee_for_next_block(&tip));
+            publish_base_fee(&engine, &self.mempool, base_fee_for_next_block(&tip)).await;
         }
 
         // Guards against a genuine race between this node's two independent block-ingestion
@@ -674,6 +674,7 @@ impl HelixNode {
             self.store.clone(),
             self.chain_state.clone(),
             engine.clone(),
+            self.mempool.clone(),
             last_applied_height.clone(),
         ));
 
@@ -966,6 +967,24 @@ fn base_fee_for_next_block(block: &Block) -> u64 {
     )
 }
 
+/// Publish the next block's base fee to both components that need it: the engine, which stamps
+/// it into blocks it proposes and rejects blocks carrying anything else, and the mempool, which
+/// refuses transactions that cannot afford it.
+///
+/// One function rather than two calls at each of the three sites that learn a new base fee
+/// (startup from the persisted tip, every commit, RPC catch-up). If the two ever drift apart the
+/// pool starts lying about what it will accept — admitting transactions doomed to fail at
+/// execution, or turning away ones that would have worked. Keeping them adjacent makes adding a
+/// fourth site that updates only one of them the harder thing to do by accident.
+async fn publish_base_fee(
+    engine: &Arc<RwLock<BftEngine>>,
+    mempool: &Arc<RwLock<Mempool>>,
+    base_fee_per_byte: u64,
+) {
+    engine.write().await.set_base_fee_per_byte(base_fee_per_byte);
+    mempool.write().await.set_base_fee_per_byte(base_fee_per_byte);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_finalized_block(
     block: Block,
@@ -1141,7 +1160,7 @@ async fn apply_finalized_block(
     // Advance the EIP-1559 base fee now that this block is committed: the next block produced
     // or validated by this node must carry `next_base_fee`. Both ingestion paths funnel through
     // here, so the engine's expected base fee stays in lockstep with the persisted tip.
-    engine.write().await.set_base_fee_per_byte(next_base_fee);
+    publish_base_fee(engine, mempool, next_base_fee).await;
 
     { mempool.write().await.remove_committed(&tx_hashes); }
 
@@ -1505,6 +1524,7 @@ async fn rpc_sync_loop(
     store: Arc<RwLock<HelixDb>>,
     chain_state: Arc<RwLock<ChainState>>,
     engine: Arc<RwLock<BftEngine>>,
+    mempool: Arc<RwLock<Mempool>>,
     last_applied_height: Arc<Mutex<u64>>,
 ) {
     let Some(peer_url) = sync_peer else {
@@ -1569,7 +1589,7 @@ async fn rpc_sync_loop(
                 // bypassed apply_finalized_block, so without this the engine would keep a stale
                 // base fee and stamp/validate the wrong value for its next block.
                 if let Ok(tip) = store.read().await.get_block_by_height(new_height) {
-                    engine.write().await.set_base_fee_per_byte(base_fee_for_next_block(&tip));
+                    publish_base_fee(&engine, &mempool, base_fee_for_next_block(&tip)).await;
                 }
                 info!(
                     applied,

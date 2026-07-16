@@ -6,9 +6,9 @@ use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 use helix_executor::governance::{encode_proposal, encode_vote, GovernanceParam};
 
+use crate::fee::price_and_sign;
 use crate::keyfile::KeyFile;
 
-const DEFAULT_FEE_NANO: u64 = 10_000; // 0.00001 HLX
 
 #[derive(Clone, clap::ValueEnum)]
 pub enum GovParamArg {
@@ -38,8 +38,9 @@ pub enum GovernanceCmd {
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
         /// Fee in nano-HLX (default: 10000)
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
     },
     /// Cast a stake-weighted yes-vote on a pending proposal
     Vote {
@@ -49,8 +50,9 @@ pub enum GovernanceCmd {
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
         /// Fee in nano-HLX (default: 10000)
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
     },
     /// Show a single proposal's status
     Show {
@@ -79,7 +81,7 @@ async fn propose(
     param: GovParamArg,
     new_value: u64,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
@@ -100,7 +102,7 @@ async fn propose(
         from: from.clone(),
         to: None,
         amount: 0,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: encode_proposal(param.into(), new_value),
         crypto_version: kp.scheme,
@@ -108,12 +110,11 @@ async fn propose(
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("Creating governance proposal from {}", kf.address);
     println!("  New value : {}", new_value);
-    println!("  Fee       : {} nano-HLX", fee);
+    println!("  Fee       : {} nano-HLX", tx.fee);
     println!("  Nonce     : {}", nonce);
 
     let res = submit(&tx, node).await?;
@@ -123,7 +124,7 @@ async fn propose(
     Ok(())
 }
 
-async fn vote(proposal_id: u64, key_path: PathBuf, fee: u64, node: &str) -> Result<()> {
+async fn vote(proposal_id: u64, key_path: PathBuf, fee: Option<u64>, node: &str) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
     let kp = if kf.is_encrypted() {
         let pass = rpassword_read("Wallet passphrase: ")?;
@@ -142,7 +143,7 @@ async fn vote(proposal_id: u64, key_path: PathBuf, fee: u64, node: &str) -> Resu
         from: from.clone(),
         to: None,
         amount: 0,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: encode_vote(proposal_id),
         crypto_version: kp.scheme,
@@ -150,11 +151,10 @@ async fn vote(proposal_id: u64, key_path: PathBuf, fee: u64, node: &str) -> Resu
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("Voting yes on proposal {} as {}", proposal_id, kf.address);
-    println!("  Fee   : {} nano-HLX", fee);
+    println!("  Fee   : {} nano-HLX", tx.fee);
     println!("  Nonce : {}", nonce);
 
     let res = submit(&tx, node).await?;

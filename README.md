@@ -473,9 +473,30 @@ already the JSON format.)*
 
 ```bash
 helix tx send hlx... 10.5 --key alice.json            # send 10.5 HLX
-helix tx send hlx... 10.5 --key alice.json --fee 20000  # custom fee (default: 10000 nano-HLX)
+helix tx send hlx... 10.5 --key alice.json --fee 20000  # pin the fee yourself; omit --fee and
+                                                       # the CLI prices it off the chain's
+                                                       # current base fee (see Fees, below)
 helix tx status <hash>                                 # confirmed / pending / not found
 ```
+
+### Fees
+
+Helix charges **per transaction byte**, not per transaction: a block carries a base fee
+(`base_fee_per_byte`, visible in `helix chain status`) and every transaction owes
+`base_fee_per_byte × its size`. That portion is burned; anything above it tips the validator and
+buys priority. The base fee drifts up to ±12.5% per block toward a 1 MB target, so it rises under
+load and decays back to its floor of 1 nano/byte when blocks are quiet.
+
+Size matters more here than on most chains, because Helix signs with post-quantum ML-DSA: a
+signature is 3,309 bytes and a public key 1,952, so **a plain transfer is ~5.4 KB and costs
+~5,410 nano-HLX at the floor** — about 0.0000054 HLX. A contract deploy carries its own bytecode
+on top and costs proportionally more (up to ~71,000 nano at the 64 KiB code limit).
+
+This is why `--fee` is optional and best left alone: omit it and the CLI asks the node what it
+currently charges, prices the transaction for its actual size, and adds 100% headroom so it still
+clears if the base fee climbs while the transaction waits. Pin `--fee` only when you want to
+overpay for priority — or underpay and find out. A transaction paying less than its size costs is
+rejected on submission, with the shortfall spelled out.
 
 ### Querying the Chain
 

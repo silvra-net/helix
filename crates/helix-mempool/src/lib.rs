@@ -1,4 +1,4 @@
-use helix_core::{transaction::Amount, Transaction};
+use helix_core::{transaction::Amount, Transaction, TxType};
 use helix_crypto::{Hash, PublicKey};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -14,6 +14,16 @@ pub enum MempoolError {
     Full(usize),
     #[error("Fee too low: got {got}, minimum {min}")]
     FeeTooLow { got: Amount, min: Amount },
+    #[error(
+        "Fee below the block base fee: got {got}, need at least {need} \
+         ({size_bytes} bytes × {base_fee_per_byte} nano-HLX/byte)"
+    )]
+    BelowBaseFee {
+        got: Amount,
+        need: Amount,
+        size_bytes: u64,
+        base_fee_per_byte: u64,
+    },
     #[error("Invalid transaction: {0}")]
     Invalid(String),
 }
@@ -44,6 +54,17 @@ pub struct Mempool {
     max_size: usize,
     min_fee: Amount,
     ttl: Duration,
+    /// The EIP-1559 base fee (nano-HLX per tx byte) the next block will charge, mirrored from
+    /// consensus via `set_base_fee_per_byte` after every commit. The pool holds a copy rather
+    /// than reaching for chain state, which it has no access to.
+    ///
+    /// Without it, admission had only the flat `min_fee` to go on, and the two disagree badly:
+    /// `min_fee` is 1000 nano while a plain ML-DSA-signed transfer is ~5.4 KB, so even at the
+    /// base-fee *floor* it owes ~5410 nano. Every transaction paying between the two was
+    /// admitted, gossiped, mined into a block, and only then rejected by `execute_transaction`
+    /// for underpaying — burning a block slot to fail a transaction the pool could have turned
+    /// away up front, with a clear reason, before the sender ever waited on it.
+    base_fee_per_byte: u64,
 }
 
 impl Mempool {
@@ -56,6 +77,7 @@ impl Mempool {
             max_size: DEFAULT_MAX_SIZE,
             min_fee: DEFAULT_MIN_FEE,
             ttl: DEFAULT_TTL,
+            base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
         }
     }
 
@@ -70,6 +92,7 @@ impl Mempool {
             max_size,
             min_fee,
             ttl: DEFAULT_TTL,
+            base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
         }
     }
 
@@ -84,6 +107,7 @@ impl Mempool {
             max_size,
             min_fee,
             ttl,
+            base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
         }
     }
 
@@ -92,6 +116,23 @@ impl Mempool {
     /// `max_size`/`min_fee`.
     pub fn with_ttl(ttl: Duration) -> Self {
         Self::with_limits_and_ttl(DEFAULT_MAX_SIZE, DEFAULT_MIN_FEE, ttl)
+    }
+
+    /// Mirror the base fee the next block will charge, so admission can reject what execution
+    /// would reject anyway. The node calls this from the same place it reseeds the consensus
+    /// engine's own copy — at startup from the persisted tip, and after every commit.
+    ///
+    /// Only affects transactions admitted *after* it: a pool holding transactions priced for a
+    /// lower base fee keeps them, and they fail at execution as they did before. Re-pricing the
+    /// existing pool on every commit would be the thorough thing, but the fee moves at most
+    /// ±12.5% per block and a stale transaction expires on its own (`ttl`) — not worth walking
+    /// the whole pool every 2 seconds.
+    pub fn set_base_fee_per_byte(&mut self, base_fee_per_byte: u64) {
+        self.base_fee_per_byte = base_fee_per_byte;
+    }
+
+    pub fn base_fee_per_byte(&self) -> u64 {
+        self.base_fee_per_byte
     }
 
     /// Drop all transactions that have been sitting in the pool longer than `ttl`.
@@ -146,6 +187,25 @@ impl Mempool {
                 got: tx.fee,
                 min: self.min_fee,
             });
+        }
+
+        // Mirrors `execute_transaction`'s base-fee check, including its exemption: double-sign
+        // evidence carries two full votes (~16 KB) and pays a flat reporter fee that the base
+        // fee exceeds even at the floor, so charging it here would reject every slashing report
+        // at the pool — silently disabling slashing, exactly as a fee-0 evidence tx once did.
+        // The two checks must agree; if they ever drift, this pool starts either admitting
+        // transactions that cannot execute or refusing ones that could.
+        if tx.tx_type != TxType::SubmitDoubleSignEvidence {
+            let size_bytes = tx.size_bytes();
+            let need = self.base_fee_per_byte.saturating_mul(size_bytes);
+            if tx.fee < need {
+                return Err(MempoolError::BelowBaseFee {
+                    got: tx.fee,
+                    need,
+                    size_bytes,
+                    base_fee_per_byte: self.base_fee_per_byte,
+                });
+            }
         }
 
         let hash = tx.hash().to_hex();
@@ -288,6 +348,13 @@ mod tests {
     use helix_core::{Transaction, TxType};
     use helix_crypto::{Address, KeyPair, Signature};
 
+    /// Fees here are ~10k nano and up, not the ~1k `min_fee` suggests, because a real
+    /// ML-DSA-signed transfer is ~5.4 KB and owes ~5410 nano at the base-fee floor alone. This
+    /// suite used to build every transaction with `fee: 5_000` — over the flat minimum, under
+    /// what the chain charges — so each one would have been admitted here and then rejected at
+    /// execution. Nothing caught it because these tests never reach the executor. Keep test fees
+    /// above the floor; a value that only clears `min_fee` describes a transaction that cannot
+    /// actually be spent.
     fn make_tx(keypair: &KeyPair, fee: Amount, nonce: u64) -> Transaction {
         let addr = Address::from_public_key(&keypair.public);
         let mut tx = Transaction {
@@ -315,13 +382,13 @@ mod tests {
         let mut pool = Mempool::new();
 
         // Two TXs from same sender — must come out in nonce order (not fee order)
-        let tx_lo = make_tx(&kp1, 5_000, 0);
-        let tx_hi = make_tx(&kp1, 10_000, 1);
+        let tx_lo = make_tx(&kp1, 10_000, 0);
+        let tx_hi = make_tx(&kp1, 20_000, 1);
         pool.add(tx_lo).unwrap();
         pool.add(tx_hi).unwrap();
 
         // TX from a second sender (higher fee) also in pool
-        let tx_other = make_tx(&kp2, 20_000, 0);
+        let tx_other = make_tx(&kp2, 40_000, 0);
         pool.add(tx_other).unwrap();
 
         assert_eq!(pool.len(), 3);
@@ -344,6 +411,72 @@ mod tests {
         assert!(matches!(pool.add(tx), Err(MempoolError::FeeTooLow { .. })));
     }
 
+    /// The gap this whole field closes: a fee comfortably above the flat `min_fee` but below
+    /// what the block will actually charge for the transaction's size. It used to be admitted,
+    /// gossiped, and mined, only to be rejected by the executor — the sender waited on a
+    /// transaction that could never land. 5000 is not a strawman: it is what every test in this
+    /// file used to pass.
+    #[test]
+    fn a_fee_over_the_flat_minimum_but_under_the_base_fee_is_rejected_up_front() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+        let tx = make_tx(&kp, 5_000, 0);
+        let size = tx.size_bytes();
+        // Clears `min_fee` (1000) — the old code let it straight in — but a 1-nano/byte floor
+        // already costs more than this.
+        assert!(5_000 < size, "premise: the floor alone outprices this fee");
+
+        let err = pool.add(tx).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::BelowBaseFee { need, .. } if need == size),
+            "{err:?}"
+        );
+    }
+
+    /// The pool's base-fee check must agree with `execute_transaction`'s, exemption included.
+    /// Double-sign evidence carries two full votes and pays a flat reporter fee the base fee
+    /// dwarfs, so charging it here would reject every slashing report at admission — which is
+    /// exactly how slashing was silently dead once before, when the evidence tx paid fee 0 and
+    /// `min_fee` turned it away on every node including the reporter's own.
+    #[test]
+    fn double_sign_evidence_is_exempt_from_the_base_fee_like_it_is_at_execution() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        let mut tx = make_tx(&kp, 10_000, 0);
+        tx.tx_type = TxType::SubmitDoubleSignEvidence;
+        // Stand in for the ~16 KB of two signed votes a real report carries.
+        tx.data = vec![0u8; 16_000];
+        let hash = tx.signing_hash();
+        tx.signature = kp.sign(hash.as_bytes()).unwrap();
+
+        assert!(
+            tx.fee < tx.size_bytes(),
+            "premise: the reporter fee is below what the base fee would charge for this size"
+        );
+        assert!(pool.add(tx).is_ok(), "a slashing report must never be priced out of the pool");
+    }
+
+    /// A rising base fee has to actually bite: the pool mirrors consensus, so what it accepts
+    /// must move with it rather than staying frozen at the floor it started on.
+    #[test]
+    fn raising_the_base_fee_tightens_what_the_pool_accepts() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+        let tx = make_tx(&kp, 10_000, 0);
+        let size = tx.size_bytes();
+
+        assert!(pool.add(tx.clone()).is_ok(), "affordable at the floor");
+
+        pool.remove_committed(&[tx.hash()]);
+        pool.set_base_fee_per_byte(2);
+        let err = pool.add(tx).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::BelowBaseFee { need, .. } if need == size * 2),
+            "the same fee must stop clearing once the byte price doubles: {err:?}"
+        );
+    }
+
     #[test]
     fn test_nonce_ordering_preserved() {
         // Submitting nonces out of order should still produce them sorted in take()
@@ -352,7 +485,7 @@ mod tests {
 
         // Insert nonce 2 first, then 0, then 1 — all same fee
         for nonce in [2u64, 0, 1] {
-            pool.add(make_tx(&kp, 5_000, nonce)).unwrap();
+            pool.add(make_tx(&kp, 10_000, nonce)).unwrap();
         }
         let taken = pool.take(10);
         assert_eq!(taken.iter().map(|t| t.nonce).collect::<Vec<_>>(), vec![0, 1, 2]);
@@ -362,7 +495,7 @@ mod tests {
     fn test_remove_committed() {
         let kp = KeyPair::generate();
         let mut pool = Mempool::new();
-        let tx = make_tx(&kp, 5_000, 0);
+        let tx = make_tx(&kp, 10_000, 0);
         let hash = tx.hash();
         pool.add(tx).unwrap();
         assert_eq!(pool.len(), 1);
@@ -377,8 +510,8 @@ mod tests {
         let kp = KeyPair::generate();
         let mut pool = Mempool::new();
 
-        let tx1 = make_tx(&kp, 5_000, 0);
-        let tx2 = make_tx(&kp, 6_000, 0); // same sender, same nonce, higher fee
+        let tx1 = make_tx(&kp, 10_000, 0);
+        let tx2 = make_tx(&kp, 12_000, 0); // same sender, same nonce, higher fee
 
         pool.add(tx1).unwrap();
         assert!(matches!(
@@ -395,12 +528,12 @@ mod tests {
         let kp = KeyPair::generate();
         let mut pool = Mempool::new();
 
-        let tx = make_tx(&kp, 5_000, 0);
+        let tx = make_tx(&kp, 10_000, 0);
         let hash = tx.hash();
         pool.add(tx).unwrap();
         pool.remove_committed(&[hash]);
 
-        let tx2 = make_tx(&kp, 6_000, 0);
+        let tx2 = make_tx(&kp, 12_000, 0);
         assert!(pool.add(tx2).is_ok(), "slot should be free after commit");
     }
 
@@ -411,22 +544,22 @@ mod tests {
         let kp3 = KeyPair::generate();
         let mut pool = Mempool::with_limits(2, 1_000);
 
-        let cheap = make_tx(&kp1, 5_000, 0);
+        let cheap = make_tx(&kp1, 10_000, 0);
         let cheap_hash = cheap.hash();
-        let mid = make_tx(&kp2, 6_000, 0);
+        let mid = make_tx(&kp2, 12_000, 0);
         pool.add(cheap).unwrap();
         pool.add(mid).unwrap();
         assert_eq!(pool.len(), 2);
 
         // Pool is full, but this tx outbids the cheapest (5_000) — must evict it.
-        let expensive = make_tx(&kp3, 7_000, 0);
+        let expensive = make_tx(&kp3, 14_000, 0);
         pool.add(expensive).unwrap();
 
         assert_eq!(pool.len(), 2);
         assert!(!pool.contains(&cheap_hash), "cheapest tx should have been evicted");
 
         // Evicted sender's nonce slot must be freed too.
-        let resubmit = make_tx(&kp1, 8_000, 0);
+        let resubmit = make_tx(&kp1, 16_000, 0);
         assert!(pool.add(resubmit).is_ok());
     }
 
@@ -437,11 +570,11 @@ mod tests {
         let kp3 = KeyPair::generate();
         let mut pool = Mempool::with_limits(2, 1_000);
 
-        pool.add(make_tx(&kp1, 5_000, 0)).unwrap();
-        pool.add(make_tx(&kp2, 6_000, 0)).unwrap();
+        pool.add(make_tx(&kp1, 10_000, 0)).unwrap();
+        pool.add(make_tx(&kp2, 12_000, 0)).unwrap();
 
         // Equal to the cheapest fee — must not evict, must reject as Full.
-        let tx = make_tx(&kp3, 5_000, 0);
+        let tx = make_tx(&kp3, 10_000, 0);
         assert!(matches!(pool.add(tx), Err(MempoolError::Full(2))));
         assert_eq!(pool.len(), 2);
     }
@@ -453,10 +586,10 @@ mod tests {
         let attacker_kp = KeyPair::generate();
         let mut pool = Mempool::with_limits(2, 1_000);
 
-        let cheap = make_tx(&kp1, 5_000, 0);
+        let cheap = make_tx(&kp1, 10_000, 0);
         let cheap_hash = cheap.hash();
         pool.add(cheap).unwrap();
-        pool.add(make_tx(&kp2, 6_000, 0)).unwrap();
+        pool.add(make_tx(&kp2, 12_000, 0)).unwrap();
         assert_eq!(pool.len(), 2);
 
         // Would outbid the cheapest tx (5_000) on fee alone, but the signature is
@@ -474,7 +607,7 @@ mod tests {
         let kp = KeyPair::generate();
         let mut pool = Mempool::with_limits_and_ttl(100, 1_000, Duration::from_millis(1));
 
-        let stuck = make_tx(&kp, 5_000, 0);
+        let stuck = make_tx(&kp, 10_000, 0);
         pool.add(stuck).unwrap();
         assert_eq!(pool.len(), 1);
 
@@ -483,7 +616,7 @@ mod tests {
         // A resubmission at the same (sender, nonce) would normally be rejected
         // with NoncePending — but the stuck tx is past its TTL, so add() must
         // evict it first and admit the new one.
-        let resubmit = make_tx(&kp, 6_000, 0);
+        let resubmit = make_tx(&kp, 12_000, 0);
         pool.add(resubmit).unwrap();
         assert_eq!(pool.len(), 1);
     }
@@ -492,7 +625,7 @@ mod tests {
     fn test_take_also_evicts_expired() {
         let kp = KeyPair::generate();
         let mut pool = Mempool::with_limits_and_ttl(100, 1_000, Duration::from_millis(1));
-        pool.add(make_tx(&kp, 5_000, 0)).unwrap();
+        pool.add(make_tx(&kp, 10_000, 0)).unwrap();
 
         std::thread::sleep(Duration::from_millis(10));
 

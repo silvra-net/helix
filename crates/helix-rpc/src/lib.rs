@@ -238,4 +238,9 @@ pub struct NodeStatus {
     /// reachable only over the open internet. See `resolve_seed_peer_multiaddr` in
     /// `helix-node` for the client side of this.
     pub p2p_port: u16,
+    /// The EIP-1559 base fee (nano-HLX per transaction byte) the next block will charge. A
+    /// client needs it to price a transaction: the required fee is `base_fee_per_byte ×
+    /// tx.size_bytes()`, and paying less means the transaction is rejected — so a flat,
+    /// hardcoded fee is only ever right until the network gets busy enough to move this.
+    pub base_fee_per_byte: u64,
 }

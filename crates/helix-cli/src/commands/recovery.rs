@@ -5,9 +5,9 @@ use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
+use crate::fee::price_and_sign;
 use crate::keyfile::KeyFile;
 
-const DEFAULT_FEE_NANO: u64 = 10_000; // 0.00001 HLX
 
 #[derive(Subcommand)]
 pub enum RecoveryCmd {
@@ -20,8 +20,9 @@ pub enum RecoveryCmd {
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
         /// Fee in nano-HLX (default: 10000)
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
     },
     /// As a registered guardian, approve rotating a lost account to a new public key
     Approve {
@@ -33,8 +34,9 @@ pub enum RecoveryCmd {
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
         /// Fee in nano-HLX (default: 10000)
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
     },
     /// Show guardian set and any in-progress recovery vote for an address
     Status {
@@ -61,7 +63,7 @@ pub async fn run(cmd: RecoveryCmd, node: &str) -> Result<()> {
 async fn register_guardians(
     guardians: Vec<String>,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
@@ -86,7 +88,7 @@ async fn register_guardians(
         from: from.clone(),
         to: None,
         amount: 0,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: guardians.join("\n").into_bytes(),
         crypto_version: kp.scheme,
@@ -95,11 +97,10 @@ async fn register_guardians(
         public_key: kp.public.clone(),
     };
 
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("Registering {} guardians for {}", guardians.len(), kf.address);
-    println!("  Fee   : {} nano-HLX", fee);
+    println!("  Fee   : {} nano-HLX", tx.fee);
     println!("  Nonce : {}", nonce);
 
     let client = reqwest::Client::new();
@@ -125,7 +126,7 @@ async fn approve(
     target: String,
     new_public_key_hex: String,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
@@ -150,7 +151,7 @@ async fn approve(
         from: from.clone(),
         to: Some(target_addr),
         amount: 0,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: new_key_bytes,
         crypto_version: kp.scheme,
@@ -159,12 +160,11 @@ async fn approve(
         public_key: kp.public.clone(),
     };
 
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("Approving recovery of {} to new key", target);
     println!("  Guardian : {}", kf.address);
-    println!("  Fee      : {} nano-HLX", fee);
+    println!("  Fee      : {} nano-HLX", tx.fee);
     println!("  Nonce    : {}", nonce);
 
     let client = reqwest::Client::new();

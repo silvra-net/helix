@@ -5,10 +5,10 @@ use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
+use crate::fee::price_and_sign;
 use crate::keyfile::KeyFile;
 
 const NANO_PER_HLX: f64 = 1_000_000_000.0;
-const DEFAULT_FEE_NANO: u64 = 10_000; // 0.00001 HLX
 
 #[derive(Subcommand)]
 pub enum TxCmd {
@@ -21,9 +21,9 @@ pub enum TxCmd {
         /// Wallet key file
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
-        /// Fee in nano-HLX (default: 10000)
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         /// Node nonce override (auto-fetched if omitted)
         #[arg(long)]
         nonce: Option<u64>,
@@ -35,8 +35,9 @@ pub enum TxCmd {
         /// Wallet key file
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         #[arg(long)]
         nonce: Option<u64>,
     },
@@ -47,8 +48,9 @@ pub enum TxCmd {
         /// Wallet key file
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         #[arg(long)]
         nonce: Option<u64>,
     },
@@ -57,8 +59,9 @@ pub enum TxCmd {
         /// Wallet key file
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         #[arg(long)]
         nonce: Option<u64>,
     },
@@ -71,8 +74,9 @@ pub enum TxCmd {
         amount: f64,
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         #[arg(long)]
         nonce: Option<u64>,
     },
@@ -85,8 +89,9 @@ pub enum TxCmd {
         amount: f64,
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         #[arg(long)]
         nonce: Option<u64>,
     },
@@ -102,8 +107,9 @@ pub enum TxCmd {
         amount: f64,
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         #[arg(long)]
         nonce: Option<u64>,
     },
@@ -113,8 +119,9 @@ pub enum TxCmd {
         bps: u16,
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
         #[arg(long)]
         nonce: Option<u64>,
     },
@@ -159,7 +166,7 @@ async fn send(
     to: String,
     amount_hlx: f64,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
@@ -190,7 +197,7 @@ async fn send(
         from: from.clone(),
         to: Some(to_addr),
         amount: amount_nano,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
@@ -199,12 +206,11 @@ async fn send(
         public_key: kp.public.clone(),
     };
 
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("Sending {:.9} HLX to {}", amount_hlx, to);
     println!("  From  : {}", kf.address);
-    println!("  Fee   : {} nano-HLX", fee);
+    println!("  Fee   : {} nano-HLX", tx.fee);
     println!("  Nonce : {}", nonce);
 
     submit_tx(&tx, node).await
@@ -215,7 +221,7 @@ async fn simple_amount_tx(
     tx_type: TxType,
     amount_hlx: f64,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
@@ -239,15 +245,14 @@ async fn simple_amount_tx(
         from: from.clone(),
         to: None,
         amount: amount_nano,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     submit_tx(&tx, node).await
 }
@@ -256,7 +261,7 @@ async fn simple_amount_tx(
 async fn zero_amount_tx(
     tx_type: TxType,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
@@ -279,15 +284,14 @@ async fn zero_amount_tx(
         from: from.clone(),
         to: None,
         amount: 0,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     submit_tx(&tx, node).await
 }
@@ -299,7 +303,7 @@ async fn targeted_amount_tx(
     validator: String,
     amount_hlx: f64,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
@@ -325,20 +329,19 @@ async fn targeted_amount_tx(
         from: from.clone(),
         to: Some(validator_addr),
         amount: amount_nano,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("  From      : {}", kf.address);
     println!("  Validator : {}", validator);
     println!("  Amount    : {:.9} HLX", amount_hlx);
-    println!("  Fee       : {} nano-HLX", fee);
+    println!("  Fee       : {} nano-HLX", tx.fee);
     println!("  Nonce     : {}", nonce);
 
     submit_tx(&tx, node).await
@@ -349,7 +352,7 @@ async fn redelegate(
     to_validator: String,
     amount_hlx: f64,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
@@ -377,7 +380,7 @@ async fn redelegate(
         from: from.clone(),
         to: Some(dst),
         amount: amount_nano,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         // The destination rides in `to`; the source has to travel in `data` as its address
         // string — a transaction has only one `to` field and this is the one operation that
@@ -387,13 +390,12 @@ async fn redelegate(
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("  From      : {}", kf.address);
     println!("  Moving    : {} -> {}", from_validator, to_validator);
     println!("  Amount    : {:.9} HLX", amount_hlx);
-    println!("  Fee       : {} nano-HLX", fee);
+    println!("  Fee       : {} nano-HLX", tx.fee);
     println!("  Nonce     : {}", nonce);
     println!();
     println!("  Note: this stake stays slashable for {} for 7 days.", from_validator);
@@ -404,7 +406,7 @@ async fn redelegate(
 async fn set_commission(
     bps: u16,
     key_path: PathBuf,
-    fee: u64,
+    fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
@@ -427,19 +429,18 @@ async fn set_commission(
         from: from.clone(),
         to: None,
         amount: 0,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: bps.to_le_bytes().to_vec(),
         crypto_version: kp.scheme,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("  Validator  : {}", kf.address);
     println!("  Commission : {} bps ({:.2}%)", bps, bps as f64 / 100.0);
-    println!("  Fee        : {} nano-HLX", fee);
+    println!("  Fee        : {} nano-HLX", tx.fee);
     println!("  Nonce      : {}", nonce);
 
     submit_tx(&tx, node).await

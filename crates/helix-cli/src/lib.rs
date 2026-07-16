@@ -4,6 +4,7 @@
 //! the chain database or boot the node runtime.
 
 pub mod commands;
+pub mod fee;
 pub mod keyfile;
 
 use anyhow::Result;

@@ -5,9 +5,9 @@ use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
+use crate::fee::price_and_sign;
 use crate::keyfile::KeyFile;
 
-const DEFAULT_FEE_NANO: u64 = 10_000; // 0.00001 HLX
 
 #[derive(Subcommand)]
 pub enum IdentityCmd {
@@ -19,8 +19,9 @@ pub enum IdentityCmd {
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
         /// Fee in nano-HLX (default: 10000)
-        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
-        fee: u64,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
     },
     /// Show Proof of Personhood status for an address
     Status {
@@ -36,7 +37,7 @@ pub async fn run(cmd: IdentityCmd, node: &str) -> Result<()> {
     }
 }
 
-async fn attest(address: String, key_path: PathBuf, fee: u64, node: &str) -> Result<()> {
+async fn attest(address: String, key_path: PathBuf, fee: Option<u64>, node: &str) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
     let kp = if kf.is_encrypted() {
         let pass = rpassword_read("Wallet passphrase: ")?;
@@ -57,7 +58,7 @@ async fn attest(address: String, key_path: PathBuf, fee: u64, node: &str) -> Res
         from: from.clone(),
         to: Some(to),
         amount: 0,
-        fee,
+        fee: 0, // replaced by price_and_sign below
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
@@ -66,12 +67,11 @@ async fn attest(address: String, key_path: PathBuf, fee: u64, node: &str) -> Res
         public_key: kp.public.clone(),
     };
 
-    let signing_hash = tx.signing_hash();
-    tx.signature = kp.sign(signing_hash.as_bytes())?;
+    price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("Attesting personhood for {}", address);
     println!("  Attester : {}", kf.address);
-    println!("  Fee      : {} nano-HLX", fee);
+    println!("  Fee      : {} nano-HLX", tx.fee);
     println!("  Nonce    : {}", nonce);
 
     let client = reqwest::Client::new();
