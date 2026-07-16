@@ -2,12 +2,14 @@ use std::collections::HashMap;
 
 use helix_core::Block;
 use helix_crypto::Hash;
+use helix_executor::receipt::Receipt;
 
 use crate::{BlockStore, StorageResult, StorageError};
 
 pub struct MemBlockStore {
     by_hash: HashMap<String, Block>,
     by_height: HashMap<u64, Hash>,
+    receipts: HashMap<String, Receipt>,
     latest_height: u64,
 }
 
@@ -16,6 +18,7 @@ impl MemBlockStore {
         MemBlockStore {
             by_hash: HashMap::new(),
             by_height: HashMap::new(),
+            receipts: HashMap::new(),
             latest_height: 0,
         }
     }
@@ -52,6 +55,17 @@ impl BlockStore for MemBlockStore {
             self.latest_height = height;
         }
         Ok(())
+    }
+
+    fn put_receipts(&mut self, receipts: &[Receipt]) -> StorageResult<()> {
+        for r in receipts {
+            self.receipts.insert(r.tx_hash.clone(), r.clone());
+        }
+        Ok(())
+    }
+
+    fn get_receipt(&self, tx_hash: &Hash) -> StorageResult<Option<Receipt>> {
+        Ok(self.receipts.get(&tx_hash.to_hex()).cloned())
     }
 
     fn latest_height(&self) -> u64 {

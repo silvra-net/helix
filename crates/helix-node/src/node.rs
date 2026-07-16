@@ -1041,8 +1041,11 @@ async fn apply_finalized_block(
         engine.write().await.sync_to_externally_finalized_block(height, block.hash());
     }
 
-    // Execute transactions
-    {
+    // Execute transactions. The per-tx receipts are kept and persisted below: they are the only
+    // record of whether a committed transaction did anything, and warning about the count in the
+    // log while dropping them left `hlx tx status`, the explorer and Spark all reporting a
+    // rejected transfer as `confirmed`.
+    let tx_receipts = {
         let mut state = chain_state.write().await;
         let receipt = execute_block(&mut state, &block, reward_address.as_deref());
         if receipt.failed_txs() > 0 {
@@ -1055,7 +1058,8 @@ async fn apply_finalized_block(
         // wants to compare running nodes without trawling logs. See ChainState::state_hash's
         // doc comment for exactly what this is and isn't.
         debug!(height, state_hash = %state.state_hash().to_hex(), "Block applied");
-    }
+        receipt.tx_receipts
+    };
 
     // Double-sign slashing does NOT happen here. It used to: this function unconditionally
     // drained engine.take_evidence() and slashed directly. But pending_evidence is per-node,
@@ -1151,6 +1155,11 @@ async fn apply_finalized_block(
         if let Err(e) = s.put_block(block) {
             error!("Failed to store block {}: {}", height, e);
             return;
+        }
+        // A block whose receipts failed to write is still a valid block — the chain is not held
+        // up for it. Their absence reads as `unknown` at the RPC, never as success.
+        if let Err(e) = s.put_receipts(&tx_receipts) {
+            error!("Failed to store receipts for block {}: {}", height, e);
         }
         let state = chain_state.read().await;
         if let Err(e) = s.save_chain_state(&state) {
@@ -2328,6 +2337,66 @@ mod handle_p2p_event_tests {
     /// so it mints twice regardless — silently inflating supply. Found in practice as a
     /// small, fixed `circulating_supply` divergence between two otherwise-identical nodes.
     /// Simulates the race by calling `apply_finalized_block` twice for the identical block
+    /// Applying a block must leave behind a record of what its transactions actually did.
+    /// The chain executed them, warned about the failures in its own log, and threw the
+    /// receipts away — so a transaction the executor rejected was indistinguishable, from
+    /// outside the node, from one that moved money. Uses the real case that exposed it: a
+    /// zero-amount transfer, which is committed, charged, and refused.
+    #[tokio::test]
+    async fn apply_finalized_block_persists_why_a_transaction_failed() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let sender_kp = KeyPair::generate();
+        let sender = Address::from_public_key(&sender_kp.public);
+
+        let mut rejected = Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: sender.clone(),
+            to: Some(addr.clone()),
+            amount: 0, // execute_transfer refuses this, after the block is already committed
+            fee: 10_000,
+            nonce: 0,
+            data: vec![],
+            crypto_version: sender_kp.scheme,
+            signature: Sig::from_bytes(vec![]),
+            public_key: sender_kp.public.clone(),
+        };
+        rejected.signature = sender_kp.sign(rejected.signing_hash().as_bytes()).unwrap();
+        let tx_hash = rejected.hash();
+
+        let mut block = signed_block(&kp, 1, Hash::ZERO);
+        block.transactions = vec![rejected];
+        block.header.signature = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut state = chain_state.write().await;
+            state.update_account(&sender, |acc| acc.balance = 1_000_000);
+        }
+        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr, 0)));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        let last_applied_height = Arc::new(Mutex::new(0));
+
+        apply_finalized_block(block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+
+        let receipt = store
+            .read()
+            .await
+            .get_receipt(&tx_hash)
+            .unwrap()
+            .expect("the block was applied, so its receipt must have been written");
+        assert!(!receipt.success, "a rejected transfer must not be recorded as successful");
+        assert!(
+            receipt.error.as_deref().is_some_and(|e| e.contains("greater than zero")),
+            "the reason has to survive to the caller, not just the log: {:?}",
+            receipt.error
+        );
+    }
+
     /// against the same `last_applied_height` — the second call must be a complete no-op.
     #[tokio::test]
     async fn apply_finalized_block_does_not_double_mint_a_racing_duplicate_for_the_same_height() {

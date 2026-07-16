@@ -909,7 +909,30 @@ async fn get_transaction_status(
                 );
             };
             let mut entry = json!(tx_history_entry(&block, tx));
-            entry["status"] = json!("confirmed");
+            // Being in a block is not the same as having worked. The executor rejects
+            // transactions for a bad nonce, insufficient balance or a zero amount, and they are
+            // committed and charged the fee exactly like any other — this answered `confirmed`
+            // to all of them, which is the difference between "your money arrived" and "it
+            // didn't". The receipt is the only thing that knows.
+            match store.get_receipt(&tx_hash) {
+                Ok(Some(r)) if r.success => {
+                    entry["status"] = json!("applied");
+                    entry["fee_burned_hlx"] = json!(r.fee_burned as f64 / 1_000_000_000.0);
+                    entry["fee_to_validator_hlx"] =
+                        json!(r.fee_to_validator as f64 / 1_000_000_000.0);
+                }
+                Ok(Some(r)) => {
+                    entry["status"] = json!("failed");
+                    entry["error"] = json!(r.error);
+                    entry["fee_burned_hlx"] = json!(r.fee_burned as f64 / 1_000_000_000.0);
+                    entry["fee_to_validator_hlx"] =
+                        json!(r.fee_to_validator as f64 / 1_000_000_000.0);
+                }
+                // No receipt: either this block predates receipt storage, or the write failed.
+                // Either way this node cannot say what happened, and saying so is the whole
+                // point — `unknown` must never quietly mean "fine".
+                Ok(None) | Err(_) => entry["status"] = json!("unknown"),
+            }
             (StatusCode::OK, Json(entry))
         }
         Ok(None) => {
@@ -938,6 +961,7 @@ mod tests {
     use super::*;
     use helix_core::{Block, BlockHeader, CryptoVersion, TxType};
     use helix_crypto::{Hash, KeyPair, PublicKey, Signature};
+    use helix_executor::receipt::Receipt;
 
     fn addr(seed: u8) -> Address {
         Address::from_public_key(&PublicKey::from_bytes(vec![seed; 8]))
@@ -1035,13 +1059,17 @@ mod tests {
     /// Regression test: `GET /transactions/:hash` didn't exist server-side at all
     /// before this fix — `hlx tx status` 404'd against every hash, confirmed or not.
     #[tokio::test]
-    async fn get_transaction_status_finds_a_confirmed_transaction() {
+    async fn get_transaction_status_reports_applied_for_a_transaction_that_executed() {
         let (state, path) = fresh_app_state();
         let alice = addr(1);
         let bob = addr(2);
         let committed = tx(&alice, &bob, 10, 0);
         let hash = committed.hash();
-        state.store.write().await.put_block(block(5, &alice, vec![committed])).unwrap();
+        {
+            let mut store = state.store.write().await;
+            store.put_block(block(5, &alice, vec![committed])).unwrap();
+            store.put_receipts(&[Receipt::success(hash, 40, 60)]).unwrap();
+        }
 
         let response = get_transaction_status(State(state), Path(hash.to_hex()))
             .await
@@ -1049,9 +1077,75 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let parsed: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["status"], "confirmed");
+        assert_eq!(parsed["status"], "applied");
         assert_eq!(parsed["block_height"], 5);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The bug this whole path exists for. A zero-amount transfer is committed, charged, and
+    /// rejected by the executor — and reported as `confirmed` on the live chain, indistinguishable
+    /// from one that moved money. The reason has to reach the caller, not just the node's log.
+    #[tokio::test]
+    async fn a_transaction_the_executor_rejected_reports_failed_and_says_why() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let rejected = tx(&alice, &addr(2), 0, 0);
+        let hash = rejected.hash();
+        {
+            let mut store = state.store.write().await;
+            store.put_block(block(5, &alice, vec![rejected])).unwrap();
+            store
+                .put_receipts(&[Receipt::failure(
+                    hash,
+                    "transfer amount must be greater than zero",
+                    1_082,
+                    0,
+                )])
+                .unwrap();
+        }
+
+        let response = get_transaction_status(State(state), Path(hash.to_hex()))
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "failed", "a rejected tx must not read as a successful one");
+        assert_eq!(parsed["error"], "transfer amount must be greater than zero");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Blocks committed before receipts were stored have none, and the honest answer is that
+    /// this node doesn't know — the one thing it must never do is default to success.
+    #[tokio::test]
+    async fn a_transaction_without_a_stored_receipt_reports_unknown_not_success() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let legacy = tx(&alice, &addr(2), 10, 0);
+        let hash = legacy.hash();
+        state.store.write().await.put_block(block(5, &alice, vec![legacy])).unwrap();
+
+        let response = get_transaction_status(State(state), Path(hash.to_hex()))
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "unknown");
+        assert!(parsed["error"].is_null(), "no receipt means no claim either way");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Valid hex of the wrong length used to panic the worker task here, reachable from the
+    /// public internet: `Hash::from_hex` fed a 2-byte decode into a 32-byte `copy_from_slice`.
+    #[tokio::test]
+    async fn a_malformed_hash_is_rejected_instead_of_panicking_the_worker() {
+        let (state, path) = fresh_app_state();
+        let response = get_transaction_status(State(state), Path("abcd".to_string()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let _ = std::fs::remove_file(&path);
     }
 

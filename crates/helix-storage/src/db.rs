@@ -4,6 +4,7 @@ use std::path::Path;
 use helix_core::Block;
 use helix_crypto::{Address, Hash, PublicKey};
 use helix_executor::governance::{GovernanceParams, GovernanceProposal};
+use helix_executor::receipt::Receipt;
 use helix_executor::state::{AccountState, ChainState};
 
 use crate::{BlockStore, StorageError, StorageResult};
@@ -60,6 +61,10 @@ const ADDRESS_TX_INDEX: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefi
 /// encoding as `ADDRESS_TX_INDEX`. Backs `tx_location()` — a single-key lookup
 /// instead of scanning every block for the one that happens to contain a hash.
 const TX_HASH_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tx_hash_index");
+/// tx hash bytes → bincode(`Receipt`): did this transaction actually do anything, and if not
+/// why. See `BlockStore::put_receipts`. Absent for blocks written before this table existed,
+/// which is why the RPC has an `unknown` status rather than defaulting to success.
+const RECEIPTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("receipts");
 
 const META_HEIGHT: &str = "latest_height";
 const META_HASH: &str = "latest_hash";
@@ -100,6 +105,7 @@ impl HelixDb {
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(RECEIPTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
         Ok(HelixDb { db })
     }
@@ -581,6 +587,43 @@ impl BlockStore for HelixDb {
                 self.get_block_by_hash(&Hash::from_bytes(arr))
             }
             None => Err(StorageError::BlockNotFound(height)),
+        }
+    }
+
+    fn put_receipts(&mut self, receipts: &[Receipt]) -> StorageResult<()> {
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
+        {
+            let mut table = tx.open_table(RECEIPTS).map_err(|e| StorageError::Db(e.to_string()))?;
+            for r in receipts {
+                // The receipt carries the hash as hex, but the key is the raw bytes every other
+                // index here is keyed by, so a lookup takes a Hash and not a string convention.
+                let hash = Hash::from_hex(&r.tx_hash)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                let encoded = bincode::serialize(r)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                table
+                    .insert(hash.as_bytes().as_slice(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+        tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_receipt(&self, tx_hash: &Hash) -> StorageResult<Option<Receipt>> {
+        let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
+        let table = tx.open_table(RECEIPTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        match table
+            .get(tx_hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?
+        {
+            Some(v) => bincode::deserialize(v.value())
+                .map(Some)
+                .map_err(|e| StorageError::Serialization(e.to_string())),
+            None => Ok(None),
         }
     }
 
