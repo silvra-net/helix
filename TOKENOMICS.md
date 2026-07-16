@@ -62,20 +62,32 @@ cumulative burns.
 
 ## Fees
 
-- Fee is a **user-set field** on each transaction (`tx.fee`, in nano-HLX), floored by a
-  local mempool anti-spam minimum (`DEFAULT_MIN_FEE = 1000 nano`, per-node, *not* consensus).
-- `fuel_limit = tx.fee × fuel_per_fee_unit` *(governance-adjustable, default 1)* — the fee
-  buys execution fuel at a governance-set price.
-- **50 % of every fee is burned, 50 % pays the block validator** (`distribute_fee`).
-- Block ordering is a **bid market** (highest fee included first) but there is **no
-  EIP-1559-style floating base fee** — nominal per-fuel cost is constant unless governance
-  moves `fuel_per_fee_unit`.
+Helix charges **per transaction byte**, EIP-1559 style (shipped 2026-07-15, backlog #80).
 
-**Do fees stay constant forever?** Nominally yes — the per-fuel price is fixed until a
-governance vote changes it. That is fine while blocks are near-empty, but it means fees do
-*not* automatically respond to congestion or to a large change in HLX's fiat price. A serious
-L1 eventually wants an automatic base-fee mechanism (or at least a consensus-level, not
-per-node, min fee). See backlog.
+- Every block header carries a **base fee** (`base_fee_per_byte`), derived deterministically
+  from the parent block's fullness: ±12.5 % per block toward a 1 MB target, floored at 1
+  nano/byte. It is part of the signed header and re-checked on validation, so a proposer cannot
+  pick it.
+- Each transaction owes `base_fee_per_byte × its size`. **That portion is burned in full.**
+  Whatever the sender paid *above* it is the **tip**, and the tip is the validator's entire
+  income from that transaction (`distribute_fee`) — shared with its delegation pool, if any.
+- `fuel_limit = tx.fee × fuel_per_fee_unit` *(governance-adjustable, default 1)* — the fee also
+  buys execution fuel for contract calls.
+- `SubmitDoubleSignEvidence` is **exempt** from the base fee: its ~16 KB two-vote payload costs
+  more than the flat reporter fee even at the floor, so charging it would price slashing reports
+  out of every block and silently disable slashing.
+
+**Size dominates.** Post-quantum signatures are large — ML-DSA-65 is 3,309 bytes of signature
+plus 1,952 of public key — so a plain transfer is **~5,410 bytes and owes ~5,410 nano at the
+floor**. A contract deploy carries its bytecode too, up to ~71,000 nano at the 64 KiB limit.
+Clients do not guess at this: `helix tx send` asks the node for the current base fee, prices the
+transaction for its real size, and adds 100 % headroom so it still clears if the fee climbs while
+it waits (backlog #88). The mempool refuses anything that cannot afford the base fee, rather than
+letting it be mined and fail.
+
+> ✅ **Automatic fee market — resolved 2026-07-15 (was open question #1 here).** Fees now respond
+> to congestion on their own and no longer depend on a governance vote to reprice, and the
+> anti-spam floor is a consensus rule (the base fee) rather than a per-node convention.
 
 ## Validator economics & the stake requirement
 
@@ -117,15 +129,72 @@ burn, PoS security decoupled from monetary policy).
 - ✅ **Phantom supply cap — resolved 2026-07-15.** Cap corrected from 100M to an honest 33M
   (see the Supply section). This was the one credibility issue with a clear-cut fix.
 
-Two open questions remain — both touch consensus economics, so they belong in deliberate
-design/governance rather than a hotfix, and are tracked in the dev-loop backlog:
+- ✅ **Automatic fee market — resolved 2026-07-15** (see Fees). Congestion now reprices itself.
 
-1. **No automatic fee market** (backlog #80). Fine today; a major L1 wants base-fee/congestion
-   pricing and a consensus-level min fee, not just a per-node mempool floor.
-2. **Post-emission security budget** (backlog #81, the Bitcoin problem). After ~year 30
-   validators live on *50 %* of fees only. Whether that sustains a decentralized set depends
-   entirely on fee demand; the burn share is itself a lever (it could taper post-emission to
-   fund security). Deflation from the burn should raise the fiat value of that fee share,
-   partially self-correcting — but this must be modeled, not assumed.
+### The one real open question: what pays for security once emission stops?
 
-*Last reviewed: 2026-07-15.*
+This was filed as "the Bitcoin problem, ~year 30, validators live on 50 % of fees". Modelling it
+(2026-07-16) showed **both halves of that framing were wrong**, and the truth is sharper.
+
+**There is no 50 % share.** Since the fee market shipped, the base fee is burned *in full* and the
+validator's income is the tip alone. Nothing in consensus guarantees a validator any part of a
+transaction's fee: a sender who pays exactly the base fee pays the validator **zero**, and the
+transaction is perfectly valid. Today's ~50 % is an artifact of the CLI's 100 % headroom default —
+a client-side convention, not a rule.
+
+**The cliff is not at year 30.** The subsidy halves yearly, so it stops mattering long before it
+reaches literal zero:
+
+| Year | Subsidy, HLX/day (whole network) | Per validator, at 4 |
+|-----:|---------------------------------:|--------------------:|
+| 0    | 43,200                           | 10,800              |
+| 5    | 1,350                            | 337                 |
+| 10   | **42**                           | **10.6**            |
+| 15   | 1.3                              | 0.33                |
+| 30   | 0                                | 0                   |
+
+By **year 10** the subsidy is ~42 HLX/day across the entire validator set. The question is not
+what happens in 30 years; it is what happens in **ten**.
+
+**How Helix compares.** This model is strictly harsher than either chain it borrows from:
+
+| | Fee handling | Emission | What secures it long-term |
+|---|---|---|---|
+| Bitcoin | all fees → miner | → 0 | fees, entirely |
+| Ethereum | base burned, tip → validator | **perpetual** | issuance, with fees on top |
+| **Helix** | base burned, tip → validator | **→ 0** | **tips alone** |
+
+Helix took Ethereum's *fee* design and Bitcoin's *emission* design. Each is coherent on its own;
+together they leave voluntary tips as the only long-run security budget. Ethereum can burn its
+base fee precisely because issuance never stops paying validators.
+
+**Scale check.** At the floor, with blocks at the 1 MB target (~184 transfers/block) and clients
+tipping the CLI default, tips come to ~43 HLX/day network-wide — about the year-10 subsidy. So
+tips replace the subsidy only if blocks are *consistently full*. They do scale: sustained demand
+raises the base fee, and a client tipping proportionally raises its tip with it. But that scaling
+rests on a convention, not on consensus.
+
+**The levers, and what fits.**
+
+1. **Taper the burn.** Post-emission, route some or all of the base fee to the validator instead
+   of burning it — Bitcoin's model, reached from the other direction. Turns deflation into
+   security spending, needs no new issuance, and stays inside the 33M cap. It is the only lever
+   compatible with an honest hard cap, and the natural shape is a governance parameter that
+   tapers as the subsidy decays.
+2. **Perpetual tail emission** (Ethereum, Monero). Simple and proven, but breaks the 33M cap —
+   the exact credibility problem the cap was fixed to solve. Non-starter unless the cap itself is
+   reopened.
+3. **Do nothing.** Bet that fee demand and a tipping convention carry it. That is a bet on
+   behaviour, and it is what the chain currently does by default.
+
+**Recommendation:** lever 1, decided deliberately and well before it binds — a security budget is
+not something to design once it is already too thin. Not urgent in wall-clock terms; a decision
+that only needs making before validators notice the subsidy shrinking. But "not urgent" has been
+the reason this stayed vague through two rewrites.
+
+**Related, and concrete:** the mempool orders by `tx.fee` (the total) while the validator earns
+`fee − base_fee` (the tip). Those diverge — a large transaction paying exactly its base fee
+outranks a small one that tips well, and pays the validator nothing. Ethereum sorts by effective
+priority fee for exactly this reason. Tracked as backlog #92.
+
+*Last reviewed: 2026-07-16.*

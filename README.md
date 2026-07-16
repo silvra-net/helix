@@ -892,7 +892,9 @@ advances, since real compute was spent either way.
   it below that minimum is recoverable. That is ~0.6% of the supply the chain eventually
   reaches; everything else is earned block by block. There is no founder pre-mine beyond this.
 - **Denomination:** 1 HLX = 1,000,000,000 nano-HLX
-- **Fee split:** 50% burned (deflationary) / 50% to block validator
+- **Fee split:** the base fee (`base_fee_per_byte × transaction size`) is burned in full; the
+  rest of what the sender paid is the validator's tip. Not a fixed ratio — a sender who pays
+  exactly the base fee tips nothing. See [Fees](#fees) and `TOKENOMICS.md`.
 - **Block reward:** a halving issuance schedule mints new HLX every block (independent of
   transaction volume), so validator income doesn't depend on fee revenue alone. Starts at
   1 HLX/block, halves every 15,768,000 blocks (~1 year at the 2s block time) — the same
