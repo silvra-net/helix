@@ -85,6 +85,27 @@ pub enum TxType {
     /// undelegating between a validator's double-sign and the evidence transaction that proves
     /// it cannot escape the slash.
     Undelegate,
+    /// Move `tx.amount` (denominated in HLX) of `tx.from`'s delegation straight from the
+    /// validator named in `tx.data` (as a UTF-8 address string) to the one named in `tx.to`,
+    /// with no unbonding wait: the stake keeps earning throughout, at the source until this
+    /// transaction and at the destination afterward. Switching validators otherwise costs a
+    /// full 7-day round trip through `Undelegate` + `ClaimUnbonded` + `Delegate`, which is a
+    /// steep price for the one action the network most wants a delegator to take freely —
+    /// walking away from a validator they no longer trust.
+    ///
+    /// Skipping the queue must not skip the *slashing window*, or this would be a strictly
+    /// better escape hatch than undelegating (instant, and the stake keeps earning). So the
+    /// moved capital stays slashable for the **source** validator for a full `UNBONDING_PERIOD`
+    /// even while it sits in and earns from the destination's pool — recorded as a
+    /// `state::Redelegation` under the source. A slash of the source in that window burns the
+    /// redelegator's own shares at the destination, leaving the destination's other delegators
+    /// untouched.
+    ///
+    /// Redelegating capital that is *itself* still inside such a window is rejected (no
+    /// A→B→C hopping): each hop would otherwise have to keep every earlier source's claim
+    /// alive on the same stake, and the honest use case — leaving a validator you no longer
+    /// trust — needs exactly one hop.
+    Redelegate,
     /// `tx.from` (a validator with an existing or new delegation pool) sets the commission
     /// rate it keeps from delegator rewards. `tx.data` carries the new rate as 2
     /// little-endian bytes (basis points, 0-10000). Capped well below 100% (see

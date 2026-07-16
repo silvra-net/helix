@@ -30,6 +30,12 @@ const VALIDATOR_POOLS: TableDefinition<&str, &[u8]> = TableDefinition::new("vali
 /// per-validator delegator map stored as one blob, same "one blob per outer key" shape as
 /// `GUARDIANS`/`RECOVERY_REQUESTS` rather than a multimap keyed by (validator, delegator).
 const DELEGATOR_SHARES: TableDefinition<&str, &[u8]> = TableDefinition::new("delegator_shares");
+/// source validator address string → bincode(`Vec<Redelegation>`) — the whole per-source list
+/// as one blob, same "one blob per outer key" shape as `DELEGATOR_SHARES`. These entries are
+/// what keeps redelegated stake slashable for the validator it left (see `TxType::Redelegate`),
+/// so losing them on restart would not merely drop state: it would silently hand every
+/// in-flight redelegation a full escape from the source's slashing window.
+const REDELEGATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("redelegations");
 /// contract address string → bincode(`HashMap<key_bytes, value_bytes>`) — the whole
 /// per-contract storage map stored as one blob, same "one blob per outer key" shape as
 /// `DELEGATOR_SHARES`. Without this table, `ChainState.contract_storage` would silently
@@ -82,6 +88,7 @@ impl HelixDb {
         tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -108,6 +115,7 @@ impl HelixDb {
             let mut personhood_authorities = tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut validator_pools = tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut delegator_shares = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut redelegations = tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut contract_storage = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut genesis_extra_validators = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -218,6 +226,31 @@ impl HelixDb {
                 delegator_shares.insert(addr.as_str(), encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // Unlike every other table here, this one needs stale keys actively removed: a
+            // source validator's entry disappears from `ChainState::redelegations` once its
+            // last window closes (`prune_expired_redelegations`), and these loops only ever
+            // insert. Leaving the old blob behind would resurrect expired redelegations on the
+            // next restart — re-exposing settled stake to a slash it had already outlived.
+            let stale: Vec<String> = {
+                let mut out = Vec::new();
+                let iter = redelegations.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+                for entry in iter {
+                    let (k, _) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+                    if !state.redelegations.contains_key(k.value()) {
+                        out.push(k.value().to_string());
+                    }
+                }
+                out
+            };
+            for key in &stale {
+                redelegations.remove(key.as_str()).map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+            for (src, entries) in &state.redelegations {
+                let encoded = bincode::serialize(entries)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                redelegations.insert(src.as_str(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
             for (addr, storage) in &state.contract_storage {
                 let encoded = bincode::serialize(storage)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -246,6 +279,7 @@ impl HelixDb {
         let personhood_authorities_table = tx.open_table(PERSONHOOD_AUTHORITIES).map_err(|e| StorageError::Db(e.to_string()))?;
         let validator_pools_table = tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
         let delegator_shares_table = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
+        let redelegations_table = tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         let contract_storage_table = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_extra_validators_table = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -353,6 +387,15 @@ impl HelixDb {
             delegator_shares.insert(k.value().to_string(), shares);
         }
 
+        let mut redelegations = std::collections::HashMap::new();
+        let redelegations_iter = redelegations_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        for entry in redelegations_iter {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let entries = bincode::deserialize(v.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            redelegations.insert(k.value().to_string(), entries);
+        }
+
         let mut contract_storage = std::collections::HashMap::new();
         let mut contract_storage_iter = contract_storage_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
         while let Some(entry) = contract_storage_iter.next() {
@@ -410,6 +453,7 @@ impl HelixDb {
             personhood_authorities,
             validator_pools,
             delegator_shares,
+            redelegations,
             contract_storage,
             genesis_extra_validators,
         })
@@ -852,6 +896,77 @@ mod tests {
         assert!(
             loaded.recovery_request(&owner).is_none(),
             "a cleared recovery request resurrected from the DB after reopening"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn redelegations_survive_reopening_the_database() {
+        use helix_executor::state::Redelegation;
+        let (db, path) = fresh_db();
+        let (src, dst, delegator) = (addr(1), addr(2), addr(3));
+
+        let mut state = ChainState::new(1_000_000);
+        state.redelegations.insert(
+            src.to_string(),
+            vec![Redelegation {
+                delegator: delegator.to_string(),
+                dst: dst.to_string(),
+                amount: 100_000_000_000,
+                unlock_height: 302_400,
+            }],
+        );
+        db.save_chain_state(&state).unwrap();
+
+        // A node restart must not forget that this stake is still slashable for `src` —
+        // forgetting it would silently hand every in-flight redelegation a free escape.
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        let entries = loaded.redelegations.get(&src.to_string()).expect("src's claim must survive");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].delegator, delegator.to_string());
+        assert_eq!(entries[0].dst, dst.to_string());
+        assert_eq!(entries[0].amount, 100_000_000_000);
+        assert_eq!(entries[0].unlock_height, 302_400);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pruned_redelegation_does_not_resurrect_after_reopening() {
+        use helix_executor::state::Redelegation;
+        let (db, path) = fresh_db();
+        let (src, dst, delegator) = (addr(1), addr(2), addr(3));
+
+        let mut state = ChainState::new(1_000_000);
+        state.redelegations.insert(
+            src.to_string(),
+            vec![Redelegation {
+                delegator: delegator.to_string(),
+                dst: dst.to_string(),
+                amount: 100_000_000_000,
+                unlock_height: 302_400,
+            }],
+        );
+        db.save_chain_state(&state).unwrap();
+
+        // The window closes and the entry is pruned out of state, removing the whole `src` key.
+        state.prune_expired_redelegations(302_400);
+        assert!(state.redelegations.is_empty());
+        db.save_chain_state(&state).unwrap();
+
+        // These save loops only insert, so without an explicit stale-key removal the old blob
+        // would still be in the table and reload as a live claim — re-exposing stake to a slash
+        // window it had already outlived.
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+        assert!(
+            loaded.redelegations.is_empty(),
+            "an expired redelegation resurrected from the DB after reopening"
         );
 
         let _ = std::fs::remove_file(&path);

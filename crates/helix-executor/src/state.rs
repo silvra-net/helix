@@ -138,6 +138,25 @@ pub struct DelegationPool {
     pub commission_bps: u16,
 }
 
+/// One `TxType::Redelegate`'s worth of capital that has left the source validator's pool for
+/// `dst`'s, but is still inside the source's slashing window. Stored under the source validator
+/// in `ChainState::redelegations`.
+///
+/// Slashing one of these does not touch the destination pool's other delegators: the loss is
+/// taken by burning `delegator`'s own shares in `dst`, since they are the only one who chose to
+/// back the misbehaving source validator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Redelegation {
+    /// Address string of the delegator who moved the stake.
+    pub delegator: String,
+    /// Address string of the validator whose pool now holds it (and pays rewards on it).
+    pub dst: String,
+    /// nano-HLX still exposed to the source validator's slashing. Shrinks as slashes land.
+    pub amount: u64,
+    /// Height at which the source's slashing window closes and the entry is pruned.
+    pub unlock_height: u64,
+}
+
 /// Full world state of the chain
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainState {
@@ -222,6 +241,19 @@ pub struct ChainState {
     /// grow large per popular validator and is only read/written on delegate/undelegate.
     #[serde(default)]
     pub delegator_shares: HashMap<String, HashMap<String, u64>>,
+    /// Capital moved straight from one validator's pool into another's via
+    /// `TxType::Redelegate`, keyed by the **source** validator it is still slashable for.
+    /// Absent entry = nothing is currently redelegating away from that validator.
+    ///
+    /// This exists because redelegation lets stake skip the unbonding queue, which is the only
+    /// thing that normally keeps departing capital within reach of `slash` (see
+    /// `AccountState::unbonding_source`). Without tracking it, redelegating between a
+    /// validator's double-sign and the evidence transaction proving it would be a strictly
+    /// better escape than undelegating: instant, and the stake keeps earning at the
+    /// destination. Entries are pruned by `prune_expired_redelegations` once their window
+    /// closes.
+    #[serde(default)]
+    pub redelegations: HashMap<String, Vec<Redelegation>>,
     /// Per-contract persistent key-value storage: contract address string -> {key -> value}.
     /// Written only via `TxType::CallContract`'s `storage_write` host call (see
     /// `helix_vm::HostContext`) — a contract can only ever read/write its *own* entry here
@@ -262,6 +294,7 @@ impl ChainState {
             personhood_authorities: Vec::new(),
             validator_pools: HashMap::new(),
             delegator_shares: HashMap::new(),
+            redelegations: HashMap::new(),
             contract_storage: HashMap::new(),
             genesis_extra_validators: Vec::new(),
         }
@@ -395,8 +428,82 @@ impl ChainState {
             }
         }
 
+        total += self.slash_redelegations_away_from(&key, fraction_bps);
+
         self.total_burned += total;
         total
+    }
+
+    /// Slash the capital that redelegated away from `src` and is still inside its window,
+    /// wherever it now sits. Returns the nano-HLX slashed; the caller burns it.
+    ///
+    /// The loss lands on the redelegator alone — their shares in the destination pool are burned
+    /// — rather than on the destination pool's value. Charging the pool would make every other
+    /// delegator at the destination pay for a validator they never chose to back, which is the
+    /// opposite of what makes shared slashing risk a useful incentive at all.
+    fn slash_redelegations_away_from(&mut self, src: &str, fraction_bps: u64) -> u64 {
+        let Some(mut entries) = self.redelegations.remove(src) else {
+            return 0;
+        };
+        let mut total: u64 = 0;
+
+        for entry in &mut entries {
+            let slash_amt = (entry.amount as u128 * fraction_bps as u128 / 10_000) as u64;
+            if slash_amt == 0 {
+                continue;
+            }
+            let Some(pool) = self.validator_pools.get_mut(&entry.dst) else {
+                continue;
+            };
+            if pool.total_delegated_stake == 0 || pool.total_shares == 0 {
+                continue;
+            }
+            // Round the burned share count *up*, so rounding can never leave the redelegator
+            // holding value the slash was supposed to take — the same direction
+            // `execute_undelegate` rounds in, and for the same reason.
+            let shares_to_burn = ((slash_amt as u128 * pool.total_shares as u128)
+                .div_ceil(pool.total_delegated_stake as u128)) as u64;
+
+            let Some(held) = self
+                .delegator_shares
+                .get_mut(&entry.dst)
+                .and_then(|m| m.get_mut(&entry.delegator))
+            else {
+                continue;
+            };
+            // The redelegator may already have undelegated part of this position — take what is
+            // still there and no more. What they undelegated is not lost to the slash: it went
+            // into their unbonding queue tagged with `dst`, not `src`, so this entry is the only
+            // claim `src` has on it. That is a deliberate, bounded leak; see `TxType::Redelegate`.
+            let shares_to_burn = shares_to_burn.min(*held);
+            if shares_to_burn == 0 {
+                continue;
+            }
+            let value_burned =
+                (shares_to_burn as u128 * pool.total_delegated_stake as u128 / pool.total_shares as u128) as u64;
+
+            *held -= shares_to_burn;
+            if *held == 0 {
+                self.delegator_shares.get_mut(&entry.dst).unwrap().remove(&entry.delegator);
+            }
+            pool.total_shares -= shares_to_burn;
+            pool.total_delegated_stake -= value_burned;
+            entry.amount = entry.amount.saturating_sub(value_burned);
+            total += value_burned;
+        }
+
+        self.redelegations.insert(src.to_string(), entries);
+        total
+    }
+
+    /// Drop redelegation entries whose source-slashing window has closed. Called once per block
+    /// (see `execute_block`) — without it every redelegation ever made would stay in consensus
+    /// state forever, and each source validator's slash would walk a list that only grows.
+    pub fn prune_expired_redelegations(&mut self, height: u64) {
+        self.redelegations.retain(|_, entries| {
+            entries.retain(|e| height < e.unlock_height && e.amount > 0);
+            !entries.is_empty()
+        });
     }
 
     /// Resolve a registered name (without `.hlx`) to its owning address string.
@@ -595,6 +702,10 @@ impl ChainState {
             // Nested HashMap -> HashMap, same non-determinism problem as everything else
             // here — flattened to a sorted map of maps rather than hashed as-is.
             delegator_shares: BTreeMap<&'a str, BTreeMap<&'a str, u64>>,
+            // Only the outer map needs sorting: each `Vec<Redelegation>` is built by pushing
+            // in transaction order and pruned with `retain`, both of which every node performs
+            // identically, so the vector order is already consensus-deterministic.
+            redelegations: BTreeMap<&'a str, &'a Vec<Redelegation>>,
             // Byte-string keys have no Ord impl conflict to worry about (unlike
             // PublicKey above) — Vec<u8> already implements Ord lexicographically.
             contract_storage: BTreeMap<&'a str, BTreeMap<&'a Vec<u8>, &'a Vec<u8>>>,
@@ -644,6 +755,7 @@ impl ChainState {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.iter().map(|(dk, dv)| (dk.as_str(), *dv)).collect()))
                 .collect(),
+            redelegations: self.redelegations.iter().map(|(k, v)| (k.as_str(), v)).collect(),
             contract_storage: self
                 .contract_storage
                 .iter()

@@ -68,6 +68,10 @@ pub fn execute_block(
 
     state.total_burned = state.total_burned.saturating_add(total_burned);
 
+    // Redelegations whose source-slashing window has closed stop being consensus state. Done
+    // after the transactions so an entry created in this block is never pruned by it.
+    state.prune_expired_redelegations(height);
+
     // Block reward: minted independently of transaction volume, capped so `total_issued`
     // never crosses the `total_supply` hard cap regardless of what the schedule says.
     let scheduled = genesis::scheduled_block_reward(height);
@@ -144,6 +148,7 @@ pub fn execute_transaction(
         TxType::SubmitDoubleSignEvidence => execute_submit_double_sign_evidence(state, tx, validator, tx_hash, base_fee_amount),
         TxType::Delegate => execute_delegate(state, tx, validator, tx_hash, base_fee_amount),
         TxType::Undelegate => execute_undelegate(state, tx, validator, tx_hash, height, base_fee_amount),
+        TxType::Redelegate => execute_redelegate(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::SetCommission => execute_set_commission(state, tx, validator, tx_hash, base_fee_amount),
     }
 }
@@ -493,6 +498,177 @@ fn execute_delegate(
 
     state.update_account(&tx.from, |acc| {
         acc.balance -= total_cost;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// `tx.data` names the source validator (UTF-8 address string), `tx.to` the destination, and
+/// `tx.amount` the HLX value (not raw shares) to move. Redeems shares from the source pool at
+/// its current share price and mints shares in the destination pool at *its* price, in one
+/// transaction and with no unbonding wait — but records the moved capital as still slashable
+/// for the source until `UNBONDING_PERIOD` has passed. See `TxType::Redelegate`.
+fn execute_redelegate(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+    height: u64,
+    base_fee_amount: u64,
+) -> Receipt {
+    let sender = state.get_or_default(&tx.from);
+
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
+    }
+    if tx.amount == 0 {
+        return Receipt::failure(tx_hash, "redelegation amount must be greater than zero", 0, 0);
+    }
+    let Some(dst) = &tx.to else {
+        return Receipt::failure(tx_hash, "redelegate requires a destination validator address", 0, 0);
+    };
+    let Ok(src_str) = std::str::from_utf8(&tx.data) else {
+        return Receipt::failure(tx_hash, "redelegate source address is not valid UTF-8", 0, 0);
+    };
+    let Ok(src) = Address::from_str(src_str) else {
+        return Receipt::failure(tx_hash, "redelegate source is not a valid address", 0, 0);
+    };
+    let (src_key, dst_key) = (src.to_string(), dst.to_string());
+    if src_key == dst_key {
+        return Receipt::failure(tx_hash, "cannot redelegate to the same validator", 0, 0);
+    }
+
+    // No A->B->C hopping while the earlier hop's window is still open — see `TxType::Redelegate`.
+    let sender_key = tx.from.to_string();
+    let already_redelegating = state
+        .redelegations
+        .values()
+        .flatten()
+        .any(|r| r.delegator == sender_key && r.dst == src_key);
+    if already_redelegating {
+        return Receipt::failure(
+            tx_hash,
+            "this delegation is itself still inside a redelegation window; wait for it to end \
+             before moving the stake on",
+            0,
+            0,
+        );
+    }
+
+    // The destination must be a real validator identity and must have the self-bond headroom to
+    // take the stake — identical to what `execute_delegate` demands, since that is exactly what
+    // this is from the destination's point of view.
+    let dst_self_staked = state.accounts.get(&dst_key).map(|a| a.staked).unwrap_or(0);
+    if dst_self_staked == 0 {
+        return Receipt::failure(
+            tx_hash,
+            "destination address has never self-staked — not a recognized validator identity",
+            0,
+            0,
+        );
+    }
+    let dst_existing = state.validator_pools.get(&dst_key).map(|p| p.total_delegated_stake).unwrap_or(0);
+    if !state::self_bond_ratio_ok(dst_self_staked, dst_existing.saturating_add(tx.amount)) {
+        return Receipt::failure(
+            tx_hash,
+            "redelegation rejected: the destination validator's self-bond ratio is already at \
+             its maximum leverage for its current self-stake",
+            0,
+            0,
+        );
+    }
+
+    // --- Redeem from the source pool (mirrors `execute_undelegate`'s share math) ---
+    let Some(src_pool) = state.validator_pools.get(&src_key) else {
+        return Receipt::failure(tx_hash, "no delegation pool for the source validator", 0, 0);
+    };
+    if src_pool.total_shares == 0 || src_pool.total_delegated_stake == 0 {
+        return Receipt::failure(tx_hash, "source delegation pool is empty", 0, 0);
+    }
+    let Some(owned_shares) = state
+        .delegator_shares
+        .get(&src_key)
+        .and_then(|m| m.get(&sender_key))
+        .copied()
+    else {
+        return Receipt::failure(tx_hash, "no delegation from this address to the source validator", 0, 0);
+    };
+    let my_value =
+        (owned_shares as u128 * src_pool.total_delegated_stake as u128 / src_pool.total_shares as u128) as u64;
+    if tx.amount > my_value {
+        return Receipt::failure(
+            tx_hash,
+            &format!("insufficient delegated balance: have {}, requested {}", my_value, tx.amount),
+            0,
+            0,
+        );
+    }
+    let src_shares_to_burn = ((tx.amount as u128 * src_pool.total_shares as u128)
+        .div_ceil(src_pool.total_delegated_stake as u128)) as u64;
+    let src_shares_to_burn = src_shares_to_burn.min(owned_shares);
+
+    // --- Mint into the destination pool (mirrors `execute_delegate`'s share math) ---
+    let dst_shares_to_mint = match state.validator_pools.get(&dst_key) {
+        Some(p) if p.total_shares > 0 && p.total_delegated_stake > 0 => {
+            (tx.amount as u128 * p.total_shares as u128 / p.total_delegated_stake as u128) as u64
+        }
+        _ => tx.amount,
+    };
+    if dst_shares_to_mint == 0 {
+        return Receipt::failure(
+            tx_hash,
+            "redelegation amount is too small to mint any shares at the destination's current \
+             share price",
+            0,
+            0,
+        );
+    }
+
+    // Everything is validated — commit.
+    {
+        let src_pool = state.validator_pools.get_mut(&src_key).expect("checked above");
+        src_pool.total_shares -= src_shares_to_burn;
+        src_pool.total_delegated_stake -= tx.amount;
+    }
+    {
+        let holders = state.delegator_shares.get_mut(&src_key).expect("checked above");
+        let remaining = owned_shares - src_shares_to_burn;
+        if remaining == 0 {
+            holders.remove(&sender_key);
+        } else {
+            holders.insert(sender_key.clone(), remaining);
+        }
+    }
+    let dst_pool = state.validator_pools.entry(dst_key.clone()).or_insert_with(|| DelegationPool {
+        total_shares: 0,
+        total_delegated_stake: 0,
+        commission_bps: DEFAULT_COMMISSION_BPS,
+    });
+    dst_pool.total_shares += dst_shares_to_mint;
+    dst_pool.total_delegated_stake += tx.amount;
+    *state
+        .delegator_shares
+        .entry(dst_key.clone())
+        .or_default()
+        .entry(sender_key.clone())
+        .or_insert(0) += dst_shares_to_mint;
+
+    // The source's claim on this capital outlives its presence in the source's pool.
+    state.redelegations.entry(src_key).or_default().push(state::Redelegation {
+        delegator: sender_key,
+        dst: dst_key,
+        amount: tx.amount,
+        unlock_height: height + state::UNBONDING_PERIOD,
+    });
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
         acc.nonce += 1;
     });
 
@@ -4161,6 +4337,230 @@ mod tests {
             state.get(&delegator).unwrap().balance,
             balance_before,
             "claimed funds are out of reach of the source validator's slash"
+        );
+    }
+
+    /// Two validators with self-stake, and `delegator` funded and already delegated `amount`
+    /// to `src`. Returns (src, dst, delegator keypair, delegator address, fee validator).
+    fn redelegation_fixture(amount: u64) -> (Address, Address, KeyPair, Address, Address, ChainState) {
+        let src = Address::from_public_key(&KeyPair::generate().public);
+        let dst = Address::from_public_key(&KeyPair::generate().public);
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let fee_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&src, |acc| acc.staked = 100_000 * 1_000_000_000);
+        state.update_account(&dst, |acc| acc.staked = 100_000 * 1_000_000_000);
+        state.update_account(&delegator, |acc| acc.balance = 1_000_000_000_000);
+
+        let delegate_tx = signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(src.clone()), amount, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate_tx, &fee_validator, 0, 0).success);
+
+        (src, dst, delegator_kp, delegator, fee_validator, state)
+    }
+
+    fn redelegate_tx(kp: &KeyPair, from: &Address, src: &Address, dst: &Address, amount: u64, nonce: u64) -> Transaction {
+        signed_tx(kp, from, TxType::Redelegate, Some(dst.clone()), amount, src.to_string().into_bytes(), nonce, 10_000)
+    }
+
+    #[test]
+    fn redelegate_moves_stake_between_pools_without_unbonding() {
+        let amount = 100_000_000_000;
+        let (src, dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+
+        let tx = redelegate_tx(&kp, &delegator, &src, &dst, amount, 1);
+        let receipt = execute_transaction(&mut state, &tx, &fee_validator, 0, 0);
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+
+        assert_eq!(state.validator_pools.get(&src.to_string()).unwrap().total_delegated_stake, 0, "source pool must be drained");
+        assert_eq!(state.validator_pools.get(&dst.to_string()).unwrap().total_delegated_stake, amount, "destination pool must hold it");
+        assert_eq!(
+            state.get(&delegator).unwrap().unbonding_stake,
+            0,
+            "redelegation must not route through the unbonding queue at all"
+        );
+        assert!(
+            state.delegator_shares.get(&dst.to_string()).unwrap().contains_key(&delegator.to_string()),
+            "delegator must hold shares in the destination pool"
+        );
+    }
+
+    #[test]
+    fn redelegating_before_the_slash_lands_does_not_escape_it() {
+        // The whole reason redelegation needs its own bookkeeping. Without it this would be a
+        // strictly better escape than undelegating: instant, and the stake keeps earning at the
+        // destination the entire time.
+        let amount = 100_000_000_000;
+        let (src, dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+
+        // src double-signs; the delegator front-runs the evidence transaction.
+        let tx = redelegate_tx(&kp, &delegator, &src, &dst, amount, 1);
+        assert!(execute_transaction(&mut state, &tx, &fee_validator, 0, 0).success);
+
+        state.slash(&src, 500);
+
+        let shares = *state.delegator_shares.get(&dst.to_string()).unwrap().get(&delegator.to_string()).unwrap();
+        let dst_pool = state.validator_pools.get(&dst.to_string()).unwrap();
+        let my_value = (shares as u128 * dst_pool.total_delegated_stake as u128 / dst_pool.total_shares as u128) as u64;
+        assert_eq!(my_value, amount * 95 / 100, "the redelegated stake must still take src's 5% slash");
+    }
+
+    #[test]
+    fn slashing_a_redelegation_source_spares_the_destinations_other_delegators() {
+        // The redelegator alone chose to back `src`, so the loss must come out of their shares
+        // at `dst` — not out of `dst`'s pool value, which every other delegator there shares.
+        let amount = 100_000_000_000;
+        let (src, dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+
+        let bystander_kp = KeyPair::generate();
+        let bystander = Address::from_public_key(&bystander_kp.public);
+        state.update_account(&bystander, |acc| acc.balance = 1_000_000_000_000);
+        let bystander_delegate = signed_tx(&bystander_kp, &bystander, TxType::Delegate, Some(dst.clone()), amount, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &bystander_delegate, &fee_validator, 0, 0).success);
+
+        let tx = redelegate_tx(&kp, &delegator, &src, &dst, amount, 1);
+        assert!(execute_transaction(&mut state, &tx, &fee_validator, 0, 0).success);
+
+        state.slash(&src, 500);
+
+        let pool = state.validator_pools.get(&dst.to_string()).unwrap();
+        let value_of = |addr: &Address| {
+            let shares = *state.delegator_shares.get(&dst.to_string()).unwrap().get(&addr.to_string()).unwrap();
+            (shares as u128 * pool.total_delegated_stake as u128 / pool.total_shares as u128) as u64
+        };
+        assert_eq!(value_of(&bystander), amount, "the bystander never backed src and must lose nothing");
+        assert_eq!(value_of(&delegator), amount * 95 / 100, "the redelegator takes the full loss");
+    }
+
+    #[test]
+    fn slashing_the_redelegation_destination_does_not_reach_the_source() {
+        // The mirror case: `dst` misbehaving hits its pool (including the freshly arrived
+        // stake, which is genuinely backing dst now), but must not touch `src`'s books.
+        let amount = 100_000_000_000;
+        let (src, dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+
+        let tx = redelegate_tx(&kp, &delegator, &src, &dst, amount, 1);
+        assert!(execute_transaction(&mut state, &tx, &fee_validator, 0, 0).success);
+
+        state.slash(&dst, 500);
+
+        assert_eq!(
+            state.validator_pools.get(&dst.to_string()).unwrap().total_delegated_stake,
+            amount * 95 / 100,
+            "dst's own pool slash applies normally to stake now backing it"
+        );
+        assert_eq!(
+            state.redelegations.get(&src.to_string()).unwrap()[0].amount,
+            amount,
+            "src's outstanding claim is unaffected by dst's misbehavior"
+        );
+    }
+
+    #[test]
+    fn redelegate_rejects_hopping_while_a_window_is_still_open() {
+        let amount = 100_000_000_000;
+        let (src, dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+        let third = Address::from_public_key(&KeyPair::generate().public);
+        state.update_account(&third, |acc| acc.staked = 100_000 * 1_000_000_000);
+
+        let hop1 = redelegate_tx(&kp, &delegator, &src, &dst, amount, 1);
+        assert!(execute_transaction(&mut state, &hop1, &fee_validator, 0, 0).success);
+
+        // dst -> third, while src's claim on this stake is still open. Rejected: each further
+        // hop would have to keep every earlier source's claim alive on the same capital.
+        let hop2 = redelegate_tx(&kp, &delegator, &dst, &third, amount, 2);
+        let receipt = execute_transaction(&mut state, &hop2, &fee_validator, 0, 0);
+        assert!(!receipt.success, "A->B->C hopping inside the window must be rejected");
+        assert!(
+            receipt.error.as_deref().unwrap_or_default().contains("still inside a redelegation window"),
+            "expected the hop rejection, got: {:?}",
+            receipt.error
+        );
+    }
+
+    #[test]
+    fn redelegate_is_allowed_again_once_the_window_has_expired() {
+        let amount = 100_000_000_000;
+        let (src, dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+        let third = Address::from_public_key(&KeyPair::generate().public);
+        state.update_account(&third, |acc| acc.staked = 100_000 * 1_000_000_000);
+
+        let hop1 = redelegate_tx(&kp, &delegator, &src, &dst, amount, 1);
+        assert!(execute_transaction(&mut state, &hop1, &fee_validator, 0, 0).success);
+
+        state.prune_expired_redelegations(UNBONDING_PERIOD);
+        assert!(state.redelegations.is_empty(), "the expired entry must be pruned");
+
+        let hop2 = redelegate_tx(&kp, &delegator, &dst, &third, amount, 2);
+        let receipt = execute_transaction(&mut state, &hop2, &fee_validator, UNBONDING_PERIOD, 0);
+        assert!(receipt.success, "expected success once the window closed, got: {:?}", receipt.error);
+    }
+
+    #[test]
+    fn pruned_redelegation_is_beyond_the_sources_reach() {
+        let amount = 100_000_000_000;
+        let (src, dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+
+        let tx = redelegate_tx(&kp, &delegator, &src, &dst, amount, 1);
+        assert!(execute_transaction(&mut state, &tx, &fee_validator, 0, 0).success);
+        state.prune_expired_redelegations(UNBONDING_PERIOD);
+
+        state.slash(&src, 500);
+
+        assert_eq!(
+            state.validator_pools.get(&dst.to_string()).unwrap().total_delegated_stake,
+            amount,
+            "once the window closes, src's slash can no longer reach the moved stake"
+        );
+    }
+
+    #[test]
+    fn redelegate_rejects_same_source_and_destination() {
+        let amount = 100_000_000_000;
+        let (src, _dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+
+        let tx = redelegate_tx(&kp, &delegator, &src, &src, amount, 1);
+        let receipt = execute_transaction(&mut state, &tx, &fee_validator, 0, 0);
+        assert!(!receipt.success, "redelegating to the same validator must be rejected");
+    }
+
+    #[test]
+    fn redelegate_rejects_amount_above_owned_value() {
+        let amount = 100_000_000_000;
+        let (src, dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+
+        let tx = redelegate_tx(&kp, &delegator, &src, &dst, amount * 2, 1);
+        let receipt = execute_transaction(&mut state, &tx, &fee_validator, 0, 0);
+        assert!(!receipt.success, "cannot redelegate more than is delegated");
+        assert!(state.redelegations.is_empty(), "a rejected redelegation must leave no claim behind");
+    }
+
+    #[test]
+    fn redelegate_rejects_destination_that_never_self_staked() {
+        let amount = 100_000_000_000;
+        let (src, _dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+        let stranger = Address::from_public_key(&KeyPair::generate().public);
+
+        let tx = redelegate_tx(&kp, &delegator, &src, &stranger, amount, 1);
+        let receipt = execute_transaction(&mut state, &tx, &fee_validator, 0, 0);
+        assert!(!receipt.success, "destination must be a real validator identity");
+    }
+
+    #[test]
+    fn redelegate_rejects_breaching_the_destinations_self_bond_ratio() {
+        let amount = 100_000_000_000;
+        let (src, dst, kp, delegator, fee_validator, mut state) = redelegation_fixture(amount);
+        // Leave dst with only enough self-stake to back a fraction of the incoming amount.
+        state.update_account(&dst, |acc| acc.staked = 1_000_000);
+
+        let tx = redelegate_tx(&kp, &delegator, &src, &dst, amount, 1);
+        let receipt = execute_transaction(&mut state, &tx, &fee_validator, 0, 0);
+        assert!(!receipt.success, "destination's self-bond ratio must gate redelegation in too");
+        assert_eq!(
+            state.validator_pools.get(&src.to_string()).unwrap().total_delegated_stake,
+            amount,
+            "a rejected redelegation must leave the source pool untouched"
         );
     }
 

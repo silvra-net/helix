@@ -647,7 +647,25 @@ helix tx claim-unbonded --key alice.json
 
 `undelegate`'s amount is the HLX value you want back (principal plus whatever compounded, or
 minus anything lost to a slash since you delegated), not raw shares — the CLI/executor
-convert internally. A few things worth knowing:
+convert internally.
+
+### Switching Validators
+
+Undelegating and re-delegating means 7 days out of the market. To move a delegation directly,
+with no unbonding wait and no missed rewards:
+
+```bash
+helix tx redelegate hlxOldValidator... hlxNewValidator... 50 --key alice.json
+```
+
+The stake earns at the old validator up to this transaction and at the new one immediately
+after. What it does *not* do is shed the old validator's slashing risk: the moved stake stays
+slashable for the validator you left for a full 7 days, so redelegating away from one that has
+already double-signed does not dodge the hit — the loss comes out of your shares at the new
+validator, leaving that validator's other delegators untouched. Redelegating stake that is
+itself still inside such a window is rejected; wait it out before moving again.
+
+A few things worth knowing about delegation generally:
 
 - **No governance power.** Delegating moves your economic exposure to the validator's
   performance, not your vote — governance weight stays tied to your own `helix tx stake`
@@ -805,11 +823,13 @@ advances, since real compute was spent either way.
   accounts flood the validator set.
 - **Unbonding period:** 7 days from `tx unstake` to claimable — stake stays slashable the
   whole time. Same for delegated stake redeemed via `tx undelegate`: it remains slashable for
-  the validator it was withdrawn from until the period ends.
+  the validator it was withdrawn from until the period ends. `tx redelegate` skips the wait
+  but not the window: the stake earns at its new validator immediately while staying slashable
+  for the old one for the same 7 days.
 - **Slashing:** 5% of staked HLX burned, plus immediate exclusion from BFT rounds, on
-  confirmed double-sign. Reaches the validator's own stake, its delegation pool, and any stake
-  still unbonding out of either — so neither unstaking nor undelegating ahead of the evidence
-  escapes it.
+  confirmed double-sign. Reaches the validator's own stake, its delegation pool, any stake
+  still unbonding out of either, and any stake that redelegated away inside the window — so no
+  exit taken ahead of the evidence escapes it.
 - **Circulating supply** = total issued − total burned. Total issued starts small (just the
   genesis validator stake) and grows block by block via the emission schedule above.
 - No liquid HLX is pre-mined to any wallet at genesis — the genesis validator receives only

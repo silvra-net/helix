@@ -90,6 +90,23 @@ pub enum TxCmd {
         #[arg(long)]
         nonce: Option<u64>,
     },
+    /// Move a delegation straight from one validator to another, with no unbonding wait —
+    /// the stake keeps earning throughout. It stays slashable for the validator you left for
+    /// 7 days, so switching away from one that has already misbehaved does not avoid the hit
+    Redelegate {
+        /// Validator address to move the delegation away from
+        from_validator: String,
+        /// Validator address to move it to
+        to_validator: String,
+        /// Amount in HLX to move (its current value, not raw shares)
+        amount: f64,
+        #[arg(short, long, default_value = "wallet.json")]
+        key: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_FEE_NANO)]
+        fee: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
     /// Set the commission rate this validator keeps from delegator rewards
     SetCommission {
         /// Commission in basis points (0-5000, i.e. 0%-50%)
@@ -127,6 +144,9 @@ pub async fn run(cmd: TxCmd, node: &str) -> Result<()> {
         }
         TxCmd::Undelegate { validator, amount, key, fee, nonce } => {
             targeted_amount_tx(TxType::Undelegate, validator, amount, key, fee, nonce, node).await
+        }
+        TxCmd::Redelegate { from_validator, to_validator, amount, key, fee, nonce } => {
+            redelegate(from_validator, to_validator, amount, key, fee, nonce, node).await
         }
         TxCmd::SetCommission { bps, key, fee, nonce } => {
             set_commission(bps, key, fee, nonce, node).await
@@ -320,6 +340,63 @@ async fn targeted_amount_tx(
     println!("  Amount    : {:.9} HLX", amount_hlx);
     println!("  Fee       : {} nano-HLX", fee);
     println!("  Nonce     : {}", nonce);
+
+    submit_tx(&tx, node).await
+}
+
+async fn redelegate(
+    from_validator: String,
+    to_validator: String,
+    amount_hlx: f64,
+    key_path: PathBuf,
+    fee: u64,
+    nonce_override: Option<u64>,
+    node: &str,
+) -> Result<()> {
+    let kf = KeyFile::load(&key_path)?;
+    let kp = if kf.is_encrypted() {
+        let pass = rpassword_read("Wallet passphrase: ")?;
+        kf.to_keypair(Some(&pass))?
+    } else {
+        kf.to_keypair(None)?
+    };
+    let from = Address::from_str(&kf.address)
+        .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
+    let src = Address::from_str(&from_validator)
+        .map_err(|e| anyhow::anyhow!("Invalid source validator address: {}", e))?;
+    let dst = Address::from_str(&to_validator)
+        .map_err(|e| anyhow::anyhow!("Invalid destination validator address: {}", e))?;
+    let amount_nano = (amount_hlx * NANO_PER_HLX) as u64;
+    let nonce = match nonce_override {
+        Some(n) => n,
+        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+    };
+    let mut tx = Transaction {
+        version: 1,
+        tx_type: TxType::Redelegate,
+        from: from.clone(),
+        to: Some(dst),
+        amount: amount_nano,
+        fee,
+        nonce,
+        // The destination rides in `to`; the source has to travel in `data` as its address
+        // string — a transaction has only one `to` field and this is the one operation that
+        // names two validators.
+        data: src.to_string().into_bytes(),
+        crypto_version: kp.scheme,
+        signature: Signature::from_bytes(vec![]),
+        public_key: kp.public.clone(),
+    };
+    let signing_hash = tx.signing_hash();
+    tx.signature = kp.sign(signing_hash.as_bytes())?;
+
+    println!("  From      : {}", kf.address);
+    println!("  Moving    : {} -> {}", from_validator, to_validator);
+    println!("  Amount    : {:.9} HLX", amount_hlx);
+    println!("  Fee       : {} nano-HLX", fee);
+    println!("  Nonce     : {}", nonce);
+    println!();
+    println!("  Note: this stake stays slashable for {} for 7 days.", from_validator);
 
     submit_tx(&tx, node).await
 }
