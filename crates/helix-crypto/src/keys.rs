@@ -230,6 +230,24 @@ impl KeyPair {
         }
     }
 
+    /// Rebuild an ML-DSA keypair from its 32-byte seed alone — FIPS 204 derives the whole
+    /// key deterministically from ξ, so the seed *is* the key.
+    ///
+    /// This is what makes a 24-word BIP39 backup possible: the seed is exactly the 32 bytes
+    /// BIP39 encodes as entropy, so words → seed → keypair → the same address, with no wallet
+    /// file involved (see `helix wallet restore`). Only ML-DSA: SLH-DSA's key is not a
+    /// re-derivable seed in this way, and callers must keep its file.
+    pub fn from_mldsa_seed(seed: &[u8]) -> CryptoResult<Self> {
+        let seed = mldsa_seed(seed)?;
+        let sk = MlDsaSigningKey::<MlDsa65>::new(&seed);
+        let vk = sk.verifying_key();
+        Ok(KeyPair {
+            public: PublicKey::from_bytes(vk.encode().to_vec()),
+            secret: SecretKey::from_bytes(seed.to_vec()),
+            scheme: CryptoScheme::MlDsa,
+        })
+    }
+
     /// Reconstruct and structurally validate a keypair from raw bytes previously
     /// produced by `generate_for` (e.g. loaded from a wallet or validator key file).
     pub fn from_raw(

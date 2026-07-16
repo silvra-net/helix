@@ -24,3 +24,5 @@ anyhow.workspace = true
 aes-gcm.workspace = true
 argon2.workspace = true
 rand.workspace = true
+bip39 = "2.2.2"
+rpassword = "7.5.4"

@@ -450,6 +450,9 @@ helix wallet new -o alice.json                       # generate a new ML-DSA key
 helix wallet new -o alice.json --passphrase "..."     # ...encrypted at rest (AES-256-GCM + Argon2id)
 helix wallet new -o alice.json --scheme sphincs-plus  # ...using SPHINCS+ instead of ML-DSA
 
+helix wallet restore                                  # rebuild a wallet from its 24 words
+helix wallet restore --mnemonic "trim thought ..."    # ...non-interactively (lands in shell history)
+
 helix wallet info --key alice.json                    # address, public key, algorithm
 helix wallet address --key alice.json                 # just the address (for scripting)
 helix wallet encrypt "newpass" --key alice.json        # add/change passphrase on an existing wallet
@@ -464,6 +467,22 @@ per-use conversion step.
 
 A wallet file is portable — it's just JSON. Anyone with the file (and its passphrase, if
 encrypted) can sign as that address, so treat it like a private key, because it is one.
+
+#### The recovery phrase
+
+Creating an ML-DSA wallet prints 24 words, once. Write them on paper. They *are* the wallet:
+`helix wallet restore` turns them back into the exact same address on any machine, with no file
+to copy — which is the point, because a wallet file lives on a disk, and disks die with the
+machine they're in.
+
+They are shown once and never again. The wallet file stores the key, not the words, and there is
+no command to reprint them — a command that turns a wallet file into a displayed key is a
+liability, not a feature. If you lose the phrase, the file still works; if you lose both, the
+wallet is gone, and nobody can help you.
+
+The words also work in the Spark app: same 24 words, same address, since both derive the key from
+the same seed the phrase encodes. (SPHINCS+ wallets have no phrase — that scheme's key is not
+re-derivable from a seed, so its file is the only copy.)
 
 *(A converter, `helix wallet import-node-key`, exists only for the pre-2026-07 raw-binary key
 format some very old nodes wrote. You almost certainly don't have one — modern keys are

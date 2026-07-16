@@ -465,10 +465,13 @@ async fn submit_tx(tx: &Transaction, node: &str) -> Result<()> {
     Ok(())
 }
 
-fn rpassword_read(_prompt: &str) -> Result<String> {
-    let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
-    Ok(s.trim().to_string())
+/// Read a passphrase without echoing it.
+///
+/// Named `rpassword_read` and taking a `_prompt` it ignored, this used to be a plain
+/// `stdin().read_line` — so every wallet passphrase was typed in clear text and left sitting in
+/// the terminal's scrollback. The name described the intent; nothing implemented it.
+pub(crate) fn rpassword_read(prompt: &str) -> Result<String> {
+    Ok(rpassword::prompt_password(prompt)?.trim().to_string())
 }
 
 async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {
