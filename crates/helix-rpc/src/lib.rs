@@ -133,6 +133,14 @@ pub struct TxHistoryEntry {
     pub block_height: u64,
     pub block_hash: String,
     pub timestamp: u64,
+    /// What execution actually did with it: `applied`, `failed`, or `unknown` when this node
+    /// has no receipt (blocks committed before receipts were stored). Deliberately not
+    /// `confirmed` — being in a block is not an outcome, and reading it as one is how a
+    /// rejected transfer came to look exactly like a successful payment in a wallet history.
+    pub status: String,
+    /// Why it failed, straight from the executor. Absent unless `status` is `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

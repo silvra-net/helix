@@ -754,7 +754,12 @@ async fn get_contract_storage(
 }
 
 /// Builds the RPC-facing history entry for one transaction from the block it's in.
-fn tx_history_entry(block: &helix_core::Block, tx: &Transaction) -> TxHistoryEntry {
+fn tx_history_entry(
+    block: &helix_core::Block,
+    tx: &Transaction,
+    outcome: (String, Option<String>),
+) -> TxHistoryEntry {
+    let (status, error) = outcome;
     TxHistoryEntry {
         hash: tx.hash().to_hex(),
         from: tx.from.to_string(),
@@ -766,6 +771,21 @@ fn tx_history_entry(block: &helix_core::Block, tx: &Transaction) -> TxHistoryEnt
         block_height: block.height(),
         block_hash: block.hash().to_hex(),
         timestamp: block.header.timestamp,
+        status,
+        error,
+    }
+}
+
+/// What the stored receipt says happened to `tx_hash`, as (status, error).
+///
+/// A missing receipt is `unknown`, never success: the block may predate receipt storage, or
+/// the write may have failed. Both endpoints that report an outcome go through here so they
+/// cannot drift into telling callers different stories about the same transaction.
+fn receipt_outcome(store: &HelixDb, tx_hash: &Hash) -> (String, Option<String>) {
+    match store.get_receipt(tx_hash) {
+        Ok(Some(r)) if r.success => ("applied".to_string(), None),
+        Ok(Some(r)) => ("failed".to_string(), r.error),
+        Ok(None) | Err(_) => ("unknown".to_string(), None),
     }
 }
 
@@ -781,7 +801,9 @@ fn extract_tx_history(blocks: &[helix_core::Block], address: &str) -> Vec<TxHist
             let is_sender = tx.from.to_string() == address;
             let is_recipient = tx.to.as_ref().map(|a| a.to_string()).as_deref() == Some(address);
             if is_sender || is_recipient {
-                history.push(tx_history_entry(block, tx));
+                // No store here by design (this is the pure ground truth for the indexed
+                // lookup), so no receipt either — the outcome is not what it checks.
+                history.push(tx_history_entry(block, tx, ("unknown".to_string(), None)));
             }
         }
     }
@@ -827,7 +849,8 @@ async fn get_account_transactions(
     for (height, tx_index) in refs {
         let Ok(block) = store.get_block_by_height(height) else { continue };
         let Some(tx) = block.transactions.get(tx_index as usize) else { continue };
-        history.push(tx_history_entry(&block, tx));
+        let outcome = receipt_outcome(&store, &tx.hash());
+        history.push(tx_history_entry(&block, tx, outcome));
     }
 
     (
@@ -908,30 +931,18 @@ async fn get_transaction_status(
                     Json(json!({ "error": "indexed tx position out of range" })),
                 );
             };
-            let mut entry = json!(tx_history_entry(&block, tx));
-            // Being in a block is not the same as having worked. The executor rejects
+            // Being in a block is not the same as having worked: the executor rejects
             // transactions for a bad nonce, insufficient balance or a zero amount, and they are
-            // committed and charged the fee exactly like any other — this answered `confirmed`
+            // committed and charged the fee exactly like any other. This answered `confirmed`
             // to all of them, which is the difference between "your money arrived" and "it
             // didn't". The receipt is the only thing that knows.
-            match store.get_receipt(&tx_hash) {
-                Ok(Some(r)) if r.success => {
-                    entry["status"] = json!("applied");
-                    entry["fee_burned_hlx"] = json!(r.fee_burned as f64 / 1_000_000_000.0);
-                    entry["fee_to_validator_hlx"] =
-                        json!(r.fee_to_validator as f64 / 1_000_000_000.0);
-                }
-                Ok(Some(r)) => {
-                    entry["status"] = json!("failed");
-                    entry["error"] = json!(r.error);
-                    entry["fee_burned_hlx"] = json!(r.fee_burned as f64 / 1_000_000_000.0);
-                    entry["fee_to_validator_hlx"] =
-                        json!(r.fee_to_validator as f64 / 1_000_000_000.0);
-                }
-                // No receipt: either this block predates receipt storage, or the write failed.
-                // Either way this node cannot say what happened, and saying so is the whole
-                // point — `unknown` must never quietly mean "fine".
-                Ok(None) | Err(_) => entry["status"] = json!("unknown"),
+            let mut entry = json!(tx_history_entry(&block, tx, receipt_outcome(&store, &tx_hash)));
+            // The burn split is in the receipt anyway, and it is the only place a caller can
+            // see what the fee actually did — how much EIP-1559 burned, how much the validator
+            // earned.
+            if let Ok(Some(r)) = store.get_receipt(&tx_hash) {
+                entry["fee_burned_hlx"] = json!(r.fee_burned as f64 / 1_000_000_000.0);
+                entry["fee_to_validator_hlx"] = json!(r.fee_to_validator as f64 / 1_000_000_000.0);
             }
             (StatusCode::OK, Json(entry))
         }
@@ -1224,6 +1235,58 @@ mod tests {
             assert_eq!(entry["block_height"], want.block_height);
             assert_eq!(entry["from"], want.from);
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Where the bug was actually found: a wallet history. A rejected transfer sat in this list
+    /// looking exactly like a payment that went through — same shape, same fields, no outcome
+    /// anywhere. Fixing only `/transactions/{hash}` would have left the list, which is what
+    /// Spark and the explorer render, still saying nothing.
+    #[tokio::test]
+    async fn account_history_marks_a_failed_transaction_instead_of_listing_it_like_any_other() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let bob = addr(2);
+
+        let good = tx(&alice, &bob, 10, 0);
+        let bad = tx(&alice, &bob, 0, 1);
+        let (good_hash, bad_hash) = (good.hash(), bad.hash());
+        {
+            let mut store = state.store.write().await;
+            store.put_block(block(1, &alice, vec![good, bad])).unwrap();
+            store
+                .put_receipts(&[
+                    Receipt::success(good_hash, 40, 60),
+                    Receipt::failure(bad_hash, "transfer amount must be greater than zero", 40, 0),
+                ])
+                .unwrap();
+        }
+
+        let response = get_account_transactions(
+            State(state),
+            Path(alice.to_string()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let got = parsed["transactions"].as_array().unwrap();
+
+        let by_hash = |h: &Hash| {
+            got.iter()
+                .find(|e| e["hash"] == h.to_hex())
+                .unwrap_or_else(|| panic!("history is missing {}", h.to_hex()))
+                .clone()
+        };
+        assert_eq!(by_hash(&good_hash)["status"], "applied");
+        assert_eq!(by_hash(&bad_hash)["status"], "failed");
+        assert_eq!(by_hash(&bad_hash)["error"], "transfer amount must be greater than zero");
+        assert!(
+            by_hash(&good_hash)["error"].is_null(),
+            "a successful tx carries no error"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
