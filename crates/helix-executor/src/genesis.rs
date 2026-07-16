@@ -43,7 +43,13 @@ pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 1_000_000; // 1 M HLX
 /// `TOTAL_SUPPLY_HLX` and the genesis stake is instead released gradually, earned by
 /// whoever actually produces blocks, via `scheduled_block_reward` — the same shape as
 /// Bitcoin's coinbase subsidy. Nothing stops an operator from prefunding specific wallets
-/// here for legitimate bootstrap needs (e.g. a faucet), it's just empty today.
+/// here for legitimate bootstrap needs (e.g. a faucet or a treasury), it's just empty today.
+///
+/// Like `VALIDATOR_GENESIS_STAKE_HLX`, this is a default for chains launching *fresh*: what a
+/// chain actually allocated is recorded in `ChainState::genesis_allocations` and handed to
+/// joining nodes over `GET /genesis`. That is what makes filling this in safe at all — before
+/// it, a populated prefund would have been rebuilt by each joining node from *its own* binary,
+/// so any build skew became a genesis mismatch and a diverged chain.
 const GENESIS_PREFUND: &[(&str, u64)] = &[];
 
 /// Starting per-block issuance before any halving, in whole HLX. Minted on top of the
@@ -85,7 +91,11 @@ pub fn scheduled_block_reward(height: u64) -> u64 {
 
 pub struct GenesisConfig {
     pub validator: Address,
-    pub allocations: Vec<(Address, u64)>, // (address, nano-HLX balance)
+    /// Liquid genesis balances (address, nano-HLX). Seeded from the `GENESIS_PREFUND` default
+    /// for a chain launching fresh; a node joining an existing chain replaces it with that
+    /// chain's real allocations from the peer's `GET /genesis`, exactly like `validator_stake`
+    /// and `extra_validators`. See `ChainState::genesis_allocations`.
+    pub allocations: Vec<(Address, u64)>,
     /// The network's personhood-issuing authorities, if configured — see
     /// `ChainState::personhood_authorities`'s doc comment. Empty means `ProvePersonhood` stays
     /// disabled until an operator explicitly sets at least one; there is deliberately no
@@ -155,6 +165,7 @@ impl GenesisConfig {
             state.set_balance(address, *nano);
             issued += nano;
         }
+        state.genesis_allocations = self.allocations.clone();
 
         // Validator genesis stake — staked directly so it survives epoch 1 rotation
         let validator_stake = self.validator_stake;
@@ -255,19 +266,48 @@ mod tests {
         assert_eq!(state.total_issued, peer_stake, "issuance must count what was really staked");
     }
 
-    /// Two nodes that disagree about the genesis stake must produce different `state_hash`es —
-    /// otherwise the divergence this whole field exists to prevent would go unnoticed by the
-    /// one tool built to detect it.
+    /// The joining path for liquid balances: a node must credit the allocations its peer
+    /// reports, and record them, rather than applying its own `GENESIS_PREFUND` default. This is
+    /// what makes an operator treasury or faucet safe to configure at all — without it, filling
+    /// the constant means every node with a different build rebuilds a different genesis.
     #[test]
-    fn a_different_genesis_stake_shows_up_in_the_state_hash() {
+    fn build_state_credits_the_configured_allocations_not_the_compile_time_default() {
         let validator = some_address();
-        let default_state = GenesisConfig::devnet(validator.clone()).build_state();
+        let treasury = some_address();
+        let peer_allocation = 100_000 * NANO_PER_HLX;
 
-        let mut cfg = GenesisConfig::devnet(validator);
-        cfg.validator_stake = 330_000 * NANO_PER_HLX;
-        let retuned_state = cfg.build_state();
+        let mut cfg = GenesisConfig::devnet(validator.clone());
+        assert!(cfg.allocations.is_empty(), "the default prefund is empty — the premise here");
+        cfg.allocations = vec![(treasury.clone(), peer_allocation)];
+        let state = cfg.build_state();
 
-        assert_ne!(default_state.state_hash(), retuned_state.state_hash());
+        assert_eq!(state.accounts[&treasury.to_string()].balance, peer_allocation);
+        assert_eq!(state.genesis_allocations, vec![(treasury, peer_allocation)]);
+        assert_eq!(
+            state.total_issued,
+            peer_allocation + VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX,
+            "issuance must count the liquid balances too, or the supply books are wrong"
+        );
+    }
+
+    /// Both genesis records must be part of `state_hash`, so two nodes that disagree about them
+    /// are caught by the one tool built to spot divergence.
+    ///
+    /// Deliberately mutates `ChainState` directly instead of going through `build_state`: doing
+    /// it via config would also change `accounts` (a different stake, a funded treasury), and
+    /// the hash would then differ for that reason alone — passing whether or not these fields
+    /// are in `Canonical` at all, which is the very thing under test.
+    #[test]
+    fn the_genesis_records_are_part_of_the_state_hash() {
+        let base = ChainState::new(33_000_000 * NANO_PER_HLX);
+
+        let mut other_stake = ChainState::new(33_000_000 * NANO_PER_HLX);
+        other_stake.genesis_validator_stake = 330_000 * NANO_PER_HLX;
+        assert_ne!(base.state_hash(), other_stake.state_hash(), "stake must be hashed");
+
+        let mut other_allocations = ChainState::new(33_000_000 * NANO_PER_HLX);
+        other_allocations.genesis_allocations = vec![(some_address(), 100_000 * NANO_PER_HLX)];
+        assert_ne!(base.state_hash(), other_allocations.state_hash(), "allocations must be hashed");
     }
 
     #[test]

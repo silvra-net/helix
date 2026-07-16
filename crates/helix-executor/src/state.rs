@@ -287,6 +287,20 @@ pub struct ChainState {
     /// retuned later without forking every chain that already launched under the old value.
     #[serde(default)]
     pub genesis_validator_stake: u64,
+    /// Liquid balances handed out at genesis beyond any staked amounts (address, nano-HLX) —
+    /// e.g. a faucet or an operator treasury. The third and last piece of genesis that cannot be
+    /// re-derived from the genesis block, recorded here for the same reason as
+    /// `genesis_extra_validators` and `genesis_validator_stake`: `GENESIS_PREFUND` is a
+    /// compile-time default describing how a *new* chain would launch on this build, and a node
+    /// joining an existing chain must not rebuild that chain's genesis from it.
+    ///
+    /// Empty for every chain launched so far, which is the only reason reading it back as empty
+    /// is safe: an empty table is indistinguishable from an absent one, so a chain that had
+    /// launched with a non-empty `GENESIS_PREFUND` before this field existed would come back
+    /// wrong. None ever did — the constant has been `&[]` since well before any live chain's
+    /// genesis. Chains launching from here on store whatever they actually allocated.
+    #[serde(default)]
+    pub genesis_allocations: Vec<(Address, u64)>,
 }
 
 impl ChainState {
@@ -313,6 +327,7 @@ impl ChainState {
             contract_storage: HashMap::new(),
             genesis_extra_validators: Vec::new(),
             genesis_validator_stake: 0,
+            genesis_allocations: Vec::new(),
         }
     }
 
@@ -727,6 +742,7 @@ impl ChainState {
             contract_storage: BTreeMap<&'a str, BTreeMap<&'a Vec<u8>, &'a Vec<u8>>>,
             genesis_extra_validators: BTreeMap<&'a str, u64>,
             genesis_validator_stake: u64,
+            genesis_allocations: BTreeMap<&'a str, u64>,
         }
 
         let canonical = Canonical {
@@ -784,6 +800,11 @@ impl ChainState {
                 .map(|(a, s)| (a.as_str(), *s))
                 .collect(),
             genesis_validator_stake: self.genesis_validator_stake,
+            genesis_allocations: self
+                .genesis_allocations
+                .iter()
+                .map(|(a, b)| (a.as_str(), *b))
+                .collect(),
         };
 
         let bytes = bincode::serialize(&canonical).expect("canonical chain state serialization is infallible");

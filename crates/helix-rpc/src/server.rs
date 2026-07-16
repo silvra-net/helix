@@ -227,11 +227,15 @@ async fn get_blocks_range(
 /// `GET /genesis` — everything a node bootstrapping fresh against this one as its
 /// `sync_peer` needs to reconstruct an identical genesis, instead of self-signing its own
 /// (see `HelixNode::new`'s doc comment on why that produces a distinct, incompatible
-/// height-0 block per node): the genesis block itself (`validator` in its header identifies
-/// who got the bootstrap stake) plus `personhood_authorities`, which — unlike the
-/// (currently always empty) `GENESIS_PREFUND` allocations — is a per-deployment choice with
-/// no way to re-derive it from the block alone. Both together let a new node build the
-/// exact same initial `ChainState` this one started from.
+/// height-0 block per node).
+///
+/// The genesis block identifies *who* got the bootstrap stake; everything else here is a
+/// per-deployment choice that cannot be re-derived from the block: `personhood_authorities`,
+/// the governance params, the bootstrap `validator_stake_nano`, any `extra_validators`, and any
+/// liquid `allocations`. Each is served from chain state rather than from this node's own
+/// compile-time defaults, which describe how a *new* chain would launch on today's build — not
+/// how this one launched. Together they let a joining node rebuild the exact same initial
+/// `ChainState` this chain started from, whatever build it happens to be running.
 async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
     let store = state.store.read().await;
     let block = match store.get_block_by_height(0) {
@@ -249,6 +253,11 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
         .genesis_extra_validators
         .iter()
         .map(|(addr, stake)| json!({ "address": addr.as_str(), "stake_nano": stake }))
+        .collect();
+    let allocations: Vec<serde_json::Value> = cs
+        .genesis_allocations
+        .iter()
+        .map(|(addr, balance)| json!({ "address": addr.as_str(), "balance_nano": balance }))
         .collect();
     // This node's *current* governance_params, not necessarily its genesis-time ones — if a
     // proposal changed a param since genesis, a node adopting this as its starting value will
@@ -270,6 +279,10 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
             // `VALIDATOR_GENESIS_STAKE_HLX`: the constant is a default for *new* chains and may
             // since have been retuned, whereas this chain's genesis is fixed forever.
             "validator_stake_nano": cs.genesis_validator_stake,
+            // Liquid genesis balances (faucet, treasury, …). Served for the same reason as the
+            // two above: `GENESIS_PREFUND` is a compile-time default for new chains, not a
+            // description of what this one handed out at height 0.
+            "allocations": allocations,
         })),
     )
 }
@@ -1235,6 +1248,29 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["validator_stake_nano"].as_u64(), Some(launched_with));
+    }
+
+    /// Liquid genesis balances must reach a joining node over the wire. `GENESIS_PREFUND` is
+    /// empty on every build today, so a node that never hears about a treasury silently rebuilds
+    /// a genesis without it — and then disagrees about the balance of a real, funded account.
+    #[tokio::test]
+    async fn get_genesis_reports_the_chains_liquid_allocations() {
+        let state = fresh_test_state();
+        let validator = addr(7);
+        let treasury = addr(8);
+        state.store.write().await.put_block(block(0, &validator, vec![])).unwrap();
+
+        let allocated = 100_000 * helix_executor::genesis::NANO_PER_HLX;
+        state.chain_state.write().await.genesis_allocations = vec![(treasury.clone(), allocated)];
+
+        let response = get_genesis(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let allocations = json["allocations"].as_array().unwrap();
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0]["address"].as_str(), Some(treasury.as_str()));
+        assert_eq!(allocations[0]["balance_nano"].as_u64(), Some(allocated));
     }
 
     /// `from` near `u64::MAX` used to be added directly to `count`, which overflows.

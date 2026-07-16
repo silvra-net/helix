@@ -419,6 +419,10 @@ impl HelixNode {
             // today and need not stay so: retuning the default must not make this node rebuild
             // a genesis the chain never had and diverge from every other node on it.
             peer_genesis_cfg.validator_stake = peer_genesis.validator_stake;
+            // Same for the liquid genesis balances: replace, never merge. This node's own
+            // `GENESIS_PREFUND` describes a chain it isn't joining, and adding those balances on
+            // top would mint HLX out of thin air relative to the real chain.
+            peer_genesis_cfg.allocations = peer_genesis.allocations;
             let mut state = peer_genesis_cfg.build_state();
             state.governance_params = peer_genesis.governance_params;
             store.save_chain_state(&state)?;
@@ -1354,6 +1358,7 @@ struct PeerGenesis {
     governance_params: GovernanceParams,
     extra_validators: Vec<(Address, u64)>,
     validator_stake: u64,
+    allocations: Vec<(Address, u64)>,
 }
 
 async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
@@ -1408,12 +1413,29 @@ async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
         .get("validator_stake_nano")
         .and_then(|v| v.as_u64())
         .unwrap_or(VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX);
+    // A peer too old to report these is one whose chain launched before the field existed, and
+    // `GENESIS_PREFUND` has been empty for far longer than that — so an absent list really does
+    // mean "no liquid genesis balances", not "unknown".
+    let allocations = resp
+        .get("allocations")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let address = Address::from_str(entry.get("address")?.as_str()?).ok()?;
+                    let balance = entry.get("balance_nano")?.as_u64()?;
+                    Some((address, balance))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(PeerGenesis {
         block,
         personhood_authorities,
         governance_params,
         extra_validators,
         validator_stake,
+        allocations,
     })
 }
 
