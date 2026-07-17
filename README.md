@@ -248,14 +248,15 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_CONFIG` | `./helix.toml` | Path to the config file described above. |
 | `HELIX_REWARD_ADDRESS` | (validator address) | Address that receives the 50% validator fee reward. Set this to your app wallet address so fees land there instead of the signing key. Overrides `reward_address` in `helix.toml`. |
 | `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). Overrides `rpc_bind` in `helix.toml`. |
-| `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address. Overrides `p2p_listen_addr` in `helix.toml`. |
+| `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address (raw TCP). Overrides `p2p_listen_addr` in `helix.toml`. |
+| `HELIX_P2P_WS_LISTEN` | (none) | Extra P2P listen address that carries libp2p inside a **WebSocket** (e.g. `127.0.0.1:8547`), on top of the raw TCP above. Set this when the node's only route in from outside is an HTTPS reverse proxy or a Cloudflare tunnel, which forward WebSockets but not raw TCP — see "Validating from behind a reverse proxy / Cloudflare tunnel" below. Overrides `p2p_ws_listen_addr` in `helix.toml`. |
 | `HELIX_SYNC_PEER` | `https://helix.silvra.net` | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks, and is the target of the periodic RPC catch-up that keeps a follower current when the peer's raw P2P port isn't reachable. Defaults to the public network's seed; override to point at a different network, or set `HELIX_NEW_CHAIN=1` to disable seeding entirely. Overrides `sync_peer` in `helix.toml`. |
 | `HELIX_NEW_CHAIN` | (off) | Set truthy (`1`/`true`) to run a **standalone chain** — the node self-signs its own genesis instead of joining the public network via the default seed. Set this for a private devnet, or for the origin node of a brand-new network. Ignored if a sync peer is explicitly configured. Overrides `new_chain` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY` | `validator-key.json` | Path to the validator key file (unified `KeyFile` JSON, same format as `helix wallet`). Overrides `validator_key_path` in `helix.toml`. |
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.json` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.json` if it was encrypted (e.g. via `helix wallet encrypt`). Not needed for the default plaintext key file. |
 | `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` (30 min) | How long an unconfirmed transaction may sit in the mempool before it's evicted, freeing its (sender, nonce) slot. Overrides `mempool_tx_ttl_secs` in `helix.toml`. |
-| `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable host (a domain or public IP, no scheme/port — the configured P2P port is appended automatically). Set this on any node reachable from the outside so it can announce itself to peers via peer exchange (see "Network Resilience" below). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
+| `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable address, announced to peers via peer exchange (see "Network Resilience" below). Either a bare host (a domain or public IP, no scheme/port — the configured raw-TCP P2P port is appended automatically), or, for a node behind a proxy/tunnel, a full multiaddr starting with `/` (e.g. `/dns4/host/tcp/443/tls/ws`). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
 | `HELIX_GENESIS_EXTRA_VALIDATORS` | (none) | Comma-separated `address:stake_hlx` pairs — additional validators to pre-stake directly at genesis, beyond the one bootstrap validator every chain has always had. Only takes effect for a fresh chain (same caveat as `HELIX_PERSONHOOD_AUTHORITIES`). See "Bootstrapping a Multi-Validator Network" below. Overrides `genesis_extra_validators` in `helix.toml`. |
 | `HELIX_P2P_SEED_PEERS` | (none) | Comma-separated libp2p multiaddrs (e.g. `/ip4/1.2.3.4/tcp/8546,/dns4/peer.example/tcp/8546`) to dial directly, in addition to the one derived from `sync_peer`. Use this to wire a validator set into a full mesh — every validator should peer with every other, not hub-and-spoke through one node. Overrides `p2p_seed_peers` in `helix.toml`. |
 | `HELIX_P2P_DISABLE_MDNS` | (off) | Set truthy (`1`/`true`) to turn off mDNS LAN auto-discovery, leaving only seed peers + peer exchange. Needed only when two independent Helix networks share a LAN (mDNS would otherwise cross-wire them). Overrides `p2p_disable_mdns` in `helix.toml`. |
@@ -338,6 +339,37 @@ or a domain pointing at one, with port `8546`/your configured P2P port open). A 
 NAT with no forwarded port should leave it unset; it still participates fully, both dialing
 addresses it learns and relaying them onward, it just never advertises an address of its own
 that nobody could actually reach.
+
+### Validating from behind a reverse proxy / Cloudflare tunnel
+
+A node's raw P2P transport is TCP. That is a problem for the common home-server setup where the
+only way in from the internet is an HTTPS reverse proxy or a Cloudflare tunnel: those forward
+HTTP and WebSocket traffic on port 443, but not raw TCP on some other port. Such a node can
+still fetch genesis and follow the chain over its RPC (which *is* proxied), but peers can never
+dial its libp2p port — so it never receives gossip, and **gossip is what validating requires**:
+BFT needs proposals and votes, and those only travel over P2P, never RPC. The result is a node
+that can observe the chain but not take part in producing it.
+
+`HELIX_P2P_WS_LISTEN` fixes this by additionally carrying libp2p inside a WebSocket, which a
+proxy *does* forward. Point the proxy/tunnel at this WebSocket port, and peers dial the node at
+`/dns4/<your-host>/tcp/443/tls/ws` — the proxy terminates TLS and forwards the plaintext
+WebSocket to your listener behind it. This costs nothing in peer authenticity: libp2p's Noise
+handshake runs *inside* the WebSocket, so the proxy carries the frames but cannot impersonate a
+peer — the outer TLS is transport packaging, not the trust boundary.
+
+```bash
+# On the node behind the tunnel: listen on a local WebSocket port, and announce the
+# publicly-dialable /tls/ws address so peers can reach you.
+HELIX_P2P_WS_LISTEN="127.0.0.1:8547"          # tunnel forwards 443 -> here
+HELIX_P2P_PUBLIC_ADDR="/dns4/your-host.example/tcp/443/tls/ws"
+
+# On a peer connecting to it:
+HELIX_P2P_SEED_PEERS="/dns4/your-host.example/tcp/443/tls/ws"
+```
+
+Nodes reached this way and nodes on plain TCP interoperate freely — every node can dial both
+`/ws`/`/tls/ws` and raw `/tcp` multiaddrs regardless of how it is itself reachable. A node not
+behind a proxy needs none of this and keeps using raw TCP as before.
 
 ### Bootstrapping a Multi-Validator Network
 

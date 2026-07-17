@@ -460,6 +460,12 @@ impl HelixNode {
                 .parse()
                 .with_context(|| format!("invalid P2P listen address: {}", addr))?;
         }
+        if let Some(addr) = config::resolve("HELIX_P2P_WS_LISTEN", &cfg.p2p_ws_listen_addr) {
+            p2p_config.ws_listen_addr = Some(
+                addr.parse()
+                    .with_context(|| format!("invalid P2P WebSocket listen address: {}", addr))?,
+            );
+        }
 
         // Explicit seed peer — `sync_peer` gets this node its historical blocks over plain
         // HTTP, but on its own it left gossipsub with nothing but mDNS for live connectivity.
@@ -485,8 +491,17 @@ impl HelixNode {
         // followers connected only to a single hub have no path to each other if that hub goes
         // down). Optional — a node behind NAT or with no public host set still participates in
         // peer exchange, it just never announces itself, and relays what it learns from others.
-        if let Some(host) = config::resolve("HELIX_P2P_PUBLIC_ADDR", &cfg.p2p_public_addr) {
-            let addr = format!("/{}/{host}/tcp/{}", multiaddr_kind(&host), p2p_config.listen_addr.port());
+        if let Some(value) = config::resolve("HELIX_P2P_PUBLIC_ADDR", &cfg.p2p_public_addr) {
+            // A value starting with `/` is already a full multiaddr — used verbatim. This is how
+            // a node behind an HTTPS proxy / Cloudflare tunnel announces a WebSocket address
+            // (`/dns4/host/tcp/443/tls/ws`), whose transport and port the plain host+raw-TCP-port
+            // form below cannot express. Anything else is treated as a bare host, with this
+            // node's raw TCP P2P port appended — the original, still-common case.
+            let addr = if value.starts_with('/') {
+                value
+            } else {
+                format!("/{}/{value}/tcp/{}", multiaddr_kind(&value), p2p_config.listen_addr.port())
+            };
             info!(multiaddr = %addr, "Announcing our own P2P address via peer exchange");
             p2p_config.public_addr = Some(addr);
         }

@@ -74,6 +74,15 @@ const FT_C_P2P: u16 = 29_626;
 const FT_D_RPC: u16 = 29_635;
 const FT_D_P2P: u16 = 29_636;
 
+/// Fourth port range, for the WebSocket-transport test. `WS_A_WS` is the extra
+/// `HELIX_P2P_WS_LISTEN` port A listens on for P2P-inside-a-WebSocket, on top of its raw-TCP
+/// `WS_A_P2P`.
+const WS_A_RPC: u16 = 29_645;
+const WS_A_P2P: u16 = 29_646;
+const WS_A_WS: u16 = 29_647;
+const WS_B_RPC: u16 = 29_655;
+const WS_B_P2P: u16 = 29_656;
+
 /// Owns a spawned node's child process and its temp working directory. Killing the process
 /// on drop (even if the test panics or an assertion fails partway through) is the whole point
 /// — without it, a failing run leaks `helix` processes still bound to these ports, and every
@@ -398,6 +407,74 @@ async fn four_validators_survive_one_going_offline() {
     assert_eq!(a["best_hash"], c["best_hash"], "survivors A and C disagree on the block hash at height {}", a["height"]);
     assert_eq!(a["state_hash"], b["state_hash"], "survivors A and B computed different state at height {}", a["height"]);
     assert_eq!(a["state_hash"], c["state_hash"], "survivors A and C computed different state at height {}", a["height"]);
+}
+
+/// A follower reaches a node and follows its chain over a **WebSocket** P2P transport
+/// (`/ip4/.../tcp/<port>/ws`), not raw TCP. This is the connectivity path that lets a node
+/// behind an HTTPS reverse proxy or a Cloudflare tunnel be dialed at all: such a proxy forwards
+/// WebSockets but not raw libp2p TCP, so without this a tunnelled node can only ever follow the
+/// chain over RPC — enough to observe, never to validate (BFT needs gossip for proposals and
+/// votes). See `helix_p2p::P2PConfig::ws_listen_addr`.
+///
+/// A listens on both raw TCP (`WS_A_P2P`) and WebSocket (`WS_A_WS`); B is given only A's
+/// WebSocket multiaddr as its seed peer. What this pins is that the WebSocket transport is
+/// wired end-to-end: A's `/ws` listener starts, B parses and dials a `/ws` multiaddr, the Noise
+/// handshake completes inside the WebSocket, and gossip flows well enough for B to converge on
+/// A's exact `state_hash`. It does not, on its own, prove B used *only* the WebSocket: B also
+/// learns A's raw-TCP port from `/status` (for the sync-peer dial) and could reach it on
+/// loopback. The raw pure-WebSocket case — no TCP path available at all, dialed through a real
+/// Cloudflare tunnel — was verified live and is recorded in the CTO backlog (#103); a tunnel is
+/// not reproducible in CI, which is why this test asserts the transport works rather than that
+/// TCP was excluded.
+#[tokio::test]
+#[ignore = "spawns two real node processes and runs a WebSocket-transport sync (~20-30s wall-clock) — run explicitly with --ignored, not on every CI push"]
+async fn a_follower_syncs_over_a_websocket_transport() {
+    // A is the genesis node, listening on BOTH raw TCP and WebSocket for P2P.
+    let _node_a = spawn_node_with(
+        WS_A_RPC,
+        WS_A_P2P,
+        None,
+        &[("HELIX_P2P_WS_LISTEN", &format!("127.0.0.1:{WS_A_WS}"))],
+        None,
+    );
+    wait_until_reachable(WS_A_RPC, Duration::from_secs(15)).await;
+
+    // B seeds from A over RPC (genesis + history) and is handed ONLY A's WebSocket multiaddr as
+    // its P2P seed peer — so the live-gossip link it is told to build is the `/ws` one.
+    let ws_seed = format!("/ip4/127.0.0.1/tcp/{WS_A_WS}/ws");
+    let _node_b = spawn_node_with(
+        WS_B_RPC,
+        WS_B_P2P,
+        Some(WS_A_RPC),
+        &[("HELIX_P2P_SEED_PEERS", &ws_seed)],
+        None,
+    );
+    wait_until_reachable(WS_B_RPC, Duration::from_secs(15)).await;
+
+    // Both must climb together and agree on the execution result, not just the block hash —
+    // if the WebSocket transport failed to load or dial, B would never receive A's gossip and
+    // the snapshot would never match. Poll both together for one round where they report the
+    // identical height at once (a naive one-after-another read would race two independently
+    // advancing nodes), then compare hashes.
+    let min_height = wait_for_height(WS_A_RPC, 8, Duration::from_secs(120)).await["height"]
+        .as_u64()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let (a, b) = loop {
+        if let (Some(a), Some(b)) = (status(WS_A_RPC).await, status(WS_B_RPC).await) {
+            let (ha, hb) = (a["height"].as_u64().unwrap_or(0), b["height"].as_u64().unwrap_or(1));
+            if ha >= min_height && ha == hb {
+                break (a, b);
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the WebSocket follower never reached the genesis node's height >= {min_height} within 90s"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    };
+    assert_eq!(a["best_hash"], b["best_hash"], "A and the WebSocket follower disagree on the block hash at height {}", a["height"]);
+    assert_eq!(a["state_hash"], b["state_hash"], "A and the WebSocket follower computed different state at height {}", a["height"]);
 }
 
 /// Polls all three nodes together until one round observes the *identical* height on all

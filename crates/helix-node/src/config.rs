@@ -13,6 +13,13 @@ use serde::Deserialize;
 pub struct NodeConfig {
     pub rpc_bind: Option<String>,
     pub p2p_listen_addr: Option<String>,
+    /// Extra listen address for P2P-inside-a-WebSocket, on top of `p2p_listen_addr`'s raw
+    /// TCP (e.g. `127.0.0.1:8547`). Set this when the node's only route in from the outside
+    /// is an HTTPS reverse proxy or a Cloudflare tunnel, which forward WebSockets but not raw
+    /// TCP — without it such a node can never be dialed, so it can follow the chain over RPC
+    /// but never validate (BFT needs gossip). See `helix_p2p::P2PConfig::ws_listen_addr`.
+    /// Overridable via `HELIX_P2P_WS_LISTEN`. Absent keeps the node raw-TCP-only.
+    pub p2p_ws_listen_addr: Option<String>,
     pub reward_address: Option<String>,
     pub sync_peer: Option<String>,
     /// Set truthy (`1`/`true`/`yes`/`on`) to start/run a **standalone chain** instead of
@@ -36,11 +43,14 @@ pub struct NodeConfig {
     /// configured with the same value, since it becomes part of consensus-checked state —
     /// this is an operator convention, not cryptographically enforced.
     pub personhood_authorities: Option<String>,
-    /// This node's own externally-dialable host (e.g. `helix.silvra.net` or a public IP,
-    /// no scheme/port) — used to build the multiaddr this node announces to peers via peer
-    /// exchange (`P2PConfig::public_addr`, see its doc comment for why). Absent for pure
-    /// followers / nodes behind NAT with no forwarded port: they still relay addresses they
-    /// learn from others, they just never announce themselves.
+    /// The address this node announces to peers via peer exchange (`P2PConfig::public_addr`,
+    /// see its doc comment for why). Either a bare externally-dialable host (e.g.
+    /// `helix.silvra.net` or a public IP, no scheme/port — this node's raw TCP P2P port is
+    /// appended), or a full multiaddr starting with `/` (e.g. `/dns4/host/tcp/443/tls/ws`) for
+    /// a node reachable only over a WebSocket behind an HTTPS proxy / Cloudflare tunnel, which
+    /// the bare-host form cannot express. Absent for pure followers / nodes behind NAT with no
+    /// forwarded port: they still relay addresses they learn from others, they just never
+    /// announce themselves.
     pub p2p_public_addr: Option<String>,
     /// Comma-separated `address:stake_hlx` pairs — validators to pre-stake directly at
     /// genesis beyond the one bootstrap validator every chain has always had, e.g.

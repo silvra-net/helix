@@ -100,6 +100,16 @@ impl P2PService {
             .map_err(|e| P2PError::Transport(e.to_string()))?
             .with_dns()
             .map_err(|e| P2PError::Transport(e.to_string()))?
+            // Added unconditionally, unlike the `ws_listen_addr` listener below: dialing a
+            // `/ws` or `/tls/ws` peer must work for every node, including ones that are not
+            // themselves reachable that way. A node that only listens on raw TCP still has to
+            // be able to reach a tunnelled peer.
+            .with_websocket(
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .await
+            .map_err(|e| P2PError::Transport(e.to_string()))?
             .with_behaviour(|key| {
                 let message_id_fn = |msg: &gossipsub::Message| {
                     let mut hasher = DefaultHasher::new();
@@ -201,6 +211,19 @@ impl P2PService {
 
         swarm.listen_on(listen_addr)
             .map_err(|e| P2PError::Transport(e.to_string()))?;
+
+        // Plaintext `/ws` on purpose: where this is used, TLS is terminated by the proxy in
+        // front of us (see `P2PConfig::ws_listen_addr`), and peers dial `/tls/ws` at *its*
+        // port 443. Binding this to a public interface without such a proxy would be the
+        // caller's mistake, not a default.
+        if let Some(ws_addr) = config.ws_listen_addr {
+            let ws_listen: Multiaddr = format!("/ip4/{}/tcp/{}/ws", ws_addr.ip(), ws_addr.port())
+                .parse()
+                .map_err(|e: libp2p::multiaddr::Error| P2PError::Transport(e.to_string()))?;
+            swarm.listen_on(ws_listen)
+                .map_err(|e| P2PError::Transport(e.to_string()))?;
+            info!(ws_listen = %ws_addr, "P2P WebSocket listener started");
+        }
 
         for peer_addr in &config.seed_peers {
             if let Ok(addr) = peer_addr.parse::<Multiaddr>() {

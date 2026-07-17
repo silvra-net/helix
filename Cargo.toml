@@ -68,6 +68,9 @@ libp2p = { version = "0.54", features = [
     "tcp", "noise", "yamux",
     "gossipsub", "mdns",
     "tokio", "dns", "macros",
+    # Lets a node be reachable through an HTTPS reverse proxy / Cloudflare tunnel on
+    # port 443, where raw TCP is not routable. See `P2PConfig::ws_listen_addr`.
+    "websocket",
 ] }
 void = "1"
 

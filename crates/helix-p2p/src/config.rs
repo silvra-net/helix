@@ -4,6 +4,24 @@ use std::net::SocketAddr;
 pub struct P2PConfig {
     /// Address to listen on for incoming P2P connections
     pub listen_addr: SocketAddr,
+    /// Additional address to listen on for incoming P2P connections carried inside a
+    /// WebSocket (`/ip4/<ip>/tcp/<port>/ws`), on top of the raw-TCP `listen_addr`.
+    ///
+    /// Exists because raw TCP is not routable into every deployment: a node behind an
+    /// HTTPS reverse proxy or a Cloudflare tunnel is reachable on port 443 and nowhere
+    /// else, so peers can never dial its libp2p port and it can only ever follow the
+    /// chain over RPC — enough to observe, not enough to validate (BFT needs gossip for
+    /// proposals and votes). A WebSocket is ordinary HTTP traffic that such a proxy does
+    /// forward, so this is what makes a tunnelled node dialable at all.
+    ///
+    /// The proxy terminates TLS, so peers dial `/dns4/<host>/tcp/443/tls/ws` while this
+    /// node listens on plaintext `/ws` behind it. That costs nothing in authenticity:
+    /// libp2p's Noise handshake runs *inside* the WebSocket, so the proxy carries the
+    /// frames but cannot impersonate a peer — the outer TLS is transport packaging, not
+    /// the thing peers trust each other by.
+    ///
+    /// `None` (default) keeps a node raw-TCP-only, exactly as before this existed.
+    pub ws_listen_addr: Option<SocketAddr>,
     /// Optional seed peers to connect to on startup
     pub seed_peers: Vec<String>,
     /// This node's own externally-dialable multiaddr (e.g.
@@ -49,6 +67,7 @@ impl Default for P2PConfig {
     fn default() -> Self {
         P2PConfig {
             listen_addr: "0.0.0.0:8546".parse().unwrap(),
+            ws_listen_addr: None,
             seed_peers: vec![],
             public_addr: None,
             max_peers: 50,
