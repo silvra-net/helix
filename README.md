@@ -524,6 +524,18 @@ clears if the base fee climbs while the transaction waits. Pin `--fee` only when
 overpay for priority — or underpay and find out. A transaction paying less than its size costs is
 rejected on submission, with the shortfall spelled out.
 
+Two rules follow from the fee being real money rather than a number you write down:
+
+- **You must be able to afford the fee you declare.** Submission checks it against your balance
+  and refuses otherwise. The mempool ranks by fee, so a fee nobody can pay would otherwise buy a
+  place ahead of people who can.
+- **A transaction that fails still pays.** If it was yours, correctly ordered, and you could cover
+  the fee, then it took a block slot and a validator's time — a transfer larger than your balance,
+  a contract call that runs out of fuel, a stake of zero. The fee is charged and the nonce
+  advances; only the effect is missing. `helix tx status <hash>` reports `failed` and the reason.
+  A transaction you *cannot* pay the fee for is not includable at all and costs nothing, because
+  there is nothing to take.
+
 ### Querying the Chain
 
 ```bash
@@ -958,14 +970,14 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/governance/proposals/:id` | One proposal's status |
 | GET | `/mempool` | Pending transaction count |
 | GET | `/sync/blocks` | Raw block range for peer sync (`?from=&count=`) |
-| POST | `/transactions` | Submit a signed transaction |
+| POST | `/transactions` | Submit a signed transaction — 400 if the signature, nonce slot, fee, or the sender's ability to pay it fails the check |
 | GET | `/transactions/:hash` | Transaction outcome — `applied` / `failed` (with `error`) / `pending` / `unknown`; 404 if no such transaction |
 
 ### Status response
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.7.0",
   "height": 142,
   "best_hash": "a3f8c2...",
   "peer_count": 0,
@@ -975,14 +987,17 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
   "circulating_supply_hlx": 1000141.9995,
   "total_burned_hlx": 0.0005,
   "state_hash": "b3f1a9...",
-  "p2p_port": 8546
+  "p2p_port": 8546,
+  "base_fee_per_byte": 1
 }
 ```
 
 `state_hash` is an operator-facing diagnostic (not part of consensus, not signed) — compare it
 across nodes at the same height to spot execution divergence. `p2p_port` is this node's own
 libp2p listen port — used by a joining peer to dial it directly, see "Joining an Existing
-Network" above.
+Network" above. `base_fee_per_byte` is what the next block will charge per transaction byte;
+price against it rather than hardcoding a fee, since a flat number is only right until the
+network gets busy (see "Fees" above).
 
 ---
 
