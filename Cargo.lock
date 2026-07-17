@@ -1172,6 +1172,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
+ "axum",
  "bincode",
  "bip39",
  "clap",

@@ -502,7 +502,7 @@ helix tx send hlx... 10.5 --key alice.json            # send 10.5 HLX
 helix tx send hlx... 10.5 --key alice.json --fee 20000  # pin the fee yourself; omit --fee and
                                                        # the CLI prices it off the chain's
                                                        # current base fee (see Fees, below)
-helix tx status <hash>                                 # confirmed / pending / not found
+helix tx status <hash>                                 # applied / failed (+ reason) / pending
 ```
 
 ### Fees
@@ -942,7 +942,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/blocks/height/:n/header` | Header only (for light clients) |
 | GET | `/blocks/height/:n/proof/:tx_hash` | Merkle inclusion proof for a transaction |
 | GET | `/blocks/hash/:hash` | Block by hash |
-| GET | `/blocks/range` | Range of blocks (`?from=&count=`) |
+| GET | `/blocks/range` | Range of blocks (`?from=&count=`) — display view, per-tx status included; not the sync path (see `/sync/blocks`) |
 | GET | `/accounts/:address` | Balance, staked amount, nonce — 400 on invalid address format |
 | GET | `/accounts/:address/name` | Registered `.hlx` name for this address |
 | GET | `/accounts/:address/personhood` | Proof of Personhood status |
@@ -959,7 +959,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/mempool` | Pending transaction count |
 | GET | `/sync/blocks` | Raw block range for peer sync (`?from=&count=`) |
 | POST | `/transactions` | Submit a signed transaction |
-| GET | `/transactions/:hash` | Transaction status (confirmed/pending/not found) |
+| GET | `/transactions/:hash` | Transaction outcome — `applied` / `failed` (with `error`) / `pending` / `unknown`; 404 if no such transaction |
 
 ### Status response
 

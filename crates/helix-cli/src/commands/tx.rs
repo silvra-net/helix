@@ -482,20 +482,95 @@ async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {
 }
 
 async fn tx_status(hash: String, node: &str) -> Result<()> {
-    let res: serde_json::Value = reqwest::get(format!("{}/transactions/{}", node, hash))
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("Not found: {}", err);
+    let response = reqwest::get(format!("{}/transactions/{}", node, hash)).await?;
+    // Whether the transaction exists is the HTTP status code's job, not the body's. Since
+    // receipts landed, `error` in a 200 body is the executor's reason a real, committed
+    // transaction failed — treating that as "not found" made `tx status` answer
+    // "Not found: insufficient balance" for a transaction it had just located, denying the
+    // transfer existed while quoting why it was rejected.
+    let found = response.status().is_success();
+    let res: serde_json::Value = response.json().await?;
+    if !found {
+        bail!(
+            "Not found: {}",
+            res["error"].as_str().unwrap_or("no such transaction")
+        );
     }
 
     println!("Transaction: {}", hash);
     println!("─────────────────────────────────────────");
     println!("  Status : {}", res["status"].as_str().unwrap_or("?"));
+    // The whole point of a receipt: a failed transfer still cost a fee, and the sender is owed
+    // the reason rather than having to read the node's log.
+    if let Some(reason) = res["error"].as_str() {
+        println!("  Reason : {}", reason);
+    }
     if let Some(height) = res["block_height"].as_u64() {
         println!("  Block  : #{}", height);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tx_status_tests {
+    use super::*;
+    use axum::{http::StatusCode, routing::get, Router};
+    use serde_json::json;
+
+    /// Serves one canned `/transactions/{hash}` response on a real socket, so `tx_status` is
+    /// exercised through the same reqwest path it uses in production — including the HTTP
+    /// status code, which is the whole thing under test here.
+    async fn mock_node(code: StatusCode, body: serde_json::Value) -> String {
+        let app = Router::new().route(
+            "/transactions/:hash",
+            get(move || {
+                let body = body.clone();
+                async move { (code, axum::Json(body)) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    /// The regression. A transaction the executor rejected comes back 200 with `status: failed`
+    /// and `error` carrying the reason. `tx_status` treated any `error` field as "no such
+    /// transaction" and bailed — so the one command a user runs to find out what happened to
+    /// their transfer denied it existed, while quoting the reason it failed.
+    #[tokio::test]
+    async fn a_failed_transaction_is_reported_not_called_missing() {
+        let node = mock_node(
+            StatusCode::OK,
+            json!({
+                "status": "failed",
+                "error": "insufficient balance: need 5000010820, have 0",
+                "block_height": 19,
+            }),
+        )
+        .await;
+
+        let result = tx_status("ab".repeat(32), &node).await;
+        assert!(
+            result.is_ok(),
+            "a located, failed transaction must not be reported as not found: {:?}",
+            result.err()
+        );
+    }
+
+    /// The other side of the same coin: a hash the node has never seen still has to fail loudly,
+    /// or the fix would have traded one lie for another.
+    #[tokio::test]
+    async fn an_unknown_hash_still_reports_not_found() {
+        let node = mock_node(
+            StatusCode::NOT_FOUND,
+            json!({ "error": "transaction not found" }),
+        )
+        .await;
+
+        let err = tx_status("00".repeat(32), &node)
+            .await
+            .expect_err("an unknown hash must not report as a real transaction");
+        assert!(err.to_string().contains("Not found"), "got: {}", err);
+    }
 }

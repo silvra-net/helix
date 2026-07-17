@@ -26,3 +26,8 @@ argon2.workspace = true
 rand.workspace = true
 bip39 = "2.2.2"
 rpassword = "7.5.4"
+
+[dev-dependencies]
+# Mock RPC server for the client commands — same approach `helix-node` uses to test its
+# sync client against a real HTTP server instead of a hand-stubbed transport.
+axum.workspace = true
