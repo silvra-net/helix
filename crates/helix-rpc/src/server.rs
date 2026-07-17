@@ -1074,11 +1074,18 @@ mod tests {
     }
 
     fn fresh_app_state() -> (AppState, std::path::PathBuf) {
+        // Unique by construction, per process and within it. The path used to end in a wall-clock
+        // nanosecond, which is not a uniqueness guarantee: the eighteen tests on this fixture run
+        // as parallel threads of one process, and any two that read the same nanosecond get the
+        // same file — redb refuses the second with "Database already open. Cannot acquire lock."
+        // Rare enough to pass locally every time and still fail in CI, where the clock is coarser.
+        // A counter cannot tie; the pid keeps concurrent `cargo test` runs apart.
+        static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut path = std::env::temp_dir();
         path.push(format!(
             "helix-rpc-account-tx-test-{}-{}.redb",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&path);
         let store = HelixDb::open(&path).unwrap();

@@ -435,14 +435,15 @@ mod tempdir {
 
     impl TempDir {
         pub fn new() -> std::io::Result<Self> {
+            // Counter rather than a wall-clock nanosecond: parallel test threads can read the same
+            // nanosecond and land on one directory. The same scheme in `helix-rpc`'s fixture did
+            // exactly that and broke CI; measured, it ties a few hundred times in 360k samples.
+            static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let mut path = std::env::temp_dir();
             let unique = format!(
                 "helix-multi-node-test-{}-{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             );
             path.push(unique);
             std::fs::create_dir_all(&path)?;
