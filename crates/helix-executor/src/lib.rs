@@ -285,15 +285,8 @@ fn execute_transfer(
 
     let sender = state.get_or_default(&tx.from);
 
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(
-            tx_hash,
-            &format!("nonce mismatch: expected {}, got {}", sender.nonce, tx.nonce),
-            0,
-            0,
-        );
-    }
-
+    // Stricter than the intrinsic fee check in `execute_transaction`: the fee alone is affordable
+    // by then, the amount on top of it need not be.
     let total_cost = tx.amount.saturating_add(tx.fee);
     if sender.balance < total_cost {
         return Receipt::failure(
@@ -336,10 +329,8 @@ fn execute_stake(
 
     let sender = state.get_or_default(&tx.from);
 
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-
+    // Stricter than the intrinsic fee check in `execute_transaction`: the fee alone is affordable
+    // by then, the amount on top of it need not be.
     let total_cost = tx.amount.saturating_add(tx.fee);
     if sender.balance < total_cost {
         return Receipt::failure(tx_hash, "insufficient balance", 0, 0);
@@ -366,14 +357,8 @@ fn execute_unstake(
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
     if sender.staked < tx.amount {
         return Receipt::failure(tx_hash, "insufficient staked amount", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
     }
     // Only one unbonding queue entry at a time — simplifies state and slash accounting.
     if sender.unbonding_stake > 0 {
@@ -453,12 +438,6 @@ fn execute_claim_unbonded(
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
     if sender.unbonding_stake == 0 {
         return Receipt::failure(tx_hash, "no unbonding stake to claim", 0, 0);
     }
@@ -507,9 +486,6 @@ fn execute_delegate(
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
     let Some(target) = &tx.to else {
         return Receipt::failure(tx_hash, "delegate requires a target validator address", 0, 0);
     };
@@ -610,14 +586,6 @@ fn execute_redelegate(
     height: u64,
     base_fee_amount: u64,
 ) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
     if tx.amount == 0 {
         return Receipt::failure(tx_hash, "redelegation amount must be greater than zero", 0, 0);
     }
@@ -786,12 +754,6 @@ fn execute_undelegate(
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
     let Some(target) = &tx.to else {
         return Receipt::failure(tx_hash, "undelegate requires a target validator address", 0, 0);
     };
@@ -879,14 +841,6 @@ fn execute_set_commission(
     tx_hash: Hash,
     base_fee_amount: u64,
 ) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
     if tx.data.len() != 2 {
         return Receipt::failure(tx_hash, "malformed commission payload: expected 2 bytes", 0, 0);
     }
@@ -927,14 +881,6 @@ fn execute_register_name(
     tx_hash: Hash,
     base_fee_amount: u64,
 ) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
 
     let raw_name = match std::str::from_utf8(&tx.data) {
         Ok(s) => s,
@@ -990,14 +936,6 @@ fn execute_register_guardians(
     tx_hash: Hash,
     base_fee_amount: u64,
 ) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
     if state.recovery_request(&tx.from).is_some() {
         return Receipt::failure(
             tx_hash,
@@ -1049,14 +987,6 @@ fn execute_approve_recovery(
     tx_hash: Hash,
     base_fee_amount: u64,
 ) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
 
     let Some(target) = tx.to.clone() else {
         return Receipt::failure(
@@ -1125,14 +1055,6 @@ fn execute_cancel_recovery_request(
     tx_hash: Hash,
     base_fee_amount: u64,
 ) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
     if state.recovery_request(&tx.from).is_none() {
         return Receipt::failure(tx_hash, "no pending recovery request to cancel", 0, 0);
     }
@@ -1161,14 +1083,6 @@ fn execute_submit_double_sign_evidence(
     tx_hash: Hash,
     base_fee_amount: u64,
 ) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
 
     let evidence: DoubleSignEvidence = match bincode::deserialize(&tx.data) {
         Ok(e) => e,
@@ -1219,14 +1133,6 @@ fn execute_deploy_contract(
     tx_hash: Hash,
     base_fee_amount: u64,
 ) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
     if tx.to.is_some() {
         return Receipt::failure(tx_hash, "deploy transactions must not set a recipient", 0, 0);
     }
@@ -1393,9 +1299,6 @@ fn execute_call_contract(
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
 
     let Some(target) = tx.to.clone() else {
         return Receipt::failure(tx_hash, "call transactions require a target contract address", 0, 0);
@@ -1470,12 +1373,6 @@ fn execute_create_proposal(
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
     if sender.staked == 0 {
         return Receipt::failure(tx_hash, "only stakers may create governance proposals", 0, 0);
     }
@@ -1550,12 +1447,6 @@ fn execute_vote_proposal(
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
     if sender.staked == 0 {
         return Receipt::failure(tx_hash, "only stakers may vote", 0, 0);
     }
@@ -1614,14 +1505,6 @@ fn execute_prove_personhood(
     tx_hash: Hash,
     base_fee_amount: u64,
 ) -> Receipt {
-    let sender = state.get_or_default(&tx.from);
-
-    if tx.nonce != sender.nonce {
-        return Receipt::failure(tx_hash, "nonce mismatch", 0, 0);
-    }
-    if sender.balance < tx.fee {
-        return Receipt::failure(tx_hash, "insufficient balance for fee", 0, 0);
-    }
 
     let payload: PersonhoodProofPayload = match bincode::deserialize(&tx.data) {
         Ok(p) => p,
@@ -4067,6 +3950,83 @@ mod tests {
         assert_eq!(receipt.fee_to_validator, 0);
         assert_eq!(state.get_or_default(&addr).balance, 0);
         assert_eq!(state.get_or_default(&addr).nonce, 0);
+    }
+
+    /// Every transaction type, not just the two above. `execute_transaction` decides nonce and fee
+    /// affordability once, before it dispatches, which is what makes it safe for the individual
+    /// executors to carry no such check of their own — they used to, identically, eighteen times
+    /// over, and that dead repetition was free to drift out of step with the real gate.
+    ///
+    /// So this is the test that holds the removal up. It walks every type through both intrinsic
+    /// failures and demands the central verdict each time. Move the gate back down into the
+    /// executors, or drop a type out of its reach, and this fails for that type immediately.
+    #[test]
+    fn no_transaction_type_can_slip_past_the_central_intrinsic_gate() {
+        // Every variant of `TxType`. RegisterIdentity is included deliberately even though its
+        // executor is a stub: the gate is what protects it, and that must stay true.
+        let all_types = [
+            TxType::Transfer,
+            TxType::Stake,
+            TxType::Unstake,
+            TxType::ClaimUnbonded,
+            TxType::Delegate,
+            TxType::Undelegate,
+            TxType::Redelegate,
+            TxType::SetCommission,
+            TxType::RegisterName,
+            TxType::RegisterIdentity,
+            TxType::RegisterGuardians,
+            TxType::ApproveRecovery,
+            TxType::CancelRecoveryRequest,
+            TxType::SubmitDoubleSignEvidence,
+            TxType::DeployContract,
+            TxType::CallContract,
+            TxType::CreateProposal,
+            TxType::VoteProposal,
+            TxType::ProvePersonhood,
+        ];
+
+        for ty in all_types {
+            let kp = KeyPair::generate();
+            let addr = Address::from_public_key(&kp.public);
+            let other = Address::from_public_key(&KeyPair::generate().public);
+            let validator = Address::from_public_key(&KeyPair::generate().public);
+
+            // Wrong nonce, with money to burn — so nothing but the nonce can be the reason.
+            let mut state = ChainState::new(0);
+            state.update_account(&addr, |acc| acc.balance = 10_000_000);
+            let tx = signed_tx(&kp, &addr, ty.clone(), Some(other.clone()), 1_000, vec![], 7, 10_000);
+            let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+            assert!(!receipt.success, "{ty:?}: a wrong nonce must be refused");
+            assert!(
+                receipt.error.as_deref().unwrap_or("").contains("nonce mismatch"),
+                "{ty:?}: must be refused *on the nonce*, got {:?}",
+                receipt.error
+            );
+            assert_eq!(
+                state.get(&addr).unwrap().balance,
+                10_000_000,
+                "{ty:?}: a wrong-nonce transaction has no defined place in the sender's order, \
+                 so it cannot be charged"
+            );
+            assert_eq!(state.get(&addr).unwrap().nonce, 0, "{ty:?}: the nonce must not move");
+
+            // Right nonce, empty account: the fee it declares is one it cannot pay.
+            let mut state = ChainState::new(0);
+            let tx = signed_tx(&kp, &addr, ty.clone(), Some(other), 1_000, vec![], 0, 10_000);
+            let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+            assert!(!receipt.success, "{ty:?}: an unpayable fee must be refused");
+            assert!(
+                receipt.error.as_deref().unwrap_or("").contains("cannot pay the fee"),
+                "{ty:?}: must be refused *on the fee*, got {:?}",
+                receipt.error
+            );
+            assert_eq!(receipt.fee_burned, 0, "{ty:?}: nothing can be burned from an empty account");
+            assert_eq!(receipt.fee_to_validator, 0, "{ty:?}: nobody can be paid from an empty account");
+            assert_eq!(state.get_or_default(&addr).nonce, 0, "{ty:?}: the nonce must not move");
+        }
     }
 
     #[test]
