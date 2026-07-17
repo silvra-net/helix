@@ -1025,15 +1025,23 @@ async fn apply_finalized_block(
     // pre-check reads different state (the engine's `current_height` vs.
     // `store.latest_height()`) *before* ever calling this function — with no lock held across
     // that gap to the actual state mutation below, both could observe "not yet applied" and
-    // both proceed. Without this guard that race double-executes the block: every one of its
-    // transactions gets re-applied (mostly rejected the second time on stale nonces, but not
-    // guaranteed to be — see `execute_call_contract`'s side effects on failure, for one), and
-    // the block reward mint always succeeds again regardless, since it isn't nonce-gated at
-    // all — silently inflating supply beyond what the schedule intends. Found by noticing a
-    // small, fixed (non-growing) `circulating_supply` divergence between two nodes that
-    // otherwise agreed on every block hash — same symptom `ChainState::state_hash()` exists to
-    // surface, but this particular cause is a P2P/executor-boundary race, not a state-machine
-    // bug, so the fix belongs here rather than in `helix-executor`.
+    // both proceed. Without this guard that race double-executes the block.
+    //
+    // Its transactions survive that: each one in an applied block has moved its sender's nonce —
+    // success and charged failure alike — so `execute_transaction`'s intrinsic gate refuses every
+    // one of them before dispatch, charging nothing. That is a property of the fee semantics
+    // rather than of this guard, and it only became true once a failing transaction started
+    // paying; before that the nonce stayed put and a replay could genuinely re-run it, with
+    // `execute_call_contract` re-charging its fee as the sharpest case. The executor test
+    // `re_executing_a_block_replays_no_transaction_but_does_mint_again` pins this down.
+    //
+    // The block reward is why the guard has to exist regardless: nothing gates it — no nonce, no
+    // sender — so a second application mints it again and silently inflates supply beyond what
+    // the schedule intends. Found by noticing a small, fixed (non-growing) `circulating_supply`
+    // divergence between two nodes that otherwise agreed on every block hash — same symptom
+    // `ChainState::state_hash()` exists to surface, but this particular cause is a
+    // P2P/executor-boundary race, not a state-machine bug, so the fix belongs here rather than
+    // in `helix-executor`.
     {
         let mut last = last_applied_height.lock().await;
         if height <= *last {

@@ -3661,6 +3661,76 @@ mod tests {
         }
     }
 
+    /// What the double-application guard over in `helix-node` is still for — and what it is no
+    /// longer for. Two tokio tasks (this node's own BFT quorum, and a `NewCommittedBlock` gossip
+    /// arrival for the same height) can race into applying one block twice.
+    ///
+    /// The transaction half of that danger is now inert, and this pins down why: every
+    /// transaction in an applied block has moved its sender's nonce — success and charged failure
+    /// alike, since a failure pays too — so on a second pass the central gate refuses all of them
+    /// before dispatch and charges nothing. Note that this became true only with the charged
+    /// failure: while a failing transaction left the nonce untouched, a replayed block could
+    /// genuinely re-run it.
+    ///
+    /// The block reward is the half that is *not* inert. Nothing gates it — no nonce, no sender —
+    /// so a second application mints it again and silently inflates supply beyond the schedule.
+    /// That alone is why the guard must stay, and it is what this test protects against someone
+    /// reading the transaction half above and concluding the guard is now redundant.
+    #[test]
+    fn re_executing_a_block_replays_no_transaction_but_does_mint_again() {
+        let kp = KeyPair::generate();
+        let sender = Address::from_public_key(&kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.update_account(&sender, |acc| acc.balance = 1_000_000);
+
+        let fee = 50_000;
+        // One that works and one that is payable but doomed: both must move the nonce, which is
+        // the whole reason the replay finds nothing left to do.
+        let ok = signed_tx(&kp, &sender, TxType::Transfer, Some(recipient.clone()), 100_000, vec![], 0, fee);
+        let doomed = signed_tx(&kp, &sender, TxType::Transfer, Some(recipient.clone()), 10_000_000, vec![], 1, fee);
+
+        let mut block = empty_block(&validator, 1);
+        block.transactions = vec![ok, doomed];
+
+        let first = execute_block(&mut state, &block, None);
+        assert!(first.tx_receipts[0].success, "the funded transfer must go through");
+        assert!(!first.tx_receipts[1].success, "the 10 HLX transfer is unaffordable and must fail");
+        assert_eq!(state.get(&sender).unwrap().nonce, 2, "both transactions consumed their nonce");
+
+        let sender_balance = state.get(&sender).unwrap().balance;
+        let recipient_balance = state.get(&recipient).unwrap().balance;
+        let burned = state.total_burned;
+
+        // The very same block again, exactly as the race would apply it.
+        let second = execute_block(&mut state, &block, None);
+
+        for r in &second.tx_receipts {
+            assert!(!r.success, "no transaction may take effect twice");
+            assert!(
+                r.error.as_deref().unwrap_or("").contains("nonce mismatch"),
+                "the central gate must refuse the replay on the stale nonce, got {:?}",
+                r.error
+            );
+        }
+        assert_eq!(second.total_burned, 0, "a refused replay burns nothing");
+        assert_eq!(state.total_burned, burned, "and cannot move the chain's burn total");
+        assert_eq!(state.get(&sender).unwrap().balance, sender_balance, "the sender must not pay twice");
+        assert_eq!(state.get(&sender).unwrap().nonce, 2, "the nonce must not move again");
+        assert_eq!(
+            state.get(&recipient).unwrap().balance,
+            recipient_balance,
+            "the recipient must not be paid twice"
+        );
+
+        assert!(
+            second.block_reward_minted > 0,
+            "the block reward IS minted again — this is the danger the node-side guard exists for"
+        );
+    }
+
     #[test]
     fn execute_block_mints_the_scheduled_block_reward_to_the_validator() {
         let validator = Address::from_public_key(&KeyPair::generate().public);
