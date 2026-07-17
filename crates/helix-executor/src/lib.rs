@@ -104,7 +104,7 @@ pub fn execute_transaction(
 ) -> Receipt {
     let tx_hash = tx.hash();
 
-    // Signature check first — fee is still charged on nonce/balance failure
+    // Signature first: an unsigned transaction is nobody's, so there is no one to charge.
     if !verify_tx_signature(state, tx) {
         return Receipt::failure(tx_hash, "invalid signature", 0, 0);
     }
@@ -129,7 +129,30 @@ pub fn execute_transaction(
         return Receipt::failure(tx_hash, "fee below block base fee", 0, 0);
     }
 
-    match tx.tx_type {
+    // Intrinsic validity, decided once here rather than re-derived by eighteen executors: the
+    // sender must be at this nonce, and must be able to cover the fee. These two alone decide
+    // whether a transaction is includable at all, and neither can be charged for — there is
+    // either nothing to take, or no defined position in the sender's order to take it from.
+    // Everything past this point is a transaction that has paid.
+    let sender = state.get_or_default(&tx.from);
+    if tx.nonce != sender.nonce {
+        return Receipt::failure(
+            tx_hash,
+            &format!("nonce mismatch: expected {}, got {}", sender.nonce, tx.nonce),
+            0,
+            0,
+        );
+    }
+    if sender.balance < tx.fee {
+        return Receipt::failure(
+            tx_hash,
+            &format!("cannot pay the fee: needs {}, has {}", tx.fee, sender.balance),
+            0,
+            0,
+        );
+    }
+
+    let receipt = match tx.tx_type {
         TxType::Transfer => execute_transfer(state, tx, validator, tx_hash, base_fee_amount),
         TxType::Stake => execute_stake(state, tx, validator, tx_hash, base_fee_amount),
         TxType::Unstake => execute_unstake(state, tx, validator, tx_hash, height, base_fee_amount),
@@ -150,7 +173,75 @@ pub fn execute_transaction(
         TxType::Undelegate => execute_undelegate(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::Redelegate => execute_redelegate(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::SetCommission => execute_set_commission(state, tx, validator, tx_hash, base_fee_amount),
+    };
+
+    if receipt.success {
+        return receipt;
     }
+    // The operation failed, but the transaction itself was the sender's own, correctly ordered,
+    // and payable — it took a block slot and real validator CPU (verifying its ML-DSA signature
+    // alone means hashing ~5.3 KB of key and signature), so it pays for that.
+    //
+    // Until this existed, it did not. An empty wallet could sign a transfer it could never
+    // afford, have it admitted, packed, executed and rejected, and pay nothing — and because the
+    // nonce never moved either, the very same signed bytes could be replayed forever. Worse, the
+    // fee it merely *claimed* still ranked it: the mempool sorts on a self-declared number, so
+    // the unfunded transaction outbid paying ones for the pool and got packed first.
+    // `execute_call_contract` had already reasoned its way to exactly this conclusion for traps;
+    // the other seventeen executors never got it.
+    //
+    // Safe to charge here because a failing executor never mutates: each validates fully before
+    // committing, and `distribute_fee` — the only fallible-looking step after a commit — cannot
+    // actually fail. A failure receipt therefore means chain state is untouched.
+    charge_failed_transaction(state, tx, validator, tx_hash, base_fee_amount, receipt)
+}
+
+/// Take the fee for a transaction that was includable — right sender, right nonce, fee
+/// affordable — but whose operation failed. The fee is charged and the nonce advances exactly as
+/// on success; only the operation's effect is missing.
+///
+/// Reports the real burn/tip split rather than zeroes. Receipts are persisted and served over
+/// RPC now, so the split is the answer to "what did this cost me" — and a failed transaction is
+/// precisely when someone asks.
+fn charge_failed_transaction(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+    base_fee_amount: u64,
+    failed: Receipt,
+) -> Receipt {
+    let reason = failed.error.unwrap_or_else(|| "transaction failed".to_string());
+    // `execute_transaction` established `balance >= fee` before dispatching.
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+    let (burned, reward) = distribute_fee(state, validator, tx.fee, base_fee_amount)
+        .expect("distribute_fee is infallible");
+    Receipt::failure(tx_hash, &reason, burned, reward)
+}
+
+/// Can `tx`'s sender actually cover the fee it declares?
+///
+/// The one question the mempool cannot answer for itself: it holds no chain state, by design
+/// (see `Mempool::add_with_recovery_key`), so `fee` arrives there as a number the sender merely
+/// *claims*. The pool ranks and evicts on that claim, and the block producer packs by it — so
+/// until this was asked at admission, a wallet with no funds at all could claim any fee it liked,
+/// outbid every paying transaction for pool space, get packed first, and then fail at execution
+/// costing exactly nothing, because there was nothing to take from it. Free, and repeatable with
+/// the same bytes forever.
+///
+/// Deliberately the *same* rule `execute_transaction` uses to decide includability, and no
+/// stricter: not `amount + fee`, because a transaction whose amount is short still executes and
+/// still pays, and its balance may legitimately change before it is included. Admission and
+/// execution must agree — if they drift, this pool starts either admitting transactions that
+/// cannot execute or refusing ones that could.
+///
+/// Belongs at the callers that already hold chain state (the RPC submit path and the P2P gossip
+/// path), not inside the pool: the pool's state-freedom is a design decision, not an oversight.
+pub fn can_pay_fee(state: &ChainState, tx: &Transaction) -> bool {
+    state.get_or_default(&tx.from).balance >= tx.fee
 }
 
 /// Verify a transaction's signature, accounting for social recovery: if `tx.from`'s
@@ -1329,22 +1420,18 @@ fn execute_call_contract(
     let call_result = helix_vm::call(&code, fuel_limit, &mut ctx);
 
     if let Err(e) = call_result {
-        // Charge the fee and advance the nonce even though the call failed — fuel-
-        // metered execution was actually attempted and consumed real validator CPU.
-        // Without this, the identical tx (nonce never moved, balance never touched)
-        // can be resubmitted and re-executed by every validator forever at zero
-        // cost — e.g. a deliberately fuel-exhausting loop makes this a free,
-        // repeatable DoS instead of a one-time failed call. `ctx` (and every
-        // storage_write/transfer it buffered) is simply dropped here, never applied —
-        // this is the atomicity guarantee host imports need: a trap must leave chain
-        // state exactly as it was before the call started.
-        state.update_account(&tx.from, |acc| {
-            acc.balance -= tx.fee;
-            acc.nonce += 1;
-        });
-        return distribute_fee(state, validator, tx.fee, base_fee_amount)
-            .map(|_| Receipt::failure(tx_hash, &format!("contract call failed: {e}"), 0, 0))
-            .unwrap_or_else(|de| Receipt::failure(tx_hash, &de.to_string(), 0, 0));
+        // `ctx` (and every storage_write/transfer it buffered) is simply dropped here, never
+        // applied — the atomicity guarantee host imports need: a trap must leave chain state
+        // exactly as it was before the call started.
+        //
+        // The fee is still charged and the nonce still advances, because fuel-metered execution
+        // was genuinely attempted and burned real validator CPU — a deliberately fuel-exhausting
+        // loop must be a one-time cost to its author, not a free tx replayable forever. That
+        // charge used to happen right here, and only here; it now happens centrally in
+        // `execute_transaction` for every failing transaction. Doing it in both places would
+        // take the fee twice. The old code also reported the split as `0, 0` while actually
+        // charging, which is a lie the central path does not tell.
+        return Receipt::failure(tx_hash, &format!("contract call failed: {e}"), 0, 0);
     }
 
     // `ctx` is consumed here, ending the immutable borrow of `state` it held for reads —
@@ -2078,20 +2165,22 @@ mod tests {
         assert!(execute_transaction(&mut state, &approve_tx, &validator, 1, 0).success);
         assert!(state.recovery_request(&owner).is_some());
 
-        // Owner is now locked out of changing guardians...
+        // Owner is now locked out of changing guardians... The attempt is rejected but still
+        // pays and consumes nonce 1, like any payable transaction that took a block slot and
+        // failed — hence nonce 2 for the next one.
         let blocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 1, 10_000);
         let receipt = execute_transaction(&mut state, &blocked_tx, &validator, 2, 0);
         assert!(!receipt.success, "guardian changes should be blocked while a request is pending");
 
         // ...until they cancel the stuck request themselves, still with their original key
         // (recovery never finalized, so no override key was ever set).
-        let cancel_tx = signed_cancel_recovery_request_tx(&owner_kp, &owner, 1, 10_000);
+        let cancel_tx = signed_cancel_recovery_request_tx(&owner_kp, &owner, 2, 10_000);
         let receipt = execute_transaction(&mut state, &cancel_tx, &validator, 2, 0);
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert!(state.recovery_request(&owner).is_none());
 
         // Guardian changes work again.
-        let unblocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 2, 10_000);
+        let unblocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 3, 10_000);
         let receipt = execute_transaction(&mut state, &unblocked_tx, &validator, 3, 0);
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
     }
@@ -2651,10 +2740,11 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
-        assert!(state.proposals.is_empty());
-        // Rejected before any balance/nonce mutation — the tx is simply invalid.
-        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000);
-        assert_eq!(state.get(&addr).unwrap().nonce, 0);
+        assert!(state.proposals.is_empty(), "the chain-stalling proposal must not exist");
+        // The proposal is refused; the fee is charged, as for any payable transaction that took a
+        // block slot and failed.
+        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000 - 10_000);
+        assert_eq!(state.get(&addr).unwrap().nonce, 1);
     }
 
     #[test]
@@ -3883,9 +3973,15 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx2, &validator, 0, 0);
 
         assert!(!receipt.success, "a delegation that would mint zero shares must be rejected");
-        // Victim keeps every nano — no funds absorbed, no fee charged on the rejected tx.
-        assert_eq!(state.get(&victim).unwrap().balance, victim_balance_before, "victim's balance must be untouched");
-        assert_eq!(state.get(&victim).unwrap().nonce, 0, "rejected delegation must not advance the nonce");
+        // What this guard exists for: not one nano of the delegation is absorbed by the pool's
+        // existing shareholders. The fee is charged like on any failed payable transaction — the
+        // 5 nHLX it tried to delegate is what must stay put.
+        assert_eq!(
+            state.get(&victim).unwrap().balance,
+            victim_balance_before - 10_000,
+            "only the fee may leave — the delegated amount must not be absorbed"
+        );
+        assert_eq!(state.get(&victim).unwrap().nonce, 1, "a charged failure consumes its nonce");
         let pool = state.validator_pools.get(&target.to_string()).unwrap();
         assert_eq!(pool.total_delegated_stake, 10_000_000_000, "pool value must be untouched");
         assert_eq!(pool.total_shares, 1_000_000_000, "pool shares must be untouched");
@@ -3896,9 +3992,11 @@ mod tests {
     }
 
     #[test]
-    fn transfer_without_recipient_is_rejected_and_burns_nothing() {
+    fn transfer_without_recipient_is_rejected_without_destroying_the_amount() {
         // A `Transfer` with `to: None` used to debit `amount + fee` from the sender and credit
-        // nobody, silently destroying `amount`. It must be rejected outright instead.
+        // nobody, silently destroying `amount`. It must be rejected instead — the amount stays
+        // put. The fee is charged, as for any payable transaction that took a block slot and
+        // failed; that is the fee's job, and it is not what this test guards.
         let kp = KeyPair::generate();
         let addr = Address::from_public_key(&kp.public);
         let validator = Address::from_public_key(&KeyPair::generate().public);
@@ -3910,14 +4008,71 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success, "a recipient-less transfer must be rejected");
-        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000, "no funds may be debited or burned");
-        assert_eq!(state.get(&addr).unwrap().nonce, 0, "rejected transfer must not advance the nonce");
+        assert_eq!(
+            state.get(&addr).unwrap().balance,
+            1_000_000 - 10_000,
+            "only the fee may leave — the 100_000 must not be destroyed"
+        );
+        assert_eq!(state.get(&addr).unwrap().nonce, 1, "a charged failure consumes its nonce");
+    }
+
+    /// The DoS this whole gate exists for, executor half. A transaction that its sender could
+    /// pay for but that fails anyway used to cost exactly nothing: no fee, and — worse — no
+    /// nonce, so the identical signed bytes could be replayed forever. Every validator would
+    /// re-verify its ~5.3 KB ML-DSA signature every time, for free.
+    #[test]
+    fn a_failed_transaction_pays_its_fee_and_cannot_be_replayed() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        // Enough for the fee, nowhere near enough for the transfer itself.
+        state.update_account(&addr, |acc| acc.balance = 50_000);
+
+        let tx = signed_tx(&kp, &addr, TxType::Transfer, Some(recipient.clone()), 1_000_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+        assert!(!receipt.success, "the transfer is unaffordable and must fail");
+        assert_eq!(state.get(&addr).unwrap().balance, 40_000, "the fee must be charged");
+        assert_eq!(state.get(&addr).unwrap().nonce, 1, "the nonce must be consumed");
+        assert_eq!(receipt.fee_to_validator, 10_000, "the receipt must report where the fee went");
+        assert_eq!(state.get(&validator).unwrap().balance, 10_000, "the validator must be paid for the work");
+        assert!(state.get(&recipient).is_none(), "the recipient must receive nothing");
+
+        // The same bytes again: the nonce moved, so this is no longer replayable.
+        let again = execute_transaction(&mut state, &tx, &validator, 0, 0);
+        assert!(!again.success);
+        assert!(again.error.unwrap().contains("nonce mismatch"), "a replay must be refused on nonce");
+        assert_eq!(state.get(&addr).unwrap().balance, 40_000, "a refused replay must not charge twice");
+    }
+
+    /// The counterweight: a sender who cannot even cover the fee is charged nothing, because
+    /// there is nothing to charge. That is exactly why the pool must refuse them at admission
+    /// (`can_pay_fee`) — execution alone can never make this case cost anything.
+    #[test]
+    fn a_sender_who_cannot_cover_the_fee_is_not_charged_and_keeps_its_nonce() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        let tx = signed_tx(&kp, &addr, TxType::Transfer, Some(validator.clone()), 1_000, vec![], 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+        assert!(!receipt.success);
+        assert!(receipt.error.unwrap().contains("cannot pay the fee"));
+        assert_eq!(receipt.fee_burned, 0);
+        assert_eq!(receipt.fee_to_validator, 0);
+        assert_eq!(state.get_or_default(&addr).balance, 0);
+        assert_eq!(state.get_or_default(&addr).nonce, 0);
     }
 
     #[test]
     fn stake_zero_amount_is_rejected() {
-        // Consistency with transfer/delegate/undelegate, which all reject a zero amount — a
-        // zero-value stake is a pure no-op that would otherwise still charge a fee.
+        // Consistency with transfer/delegate/undelegate, which all reject a zero amount: a
+        // zero-value stake is a pure no-op and must not be recorded as one.
         let kp = KeyPair::generate();
         let addr = Address::from_public_key(&kp.public);
         let validator = Address::from_public_key(&KeyPair::generate().public);
@@ -3929,7 +4084,12 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success, "a zero-amount stake must be rejected");
-        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000, "no fee may be charged on a rejected zero stake");
+        assert_eq!(state.get(&addr).unwrap().staked, 0, "nothing may be staked");
+        assert_eq!(
+            state.get(&addr).unwrap().balance,
+            1_000_000 - 10_000,
+            "the fee is still charged: the transaction was payable and took a block slot"
+        );
     }
 
     #[test]
