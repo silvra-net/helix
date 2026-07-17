@@ -884,7 +884,23 @@ async fn submit_transaction(
     Json(tx): Json<Transaction>,
 ) -> impl IntoResponse {
     let tx_hash = tx.hash().to_hex();
-    let recovery_key = state.chain_state.read().await.recovery_key(&tx.from).cloned();
+    let (recovery_key, can_pay) = {
+        let chain = state.chain_state.read().await;
+        (
+            chain.recovery_key(&tx.from).cloned(),
+            helix_executor::can_pay_fee(&chain, &tx),
+        )
+    };
+    // The pool ranks on a fee the sender only claims, and cannot check the claim itself — it has
+    // no chain state. Asking here, where the state is already open for the recovery key, is what
+    // stops an empty wallet from outbidding paying users for pool space with a fee it could never
+    // pay. See `helix_executor::can_pay_fee`.
+    if !can_pay {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "sender cannot pay the declared fee" })),
+        );
+    }
     let mut mempool = state.mempool.write().await;
     let result = mempool.add_with_recovery_key(tx.clone(), recovery_key.as_ref());
     drop(mempool);
@@ -1077,6 +1093,84 @@ mod tests {
             p2p_command_tx,
         };
         (state, path)
+    }
+
+    /// The attack this gate closes, proven end to end at the door it comes through.
+    ///
+    /// A wallet with no funds signs a valid transfer and simply *claims* an enormous fee. The
+    /// pool cannot check that claim — it holds no chain state — but it ranks and evicts by it, so
+    /// the claim alone used to buy pool space ahead of paying users, a front-of-block slot, and
+    /// then cost nothing at execution, because an empty account has nothing to take.
+    #[tokio::test]
+    async fn an_unfunded_fee_claim_is_refused_at_the_door() {
+        let (state, path) = fresh_app_state();
+        let kp = KeyPair::generate();
+        let from = Address::from_public_key(&kp.public);
+        let to = Address::from_public_key(&KeyPair::generate().public);
+
+        // Sender's balance is never set: this account has nothing, and claims u64::MAX/2.
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from,
+            to: Some(to),
+            amount: 1_000,
+            fee: u64::MAX / 2,
+            nonce: 0,
+            data: vec![],
+            crypto_version: CryptoVersion::MlDsa,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+
+        let response = submit_transaction(State(state.clone()), Json(tx)).await.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a fee the sender cannot pay must not buy a place in the pool"
+        );
+        assert!(
+            state.mempool.read().await.is_empty(),
+            "the pool must stay empty — an admitted claim is what evicts honest transactions"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The counterweight: the gate must not turn away someone who can actually pay.
+    #[tokio::test]
+    async fn a_funded_sender_is_still_admitted() {
+        let (state, path) = fresh_app_state();
+        let kp = KeyPair::generate();
+        let from = Address::from_public_key(&kp.public);
+        let to = Address::from_public_key(&KeyPair::generate().public);
+        state
+            .chain_state
+            .write()
+            .await
+            .update_account(&from, |acc| acc.balance = 1_000_000);
+
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from,
+            to: Some(to),
+            amount: 1_000,
+            fee: 10_000,
+            nonce: 0,
+            data: vec![],
+            crypto_version: CryptoVersion::MlDsa,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+
+        let response = submit_transaction(State(state.clone()), Json(tx)).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(!state.mempool.read().await.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Regression test: `GET /transactions/:hash` didn't exist server-side at all
@@ -1469,6 +1563,11 @@ mod tests {
         let keypair = KeyPair::generate();
         let alice = Address::from_public_key(&keypair.public);
         let bob = addr(2);
+        // Alice must be able to afford the fee she declares, or submission refuses her before the
+        // pool ever sees the tx — a claimed fee no longer buys admission (`can_pay_fee`). Same
+        // kind of lesson as the base-fee note below: the fixture has to satisfy every rule the
+        // real door applies, not just the one under test.
+        state.chain_state.write().await.update_account(&alice, |acc| acc.balance = 1_000_000);
         let mut submitted = Transaction {
             // Clears the base fee for its own size, not merely Mempool's flat min_fee — that
             // distinction is what this comment used to get wrong, along with the rest of the suite.

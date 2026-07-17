@@ -721,7 +721,20 @@ async fn handle_p2p_event(
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
-            let recovery_key = chain_state.read().await.recovery_key(&tx.from).cloned();
+            let (recovery_key, can_pay) = {
+                let chain = chain_state.read().await;
+                (
+                    chain.recovery_key(&tx.from).cloned(),
+                    helix_executor::can_pay_fee(&chain, &tx),
+                )
+            };
+            // The same gate the RPC submit path applies. Without it here, the RPC's rate limiter
+            // would be the only thing between an unfunded fee claim and the pool — and a peer
+            // reaches this path without ever touching the RPC. See `helix_executor::can_pay_fee`.
+            if !can_pay {
+                warn!(from = %tx.from, fee = tx.fee, "Rejected peer tx: sender cannot pay the declared fee");
+                return;
+            }
             let mut pool = mempool.write().await;
             match pool.add_with_recovery_key(tx, recovery_key.as_ref()) {
                 Ok(()) => {}
