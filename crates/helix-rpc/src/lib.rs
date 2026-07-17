@@ -6,6 +6,7 @@ pub use server::start_rpc_server;
 pub use types::{RpcError, RpcRequest, RpcResponse};
 
 use helix_core::Block;
+use helix_crypto::Hash;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +18,14 @@ pub struct TxResponse {
     pub fee_hlx: f64,
     pub tx_type: String,
     pub nonce: u64,
+    /// What execution did with it: `applied`, `failed`, or `unknown` for blocks committed
+    /// before receipts were stored. Same vocabulary as `TxHistoryEntry::status` — a
+    /// transaction must not read as successful in a block listing and failed in its own
+    /// detail view.
+    pub status: String,
+    /// Why it failed, straight from the executor. Absent unless `status` is `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,19 +42,34 @@ pub struct BlockResponse {
     pub transactions: Vec<TxResponse>,
 }
 
-impl From<Block> for BlockResponse {
-    fn from(block: Block) -> Self {
+impl BlockResponse {
+    /// Builds the display view of a block, asking `outcome` for each transaction's execution
+    /// result (`(status, error)`, as produced by `server::receipt_outcome`).
+    ///
+    /// Deliberately not a `From<Block>`: an outcome lives in the receipt store, not in the
+    /// block, so it cannot be derived from a `Block` alone. This used to be a `From` impl, and
+    /// the result was that every block endpoint silently served transactions with no status at
+    /// all — a failed transfer was indistinguishable from a settled one in any block listing.
+    /// Taking the lookup as a parameter keeps that shortcut from existing while staying pure
+    /// enough to unit-test without a database.
+    pub fn new(block: &Block, mut outcome: impl FnMut(&Hash) -> (String, Option<String>)) -> Self {
         let transactions = block
             .transactions
             .iter()
-            .map(|tx| TxResponse {
-                hash: tx.hash().to_hex(),
-                from: tx.from.to_string(),
-                to: tx.to.as_ref().map(|a| a.to_string()),
-                amount_hlx: tx.amount as f64 / 1_000_000_000.0,
-                fee_hlx: tx.fee as f64 / 1_000_000_000.0,
-                tx_type: format!("{:?}", tx.tx_type),
-                nonce: tx.nonce,
+            .map(|tx| {
+                let hash = tx.hash();
+                let (status, error) = outcome(&hash);
+                TxResponse {
+                    hash: hash.to_hex(),
+                    from: tx.from.to_string(),
+                    to: tx.to.as_ref().map(|a| a.to_string()),
+                    amount_hlx: tx.amount as f64 / 1_000_000_000.0,
+                    fee_hlx: tx.fee as f64 / 1_000_000_000.0,
+                    tx_type: format!("{:?}", tx.tx_type),
+                    nonce: tx.nonce,
+                    status,
+                    error,
+                }
             })
             .collect();
         BlockResponse {

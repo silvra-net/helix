@@ -191,7 +191,7 @@ async fn get_latest_block(State(state): State<AppState>) -> impl IntoResponse {
     let store = state.store.read().await;
     let height = store.latest_height();
     match store.get_block_by_height(height) {
-        Ok(block) => (StatusCode::OK, Json(json!(BlockResponse::from(block)))),
+        Ok(block) => (StatusCode::OK, Json(json!(block_response(&block, &store)))),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))),
     }
 }
@@ -202,7 +202,7 @@ async fn get_block_by_height(
 ) -> impl IntoResponse {
     let store = state.store.read().await;
     match store.get_block_by_height(n) {
-        Ok(block) => (StatusCode::OK, Json(json!(BlockResponse::from(block)))),
+        Ok(block) => (StatusCode::OK, Json(json!(block_response(&block, &store)))),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))),
     }
 }
@@ -222,15 +222,19 @@ async fn get_block_by_hash(
     };
     let store = state.store.read().await;
     match store.get_block_by_hash(&hash) {
-        Ok(block) => (StatusCode::OK, Json(json!(BlockResponse::from(block)))),
+        Ok(block) => (StatusCode::OK, Json(json!(block_response(&block, &store)))),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))),
     }
 }
 
-/// Batch block download for node sync.
+/// Batch block listing for clients (explorers, wallets).
 ///
-/// `GET /blocks/range?from=<height>&count=<n>` — returns up to 500 full blocks
-/// starting at `from`.  Used by new nodes bootstrapping from a known peer.
+/// `GET /blocks/range?from=<height>&count=<n>` — returns up to 500 blocks in the
+/// `BlockResponse` display view, starting at `from`.
+///
+/// Not the sync path, despite what this comment claimed until 2026-07-17: a node bootstrapping
+/// from a peer uses `/sync/blocks`, which carries the full `Block` including signatures. This
+/// view drops those, so no node could ever have synced from it.
 async fn get_blocks_range(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, u64>>,
@@ -241,7 +245,7 @@ async fn get_blocks_range(
     let mut blocks = Vec::with_capacity(count as usize);
     for h in from..from.saturating_add(count) {
         match store.get_block_by_height(h) {
-            Ok(block) => blocks.push(BlockResponse::from(block)),
+            Ok(block) => blocks.push(block_response(&block, &store)),
             Err(_) => break, // reached tip — stop silently
         }
     }
@@ -789,6 +793,14 @@ fn receipt_outcome(store: &HelixDb, tx_hash: &Hash) -> (String, Option<String>) 
     }
 }
 
+/// The one way a block reaches a client. Routes every transaction's status through
+/// `receipt_outcome`, the same helper the single-transaction and history endpoints use, so a
+/// block listing and a transaction detail view can never disagree about whether a transfer
+/// went through.
+fn block_response(block: &Block, store: &HelixDb) -> BlockResponse {
+    BlockResponse::new(block, |tx_hash| receipt_outcome(store, tx_hash))
+}
+
 /// Extracts every transaction touching `address` (as sender or recipient) from `blocks`,
 /// newest first. Pure and store-agnostic so it can be unit-tested without a `HelixDb`.
 /// Full-scan reference implementation — kept for tests as a ground truth to check the
@@ -1123,6 +1135,71 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["status"], "failed", "a rejected tx must not read as a successful one");
         assert_eq!(parsed["error"], "transfer amount must be greater than zero");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The block view used to be a plain `From<Block>` with no store access, so every
+    /// transaction in a block listing looked alike — a rejected transfer sat next to a settled
+    /// one with nothing to tell them apart, while the detail view for that same transaction
+    /// said `failed`. One block, all three outcomes, checked per transaction.
+    #[tokio::test]
+    async fn a_block_reports_each_transactions_outcome_not_just_that_it_was_included() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let settled = tx(&alice, &addr(2), 1_000, 0);
+        let rejected = tx(&alice, &addr(2), 0, 1);
+        let ancient = tx(&alice, &addr(3), 500, 2);
+        let (settled_hash, rejected_hash, ancient_hash) =
+            (settled.hash(), rejected.hash(), ancient.hash());
+        {
+            let mut store = state.store.write().await;
+            store
+                .put_block(block(7, &alice, vec![settled, rejected, ancient]))
+                .unwrap();
+            // No receipt for `ancient` — it stands in for a block committed before receipts existed.
+            store
+                .put_receipts(&[
+                    Receipt::success(settled_hash, 40, 60),
+                    Receipt::failure(
+                        rejected_hash,
+                        "transfer amount must be greater than zero",
+                        1_082,
+                        0,
+                    ),
+                ])
+                .unwrap();
+        }
+
+        let response = get_block_by_height(State(state), Path(7)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+
+        let txs = parsed["transactions"].as_array().unwrap();
+        assert_eq!(txs.len(), 3);
+
+        let by_hash = |h: &Hash| {
+            txs.iter()
+                .find(|t| t["hash"] == h.to_hex())
+                .unwrap_or_else(|| panic!("tx {} missing from block response", h.to_hex()))
+        };
+        assert_eq!(by_hash(&settled_hash)["status"], "applied");
+        assert!(by_hash(&settled_hash)["error"].is_null());
+        assert_eq!(
+            by_hash(&rejected_hash)["status"],
+            "failed",
+            "a rejected tx must not look like a settled one in a block listing"
+        );
+        assert_eq!(
+            by_hash(&rejected_hash)["error"],
+            "transfer amount must be greater than zero"
+        );
+        assert_eq!(
+            by_hash(&ancient_hash)["status"],
+            "unknown",
+            "no receipt means unknown — never a silent success"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
