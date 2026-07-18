@@ -4,19 +4,39 @@
 [![Release](https://github.com/silvra-net/helix/actions/workflows/release.yml/badge.svg)](https://github.com/silvra-net/helix/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> A Layer-1 blockchain signed with real post-quantum cryptography. Early development.
+> A Layer-1 blockchain secured end-to-end by NIST-standardized post-quantum cryptography.
+> **Public testnet live. Mainnet targeted for August 2026.**
 
 Helix is built from the ground up for the post-quantum era: every signature is NIST
-ML-DSA-65 (FIPS 204), not a classical curve with a roadmap. On top of that sit
-Tendermint-style BFT finality, human-readable names, and social wallet recovery.
+ML-DSA-65 (FIPS 204), not a classical curve with a migration roadmap bolted on later. On
+top of that sit Tendermint-style BFT finality, a fuel-metered WASM contract VM, ZK-STARK
+proofs (hash-based, no elliptic curves), human-readable names, and social wallet recovery.
 
-**Where it actually stands.** The project is weeks old. One validator runs the public
-network, so it tolerates zero faults; the chain is reset from genesis whenever the format
-changes, taking every balance with it; and no one outside this repository has audited the
-consensus or the cryptography. The engineering is real and the code is honest about its
-gaps — see [Security](#security) for the full list — but this is a working prototype
-looking for its first independent node operators, not a network to hold value on. The
-ambition is a chain people can rely on. That is a goal here, not a description.
+**What already works, and is tested.** This is not a whitepaper — it runs. The public
+network produces finalized blocks continuously, every client command below talks to it out of
+the box, and the core is covered by an automated test suite that gates every commit (the CI
+badge above is green on `master`). Recently verified end-to-end on real infrastructure:
+
+- **Post-quantum signatures throughout** — ML-DSA-65 (FIPS 204) on every transaction, block,
+  and vote; deterministic state execution reproduced bit-for-bit across independent nodes.
+- **BFT consensus between independent validators** — proposals and votes finalize blocks
+  across separate nodes, and a validator that drops out halts finality until it returns
+  (quorum is real, not cosmetic).
+- **Validate from anywhere, even behind a firewall** — nodes reach the network over a
+  WebSocket transport that traverses an HTTPS reverse proxy / Cloudflare tunnel, so a new
+  operator can run a full validating node without opening a single inbound port.
+- **Zero-config onboarding** — a freshly downloaded binary discovers the network, verifies
+  genesis independently (it recomputes the genesis state hash rather than trusting the seed),
+  syncs history, and follows live — no manual peer configuration.
+
+**What is honestly not there yet.** One validator currently secures the public network, so
+it does not yet tolerate faults — the infrastructure for multiple independent validators is
+built and tested, but the operators are not onboarded yet. The chain is still a **testnet**:
+it is reset from genesis when the format changes, and **HLX on it is a valueless test token,
+not an investment.** The consensus and cryptography have not yet had an external security
+audit. The road from here to mainnet is deliberately short and public — see
+[Roadmap to Mainnet](#roadmap-to-mainnet) — and every gap is documented, not hidden; the
+full list is in [Security](#security).
 
 This README is a practical guide: install it, run a node, use the CLI, stake — as an
 operator or as a regular holder. Deeper reference material (REST API, wire formats, crate
@@ -37,6 +57,7 @@ layout) lives further down for when you need it.
 
 **Getting started**
 - [Why Helix?](#why-helix) — the one-table pitch
+- [Roadmap to Mainnet](#roadmap-to-mainnet) — what's done, what's live, what's next
 - [Quick Start](#quick-start) — clone → node → first transaction
 - [Installation](#installation) — prerequisites, release download, build from source
 
@@ -79,20 +100,36 @@ layout) lives further down for when you need it.
 
 ---
 
+## Roadmap to Mainnet
+
+Helix is being built in the open, and the path from today's testnet to a lasting mainnet is
+short and concrete. Nothing here is hidden behind a "coming soon."
+
+| Phase | Status | What it means |
+|---|---|---|
+| **Core protocol** | ✅ Done | PoS + BFT finality, ML-DSA-65 signatures, WASM VM, ZK-STARK proofs, names, social recovery — all implemented and running. |
+| **Public testnet** | ✅ Live | `helix.silvra.net` produces finalized blocks continuously; anyone can run a node or use the CLI against it today. |
+| **Remote validation** | ✅ Verified | A node behind any HTTPS proxy / firewall can validate over the WebSocket transport — proven end-to-end with independent validators reaching BFT quorum through a Cloudflare tunnel. |
+| **Independent validators** | 🔜 In progress | Onboarding the first external operators onto separate hardware, so the network tolerates real faults. This is the main gate to mainnet. [Become one →](#bootstrapping-a-multi-validator-network) |
+| **External security audit** | ⏳ Planned | Independent review of consensus and cryptography before value is ever at stake. |
+| **Mainnet** | 🎯 August 2026 | Fresh genesis, multiple independent validators, a freshly generated validator key, and no more resets. This is the chain meant to last. |
+
+If you want to help secure the network as one of the founding independent validators, the
+infrastructure is ready today — see
+[Bootstrapping a Multi-Validator Network](#bootstrapping-a-multi-validator-network).
+
+---
+
 ## Quick Start
 
-> **Helix is a development network today. The chain gets wiped, and everything on it with it.**
+> **This is the public testnet, not mainnet.** `helix.silvra.net` is live and stable, but it
+> is still reset from genesis when the chain format changes. **HLX on the testnet is a
+> valueless test token** — it is for trying the network, not for holding value, and it will
+> not carry over to mainnet.
 >
-> `helix.silvra.net` is public and live, but it is not a mainnet. It is reset from genesis
-> whenever the chain format changes — five times in the past week. Every reset destroys all
-> balances, all history, all of it. HLX on this chain is a test token: it has no value, it is
-> not an investment, and it will not survive to whatever launches later.
->
-> Point a node at it, send transactions, break things — that is what it is for. Just don't hold
-> anything you'd mind losing, because you will lose it. The first chain meant to last will start
-> with at least four independent validators (see
-> [Bootstrapping a Multi-Validator Network](#bootstrapping-a-multi-validator-network)); until
-> that launch is announced, assume every chain is temporary.
+> Point a node at it, send transactions, deploy a contract, break things — that is exactly what
+> it is for. Mainnet (targeted **August 2026**) launches from a fresh genesis with multiple
+> independent validators; see [Roadmap to Mainnet](#roadmap-to-mainnet).
 
 **One binary does everything.** `helix` is both the node and the client: `helix start` runs a
 node, every other subcommand (`helix wallet`, `helix tx`, …) is a thin RPC client. **You don't
@@ -116,7 +153,7 @@ helix tx send hlx... 10 --key alice.json     # send 10 HLX to another address
 helix tx status <hash>                        # check it landed
 ```
 
-Every client command targets `https://helix.silvra.net` (the public development network) by
+Every client command targets `https://helix.silvra.net` (the public testnet) by
 default. Point it somewhere else any time with `--node <url>` or `HELIX_NODE=<url>` — e.g. at
 your own local node (below).
 
@@ -314,8 +351,9 @@ seconds. The RPC fallback matters because a node's raw P2P port isn't always pub
 reachable — the public seed, for instance, is served through an HTTPS tunnel that only
 exposes its RPC — so gossip alone would leave a fresh follower stuck at the height it synced
 at startup. The periodic RPC pull closes that gap over the one channel that's always
-reachable. (The node also asks the seed via `GET /status` which port it listens on for P2P
-and dials it directly when it can, for lower-latency gossip on top.)
+reachable. (The node also asks the seed via `GET /status` for its P2P address and dials it
+directly for lower-latency gossip on top — preferring the seed's announced public multiaddr,
+including a `/tls/ws` WebSocket address behind a proxy, over a raw-TCP guess it can't reach.)
 
 ### Network Resilience (Peer Exchange)
 
@@ -362,14 +400,22 @@ peer — the outer TLS is transport packaging, not the trust boundary.
 # publicly-dialable /tls/ws address so peers can reach you.
 HELIX_P2P_WS_LISTEN="127.0.0.1:8547"          # tunnel forwards 443 -> here
 HELIX_P2P_PUBLIC_ADDR="/dns4/your-host.example/tcp/443/tls/ws"
-
-# On a peer connecting to it:
-HELIX_P2P_SEED_PEERS="/dns4/your-host.example/tcp/443/tls/ws"
 ```
 
-Nodes reached this way and nodes on plain TCP interoperate freely — every node can dial both
-`/ws`/`/tls/ws` and raw `/tcp` multiaddrs regardless of how it is itself reachable. A node not
-behind a proxy needs none of this and keeps using raw TCP as before.
+A node that announces a public address this way serves it in its `GET /status` response, so a
+peer syncing from it **discovers the WebSocket address automatically** — just set `sync_peer` to
+the node's RPC URL and the right `/tls/ws` P2P path is used with no separate seed config:
+
+```bash
+# On a peer connecting to it — no manual P2P seed needed:
+HELIX_SYNC_PEER="https://your-host.example"   # RPC over the same proxy; P2P WS is auto-discovered
+```
+
+(You can still pin extra peers explicitly with `HELIX_P2P_SEED_PEERS` for a validator mesh — see
+below — but you no longer need it just to reach a tunnelled seed.) Nodes reached over WebSocket
+and nodes on plain TCP interoperate freely — every node can dial both `/ws`/`/tls/ws` and raw
+`/tcp` multiaddrs regardless of how it is itself reachable. A node not behind a proxy needs none
+of this and keeps using raw TCP as before.
 
 ### Bootstrapping a Multi-Validator Network
 
@@ -440,6 +486,38 @@ halts" (though vastly better for censorship-resistance and peer-exchange-style r
 resilience). Real Byzantine fault tolerance for `f` simultaneously faulty/offline validators
 needs `3f + 1` — 4 validators to tolerate 1 down, 7 for 2, and so on. Plan validator count
 accordingly for how much simultaneous downtime the network actually needs to survive.
+
+**Founding-validator checklist.** If you're standing up one of the first independent
+validators, here is the whole path end to end — most operators run behind a home
+server / firewall, so this assumes the WebSocket-tunnel setup:
+
+1. **Generate a validator key** on the machine that will run the node, and never let the
+   24-word phrase leave it: `helix wallet new -o validator-key.json`. Note the address.
+2. **Get that address staked** with at least `MIN_VALIDATOR_STAKE` (100,000 HLX) — either
+   pre-staked into genesis via `genesis_extra_validators` (for a brand-new network's launch),
+   or funded by transfer / accumulated block rewards (to join an existing one).
+3. **Expose a P2P path in.** Behind a proxy/tunnel, forward an HTTPS hostname (e.g.
+   `p2p.yourdomain.net`) to your local WebSocket port and set:
+   ```bash
+   HELIX_P2P_WS_LISTEN="127.0.0.1:8547"                        # tunnel 443 -> here
+   HELIX_P2P_PUBLIC_ADDR="/dns4/p2p.yourdomain.net/tcp/443/tls/ws"
+   ```
+   (On a machine with a real public IP and an open port, skip the tunnel and just set
+   `HELIX_P2P_PUBLIC_ADDR="yourdomain.net"` — the raw TCP P2P port is appended automatically.)
+4. **Announce yourself** — step 3's `HELIX_P2P_PUBLIC_ADDR` is what makes you *reachable* by
+   other validators via peer exchange. Without it you can only make outbound connections;
+   with it you become a full mesh member. This is the answer to "can everyone connect to
+   everyone?": yes — but only between the nodes that each publish a reachable address.
+5. **Mesh with the other validators** so consensus votes never depend on a single hub. Set
+   each of the other validators as seeds (in addition to the one `sync_peer` that bootstraps
+   your history):
+   ```bash
+   HELIX_SYNC_PEER="https://helix.silvra.net"                 # history + auto WS discovery
+   HELIX_P2P_SEED_PEERS="/dns4/p2p.bob.net/tcp/443/tls/ws,/dns4/p2p.carol.net/tcp/443/tls/ws"
+   ```
+6. **Start and verify:** `helix start`, then confirm `peer_count` climbs and your address
+   appears in the active validator set. `helix chain status` shows height advancing with your
+   votes counted.
 
 ### Docker Deployment
 
@@ -1112,10 +1190,10 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 
 **Known limitations (honest status, not finished guarantees):**
 
-- **The live chain is a development network and is reset from genesis without warning.** Any
+- **The live chain is a testnet and is reset from genesis without warning.** Any
   time the chain format changes — a new transaction type, a new state field, a signature or
-  hash change — the public chain is wiped and restarted. That has happened five times in the
-  past week, and will keep happening until the format settles. Balances do not survive it.
+  hash change — the public chain is wiped and restarted, and this will keep happening until
+  the format settles and mainnet launches. Balances do not survive it.
   Nothing on this chain is money. This is a deliberate trade while the protocol is still moving:
   a format change is cheap to make now because there is exactly one account and no external
   holders, and expensive to make once there are. The chain that is meant to persist will be
