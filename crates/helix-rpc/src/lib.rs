@@ -270,6 +270,17 @@ pub struct NodeStatus {
     /// reachable only over the open internet. See `resolve_seed_peer_multiaddr` in
     /// `helix-node` for the client side of this.
     pub p2p_port: u16,
+    /// This node's announced, externally-dialable P2P multiaddr, if it set one
+    /// (`HELIX_P2P_PUBLIC_ADDR`) — e.g. `/dns4/p2p.silvra.net/tcp/443/tls/ws` for a node
+    /// reachable only over a WebSocket behind an HTTPS proxy / Cloudflare tunnel. A joining node
+    /// dials *this* in preference to the raw-TCP address it would otherwise derive from
+    /// `p2p_port`, which for a tunnelled node is unreachable and just burns a ~20 s dial timeout
+    /// before the WebSocket seed is tried (the reason this field exists — see
+    /// `resolve_seed_peer_multiaddr` in `helix-node`). `#[serde(default)]` so a node running an
+    /// older build that never served this field still deserializes (to `None`, i.e. old
+    /// raw-TCP-derivation behaviour). `None` also for any node that simply announces nothing.
+    #[serde(default)]
+    pub p2p_public_addr: Option<String>,
     /// The EIP-1559 base fee (nano-HLX per transaction byte) the next block will charge. A
     /// client needs it to price a transaction: the required fee is `base_fee_per_byte ×
     /// tx.size_bytes()`, and paying less means the transaction is rejected — so a flat,

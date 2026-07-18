@@ -265,6 +265,10 @@ pub struct HelixNode {
     /// syncs from this node can derive a dialable seed address, see
     /// `resolve_seed_peer_multiaddr`.
     p2p_port: u16,
+    /// This node's announced public P2P multiaddr (`HELIX_P2P_PUBLIC_ADDR`), if any — also
+    /// surfaced to RPC (`GET /status`) so a syncing peer dials it directly rather than the
+    /// raw-TCP address derived from `p2p_port`, which is unreachable for a tunnelled node.
+    p2p_public_addr: Option<String>,
     rpc_bind: SocketAddr,
 }
 
@@ -530,6 +534,9 @@ impl HelixNode {
         }
 
         let p2p_port = p2p_config.listen_addr.port();
+        // Captured before `p2p_config` is moved into the service — surfaced via `/status` so
+        // syncing peers dial this announced address directly (see `resolve_seed_peer_multiaddr`).
+        let p2p_public_addr = p2p_config.public_addr.clone();
         let (p2p_service, p2p_command_tx, p2p_event_rx) = P2PService::new(p2p_config);
 
         let rpc_bind = resolve_rpc_bind(&cfg)?;
@@ -553,6 +560,7 @@ impl HelixNode {
             p2p_event_rx,
             p2p_service: Some(p2p_service),
             p2p_port,
+            p2p_public_addr,
             rpc_bind,
         })
     }
@@ -568,6 +576,7 @@ impl HelixNode {
             node_address: self.address.to_string(),
             peer_count: peer_count.clone(),
             p2p_port: self.p2p_port,
+            p2p_public_addr: self.p2p_public_addr.clone(),
             p2p_command_tx: self.p2p_command_tx.clone(),
         };
 
@@ -1571,12 +1580,39 @@ async fn resolve_seed_peer_multiaddr(peer_url: &str) -> Result<String> {
         .await?
         .json()
         .await?;
+
+    seed_multiaddr_from_status(&status, &host)
+}
+
+/// Pure `/status` → dialable multiaddr mapping, split out so it can be unit-tested without a
+/// live HTTP peer (see `resolve_seed_peer_multiaddr` for the fetch around it).
+///
+/// Prefers the peer's *announced* public multiaddr (`p2p_public_addr`) if it has one. A node
+/// behind an HTTPS proxy / Cloudflare tunnel is reachable only over a WebSocket on a different
+/// host+port than its raw TCP `p2p_port` (e.g. `/dns4/p2p.silvra.net/tcp/443/tls/ws` while its
+/// RPC host is `helix.silvra.net`) — a fact the raw-TCP derivation below cannot reconstruct,
+/// since it reuses the RPC host and the raw port. Dialing the derived raw-TCP address for such
+/// a peer just burns a ~20 s connection timeout on every (re)connect before the WebSocket seed
+/// is tried. Using the announced address avoids that and needs no separate seed config. Trust
+/// is unchanged: this peer already serves our genesis + history, and the P2P Noise handshake
+/// authenticates whoever we reach regardless of the address we dial. Falls back to the raw-TCP
+/// form for a peer that announces nothing (the common open-node case) or runs an older build
+/// whose `/status` has no `p2p_public_addr` field at all.
+fn seed_multiaddr_from_status(status: &serde_json::Value, host: &str) -> Result<String> {
+    if let Some(public_addr) = status
+        .get("p2p_public_addr")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(public_addr.to_string());
+    }
+
     let p2p_port = status
         .get("p2p_port")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| anyhow::anyhow!("peer's /status has no p2p_port field (older version?)"))?;
 
-    Ok(format!("/{}/{host}/tcp/{p2p_port}", multiaddr_kind(&host)))
+    Ok(format!("/{}/{host}/tcp/{p2p_port}", multiaddr_kind(host)))
 }
 
 /// Ask a peer (`GET /status`) for its current chain height. Cheap, lock-free probe used by
@@ -2066,6 +2102,46 @@ mod resolve_seed_peer_multiaddr_tests {
     async fn errors_on_unreachable_peer() {
         let result = resolve_seed_peer_multiaddr("http://127.0.0.1:1").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn prefers_the_announced_public_multiaddr_over_the_derived_raw_tcp_one() {
+        // A peer behind an HTTPS proxy / Cloudflare tunnel: its RPC host (this URL) is NOT
+        // where its P2P lives — the announced WebSocket address is on a different host and port,
+        // and the raw-TCP derivation (`/ip4/127.0.0.1/tcp/8546`) would be an unreachable dial
+        // that just burns a ~20 s timeout. The announced address must win. Regression guard for
+        // backlog #104.
+        let peer_url = serve_status(serde_json::json!({
+            "p2p_port": 8546,
+            "p2p_public_addr": "/dns4/p2p.silvra.net/tcp/443/tls/ws",
+        }))
+        .await;
+
+        let addr = resolve_seed_peer_multiaddr(&peer_url).await.unwrap();
+
+        assert_eq!(addr, "/dns4/p2p.silvra.net/tcp/443/tls/ws");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_raw_tcp_when_the_announced_addr_is_empty_or_absent() {
+        // An open node that announces nothing (empty string) — and, separately, one whose build
+        // predates the field entirely — must both keep the original raw-TCP-from-p2p_port
+        // behaviour, not error.
+        let empty = serve_status(serde_json::json!({
+            "p2p_port": 9999,
+            "p2p_public_addr": "",
+        }))
+        .await;
+        assert_eq!(
+            resolve_seed_peer_multiaddr(&empty).await.unwrap(),
+            "/ip4/127.0.0.1/tcp/9999"
+        );
+
+        let absent = serve_status(serde_json::json!({ "p2p_port": 9999 })).await;
+        assert_eq!(
+            resolve_seed_peer_multiaddr(&absent).await.unwrap(),
+            "/ip4/127.0.0.1/tcp/9999"
+        );
     }
 }
 
