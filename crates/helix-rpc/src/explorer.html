@@ -1,16 +1,20 @@
 <!--
-  Served by the node itself at `/` to browsers (see `root`). Deliberately one self-contained
-  file with no external requests: a node has to work on a machine that cannot reach a CDN, and
-  an explorer that quietly depends on someone else's font server is not one you can run air-gapped.
+  Served by the node itself at `/` to browsers (see `root`). Deliberately ONE self-contained
+  file with no external requests: a node has to work on a machine that cannot reach a CDN, and a
+  page that quietly depends on someone else's font server is not one you can run air-gapped.
+  This is the front door of the project — a hub, not just a block explorer: what Helix is, how to
+  join, how to run a node, the tokenomics, the tech, and the live chain, all in one page.
 -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Helix Explorer</title>
-<link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEfUlEQVR42u2XzY8UVRTFf/fVq/6qZoSeZiDoGIcZkI2RxGAEokEQ/FjIf4AbNyQuDHGr0cQdiVFMjCYkbPwP3LgANCGgiEGXCuPASFxAunvG0B8z1VXvuqiarh6mu2FwQUysZb26751377nnnpKbX7+hPMLH8IifRw7A3vcLEUAABX3Aaq0jZgQAAQGNllAXI8YitpBuqCNiJI2JEOOlMQyNscNuoC6CKCI3PoNXrBC3aoQLs4iXB/EGbCigMRqF5CrTeKUqcadBWJ8FzyLGDsyGHXQLjSOMX6T60glKk/tBDOpiWjfOU//xs+Sr/g1FUBeDsWze9x7B1IEEpDraty5Su/QJrttJYu4BbgfWz3Wp7v+A0uQ+UAfqEDGUpw+jLuTOdx9i/CBZS9Dgum22HPqYYPuhBFi6VnryRaricef8++D5a7KwGoAYNOqQG9+ZHh6DmD5COcrTR4jbdTRaTtdIANoiwdSh5GCRtMEUNKY0uY/c+E7CxnXEFjPggzKgLsYrVdNUrbA5I5iIYeOzxx6wybJu8EpVtPZbb7chABQxlrh1Ow10GZCU/eoiFq6eHpCBApueexsRrwc2iVXAELduPwAHVBFbIKzP0pw7S3n7K2t6++7v37DwyxlMLuirp+C6bfyxx9nw9Ju9yyRAPFo3zrPcmF3Nm6EkVEVsnvoPn6LREsHUQYwt4LptmrPfsnD1NLa8FRHpbwJMvkzjypcAlKcPI7aIRsu0bn5P/afPMV5+YBvK4GEkCBC17lB5/h027j5G48oXLPx6BhtsHSJGAupwUQd/bBKvWMEtLRL+/SfGDtOOoUqoIBbxS2gcJm+iMEkhBoiGxBhMrkzUuk109y8wXl+pdL1SrH0tleZZ3QgZpqf94vng5bI9/qPTUJI2W7mBuj5RYvQwikNwERgvmR0jSmCGbqQx2u0k0wwQW0C77RSQDBEdhwub2GCC/MQz+OVtuLCVKOoQ4Hbo4cYycfAjgqcOgDo27n4Lu2EbCz9/1ZPt7FYZP8ZfeJfy9BGMv7oNcfHATjADR3G8THXvCcozryUZEIPxS4ztOkplz3Fc1MnImca4qENlz3HGdh3F+MVEVW2e8syrVPeewMXLq2MGAkjNRK6yg2Dq5TR12hMo1FHe8Tr+Y5NJnSWruT/2BOUdb6TTU/sGWEwwdZB8ZQaNltaAMGu8gIvwgom1wyg9TIzFljYnJFtZdxE2mEi0XqTvkL5hFGxJTA4yugRiPOJ2LbtBr2apv9OYuFMH42XrxkveaXwP47V3kbhdQ4x3nxKkcz2sX6N961LqalIx0YR4zblzhIvzWXupIl6ecHGe5ty5tHXJSiEe7VuXCOvX1niBwSRUBeNTu3iS9vyFzKioozl3lvrlU5ieOc1ijC1Qv3yK5txZtKcZ0J6/QO3iSTD+OobRiimN7zWlfyBebrQpjUNym6bxgoc2pelIFgu+JWzMZrbcL41QtSTd4pcIF2+gjeuJLfdTW64PNYwSBZQ+Tzj60Z6fEAr/9sekjxOs8/91HTH//5z+AzC3Nft/pcWSAAAAAElFTkSuQmCC">
+<title>Helix — the post-quantum blockchain</title>
+<meta name="description" content="Helix (HLX) — a post-quantum Layer-1 blockchain in Rust. Explore the chain, run a node, and learn how it works.">
+<link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEfUlEQVR42u2XzY8UVRTFf/fVq/6qZoSeZiDoGIcZkI2RxGAEokEQ/FjIf4AbNyQuDHGr0cQdiVFMjCYkbPwP3LgANCGgiEGXCuPASFxAunvG0B8z1VXvuqiarh6mu2FwQUysZb26571377nnnpKbX7+hPMLH8IifRw7A3vcLEUAABX3Aaq0jZgQAAQGNllAXI8YitpBuqCNiJI2JEOOlMQyNscNuoC6CKCI3PoNXrBC3aoQLs4iXB/EGbCigMRqF5CrTeKUqcadBWJ8FzyLGDsyGHXQLjSOMX6T60glKk/tBDOpiWjfOU//xs+Sr/g1FUBeDsWze9x7B1IEEpDraty5Su/QJrttJYu4BbgfWz3Wp7v+A0uQ+UAfqEDGUpw+jLuTOdx9i/CBZS9Dgum22HPqYYPuhBFi6VnryRaricef8++D5a7KwGoAYNOqQG9+ZHh6DmD5COcrTR4jbdTRaTtdIANoiwdSh5GCRtMEUNKY0uY/c+E7CxnXEFjPggzKgLsYrVdNUrbA5I5iIYeOzxx6wybJu8EpVtPZbb7chABQxlrh1Ow10GZCU/eoiFq6eHpCBApueexsRrwc2iVXAELduPwAHVBFbIKzP0pw7S3n7K2t6++7v37DwyxlMLuirp+C6bfyxx9nw9Ju9yyRAPFo3zrPcmF3Nm6EkVEVsnvoPn6LREsHUQYwt4LptmrPfsnD1NLa8FRHpbwJMvkzjypcAlKcPI7aIRsu0bn5P/afPMV5+YBvK4GEkCBC17lB5/h027j5G48oXLPx6BhtsHSJGAupwUQd/bBKvWMEtLRL+/SfGDtOOoUqoIBbxS2gcJm+iMEkhBoiGxBhMrkzUuk109y8wXl+pdL1SrH0tleZZ3QgZpqf94vng5bI9/qPTUJI2W7mBuj5RYvQwikNwERgvmR0jSmCGbqQx2u0k0wwQW0C77RSQDBEdhwub2GCC/MQz+OVtuLCVKOoQ4Hbo4cYycfAjgqcOgDo27n4Lu2EbCz9/1ZPt7FYZP8ZfeJfy9BGMv7oNcfHATjADR3G8THXvCcozryUZEIPxS4ztOkplz3Fc1MnImca4qENlz3HGdh3F+MVEVW2e8syrVPeewMXLq2MGAkjNRK6yg2Dq5TR12hMo1FHe8Tr+Y5NJnSWruT/2BOUdb6TTU/sGWEwwdZB8ZQaNltaAMGu8gIvwgom1wyg9TIzFljYnJFtZdxE2mEi0XqTvkL5hFGxJTA4yugRiPOJ2LbtBr2apv9OYuFMH42XrxkveaXwP47V3kbhdQ4x3nxKkcz2sX6N961LqalIx0YR4zblzhIvzWXupIl6ecHGe5ty5tHXJSiEe7VuXCOvX1niBwSRUBeNTu3iS9vyFzKioozl3lvrlU5ieOc1ijC1Qv3yK5txZtKcZ0J6/QO3iSTD+OobRiimN7zWlfyBebrQpjUNym6bxgoc2pelIFgu+JWzMZrbcL41QtSTd4pcIF2+gjeuJLfdTW64PNYwSBZQ+Tzj60Z6fEAr/9sekjxOs8/91HTH//5z+AzC3Nft/pcWSAAAAAElFTkSuQmCC">
 <style>
   :root {
     --ground: #faf9f7;
     --panel: #ffffff;
+    --panel-2: #f4f2ee;
     --line: #e2ded7;
     --ink: #1b1d21;
     --dim: #6f7480;
@@ -24,6 +28,7 @@
     :root {
       --ground: #0f1218;
       --panel: #161a22;
+      --panel-2: #10131a;
       --line: #262c38;
       --ink: #e9e6e0;
       --dim: #8a909e;
@@ -35,72 +40,104 @@
     }
   }
   :root[data-theme="dark"] {
-    --ground: #0f1218; --panel: #161a22; --line: #262c38; --ink: #e9e6e0;
+    --ground: #0f1218; --panel: #161a22; --panel-2: #10131a; --line: #262c38; --ink: #e9e6e0;
     --dim: #8a909e; --accent: #e0a44a; --accent-soft: #221a0e;
     --warn-bg: #2a1710; --warn-line: #58301d; --warn-ink: #f0a883;
   }
   :root[data-theme="light"] {
-    --ground: #faf9f7; --panel: #ffffff; --line: #e2ded7; --ink: #1b1d21;
+    --ground: #faf9f7; --panel: #ffffff; --panel-2: #f4f2ee; --line: #e2ded7; --ink: #1b1d21;
     --dim: #6f7480; --accent: #9a5b06; --accent-soft: #fdf3e2;
     --warn-bg: #fdf1ec; --warn-line: #e8c4b4; --warn-ink: #8a3d1c;
   }
 
   * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
   body {
     margin: 0;
     background: var(--ground);
     color: var(--ink);
-    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    font: 15px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  code, .mono, td.num {
-    font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
-  }
+  code, .mono, td.num, pre { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; }
   .num { font-variant-numeric: tabular-nums; }
-  main { max-width: 1080px; margin: 0 auto; padding: 24px 20px 64px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  main { max-width: 1080px; margin: 0 auto; padding: 0 20px 72px; }
 
-  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
-  h1 {
-    font-size: 20px; margin: 0; letter-spacing: .16em; text-transform: uppercase;
-    font-weight: 600;
+  /* ---------- top nav ---------- */
+  .topnav {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--ground) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
   }
-  .sub { color: var(--dim); font-size: 13px; }
-  .sub b { color: var(--accent); font-weight: 600; }
+  .topnav-inner {
+    max-width: 1080px; margin: 0 auto; padding: 9px 20px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .topnav .logo { display: flex; align-items: center; gap: 8px; font-weight: 650; letter-spacing: .04em; }
+  .topnav .logo img { border-radius: 6px; display: block; }
+  .topnav nav { display: flex; gap: 4px; flex-wrap: wrap; margin-left: auto; }
+  .topnav nav a {
+    color: var(--dim); font-size: 13px; padding: 5px 9px; border-radius: 6px; white-space: nowrap;
+  }
+  .topnav nav a:hover { color: var(--ink); background: var(--panel-2); text-decoration: none; }
+
+  section[id] { scroll-margin-top: 64px; }
+  .lead { font-size: 11px; letter-spacing: .13em; text-transform: uppercase; color: var(--accent);
+          font-weight: 650; margin: 44px 0 10px; }
+  h2 { font-size: 23px; margin: 2px 0 10px; font-weight: 650; letter-spacing: -0.01em; }
+  h3 { font-size: 15px; margin: 22px 0 6px; font-weight: 650; }
+  p { margin: 8px 0; }
+  .muted { color: var(--dim); }
+
+  /* ---------- hero ---------- */
+  .hero { padding: 40px 0 8px; }
+  .hero h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.08; margin: 0 0 12px; letter-spacing: -0.02em; }
+  .hero h1 .g { color: var(--accent); }
+  .hero .tagline { font-size: 17px; color: var(--dim); max-width: 640px; margin: 0 0 18px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 4px; }
+  .chip {
+    font-size: 12.5px; padding: 5px 11px; border-radius: 999px;
+    background: var(--panel); border: 1px solid var(--line); color: var(--ink);
+  }
+  .chip b { color: var(--accent); font-weight: 650; }
+  .cta { display: flex; flex-wrap: wrap; gap: 10px; margin: 22px 0 6px; }
+  .btn {
+    display: inline-block; padding: 10px 17px; border-radius: 8px; font-size: 14px; font-weight: 600;
+    background: var(--accent); color: var(--ground); border: 1px solid var(--accent);
+  }
+  .btn:hover { text-decoration: none; filter: brightness(1.06); }
+  .btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+  .btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
 
   .warn {
-    margin: 16px 0 26px; padding: 12px 14px;
+    margin: 22px 0 6px; padding: 12px 14px;
     background: var(--warn-bg); border: 1px solid var(--warn-line); border-left-width: 3px;
-    color: var(--warn-ink); font-size: 13.5px; border-radius: 3px;
+    color: var(--warn-ink); font-size: 13.5px; border-radius: 4px;
   }
-  .warn strong { font-weight: 650; }
+  .warn strong { font-weight: 700; }
 
+  /* ---------- live strip ---------- */
   .strip {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     gap: 1px; background: var(--line); border: 1px solid var(--line);
-    border-radius: 3px; overflow: hidden; margin-bottom: 28px;
+    border-radius: 6px; overflow: hidden; margin: 10px 0 4px;
   }
-  .cell { background: var(--panel); padding: 11px 13px; }
-  .cell .k {
-    font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
-    color: var(--dim); margin-bottom: 3px;
-  }
-  .cell .v { font-size: 17px; font-variant-numeric: tabular-nums; font-weight: 550; }
+  .cell { background: var(--panel); padding: 12px 14px; }
+  .cell .k { font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); margin-bottom: 4px; }
+  .cell .v { font-size: 18px; font-variant-numeric: tabular-nums; font-weight: 600; }
   .cell .v.small { font-size: 12px; font-weight: 400; word-break: break-all; }
 
-  .cols { display: grid; grid-template-columns: 1.15fr 1fr; gap: 26px; align-items: start; }
+  /* ---------- explorer cols ---------- */
+  .cols { display: grid; grid-template-columns: 1.15fr 1fr; gap: 24px; align-items: start; margin-top: 14px; }
   @media (max-width: 820px) { .cols { grid-template-columns: 1fr; } }
-
-  h2 {
-    font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim);
-    margin: 0 0 9px; font-weight: 600;
-  }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 3px; }
+  .sub-title { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin: 0 0 9px; font-weight: 650; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
   .scroll { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-  th {
-    text-align: left; font-weight: 550; color: var(--dim); font-size: 10.5px;
-    letter-spacing: .08em; text-transform: uppercase; padding: 8px 12px;
-    border-bottom: 1px solid var(--line); white-space: nowrap;
-  }
+  th { text-align: left; font-weight: 600; color: var(--dim); font-size: 10.5px; letter-spacing: .08em;
+       text-transform: uppercase; padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   td { padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   tr:last-child td { border-bottom: 0; }
   td.num { font-variant-numeric: tabular-nums; }
@@ -108,30 +145,24 @@
 
   form { display: flex; gap: 8px; margin-bottom: 10px; }
   input {
-    flex: 1; min-width: 0; padding: 9px 11px; font-size: 13px;
+    flex: 1; min-width: 0; padding: 10px 11px; font-size: 13px;
     font-family: ui-monospace, Menlo, Consolas, monospace;
-    background: var(--panel); color: var(--ink);
-    border: 1px solid var(--line); border-radius: 3px;
+    background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
   }
-  input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input:focus-visible, button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   button {
-    padding: 9px 15px; font-size: 13px; font-weight: 550; cursor: pointer;
-    background: var(--accent); color: var(--ground);
-    border: 1px solid var(--accent); border-radius: 3px;
+    padding: 10px 15px; font-size: 13px; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: var(--ground); border: 1px solid var(--accent); border-radius: 6px;
   }
-  #result { padding: 13px; font-size: 13px; min-height: 60px; }
+  #result { padding: 13px; font-size: 13px; min-height: 64px; }
   #result .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
   #result .row span:first-child { color: var(--dim); }
-  #result .row span:last-child {
-    font-family: ui-monospace, Menlo, Consolas, monospace;
-    font-variant-numeric: tabular-nums; text-align: right; word-break: break-all;
-  }
+  #result .row span:last-child { font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
   #result .none { color: var(--dim); }
   #result .err { color: var(--warn-ink); }
-  #result .sub-h {
-    font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
-    margin: 12px 0 2px; padding-top: 10px; border-top: 1px solid var(--line);
-  }
+  #result .sub-h { font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
+    margin: 12px 0 2px; padding-top: 10px; border-top: 1px solid var(--line); }
   #result table { font-size: 12.5px; }
   #result td { padding: 5px 8px 5px 0; }
   #result td:last-child { padding-right: 0; text-align: right; }
@@ -139,68 +170,289 @@
   .bad { color: var(--warn-ink); }
   .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
 
-  footer {
-    margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--line);
-    color: var(--dim); font-size: 12.5px;
+  /* ---------- content ---------- */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 760px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+  .card h3 { margin-top: 0; }
+  .card p { color: var(--dim); font-size: 14px; }
+  .step-num { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
+    border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 12px;
+    font-weight: 700; margin-right: 8px; }
+  pre {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 14px; overflow-x: auto; font-size: 12.5px; line-height: 1.55; margin: 8px 0;
   }
-  a { color: var(--accent); }
+  pre .c { color: var(--dim); }
+  pre .p { color: var(--accent); }
+  .facts { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .facts td { padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: normal; }
+  .facts tr:last-child td { border-bottom: 0; }
+  .facts td:first-child { color: var(--dim); width: 38%; }
+  .facts td.num, .facts b { font-variant-numeric: tabular-nums; }
+  ul.clean { margin: 8px 0; padding-left: 20px; }
+  ul.clean li { margin: 5px 0; color: var(--dim); }
+  ul.clean li b { color: var(--ink); }
+
+  .links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+  .linkcard {
+    display: flex; align-items: center; gap: 10px; padding: 11px 15px; border-radius: 8px;
+    background: var(--panel); border: 1px solid var(--line); color: var(--ink); font-size: 14px; font-weight: 600;
+  }
+  .linkcard:hover { border-color: var(--accent); text-decoration: none; }
+  .linkcard span { color: var(--dim); font-weight: 400; font-size: 12.5px; }
+
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--line);
+    color: var(--dim); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  footer .sep { opacity: .5; }
 </style>
 
-<main>
-  <header>
-    <img src="data:image/png;base64,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" alt="Helix" width="30" height="30" style="border-radius:7px;align-self:center">
-    <h1>Helix</h1>
-    <div class="sub">
-      post-quantum layer 1 &middot; every signature <b>ML-DSA-65</b> (NIST FIPS&nbsp;204)
-      &middot; node <b id="ver">…</b>
-    </div>
-  </header>
-
-  <div class="warn">
-    <strong>This is a development network.</strong> The chain is reset from genesis whenever the
-    format changes — every balance goes with it. HLX here is a test token: it has no value and it
-    will not survive to whatever launches later. One validator runs this network, so it tolerates
-    zero faults. Explore it, break it, run a node against it — just don't hold anything you'd mind
-    losing.
+<div class="topnav">
+  <div class="topnav-inner">
+    <a class="logo" href="#top">
+      <img src="/logo.png" alt="Helix" width="24" height="24">Helix
+    </a>
+    <nav>
+      <a href="#network">Network</a>
+      <a href="#explorer">Explorer</a>
+      <a href="#start">Get&nbsp;started</a>
+      <a href="#node">Run&nbsp;a&nbsp;node</a>
+      <a href="#tokenomics">Tokenomics</a>
+      <a href="#tech">Technology</a>
+      <a href="#resources">Resources</a>
+    </nav>
   </div>
+</div>
 
-  <div class="strip" id="strip"></div>
+<main id="top">
+  <!-- ===================== HERO ===================== -->
+  <section class="hero">
+    <h1>The <span class="g">post-quantum</span> blockchain.</h1>
+    <p class="tagline">
+      Helix (HLX) is a Layer-1 blockchain written in Rust. Every signature uses NIST&nbsp;FIPS&nbsp;204
+      (ML-DSA-65), so the ledger stays secure even against a quantum computer. Proof-of-stake, BFT
+      consensus, two-second blocks. Made in Germany 🇩🇪.
+    </p>
+    <div class="chips">
+      <span class="chip">Signatures <b>ML-DSA-65</b> · FIPS&nbsp;204</span>
+      <span class="chip">Hash <b>BLAKE3</b></span>
+      <span class="chip"><b>PoS + BFT</b> consensus</span>
+      <span class="chip"><b>~2s</b> blocks</span>
+      <span class="chip">Fixed cap <b>33M HLX</b></span>
+      <span class="chip">Node <b id="ver">…</b></span>
+    </div>
+    <div class="cta">
+      <a class="btn" href="#start">Get started</a>
+      <a class="btn ghost" href="#node">Run a node</a>
+      <a class="btn ghost" href="https://github.com/silvra-net/helix">Source on GitHub</a>
+    </div>
 
-  <div class="cols">
-    <section>
-      <h2>Latest blocks</h2>
-      <div class="panel scroll">
-        <table>
-          <thead>
-            <tr><th>Height</th><th>Txs</th><th>Proposer</th><th>Hash</th></tr>
-          </thead>
-          <tbody id="blocks">
-            <tr><td colspan="4" class="hash">loading…</td></tr>
-          </tbody>
+    <div class="warn">
+      <strong>Public test network.</strong> HLX here is a <strong>test token with no monetary
+      value.</strong> The chain can be reset from genesis, and one validator currently secures the
+      network, so it tolerates zero faults today — decentralization is the goal, not yet the state.
+      There has been no external security audit. Explore it, run a node, build against it — just
+      don't hold anything you'd mind losing.
+    </div>
+  </section>
+
+  <!-- ===================== LIVE NETWORK ===================== -->
+  <section id="network">
+    <div class="lead">Live network</div>
+    <h2>The chain, right now</h2>
+    <p class="muted">Updates every few seconds, straight from this node — no third party in between.</p>
+    <div class="strip" id="strip"></div>
+  </section>
+
+  <!-- ===================== EXPLORER ===================== -->
+  <section id="explorer">
+    <div class="lead">Explorer</div>
+    <h2>Follow the chain</h2>
+    <div class="cols">
+      <div>
+        <div class="sub-title">Latest blocks</div>
+        <div class="panel scroll">
+          <table>
+            <thead><tr><th>Height</th><th>Txs</th><th>Proposer</th><th>Hash</th></tr></thead>
+            <tbody id="blocks"><tr><td colspan="4" class="hash">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <div class="sub-title">Look up</div>
+        <form id="lookup">
+          <input id="q" placeholder="address, tx hash, or block height" autocomplete="off"
+                 aria-label="address, transaction hash, or block height">
+          <button type="submit">Find</button>
+        </form>
+        <div class="panel" id="result">
+          <div class="none">An <code>hlx…</code> address, a 64-character transaction hash, or a block number.</div>
+        </div>
+        <div class="hint">Amounts are shown in HLX. One HLX is 1,000,000,000 nano-HLX, and the chain counts in nano.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== GET STARTED ===================== -->
+  <section id="start">
+    <div class="lead">Get started</div>
+    <h2>Send your first HLX in three steps</h2>
+    <p class="muted">
+      Everything runs from one binary, <code>helix</code>. Download it for your OS from the
+      <a href="https://github.com/silvra-net/helix/releases">latest release</a>
+      (<code>linux-x86_64</code>, <code>macos-arm64</code>, <code>windows-x86_64</code>). Out of the
+      box it talks to this network — no configuration needed.
+    </p>
+    <div class="grid3">
+      <div class="card">
+        <h3><span class="step-num">1</span>Make a wallet</h3>
+        <p>Creates a key and prints a 24-word recovery phrase. Write the phrase down once — it is the only backup.</p>
+        <pre><span class="p">helix</span> wallet new</pre>
+      </div>
+      <div class="card">
+        <h3><span class="step-num">2</span>Check your balance</h3>
+        <p>Look up any address — yours or someone else's — for balance, stake and history.</p>
+        <pre><span class="p">helix</span> account <span class="c">&lt;your-address&gt;</span></pre>
+      </div>
+      <div class="card">
+        <h3><span class="step-num">3</span>Send some HLX</h3>
+        <p>Pay a raw address or a <code>name.hlx</code>. The fee is priced from the chain automatically.</p>
+        <pre><span class="p">helix</span> tx send <span class="c">&lt;to&gt; &lt;amount&gt;</span>
+<span class="p">helix</span> tx status <span class="c">&lt;hash&gt;</span></pre>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:14px">
+      Lost a wallet? <code>helix wallet restore</code> rebuilds it from the 24 words. Point any command at
+      a different node with <code>--node&nbsp;&lt;url&gt;</code> — the default is
+      <code>https://helix.silvra.net</code>.
+    </p>
+  </section>
+
+  <!-- ===================== RUN A NODE ===================== -->
+  <section id="node">
+    <div class="lead">Run a node</div>
+    <h2>Join the network</h2>
+    <div class="grid2">
+      <div>
+        <p class="muted">
+          A node with no configuration joins <em>this</em> chain automatically: it fetches genesis
+          from a seed peer, <strong>recomputes the genesis state hash itself</strong> before trusting
+          anything, syncs the history, and then follows live.
+        </p>
+        <pre><span class="c"># download the binary, then just:</span>
+<span class="p">helix</span> start</pre>
+        <p class="muted">
+          Running from behind a home connection or Cloudflare? Helix speaks libp2p over WebSocket, so
+          a node can gossip through an HTTPS tunnel on port 443 — no open inbound port required. See
+          the README for the reverse-proxy setup.
+        </p>
+        <p class="muted">
+          Want your own private chain instead of joining this one? Start with
+          <code>HELIX_NEW_CHAIN=1</code> for a standalone genesis.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Becoming a validator</h3>
+        <ul class="clean">
+          <li>Stake at least <b>100,000 HLX</b> to enter the validator set.</li>
+          <li>Don't have a machine to run? <b>Delegate</b> to a validator and earn a share of the rewards, auto-compounded.</li>
+          <li>Unstaking has a <b>7-day</b> unbonding period; double-signing is slashed <b>5%</b> and jailed immediately.</li>
+        </ul>
+        <pre><span class="p">helix</span> tx stake <span class="c">&lt;amount&gt;</span>
+<span class="p">helix</span> tx delegate <span class="c">&lt;validator&gt; &lt;amount&gt;</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== TOKENOMICS ===================== -->
+  <section id="tokenomics">
+    <div class="lead">Tokenomics</div>
+    <h2>How HLX is issued</h2>
+    <div class="grid2">
+      <div>
+        <table class="facts">
+          <tr><td>Maximum supply</td><td><b>33,000,000 HLX</b> (a hard cap)</td></tr>
+          <tr><td>Block reward</td><td><b>1 HLX</b> per block, halving every 15,768,000 blocks (~1 year)</td></tr>
+          <tr><td>Block time</td><td>~2 seconds</td></tr>
+          <tr><td>Transaction fee</td><td>EIP-1559 base fee (per byte, <b>burned</b>) + tip to the validator</td></tr>
+          <tr><td>Min. validator stake</td><td>100,000 HLX</td></tr>
+          <tr><td>Unbonding period</td><td>7 days</td></tr>
+          <tr><td>Slashing</td><td>5% + immediate jail for double-signing</td></tr>
         </table>
       </div>
-    </section>
-
-    <section>
-      <h2>Look up</h2>
-      <form id="lookup">
-        <input id="q" placeholder="address, tx hash, or block height" autocomplete="off"
-               aria-label="address, transaction hash, or block height">
-        <button type="submit">Find</button>
-      </form>
-      <div class="panel" id="result">
-        <div class="none">An <code>hlx…</code> address, a 64-character transaction hash, or a
-        block number.</div>
+      <div>
+        <p class="muted">
+          There was no pre-mine dumped to a founder wallet. The supply enters circulation gradually
+          through block rewards, Bitcoin-style — a halving schedule under a fixed 33M cap.
+        </p>
+        <p class="muted">
+          Fees follow Ethereum's model: a per-byte base fee is <strong>burned</strong> (removing HLX
+          from supply), and anything above it tips the validator. Higher demand burns more, so the
+          money supply is disinflationary by design.
+        </p>
+        <p class="muted">
+          Staking, delegation and governance are three separate rights: delegators earn yield but
+          governance votes stay with self-stakers. Validator commission is capped at 50%.
+        </p>
       </div>
-      <div class="hint">Amounts are shown in HLX. One HLX is 1,000,000,000 nano-HLX, and the
-      chain counts in nano.</div>
-    </section>
-  </div>
+    </div>
+  </section>
+
+  <!-- ===================== TECHNOLOGY ===================== -->
+  <section id="tech">
+    <div class="lead">Technology</div>
+    <h2>What's under the hood</h2>
+    <div class="grid3">
+      <div class="card">
+        <h3>Post-quantum crypto</h3>
+        <p>Signatures are <b>ML-DSA-65</b> (NIST FIPS&nbsp;204); <b>SLH-DSA</b> (FIPS&nbsp;205) is available as a hash-based alternate. Hashing is <b>BLAKE3</b>. No home-rolled crypto — only vetted crates.</p>
+      </div>
+      <div class="card">
+        <h3>BFT consensus</h3>
+        <p>Proof-of-stake with a Tendermint-style BFT engine: 2/3+1 quorum per round, cross-round vote locking for safety, and deterministic slashing evidence on-chain.</p>
+      </div>
+      <div class="card">
+        <h3>Smart contracts</h3>
+        <p>Deterministic WASM (floats disabled by construction), fuel-metered, with host imports for storage and value transfer — no cross-contract calls, so reentrancy can't exist.</p>
+      </div>
+      <div class="card">
+        <h3>Human-readable names</h3>
+        <p>Register a <code>name.hlx</code> and receive to it instead of a raw address. Resolvable across the network and from the wallet.</p>
+      </div>
+      <div class="card">
+        <h3>Accounts that recover</h3>
+        <p>Social recovery via guardians, proof-of-personhood for sybil resistance, and on-chain governance over protocol parameters.</p>
+      </div>
+      <div class="card">
+        <h3>Honest by default</h3>
+        <p>Every transaction carries a verifiable receipt; the node exposes a deterministic state hash so any two nodes can prove they computed the same ledger.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== RESOURCES ===================== -->
+  <section id="resources">
+    <div class="lead">Resources</div>
+    <h2>Dig deeper</h2>
+    <div class="links">
+      <a class="linkcard" href="https://github.com/silvra-net/helix">GitHub <span>· source &amp; releases</span></a>
+      <a class="linkcard" href="https://discord.gg/cUwz3fVHw">Discord <span>· community</span></a>
+      <a class="linkcard" href="https://bitcointalk.org/index.php?topic=5588803">Bitcointalk <span>· announcement</span></a>
+      <a class="linkcard" href="/status">REST API <span>· /status, /genesis, …</span></a>
+      <a class="linkcard" href="/logo.png">Logo <span>· brand asset (PNG)</span></a>
+    </div>
+    <p class="muted" style="margin-top:14px">
+      The full CLI tour, node deployment guide and API reference live in the
+      <a href="https://github.com/silvra-net/helix#readme">README</a>.
+    </p>
+  </section>
 
   <footer>
-    Served by the node itself — no external requests, no tracking, nothing to install.
-    <a href="https://github.com/silvra-net/helix">Source</a> &middot;
-    <a href="/status">/status</a> &middot;
+    <span>Served by the node itself — no external requests, no tracking, nothing to install.</span>
+    <span class="sep">·</span>
+    <a href="https://github.com/silvra-net/helix">Source</a>
+    <a href="/status">/status</a>
     <a href="/genesis">/genesis</a>
   </footer>
 </main>
@@ -209,20 +461,14 @@
   const $ = (id) => document.getElementById(id);
   const NANO = 1e9;
 
-  const fmtHlx = (n) =>
-    (n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 9 });
+  const fmtHlx = (n) => (n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 9 });
   const short = (s, n = 10) => (s && s.length > n * 2 ? s.slice(0, n) + '…' + s.slice(-6) : s || '');
-  const esc = (s) =>
-    String(s).replace(/[&<>"']/g, (c) =>
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-  // Every hash, height and address on the page is a link to the lookup for it. An explorer is
-  // for following the chain — block to its transactions, transaction to its accounts, account
-  // back to its transactions — and without these it only answers questions you can already
-  // phrase, by copying hex out of one box and into another.
-  //
-  // The target is the URL fragment, not a click handler, so the lookup you are looking at has
-  // an address you can share, bookmark, or reload onto. `hashchange` does the routing.
+  // Every hash, height and address is a link to the lookup for it, so you can follow the chain —
+  // block to its transactions, transaction to its accounts, account back to its transactions. The
+  // target is the URL fragment (not a click handler), so a lookup is shareable and reloadable.
   const link = (q, text) => `<a href="#${encodeURIComponent(q)}">${esc(text ?? q)}</a>`;
 
   async function api(path) {
@@ -231,10 +477,8 @@
     return r.json();
   }
 
-  function cell(k, v, small) {
-    return `<div class="cell"><div class="k">${esc(k)}</div>
-            <div class="v${small ? ' small' : ''}">${esc(v)}</div></div>`;
-  }
+  const cell = (k, v, small) =>
+    `<div class="cell"><div class="k">${esc(k)}</div><div class="v${small ? ' small' : ''}">${esc(v)}</div></div>`;
 
   async function refresh() {
     try {
@@ -252,45 +496,33 @@
       const top = s.height;
       const heights = [];
       for (let h = top; h > Math.max(-1, top - 12); h--) heights.push(h);
-      const blocks = await Promise.all(
-        heights.map((h) => api('/blocks/height/' + h).catch(() => null))
-      );
-      $('blocks').innerHTML = blocks
-        .filter(Boolean)
-        .map(
-          (b) => `<tr>
+      const blocks = await Promise.all(heights.map((h) => api('/blocks/height/' + h).catch(() => null)));
+      $('blocks').innerHTML = blocks.filter(Boolean).map((b) => `<tr>
             <td class="num">${link(b.height, b.height.toLocaleString())}</td>
             <td class="num">${b.transactions ? b.transactions.length : 0}</td>
             <td class="hash">${link(b.validator, short(b.validator, 8))}</td>
             <td class="hash">${link(b.height, short(b.hash, 8))}</td>
-          </tr>`
-        )
-        .join('') || '<tr><td colspan="4" class="hash">no blocks yet</td></tr>';
+          </tr>`).join('') || '<tr><td colspan="4" class="hash">no blocks yet</td></tr>';
     } catch (e) {
       $('strip').innerHTML = cell('Node', 'unreachable', true);
     }
   }
 
   const row = (k, v) => `<div class="row"><span>${esc(k)}</span><span>${esc(v)}</span></div>`;
-  const rowLink = (k, q, text) =>
-    `<div class="row"><span>${esc(k)}</span><span>${link(q, text)}</span></div>`;
+  const rowLink = (k, q, text) => `<div class="row"><span>${esc(k)}</span><span>${link(q, text)}</span></div>`;
 
-  // The transactions in a block, or an account's history. `self` is the address being viewed,
-  // if any: rows are then pointed in/out from it and name the other party, since "who paid whom"
-  // is the question a history is read for.
-  //
-  // The type stays on every row even though it costs a column: this chain's history mixes
-  // Delegate and Undelegate in among the transfers, and direction alone renders a 200 HLX
-  // Undelegate — your own stake coming back — as though someone had just paid you 200 HLX.
+  // The transactions in a block, or an account's history. `self` is the address being viewed, if
+  // any: rows are then pointed in/out from it and name the other party. The type stays on every row
+  // — this chain mixes Delegate/Undelegate in among transfers, and direction alone would render a
+  // 200 HLX Undelegate (your own stake returning) as though someone paid you 200 HLX.
   function txTable(txs, self) {
     if (!txs.length) return '<div class="none" style="padding-top:6px">No transactions.</div>';
     return '<div class="scroll"><table>' + txs.map((t) => {
       const out = self && t.from === self;
       const other = self ? (out ? t.to : t.from) : t.from;
-      const arrow = self ? (out ? '→ ' : '← ') : '';
-      // A transaction the executor rejected is in the block and charged like any other. Left
-      // unmarked it reads as a payment that went through -- which is exactly how this chain's
-      // rejected zero-amount transfer sat in the history looking like an ordinary one.
+      const arrow = self ? (out ? '→ ' : '← ') : '';
+      // A rejected transaction is in the block and charged like any other; left unmarked it reads
+      // as a payment that went through.
       const failed = t.status === 'failed';
       return `<tr>
         <td class="hash">${link(t.hash, short(t.hash, 6))}</td>
@@ -308,8 +540,7 @@
       row('Hash', b.hash) +
       rowLink('Proposer', b.validator, b.validator) +
       row('Base fee', b.base_fee_per_byte + ' nano/byte') +
-      `<div class="sub-h">Transactions (${txs.length})</div>` +
-      txTable(txs);
+      `<div class="sub-h">Transactions (${txs.length})</div>` + txTable(txs);
   }
 
   async function lookup(q) {
@@ -318,27 +549,15 @@
     if (!q) return;
     out.innerHTML = '<div class="none">looking…</div>';
     try {
-      if (/^\d+$/.test(q)) {
-        showBlock(await api('/blocks/height/' + q));
-        return;
-      }
+      if (/^\d+$/.test(q)) { showBlock(await api('/blocks/height/' + q)); return; }
       if (/^[0-9a-fA-F]{64}$/.test(q)) {
-        // 64 hex is either a transaction or a block hash — the shape alone can't say which, and
-        // answering "nothing matches" to a block hash copied off this very page is a dead end
-        // the reader has no way to get out of. Try the transaction first (far commoner), then
-        // the block.
+        // 64 hex is either a transaction or a block hash — the shape can't say which. Try the
+        // transaction first (far commoner), then fall back to the block.
         let t = null;
-        try {
-          t = await api('/transactions/' + q);
-        } catch (e) {
-          showBlock(await api('/blocks/hash/' + q));
-          return;
-        }
-        // A confirmed transaction comes back flat (see TxHistoryEntry); one still in the
-        // mempool has only a hash and a status, so every other row has to tolerate absence.
-        // `unknown` is what a node with no receipt for this tx says — blocks committed before
-        // receipts were stored. It means "cannot say", not "fine", so it must not be dressed
-        // up as either.
+        try { t = await api('/transactions/' + q); }
+        catch (e) { showBlock(await api('/blocks/hash/' + q)); return; }
+        // `unknown` = a node with no receipt for this tx (blocks committed before receipts were
+        // stored). It means "cannot say", not "fine", so it must not be dressed up as either.
         const failed = t.status === 'failed';
         out.innerHTML =
           `<div class="row"><span>Status</span><span class="${failed ? 'bad' : ''}">${esc(t.status || 'unknown')}</span></div>` +
@@ -349,44 +568,38 @@
           (t.from ? (t.to ? rowLink('To', t.to, t.to) : row('To', '—')) : '') +
           (t.amount_hlx != null ? row('Amount', fmtHlx(t.amount_hlx) + ' HLX') : '') +
           (t.fee_hlx != null ? row('Fee', fmtHlx(t.fee_hlx) + ' HLX') : '') +
-          // What the fee actually did, once the receipt can say: EIP-1559 burns the base fee
-          // and only the rest reaches the validator.
           (t.fee_burned_hlx != null ? row('  burned', fmtHlx(t.fee_burned_hlx) + ' HLX') : '') +
           (t.fee_to_validator_hlx != null ? row('  to validator', fmtHlx(t.fee_to_validator_hlx) + ' HLX') : '') +
           (t.nonce != null ? row('Nonce', t.nonce) : '');
         return;
       }
       const a = await api('/accounts/' + q);
-      // History is a second call, and a failing one must not take the balance down with it:
-      // the account itself is what was asked for.
+      // History is a second call; a failing one must not take the balance down with it.
       let hist = [];
-      try {
-        hist = (await api('/accounts/' + q + '/transactions')).transactions || [];
-      } catch (e) { /* leave it empty — the account still renders */ }
+      try { hist = (await api('/accounts/' + q + '/transactions')).transactions || []; }
+      catch (e) { /* leave it empty — the account still renders */ }
       out.innerHTML =
         row('Address', a.address) +
         row('Balance', fmtHlx(a.balance_hlx) + ' HLX') +
         row('Staked', fmtHlx(a.staked_hlx) + ' HLX') +
-        (a.unbonding_stake_hlx
-          ? row('Unbonding', fmtHlx(a.unbonding_stake_hlx) + ' HLX until #' + a.unbonding_unlock_height)
-          : '') +
+        (a.unbonding_stake_hlx ? row('Unbonding', fmtHlx(a.unbonding_stake_hlx) + ' HLX until #' + a.unbonding_unlock_height) : '') +
         (a.unbonding_source ? row('Slashable for', a.unbonding_source) : '') +
         row('Nonce', a.nonce) +
-        `<div class="sub-h">Transactions (${hist.length})</div>` +
-        txTable(hist.slice(0, 15), a.address);
+        `<div class="sub-h">Transactions (${hist.length})</div>` + txTable(hist.slice(0, 15), a.address);
     } catch (e) {
-      out.innerHTML =
-        `<div class="err">${esc(e.message)}</div>` +
-        '<div class="none" style="margin-top:6px">Nothing on this chain matches that. It may ' +
-        'belong to a chain that has since been reset.</div>';
+      out.innerHTML = `<div class="err">${esc(e.message)}</div>` +
+        '<div class="none" style="margin-top:6px">Nothing on this chain matches that. It may belong to a chain that has since been reset.</div>';
     }
   }
 
-  // The fragment is the single source of truth for what's on screen, so a link to a block is a
-  // link anyone can open. Submitting the form only sets it; routing happens in one place.
+  // Section anchors (#explorer, #tokenomics, …) are page navigation, not lookups — the browser
+  // scrolls to them natively, so `fromHash` must skip them. A real lookup query is an address,
+  // a 64-hex hash, or a block number; none collide with a section id.
+  const SECTIONS = new Set(['top', 'network', 'explorer', 'start', 'node', 'tokenomics', 'tech', 'resources']);
   function fromHash() {
-    const q = decodeURIComponent(location.hash.slice(1));
-    if (!q) return;
+    const raw = location.hash.slice(1);
+    if (!raw || SECTIONS.has(raw)) return;
+    const q = decodeURIComponent(raw);
     $('q').value = q;
     lookup(q);
   }

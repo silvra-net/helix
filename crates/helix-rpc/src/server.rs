@@ -1718,10 +1718,10 @@ mod tests {
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("<title>Helix Explorer</title>"));
+        assert!(html.contains("<title>Helix — the post-quantum blockchain</title>"));
         assert!(
-            html.contains("development network"),
-            "the explorer is the first thing most people see — it has to say what this chain is"
+            html.contains("test token"),
+            "the hub is the first thing most people see — it has to say honestly what this chain is"
         );
 
         // curl, wallets, other nodes: no Accept header at all, or a JSON one.
