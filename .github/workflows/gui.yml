@@ -26,7 +26,7 @@ jobs:
             name: windows
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -43,9 +43,9 @@ jobs:
         with:
           workspaces: 'gui/src-tauri -> target'
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install frontend dependencies
         working-directory: gui
@@ -56,7 +56,7 @@ jobs:
         run: npm run tauri build
 
       - name: Upload installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: helix-wallet-${{ matrix.name }}
           path: |

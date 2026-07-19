@@ -13,7 +13,7 @@ jobs:
     name: Tag matches Cargo.toml version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compare tag against workspace.package.version
         run: |
@@ -29,7 +29,7 @@ jobs:
           echo "Tag $tag matches workspace version $cargo_version."
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.label }})
     needs: check-version
     runs-on: ${{ matrix.os }}
     strategy:
@@ -38,15 +38,18 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
             archive_ext: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
+            label: macos-arm64
             archive_ext: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            label: windows-x86_64
             archive_ext: zip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -65,7 +68,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          staging="helix-${{ github.ref_name }}-${{ matrix.target }}"
+          staging="helix-${{ github.ref_name }}-${{ matrix.label }}"
           mkdir -p "$staging"
           cp target/${{ matrix.target }}/release/helix "$staging/"
           cp README.md "$staging/"
@@ -76,7 +79,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $staging = "helix-${{ github.ref_name }}-${{ matrix.target }}"
+          $staging = "helix-${{ github.ref_name }}-${{ matrix.label }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/helix.exe" "$staging/"
           Copy-Item "README.md" "$staging/"
@@ -84,9 +87,9 @@ jobs:
           echo "ASSET=$staging.zip" >> $env:GITHUB_ENV
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.label }}
           path: ${{ env.ASSET }}
 
   build-gui:
@@ -104,7 +107,7 @@ jobs:
           - os: windows-latest
             name: windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -122,9 +125,9 @@ jobs:
           workspaces: 'gui/src-tauri -> target'
           key: gui-${{ matrix.name }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install frontend dependencies
         working-directory: gui
@@ -154,7 +157,7 @@ jobs:
           Get-ChildItem gui-dist
 
       - name: Upload wallet installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wallet-${{ matrix.name }}
           path: gui-dist/*
@@ -168,13 +171,13 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - name: Create release and upload assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
