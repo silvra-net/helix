@@ -1,0 +1,40 @@
+[package]
+name = "helix-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Helix Wallet — desktop client for the Helix blockchain"
+authors = ["SILVRA"]
+license = "MIT"
+
+# Own workspace root so the parent (helix/) workspace never pulls the Tauri dep tree into
+# `cargo build --workspace`. The path deps below still resolve into the parent crates fine.
+[workspace]
+
+[lib]
+name = "helix_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "helix-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+reqwest = { version = "0.12", features = ["json"] }
+bip39 = "2.2.2"
+rand = "0.8"
+
+# The whole point of Tauri over a browser page: link the real Rust crates and reuse the
+# exact ML-DSA signing + canonical transaction encoding the CLI and node use. No JS re-impl.
+helix-crypto = { path = "../../crates/helix-crypto" }
+helix-core = { path = "../../crates/helix-core" }
+
+[features]
+# used by `tauri dev`/`tauri build`; default kept empty for a plain `cargo build`
+custom-protocol = ["tauri/custom-protocol"]

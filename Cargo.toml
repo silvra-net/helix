@@ -14,6 +14,10 @@ members = [
     "crates/helix-vm",
     "crates/helix-zkp",
 ]
+# helix-gui is a Tauri desktop app (own webview/system deps) — kept out of the workspace so
+# `cargo build/test --workspace` stays exactly as before. It path-depends on helix-crypto /
+# helix-core to reuse the real ML-DSA signing + transaction types (no re-implementation).
+exclude = ["helix-gui"]
 resolver = "2"
 
 [workspace.package]
