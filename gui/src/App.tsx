@@ -9,9 +9,12 @@ import Send from "./views/Send";
 import Receive from "./views/Receive";
 import Staking from "./views/Staking";
 import Names from "./views/Names";
+import Recovery from "./views/Recovery";
+import Governance from "./views/Governance";
+import Settings from "./views/Settings";
 import MnemonicReveal from "./views/MnemonicReveal";
 
-type Route = "overview" | "send" | "receive" | "staking" | "names";
+type Route = "overview" | "send" | "receive" | "staking" | "names" | "recovery" | "governance" | "settings";
 
 export default function App() {
   const [meta, setMeta] = useState<WalletMeta | null>(null);
@@ -103,6 +106,9 @@ export default function App() {
           <NavItem label="Receive" active={route === "receive"} onClick={() => setRoute("receive")} />
           <NavItem label="Staking" active={route === "staking"} onClick={() => setRoute("staking")} />
           <NavItem label="Names" active={route === "names"} onClick={() => setRoute("names")} />
+          <NavItem label="Recovery" active={route === "recovery"} onClick={() => setRoute("recovery")} />
+          <NavItem label="Governance" active={route === "governance"} onClick={() => setRoute("governance")} />
+          <NavItem label="Settings" active={route === "settings"} onClick={() => setRoute("settings")} />
         </nav>
         <div className="sidebar-foot">
           <div className="key-note">Key stays in the app, never in the browser</div>
@@ -138,6 +144,9 @@ export default function App() {
           {route === "receive" && <Receive address={meta.address ?? ""} />}
           {route === "staking" && <Staking node={node} height={net?.height ?? 0} />}
           {route === "names" && <Names node={node} />}
+          {route === "recovery" && <Recovery node={node} address={meta.address ?? ""} />}
+          {route === "governance" && <Governance node={node} />}
+          {route === "settings" && <Settings address={meta.address ?? ""} />}
         </section>
 
         <footer className="statusbar">

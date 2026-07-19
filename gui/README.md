@@ -4,8 +4,9 @@ A desktop wallet for the Helix blockchain — see your balance and transaction h
 and send HLX without touching the shell. Backlog #83, stage 2+ (stage 1, the read-only block
 explorer, is served by the node itself at `GET /`).
 
-> **Status:** MVP scaffold — wallet create/restore/unlock, overview (balance/staked/history),
-> receive, and locally-signed send. Staking, names, and governance are the next stages.
+> **Status:** wallet create/restore/unlock, overview (balance/staked/history), receive, and
+> locally-signed transactions — transfers, staking/delegation, `.hlx` names, social recovery
+> (guardians) and governance. A node control-panel is the remaining follow-up.
 
 ## Why Tauri (not a browser page)
 
@@ -74,4 +75,9 @@ dev` on a machine with the Tauri prerequisites installed.
 - **SA2/SA3** ✅ local wallet + balance/history + signed send
 - **SA4** ✅ staking / delegation UI — stake, unstake, claim, delegate, redelegate, commission
 - **Names** ✅ `.hlx` — register, resolve, send to a name, name shown on Overview
-- social recovery, governance, and a node control panel are the remaining follow-ups
+- **Recovery** ✅ social recovery — register guardians, approve/cancel a recovery, share your key
+- **Governance** ✅ view parameters + proposals, vote, propose a change
+- **Settings** ✅ re-reveal the recovery phrase (re-auth'd), view address / public key
+- a node control panel (become-a-validator wizard) is the remaining follow-up; smart-contract
+  deploy/call is a developer feature left out of the wallet, and proof-of-personhood is deferred
+  (verification is authority-gated and can't be a self-serve wallet flow)

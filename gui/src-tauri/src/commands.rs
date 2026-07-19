@@ -264,3 +264,111 @@ pub async fn get_validator_pool(state: State<'_, WalletState>, node: String) -> 
     let address = state.address().ok_or("wallet is locked")?;
     rpc::get_validator_pool(&node, &address).await
 }
+
+// ---------- settings / backup ----------
+
+/// Re-derive and return the 24-word recovery phrase, re-authenticating with the passphrase. This
+/// is the deliberate "reveal" path (a wallet made before you wrote the words down would otherwise
+/// have no backup) — distinct from the one-time reveal at creation. The words are shown in the UI
+/// and never persisted.
+#[tauri::command]
+pub fn reveal_mnemonic(app: AppHandle, passphrase: Option<String>) -> Result<String, String> {
+    let path = wallet_path(&app)?;
+    wallet::reveal_mnemonic_at(&path, passphrase.as_deref())
+}
+
+/// The unlocked wallet's ML-DSA public key as hex — what a guardian needs from you to approve
+/// rotating your account to a new key during social recovery.
+#[tauri::command]
+pub fn my_public_key(state: State<'_, WalletState>) -> Result<String, String> {
+    let guard = state.inner.lock().unwrap();
+    let wallet = guard.as_ref().ok_or("wallet is locked")?;
+    Ok(hex::encode(wallet.keypair.public.as_bytes()))
+}
+
+// ---------- social recovery ----------
+
+/// Register (or replace) your guardian set. The chain derives the approval threshold from the set
+/// size (e.g. 3 of 5); 3–10 guardians. Encoded exactly as the CLI does: newline-joined addresses.
+#[tauri::command]
+pub async fn register_guardians(state: State<'_, WalletState>, node: String, guardians: Vec<String>) -> Result<rpc::SubmitResult, String> {
+    let cleaned: Vec<String> = guardians.iter().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
+    if cleaned.len() < 3 || cleaned.len() > 10 {
+        return Err(format!("choose between 3 and 10 guardians (you gave {})", cleaned.len()));
+    }
+    for g in &cleaned {
+        Address::from_str(g).map_err(|_| format!("'{g}' is not a valid guardian address"))?;
+    }
+    build_sign_submit(&state, &node, TxType::RegisterGuardians, None, 0, cleaned.join("\n").into_bytes(), None).await
+}
+
+/// As a registered guardian, approve rotating a lost account (`target`) to a `new_public_key`
+/// (hex ML-DSA key the recovering owner shares with you). The target rides in `to`, the key in
+/// `data` — same as the CLI.
+#[tauri::command]
+pub async fn approve_recovery(state: State<'_, WalletState>, node: String, target: String, new_public_key: String) -> Result<rpc::SubmitResult, String> {
+    let target_addr = Address::from_str(target.trim()).map_err(|_| format!("'{target}' is not a valid address"))?;
+    let key_bytes = hex::decode(new_public_key.trim()).map_err(|_| "the new public key is not valid hex".to_string())?;
+    if key_bytes.is_empty() {
+        return Err("enter the recovering account's new public key".into());
+    }
+    build_sign_submit(&state, &node, TxType::ApproveRecovery, Some(target_addr), 0, key_bytes, None).await
+}
+
+/// Cancel your own pending (sub-threshold) recovery request — the escape hatch that keeps a single
+/// guardian from locking you out with one stray approval. Signed with your current key; no payload.
+#[tauri::command]
+pub async fn cancel_recovery(state: State<'_, WalletState>, node: String) -> Result<rpc::SubmitResult, String> {
+    build_sign_submit(&state, &node, TxType::CancelRecoveryRequest, None, 0, vec![], None).await
+}
+
+#[tauri::command]
+pub async fn get_guardians(state: State<'_, WalletState>, node: String) -> Result<Option<rpc::GuardianInfo>, String> {
+    let address = state.address().ok_or("wallet is locked")?;
+    rpc::get_guardians(&node, &address).await
+}
+
+/// Recovery status for any address — your own, or one you're a guardian for and being asked to help.
+#[tauri::command]
+pub async fn get_recovery(node: String, address: String) -> Result<rpc::RecoveryStatus, String> {
+    let addr = Address::from_str(address.trim()).map_err(|_| format!("'{address}' is not a valid address"))?;
+    rpc::get_recovery(&node, &addr.to_string()).await
+}
+
+// ---------- governance ----------
+
+/// Which runtime parameter a proposal changes — the u8 tag the executor's `encode_proposal` reads
+/// (0 = min validator stake, 1 = fuel per fee unit). Replicated here (9-byte payload) rather than
+/// pulling in `helix-executor`; the encoding is consensus-stable.
+fn governance_param_tag(param: &str) -> Result<u8, String> {
+    match param {
+        "min_validator_stake" => Ok(0),
+        "fuel_per_fee_unit" => Ok(1),
+        other => Err(format!("unknown governance parameter '{other}'")),
+    }
+}
+
+#[tauri::command]
+pub async fn create_proposal(state: State<'_, WalletState>, node: String, param: String, new_value: u64) -> Result<rpc::SubmitResult, String> {
+    let mut data = Vec::with_capacity(9);
+    data.push(governance_param_tag(&param)?);
+    data.extend_from_slice(&new_value.to_le_bytes());
+    build_sign_submit(&state, &node, TxType::CreateProposal, None, 0, data, None).await
+}
+
+/// Cast a stake-weighted yes-vote on a pending proposal (governance is yes-vote-to-quorum; there
+/// is no "no"). Payload is the proposal id as 8 little-endian bytes, like `encode_vote`.
+#[tauri::command]
+pub async fn vote_proposal(state: State<'_, WalletState>, node: String, proposal_id: u64) -> Result<rpc::SubmitResult, String> {
+    build_sign_submit(&state, &node, TxType::VoteProposal, None, 0, proposal_id.to_le_bytes().to_vec(), None).await
+}
+
+#[tauri::command]
+pub async fn get_proposals(node: String) -> Result<Vec<rpc::Proposal>, String> {
+    rpc::get_proposals(&node).await
+}
+
+#[tauri::command]
+pub async fn get_gov_params(node: String) -> Result<rpc::GovParams, String> {
+    rpc::get_gov_params(&node).await
+}

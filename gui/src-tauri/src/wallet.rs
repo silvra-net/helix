@@ -65,6 +65,21 @@ pub fn restore_at(path: &Path, phrase: &str, passphrase: Option<&str>) -> Result
     Ok((kp, address))
 }
 
+/// Re-derive the 24-word recovery phrase from a wallet on disk, re-authenticating with the
+/// passphrase. The words are never stored, so this rebuilds them the same way `create_at` did:
+/// the ML-DSA secret *is* the 32-byte seed, and 32 bytes is exactly the entropy for 24 words —
+/// so `Mnemonic::from_entropy(seed)` reproduces the identical phrase. A wallet on a scheme with
+/// no re-derivable seed (SPHINCS+) has no phrase; say so rather than emit garbage.
+pub fn reveal_mnemonic_at(path: &Path, passphrase: Option<&str>) -> Result<String, String> {
+    let kf = KeyFile::load(path).map_err(e)?;
+    let kp = kf.to_keypair(passphrase).map_err(e)?;
+    let seed = kp.secret.as_bytes();
+    if seed.len() != 32 {
+        return Err("this wallet has no 24-word recovery phrase (only ML-DSA wallets do)".into());
+    }
+    Ok(Mnemonic::from_entropy(seed).map_err(e)?.to_string())
+}
+
 /// Load and decrypt an existing wallet. `passphrase` is required iff the file is encrypted.
 pub fn load_at(path: &Path, passphrase: Option<&str>) -> Result<(KeyPair, String), String> {
     let kf = KeyFile::load(path).map_err(e)?;
@@ -97,6 +112,21 @@ mod tests {
         let (kp, address) = load_at(&path, None).unwrap();
         assert_eq!(address, created.address);
         assert_eq!(Address::from_public_key(&kp.public).to_string(), created.address);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reveal_reproduces_the_exact_phrase_shown_at_creation() {
+        let dir = std::env::temp_dir().join(format!("helix-gui-reveal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.json");
+
+        // Encrypted so reveal has to re-authenticate with the passphrase, like the real flow.
+        let created = create_at(&path, Some("hunter2")).unwrap();
+        let revealed = reveal_mnemonic_at(&path, Some("hunter2")).unwrap();
+        assert_eq!(revealed, created.mnemonic);
+        assert!(reveal_mnemonic_at(&path, Some("wrong")).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

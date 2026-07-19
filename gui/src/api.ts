@@ -1,10 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Delegation,
+  GovParams,
+  GuardianInfo,
   HistoryEntry,
   NetworkStatus,
   NewWallet,
   Overview,
+  Proposal,
+  RecoveryStatus,
   SubmitResult,
   ValidatorPool,
   WalletMeta,
@@ -69,6 +73,37 @@ export const api = {
     invoke<string | null>("resolve_name", { node, name }),
 
   myName: (node: string) => invoke<string | null>("my_name", { node }),
+
+  // settings / backup
+  revealMnemonic: (passphrase?: string) =>
+    invoke<string>("reveal_mnemonic", { passphrase: passphrase || null }),
+
+  myPublicKey: () => invoke<string>("my_public_key"),
+
+  // social recovery
+  registerGuardians: (node: string, guardians: string[]) =>
+    invoke<SubmitResult>("register_guardians", { node, guardians }),
+
+  approveRecovery: (node: string, target: string, newPublicKey: string) =>
+    invoke<SubmitResult>("approve_recovery", { node, target, newPublicKey }),
+
+  cancelRecovery: (node: string) => invoke<SubmitResult>("cancel_recovery", { node }),
+
+  getGuardians: (node: string) => invoke<GuardianInfo | null>("get_guardians", { node }),
+
+  getRecovery: (node: string, address: string) =>
+    invoke<RecoveryStatus>("get_recovery", { node, address }),
+
+  // governance
+  createProposal: (node: string, param: string, newValue: number) =>
+    invoke<SubmitResult>("create_proposal", { node, param, newValue }),
+
+  voteProposal: (node: string, proposalId: number) =>
+    invoke<SubmitResult>("vote_proposal", { node, proposalId }),
+
+  getProposals: (node: string) => invoke<Proposal[]>("get_proposals", { node }),
+
+  getGovParams: (node: string) => invoke<GovParams>("get_gov_params", { node }),
 };
 
 export const DEFAULT_NODE = "https://helix.silvra.net";

@@ -1,8 +1,10 @@
 //! Helix Wallet — Tauri backend.
 //!
-//! Stage 1 (SA1–SA3 of backlog #83): connect to a node, show balance and history, receive, and
-//! send a locally-signed transfer. Staking / names / governance are the next stages and slot in
-//! as more commands + views without changing this shape.
+//! Connect to a node, show balance and history, receive, and send locally-signed transactions:
+//! transfers, staking/delegation, `.hlx` names, social recovery (guardians) and governance.
+//! Every command hands the frontend addresses, amounts and statuses — the `KeyPair` that signs
+//! never leaves this backend. New features slot in as more commands + views without changing this
+//! shape.
 
 mod commands;
 mod pricing;
@@ -38,6 +40,17 @@ pub fn run() {
             commands::register_name,
             commands::resolve_name,
             commands::my_name,
+            commands::reveal_mnemonic,
+            commands::my_public_key,
+            commands::register_guardians,
+            commands::approve_recovery,
+            commands::cancel_recovery,
+            commands::get_guardians,
+            commands::get_recovery,
+            commands::create_proposal,
+            commands::vote_proposal,
+            commands::get_proposals,
+            commands::get_gov_params,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Helix Wallet");

@@ -29,6 +29,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 reqwest = { version = "0.12", features = ["json"] }
 bip39 = "2.2.2"
 rand = "0.8"
+hex = "0.4"
 
 # The whole point of Tauri over a browser page: link the real Rust crates and reuse the
 # exact ML-DSA signing + canonical transaction encoding the CLI and node use. No JS re-impl.

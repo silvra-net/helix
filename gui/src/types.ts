@@ -68,3 +68,32 @@ export interface SubmitResult {
   tx_hash: string;
   status: string;
 }
+
+export interface GuardianInfo {
+  address: string;
+  guardians: string[];
+  threshold: number;
+}
+
+export interface RecoveryStatus {
+  address: string;
+  recovered_key_fingerprint: string | null;
+  pending_approvals: number | null;
+  threshold: number | null;
+}
+
+export interface Proposal {
+  id: number;
+  proposer: string;
+  param: string;
+  new_value: number;
+  created_at_height: number;
+  yes_votes: number;
+  yes_stake_hlx: number;
+  executed: boolean;
+}
+
+export interface GovParams {
+  min_validator_stake_hlx: number;
+  fuel_per_fee_unit: number;
+}

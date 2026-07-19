@@ -96,6 +96,104 @@ pub struct SubmitResult {
     pub status: String,
 }
 
+/// An account's social-recovery guardian set — mirrors `/accounts/:address/guardians`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardianInfo {
+    pub address: String,
+    pub guardians: Vec<String>,
+    /// How many guardians must approve a recovery (e.g. 3 of 5).
+    pub threshold: usize,
+}
+
+/// An account's in-progress recovery vote — mirrors `/accounts/:address/recovery` (always 200;
+/// `pending_approvals` is null when no recovery is under way).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryStatus {
+    pub address: String,
+    #[serde(default)]
+    pub recovered_key_fingerprint: Option<String>,
+    #[serde(default)]
+    pub pending_approvals: Option<usize>,
+    #[serde(default)]
+    pub threshold: Option<usize>,
+}
+
+/// One governance proposal — mirrors the node's `GovernanceProposalResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Proposal {
+    pub id: u64,
+    pub proposer: String,
+    pub param: String,
+    pub new_value: u64,
+    #[serde(default)]
+    pub created_at_height: u64,
+    #[serde(default)]
+    pub yes_votes: u64,
+    #[serde(default)]
+    pub yes_stake_hlx: f64,
+    #[serde(default)]
+    pub executed: bool,
+}
+
+/// The runtime-adjustable protocol parameters — mirrors `/governance/params`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovParams {
+    pub min_validator_stake_hlx: f64,
+    pub fuel_per_fee_unit: u64,
+}
+
+/// The guardian set registered for an address, or `None` when none is (a 404 = "not registered").
+pub async fn get_guardians(node: &str, address: &str) -> Result<Option<GuardianInfo>, String> {
+    let resp = client()
+        .get(format!("{node}/accounts/{address}/guardians"))
+        .send()
+        .await
+        .map_err(err)?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("node returned {} for {address}/guardians", resp.status()));
+    }
+    resp.json::<GuardianInfo>().await.map(Some).map_err(err)
+}
+
+pub async fn get_recovery(node: &str, address: &str) -> Result<RecoveryStatus, String> {
+    let resp = client()
+        .get(format!("{node}/accounts/{address}/recovery"))
+        .send()
+        .await
+        .map_err(err)?;
+    if !resp.status().is_success() {
+        return Err(format!("node returned {} for {address}/recovery", resp.status()));
+    }
+    resp.json::<RecoveryStatus>().await.map_err(err)
+}
+
+pub async fn get_proposals(node: &str) -> Result<Vec<Proposal>, String> {
+    let value: serde_json::Value = client()
+        .get(format!("{node}/governance/proposals"))
+        .send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)?;
+    let arr = value.get("proposals").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+    serde_json::from_value(arr).map_err(err)
+}
+
+pub async fn get_gov_params(node: &str) -> Result<GovParams, String> {
+    client()
+        .get(format!("{node}/governance/params"))
+        .send()
+        .await
+        .map_err(err)?
+        .json::<GovParams>()
+        .await
+        .map_err(err)
+}
+
 pub async fn get_status(node: &str) -> Result<NetworkStatus, String> {
     client()
         .get(format!("{node}/status"))
