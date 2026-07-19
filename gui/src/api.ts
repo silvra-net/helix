@@ -11,6 +11,7 @@ import type {
   RecoveryStatus,
   SubmitResult,
   ValidatorPool,
+  ValidatorStatus,
   WalletMeta,
 } from "./types";
 
@@ -104,6 +105,10 @@ export const api = {
   getProposals: (node: string) => invoke<Proposal[]>("get_proposals", { node }),
 
   getGovParams: (node: string) => invoke<GovParams>("get_gov_params", { node }),
+
+  // node / validator panel
+  getValidatorStatus: (node: string) =>
+    invoke<ValidatorStatus>("get_validator_status", { node }),
 };
 
 export const DEFAULT_NODE = "https://helix.silvra.net";

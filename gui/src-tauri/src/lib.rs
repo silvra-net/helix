@@ -51,6 +51,7 @@ pub fn run() {
             commands::vote_proposal,
             commands::get_proposals,
             commands::get_gov_params,
+            commands::get_validator_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Helix Wallet");

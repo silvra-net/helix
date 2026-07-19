@@ -97,3 +97,14 @@ export interface GovParams {
   min_validator_stake_hlx: number;
   fuel_per_fee_unit: number;
 }
+
+export interface ValidatorStatus {
+  self_staked_hlx: number;
+  delegated_stake_hlx: number;
+  effective_stake_hlx: number;
+  commission_bps: number | null;
+  min_validator_stake_hlx: number;
+  eligible: boolean;
+  blocks_proposed: number;
+  window: number;
+}

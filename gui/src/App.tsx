@@ -11,10 +11,11 @@ import Staking from "./views/Staking";
 import Names from "./views/Names";
 import Recovery from "./views/Recovery";
 import Governance from "./views/Governance";
+import NodeView from "./views/Node";
 import Settings from "./views/Settings";
 import MnemonicReveal from "./views/MnemonicReveal";
 
-type Route = "overview" | "send" | "receive" | "staking" | "names" | "recovery" | "governance" | "settings";
+type Route = "overview" | "send" | "receive" | "staking" | "names" | "recovery" | "governance" | "node" | "settings";
 
 export default function App() {
   const [meta, setMeta] = useState<WalletMeta | null>(null);
@@ -108,6 +109,7 @@ export default function App() {
           <NavItem label="Names" active={route === "names"} onClick={() => setRoute("names")} />
           <NavItem label="Recovery" active={route === "recovery"} onClick={() => setRoute("recovery")} />
           <NavItem label="Governance" active={route === "governance"} onClick={() => setRoute("governance")} />
+          <NavItem label="Node" active={route === "node"} onClick={() => setRoute("node")} />
           <NavItem label="Settings" active={route === "settings"} onClick={() => setRoute("settings")} />
         </nav>
         <div className="sidebar-foot">
@@ -146,6 +148,7 @@ export default function App() {
           {route === "names" && <Names node={node} />}
           {route === "recovery" && <Recovery node={node} address={meta.address ?? ""} />}
           {route === "governance" && <Governance node={node} />}
+          {route === "node" && <NodeView node={node} net={net} />}
           {route === "settings" && <Settings address={meta.address ?? ""} />}
         </section>
 

@@ -372,3 +372,42 @@ pub async fn get_proposals(node: String) -> Result<Vec<rpc::Proposal>, String> {
 pub async fn get_gov_params(node: String) -> Result<rpc::GovParams, String> {
     rpc::get_gov_params(&node).await
 }
+
+// ---------- node / validator panel ----------
+
+/// Everything the Node panel needs about *this wallet's* standing as a validator: how its stake
+/// compares to the entry threshold, and whether it is actually producing blocks (proof it's
+/// running a node). The network-wide status — height, peers, sync — comes from `get_network`.
+#[derive(Serialize)]
+pub struct ValidatorStatus {
+    pub self_staked_hlx: f64,
+    pub delegated_stake_hlx: f64,
+    pub effective_stake_hlx: f64,
+    pub commission_bps: Option<u16>,
+    pub min_validator_stake_hlx: f64,
+    /// Effective stake meets the entry threshold. Necessary to validate, but not sufficient — you
+    /// must also run a node with this key (see `blocks_proposed`).
+    pub eligible: bool,
+    /// How many of the last `window` blocks this address actually proposed.
+    pub blocks_proposed: u32,
+    pub window: u32,
+}
+
+#[tauri::command]
+pub async fn get_validator_status(state: State<'_, WalletState>, node: String) -> Result<ValidatorStatus, String> {
+    let address = state.address().ok_or("wallet is locked")?;
+    let pool = rpc::get_validator_pool(&node, &address).await?;
+    let params = rpc::get_gov_params(&node).await?;
+    // Block activity is a nice-to-have signal, never a reason to fail the whole panel.
+    let (blocks_proposed, window) = rpc::recent_proposals(&node, &address, 20).await.unwrap_or((0, 0));
+    Ok(ValidatorStatus {
+        self_staked_hlx: pool.self_staked_hlx,
+        delegated_stake_hlx: pool.delegated_stake_hlx,
+        effective_stake_hlx: pool.effective_stake_hlx,
+        commission_bps: pool.commission_bps,
+        min_validator_stake_hlx: params.min_validator_stake_hlx,
+        eligible: pool.effective_stake_hlx >= params.min_validator_stake_hlx,
+        blocks_proposed,
+        window,
+    })
+}

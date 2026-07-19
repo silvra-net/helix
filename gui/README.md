@@ -6,7 +6,7 @@ explorer, is served by the node itself at `GET /`).
 
 > **Status:** wallet create/restore/unlock, overview (balance/staked/history), receive, and
 > locally-signed transactions — transfers, staking/delegation, `.hlx` names, social recovery
-> (guardians) and governance. A node control-panel is the remaining follow-up.
+> (guardians), governance, and a node/validator panel.
 
 ## Why Tauri (not a browser page)
 
@@ -78,6 +78,7 @@ dev` on a machine with the Tauri prerequisites installed.
 - **Recovery** ✅ social recovery — register guardians, approve/cancel a recovery, share your key
 - **Governance** ✅ view parameters + proposals, vote, propose a change
 - **Settings** ✅ re-reveal the recovery phrase (re-auth'd), view address / public key
-- a node control panel (become-a-validator wizard) is the remaining follow-up; smart-contract
-  deploy/call is a developer feature left out of the wallet, and proof-of-personhood is deferred
-  (verification is authority-gated and can't be a self-serve wallet flow)
+- **Node** ✅ connected-node status (height/peers/sync), validator standing vs the stake threshold
+  with a stake-toward-validator assistant, live "blocks you proposed" signal, and how to run a node
+- smart-contract deploy/call is a developer feature left out of the wallet, and proof-of-personhood
+  is deferred (verification is authority-gated and can't be a self-serve wallet flow)

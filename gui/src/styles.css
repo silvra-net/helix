@@ -150,6 +150,19 @@ textarea { resize: vertical; }
   border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 12px;
 }
 
+/* Progress toward the validator stake threshold (Node panel) */
+.progress {
+  height: 8px; background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 99px; overflow: hidden; margin: 12px 0 2px;
+}
+.progress-bar { height: 100%; background: var(--accent); border-radius: 99px; transition: width 0.4s ease; }
+
+/* A shell command shown to copy (Node panel) */
+.codeblock {
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; font-family: var(--mono); font-size: 13px; margin: 6px 0; overflow-x: auto;
+}
+
 .error { background: var(--bad-bg); color: var(--bad); border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 12px; }
 .kv { display: flex; justify-content: space-between; padding: 6px 0; }
 .receive-address { background: var(--surface-2); border-radius: 8px; padding: 14px; word-break: break-all; margin: 12px 0; }

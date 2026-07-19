@@ -194,6 +194,33 @@ pub async fn get_gov_params(node: &str) -> Result<GovParams, String> {
         .map_err(err)
 }
 
+/// Count how many of the last `window` blocks this address proposed — the honest "are you actually
+/// validating right now?" signal. A wallet is a client and can't see whether you're running a node,
+/// but blocks you proposed prove that you are. Returns `(mine, examined)`.
+pub async fn recent_proposals(node: &str, address: &str, window: u64) -> Result<(u32, u32), String> {
+    let height = get_status(node).await?.height;
+    if height == 0 {
+        return Ok((0, 0));
+    }
+    let from = height.saturating_sub(window.saturating_sub(1));
+    let count = height - from + 1;
+    // `/blocks/range` returns a bare array of the display `BlockResponse`; we only need the proposer.
+    #[derive(Deserialize)]
+    struct BlockProposer {
+        validator: String,
+    }
+    let blocks: Vec<BlockProposer> = client()
+        .get(format!("{node}/blocks/range?from={from}&count={count}"))
+        .send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)?;
+    let mine = blocks.iter().filter(|b| b.validator == address).count() as u32;
+    Ok((mine, blocks.len() as u32))
+}
+
 pub async fn get_status(node: &str) -> Result<NetworkStatus, String> {
     client()
         .get(format!("{node}/status"))
