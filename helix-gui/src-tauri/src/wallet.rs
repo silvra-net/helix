@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use bip39::Mnemonic;
-use helix_crypto::{Address, KeyFile, KeyPair};
+use helix_crypto::{KeyFile, KeyPair};
 
 fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
@@ -83,6 +83,7 @@ fn encode(kp: &KeyPair, passphrase: Option<&str>) -> Result<KeyFile, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helix_crypto::Address;
 
     #[test]
     fn create_then_load_round_trips_the_same_address() {
