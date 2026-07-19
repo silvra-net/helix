@@ -89,9 +89,80 @@ jobs:
           name: ${{ matrix.target }}
           path: ${{ env.ASSET }}
 
+  build-gui:
+    name: Build wallet (${{ matrix.name }})
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: linux
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            rpm libfuse2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'gui/src-tauri -> target'
+          key: gui-${{ matrix.name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: npm install
+
+      - name: Build the wallet
+        working-directory: gui
+        run: npm run tauri build
+
+      - name: Collect installers (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p gui-dist
+          find gui/src-tauri/target/release/bundle -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.dmg' \) \
+            -exec cp {} gui-dist/ \;
+          ls -la gui-dist
+
+      - name: Collect installers (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path gui-dist | Out-Null
+          Get-ChildItem -Recurse gui/src-tauri/target/release/bundle -Include *.msi,*.exe |
+            Copy-Item -Destination gui-dist
+          Get-ChildItem gui-dist
+
+      - name: Upload wallet installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallet-${{ matrix.name }}
+          path: gui-dist/*
+          if-no-files-found: warn
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-gui]
     runs-on: ubuntu-latest
     permissions:
       contents: write

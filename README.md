@@ -44,6 +44,8 @@ layout) lives further down for when you need it.
 
 **New here? Pick your path:**
 
+- 🖱️ **Prefer a desktop app?** → [Desktop wallet](#desktop-wallet) — download, no shell:
+  balance, send, receive, and staking.
 - 🧑‍💻 **Just want to try it?** → [Quick Start](#quick-start) gets you from clone to first
   transaction in five commands.
 - 💰 **Holding HLX / want to earn rewards?** → [Using the CLI](#using-the-cli-helix) and
@@ -59,6 +61,7 @@ layout) lives further down for when you need it.
 - [Why Helix?](#why-helix) — the one-table pitch
 - [Roadmap to Mainnet](#roadmap-to-mainnet) — what's done, what's live, what's next
 - [Quick Start](#quick-start) — clone → node → first transaction
+- [Desktop wallet](#desktop-wallet) — the GUI app, no shell needed
 - [Installation](#installation) — prerequisites, release download, build from source
 
 **Running & operating a node**
@@ -197,6 +200,28 @@ cd helix
 cargo build --release
 # single binary: target/release/helix (node + client)
 ```
+
+---
+
+## Desktop wallet
+
+Prefer not to touch a shell? **Helix Wallet** is a small desktop app (Linux, macOS, Windows)
+that does the everyday things without the CLI: create or restore a wallet, watch your balance
+and transaction history, receive, send, and stake or delegate.
+
+- **Download** the installer for your OS from the
+  [latest release](https://github.com/silvra-net/helix/releases/latest) —
+  `.AppImage` / `.deb` (Linux), `.dmg` (macOS), `.msi` (Windows).
+- **Your key stays on your machine.** It is generated locally, encrypted at rest with the same
+  `KeyFile` format the CLI uses, and never leaves the app — the wallet signs transactions itself
+  and only talks to a node over its public REST API. The 24-word recovery phrase is shown once
+  and also works in the Spark mobile app.
+- Same honest caveat as everywhere: it points at the public **testnet** by default, and HLX
+  there is a valueless test token that does not survive a chain reset.
+
+It's an early MVP (wallet, send/receive, staking); source and build steps are in
+[`gui/`](gui/README.md). There is also a browser **block explorer** served by every node at its
+root URL — open [helix.silvra.net](https://helix.silvra.net).
 
 ---
 
