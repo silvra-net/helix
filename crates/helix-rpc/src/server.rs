@@ -64,6 +64,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
 
     let app = Router::new()
         .route("/", get(root))
+        .route("/logo.png", get(logo))
         .route("/status", get(get_status))
         .route("/blocks/latest", get(get_latest_block))
         .route("/blocks/height/:n", get(get_block_by_height))
@@ -114,6 +115,25 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
 /// a node whose explorer silently disappears if the file isn't deployed alongside it.
 const EXPLORER_HTML: &str = include_str!("explorer.html");
 
+/// The Helix logo (512×512 PNG), compiled into the binary and served at a stable URL.
+///
+/// The explorer embeds its own copy as a base64 data URI so it stays self-contained; this route
+/// exists for the opposite need — a real, fetchable URL (`https://<node>/logo.png`) that a
+/// listing directory, a chat, or anyone asking "where's the logo?" can point at directly.
+const LOGO_PNG: &[u8] = include_bytes!("logo.png");
+
+/// `GET /logo.png` — the project logo at a stable, shareable URL. Cached for a day since the
+/// bytes only ever change with a new binary.
+async fn logo() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        LOGO_PNG,
+    )
+}
+
 /// `GET /` answers a browser with the explorer and everything else with the API index.
 ///
 /// Same URL, because it is the one people are handed: `helix.silvra.net` in a browser used to
@@ -142,6 +162,7 @@ fn api_index() -> Json<Value> {
         "token": "HLX",
         "crypto": "ML-DSA-65 — NIST FIPS 204",
         "endpoints": [
+            "GET  /logo.png",
             "GET  /status",
             "GET  /blocks/latest",
             "GET  /blocks/height/{n}",
@@ -1714,6 +1735,23 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).expect("must stay JSON");
             assert_eq!(json["token"], "HLX");
         }
+    }
+
+    /// `/logo.png` serves the real image bytes with an image content type — the whole point is a
+    /// fetchable URL a listing or a chat can embed, so a broken type or an empty body defeats it.
+    #[tokio::test]
+    async fn logo_serves_the_png_bytes_with_an_image_content_type() {
+        use axum::http::header;
+
+        let response = logo().await.into_response();
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty(), "the logo must not be empty");
+        // PNG magic number — proves we're serving an actual image, not a stray text file.
+        assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "must be a real PNG");
     }
 
     /// The explorer must not reach for anything off the node. A node has to work where there is
