@@ -48,6 +48,8 @@ pub struct Overview {
     pub balance_hlx: f64,
     pub staked_hlx: f64,
     pub unbonding_hlx: f64,
+    pub unbonding_unlock_height: u64,
+    pub unbonding_source: Option<String>,
     pub nonce: u64,
 }
 
@@ -112,6 +114,8 @@ pub async fn get_overview(state: State<'_, WalletState>, node: String) -> Result
         balance_hlx: account.balance_hlx,
         staked_hlx: account.staked_hlx,
         unbonding_hlx: account.unbonding_stake_hlx,
+        unbonding_unlock_height: account.unbonding_unlock_height,
+        unbonding_source: account.unbonding_source,
         nonce: account.nonce,
     })
 }
@@ -122,28 +126,106 @@ pub async fn get_history(state: State<'_, WalletState>, node: String, limit: Opt
     rpc::get_history(&node, &address, limit.unwrap_or(25)).await
 }
 
-#[tauri::command]
-pub async fn send_hlx(state: State<'_, WalletState>, node: String, to: String, amount_hlx: f64, fee: Option<u64>) -> Result<rpc::SubmitResult, String> {
-    let from_addr_str = state.address().ok_or("wallet is locked")?;
-    let from = Address::from_str(&from_addr_str).map_err(|e| e.to_string())?;
-    let to_addr = Address::from_str(&to).map_err(|_| format!("'{to}' is not a valid Helix address"))?;
-    let amount = pricing::hlx_to_nano(amount_hlx)?;
+/// The one place a transaction is built, priced, signed, and submitted — every send/stake/
+/// delegate command funnels through here. Async fetches (nonce, base fee) run without the lock;
+/// signing happens under a short synchronous lock that is never held across an `.await`.
+async fn build_sign_submit(
+    state: &WalletState,
+    node: &str,
+    tx_type: TxType,
+    to: Option<Address>,
+    amount: u64,
+    data: Vec<u8>,
+    fee: Option<u64>,
+) -> Result<rpc::SubmitResult, String> {
+    let from_str = state.address().ok_or("wallet is locked")?;
+    let from = Address::from_str(&from_str).map_err(|e| e.to_string())?;
 
-    // Async work first, without the lock: the current nonce and (unless pinned) the base fee.
-    let nonce = rpc::fetch_nonce(&node, &from_addr_str).await;
+    let nonce = rpc::fetch_nonce(node, &from_str).await;
     let base_fee = match fee {
         Some(_) => 0,
-        None => rpc::fetch_base_fee(&node).await?,
+        None => rpc::fetch_base_fee(node).await?,
     };
 
-    // Build + sign under a short synchronous lock — the guard is dropped before the next await.
     let signed = {
         let guard = state.inner.lock().unwrap();
         let wallet = guard.as_ref().ok_or("wallet is locked")?;
-        let mut tx = pricing::build_tx(TxType::Transfer, from, Some(to_addr), amount, nonce, vec![], &wallet.keypair);
+        let mut tx = pricing::build_tx(tx_type, from, to, amount, nonce, data, &wallet.keypair);
         pricing::finalize_and_sign(&mut tx, fee, base_fee, &wallet.keypair)?;
         tx
     };
 
-    rpc::submit_tx(&node, &signed).await
+    rpc::submit_tx(node, &signed).await
+}
+
+fn parse_validator(addr: &str) -> Result<Address, String> {
+    Address::from_str(addr).map_err(|_| format!("'{addr}' is not a valid validator address"))
+}
+
+#[tauri::command]
+pub async fn send_hlx(state: State<'_, WalletState>, node: String, to: String, amount_hlx: f64, fee: Option<u64>) -> Result<rpc::SubmitResult, String> {
+    let to_addr = Address::from_str(&to).map_err(|_| format!("'{to}' is not a valid Helix address"))?;
+    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    build_sign_submit(&state, &node, TxType::Transfer, Some(to_addr), amount, vec![], fee).await
+}
+
+// ---------- staking ----------
+
+#[tauri::command]
+pub async fn stake(state: State<'_, WalletState>, node: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
+    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    build_sign_submit(&state, &node, TxType::Stake, None, amount, vec![], None).await
+}
+
+#[tauri::command]
+pub async fn unstake(state: State<'_, WalletState>, node: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
+    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    build_sign_submit(&state, &node, TxType::Unstake, None, amount, vec![], None).await
+}
+
+#[tauri::command]
+pub async fn claim_unbonded(state: State<'_, WalletState>, node: String) -> Result<rpc::SubmitResult, String> {
+    build_sign_submit(&state, &node, TxType::ClaimUnbonded, None, 0, vec![], None).await
+}
+
+#[tauri::command]
+pub async fn delegate(state: State<'_, WalletState>, node: String, validator: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
+    let v = parse_validator(&validator)?;
+    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    build_sign_submit(&state, &node, TxType::Delegate, Some(v), amount, vec![], None).await
+}
+
+#[tauri::command]
+pub async fn undelegate(state: State<'_, WalletState>, node: String, validator: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
+    let v = parse_validator(&validator)?;
+    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    build_sign_submit(&state, &node, TxType::Undelegate, Some(v), amount, vec![], None).await
+}
+
+#[tauri::command]
+pub async fn redelegate(state: State<'_, WalletState>, node: String, from_validator: String, to_validator: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
+    let src = parse_validator(&from_validator)?;
+    let dst = parse_validator(&to_validator)?;
+    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    // The destination rides in `to`; the source travels in `data` as its address string —
+    // this is the one transaction that names two validators (mirrors the CLI).
+    build_sign_submit(&state, &node, TxType::Redelegate, Some(dst), amount, src.to_string().into_bytes(), None).await
+}
+
+#[tauri::command]
+pub async fn set_commission(state: State<'_, WalletState>, node: String, bps: u16) -> Result<rpc::SubmitResult, String> {
+    // Commission rate as 2 little-endian bytes (basis points), same encoding the executor reads.
+    build_sign_submit(&state, &node, TxType::SetCommission, None, 0, bps.to_le_bytes().to_vec(), None).await
+}
+
+#[tauri::command]
+pub async fn get_delegations(state: State<'_, WalletState>, node: String) -> Result<Vec<rpc::Delegation>, String> {
+    let address = state.address().ok_or("wallet is locked")?;
+    rpc::get_delegations(&node, &address).await
+}
+
+#[tauri::command]
+pub async fn get_validator_pool(state: State<'_, WalletState>, node: String) -> Result<rpc::ValidatorPool, String> {
+    let address = state.address().ok_or("wallet is locked")?;
+    rpc::get_validator_pool(&node, &address).await
 }

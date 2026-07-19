@@ -18,7 +18,25 @@ export interface Overview {
   balance_hlx: number;
   staked_hlx: number;
   unbonding_hlx: number;
+  unbonding_unlock_height: number;
+  unbonding_source: string | null;
   nonce: number;
+}
+
+export interface Delegation {
+  validator: string;
+  shares: number;
+  value_hlx: number;
+}
+
+export interface ValidatorPool {
+  address: string;
+  has_pool: boolean;
+  self_staked_hlx: number;
+  delegated_stake_hlx: number;
+  effective_stake_hlx: number;
+  total_shares: number;
+  commission_bps: number | null;
 }
 
 export interface HistoryEntry {

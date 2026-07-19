@@ -40,7 +40,33 @@ pub struct Account {
     pub staked_hlx: f64,
     #[serde(default)]
     pub unbonding_stake_hlx: f64,
+    /// Block height at which `unbonding_stake` becomes claimable (0 = nothing unbonding).
+    #[serde(default)]
+    pub unbonding_unlock_height: u64,
+    /// The validator the unbonding stake is still slashable for, or null for an own self-unstake.
+    #[serde(default)]
+    pub unbonding_source: Option<String>,
     pub nonce: u64,
+}
+
+/// One delegation this account holds — mirrors the node's `/accounts/:address/delegations` rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Delegation {
+    pub validator: String,
+    pub shares: u64,
+    pub value_hlx: f64,
+}
+
+/// A validator's delegation pool — mirrors `/validators/:address/pool`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorPool {
+    pub address: String,
+    pub has_pool: bool,
+    pub self_staked_hlx: f64,
+    pub delegated_stake_hlx: f64,
+    pub effective_stake_hlx: f64,
+    pub total_shares: u64,
+    pub commission_bps: Option<u16>,
 }
 
 /// One row of transaction history — mirrors the node's `TxHistoryEntry`, including the honest
@@ -104,6 +130,31 @@ pub async fn fetch_nonce(node: &str, address: &str) -> u64 {
 
 pub async fn fetch_base_fee(node: &str) -> Result<u64, String> {
     Ok(get_status(node).await?.base_fee_per_byte)
+}
+
+pub async fn get_delegations(node: &str, address: &str) -> Result<Vec<Delegation>, String> {
+    let value: serde_json::Value = client()
+        .get(format!("{node}/accounts/{address}/delegations"))
+        .send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)?;
+    let arr = value.get("delegations").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+    serde_json::from_value(arr).map_err(err)
+}
+
+pub async fn get_validator_pool(node: &str, validator: &str) -> Result<ValidatorPool, String> {
+    let resp = client()
+        .get(format!("{node}/validators/{validator}/pool"))
+        .send()
+        .await
+        .map_err(err)?;
+    if !resp.status().is_success() {
+        return Err(format!("node returned {} for {validator}", resp.status()));
+    }
+    resp.json::<ValidatorPool>().await.map_err(err)
 }
 
 pub async fn get_history(node: &str, address: &str, limit: u32) -> Result<Vec<HistoryEntry>, String> {

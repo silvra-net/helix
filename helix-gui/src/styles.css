@@ -165,3 +165,14 @@ textarea { resize: vertical; }
 .mnemonic-grid li { background: var(--surface-2); border-radius: 8px; padding: 8px 10px; display: flex; gap: 8px; align-items: baseline; }
 .mnemonic-grid .idx { color: var(--muted); font-size: 11px; width: 16px; }
 .mnemonic-grid .word { font-family: var(--mono); font-size: 13px; }
+
+/* ---------- staking ---------- */
+.notice { background: var(--ok-bg); color: var(--ok); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+.metric-row.two { grid-template-columns: repeat(2, 1fr); }
+.action-panel { border-color: var(--accent); }
+.unbonding-note {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  background: var(--surface-2); border-radius: 8px; padding: 10px 12px; margin: 12px 0;
+}
+.list.bordered { border: 1px solid var(--border); border-radius: 10px; }
+button.mini { padding: 4px 9px; font-size: 12px; }

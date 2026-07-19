@@ -1,10 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  Delegation,
   HistoryEntry,
   NetworkStatus,
   NewWallet,
   Overview,
   SubmitResult,
+  ValidatorPool,
   WalletMeta,
 } from "./types";
 
@@ -33,6 +35,31 @@ export const api = {
 
   sendHlx: (node: string, to: string, amountHlx: number, fee?: number) =>
     invoke<SubmitResult>("send_hlx", { node, to, amountHlx, fee: fee ?? null }),
+
+  // staking / delegation
+  stake: (node: string, amountHlx: number) =>
+    invoke<SubmitResult>("stake", { node, amountHlx }),
+
+  unstake: (node: string, amountHlx: number) =>
+    invoke<SubmitResult>("unstake", { node, amountHlx }),
+
+  claimUnbonded: (node: string) => invoke<SubmitResult>("claim_unbonded", { node }),
+
+  delegate: (node: string, validator: string, amountHlx: number) =>
+    invoke<SubmitResult>("delegate", { node, validator, amountHlx }),
+
+  undelegate: (node: string, validator: string, amountHlx: number) =>
+    invoke<SubmitResult>("undelegate", { node, validator, amountHlx }),
+
+  redelegate: (node: string, fromValidator: string, toValidator: string, amountHlx: number) =>
+    invoke<SubmitResult>("redelegate", { node, fromValidator, toValidator, amountHlx }),
+
+  setCommission: (node: string, bps: number) =>
+    invoke<SubmitResult>("set_commission", { node, bps }),
+
+  getDelegations: (node: string) => invoke<Delegation[]>("get_delegations", { node }),
+
+  getValidatorPool: (node: string) => invoke<ValidatorPool>("get_validator_pool", { node }),
 };
 
 export const DEFAULT_NODE = "https://helix.silvra.net";
