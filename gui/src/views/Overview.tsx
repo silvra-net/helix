@@ -14,15 +14,21 @@ export default function Overview({
 }) {
   const [data, setData] = useState<OverviewData | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [name, setName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      const [ov, hist] = await Promise.all([api.getOverview(node), api.getHistory(node, 25)]);
+      const [ov, hist, nm] = await Promise.all([
+        api.getOverview(node),
+        api.getHistory(node, 25),
+        api.myName(node).catch(() => null),
+      ]);
       setData(ov);
       setHistory(hist);
+      setName(nm);
     } catch (e) {
       setError(String(e));
     }
@@ -53,7 +59,7 @@ export default function Overview({
 
       <div className="card address-card">
         <div className="address-block">
-          <div className="muted small">Your address</div>
+          <div className="muted small">Your address{name ? <> · <span className="text-accent">{name}.hlx</span></> : ""}</div>
           <div className="mono address">{data?.address ?? "…"}</div>
         </div>
         <div className="row-actions">

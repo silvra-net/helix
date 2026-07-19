@@ -60,6 +60,15 @@ export const api = {
   getDelegations: (node: string) => invoke<Delegation[]>("get_delegations", { node }),
 
   getValidatorPool: (node: string) => invoke<ValidatorPool>("get_validator_pool", { node }),
+
+  // names
+  registerName: (node: string, name: string) =>
+    invoke<SubmitResult>("register_name", { node, name }),
+
+  resolveName: (node: string, name: string) =>
+    invoke<string | null>("resolve_name", { node, name }),
+
+  myName: (node: string) => invoke<string | null>("my_name", { node }),
 };
 
 export const DEFAULT_NODE = "https://helix.silvra.net";

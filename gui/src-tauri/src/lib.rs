@@ -35,6 +35,9 @@ pub fn run() {
             commands::set_commission,
             commands::get_delegations,
             commands::get_validator_pool,
+            commands::register_name,
+            commands::resolve_name,
+            commands::my_name,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Helix Wallet");

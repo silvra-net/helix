@@ -157,6 +157,34 @@ pub async fn get_validator_pool(node: &str, validator: &str) -> Result<Validator
     resp.json::<ValidatorPool>().await.map_err(err)
 }
 
+/// Resolve a `name.hlx` (with or without the suffix) to its owning address, or `None` if it is
+/// not registered. A 404 is "not registered", not an error.
+pub async fn resolve_name(node: &str, name: &str) -> Result<Option<String>, String> {
+    let name = name.trim().trim_end_matches(".hlx");
+    let resp = client().get(format!("{node}/names/{name}")).send().await.map_err(err)?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("node returned {} resolving {name}", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(err)?;
+    Ok(v.get("address").and_then(|a| a.as_str()).map(str::to_string))
+}
+
+/// The `.hlx` name registered to an address, if any (`None` when the address has no name).
+pub async fn name_of(node: &str, address: &str) -> Result<Option<String>, String> {
+    let resp = client().get(format!("{node}/accounts/{address}/name")).send().await.map_err(err)?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("node returned {} for {address}/name", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(err)?;
+    Ok(v.get("name").and_then(|a| a.as_str()).map(str::to_string))
+}
+
 pub async fn get_history(node: &str, address: &str, limit: u32) -> Result<Vec<HistoryEntry>, String> {
     let value: serde_json::Value = client()
         .get(format!("{node}/accounts/{address}/transactions?limit={limit}"))

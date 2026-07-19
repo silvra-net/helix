@@ -176,3 +176,17 @@ textarea { resize: vertical; }
 }
 .list.bordered { border: 1px solid var(--border); border-radius: 10px; }
 button.mini { padding: 4px 9px; font-size: 12px; }
+
+/* ---------- names ---------- */
+.your-name { font-size: 22px; font-weight: 600; }
+.text-accent { color: var(--accent); }
+.text-warn { color: var(--warn); }
+.name-input { display: flex; align-items: stretch; }
+.name-input input { border-radius: 8px 0 0 8px; border-right: none; }
+.name-input .suffix {
+  display: flex; align-items: center; padding: 0 12px;
+  background: var(--surface-2); border: 1px solid var(--border); border-left: none;
+  border-radius: 0 8px 8px 0; color: var(--muted); font-family: var(--mono); font-size: 13px;
+}
+.resolve-line { margin: -8px 0 12px 2px; }
+.resolve-result { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }

@@ -162,11 +162,46 @@ fn parse_validator(addr: &str) -> Result<Address, String> {
     Address::from_str(addr).map_err(|_| format!("'{addr}' is not a valid validator address"))
 }
 
+/// A recipient may be an `hlx…` address or a `name.hlx` — resolve names to an address first.
+async fn resolve_recipient(node: &str, to: &str) -> Result<Address, String> {
+    if let Ok(addr) = Address::from_str(to) {
+        return Ok(addr);
+    }
+    match rpc::resolve_name(node, to).await? {
+        Some(addr) => Address::from_str(&addr).map_err(|e| e.to_string()),
+        None => Err(format!("'{to}' is neither a valid address nor a registered name")),
+    }
+}
+
 #[tauri::command]
 pub async fn send_hlx(state: State<'_, WalletState>, node: String, to: String, amount_hlx: f64, fee: Option<u64>) -> Result<rpc::SubmitResult, String> {
-    let to_addr = Address::from_str(&to).map_err(|_| format!("'{to}' is not a valid Helix address"))?;
+    let to_addr = resolve_recipient(&node, &to).await?;
     let amount = pricing::hlx_to_nano(amount_hlx)?;
     build_sign_submit(&state, &node, TxType::Transfer, Some(to_addr), amount, vec![], fee).await
+}
+
+// ---------- names ----------
+
+#[tauri::command]
+pub async fn register_name(state: State<'_, WalletState>, node: String, name: String) -> Result<rpc::SubmitResult, String> {
+    // Registered without the .hlx suffix (the chain stores the bare name).
+    let name = name.trim().trim_end_matches(".hlx").to_string();
+    if name.is_empty() {
+        return Err("enter a name".into());
+    }
+    build_sign_submit(&state, &node, TxType::RegisterName, None, 0, name.into_bytes(), None).await
+}
+
+#[tauri::command]
+pub async fn resolve_name(node: String, name: String) -> Result<Option<String>, String> {
+    rpc::resolve_name(&node, &name).await
+}
+
+/// The `.hlx` name registered to the unlocked wallet's address, if any.
+#[tauri::command]
+pub async fn my_name(state: State<'_, WalletState>, node: String) -> Result<Option<String>, String> {
+    let address = state.address().ok_or("wallet is locked")?;
+    rpc::name_of(&node, &address).await
 }
 
 // ---------- staking ----------

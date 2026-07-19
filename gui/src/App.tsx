@@ -8,9 +8,10 @@ import Overview from "./views/Overview";
 import Send from "./views/Send";
 import Receive from "./views/Receive";
 import Staking from "./views/Staking";
+import Names from "./views/Names";
 import MnemonicReveal from "./views/MnemonicReveal";
 
-type Route = "overview" | "send" | "receive" | "staking";
+type Route = "overview" | "send" | "receive" | "staking" | "names";
 
 export default function App() {
   const [meta, setMeta] = useState<WalletMeta | null>(null);
@@ -101,6 +102,7 @@ export default function App() {
           <NavItem label="Send" active={route === "send"} onClick={() => setRoute("send")} />
           <NavItem label="Receive" active={route === "receive"} onClick={() => setRoute("receive")} />
           <NavItem label="Staking" active={route === "staking"} onClick={() => setRoute("staking")} />
+          <NavItem label="Names" active={route === "names"} onClick={() => setRoute("names")} />
         </nav>
         <div className="sidebar-foot">
           <div className="key-note">Key stays in the app, never in the browser</div>
@@ -135,6 +137,7 @@ export default function App() {
           {route === "send" && <Send node={node} baseFee={net?.base_fee_per_byte} onDone={() => setRoute("overview")} />}
           {route === "receive" && <Receive address={meta.address ?? ""} />}
           {route === "staking" && <Staking node={node} height={net?.height ?? 0} />}
+          {route === "names" && <Names node={node} />}
         </section>
 
         <footer className="statusbar">

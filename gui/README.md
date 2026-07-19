@@ -71,6 +71,7 @@ dev` on a machine with the Tauri prerequisites installed.
 ## Roadmap (stages of backlog #83)
 
 - **SA1** ✅ read-only explorer — served by the node (`GET /`)
-- **SA2/SA3** ⏳ this app — local wallet + balance/history + signed send  *(here)*
-- **SA4** staking / delegation UI — `stake`, `unstake`, `claim`, `delegate`, validator picker
-- names (`.hlx`), social recovery, governance, and a node control panel are follow-ups
+- **SA2/SA3** ✅ local wallet + balance/history + signed send
+- **SA4** ✅ staking / delegation UI — stake, unstake, claim, delegate, redelegate, commission
+- **Names** ✅ `.hlx` — register, resolve, send to a name, name shown on Overview
+- social recovery, governance, and a node control panel are the remaining follow-ups
