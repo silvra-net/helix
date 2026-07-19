@@ -24,7 +24,7 @@ Rust backend and **never crosses into the webview**:
 ## Layout
 
 ```
-helix-gui/
+gui/
 ├── src/                 React + TypeScript frontend
 │   ├── api.ts           typed wrappers over the Tauri commands
 │   ├── App.tsx          shell: onboarding / unlock / main (overview, send, receive)
@@ -45,7 +45,7 @@ Prerequisites: [Rust](https://rustup.rs), [Node 18+](https://nodejs.org), and th
 (on Linux: `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, `build-essential`, …).
 
 ```bash
-cd helix-gui
+cd gui
 npm install
 npm run tauri dev      # launches the app against https://helix.silvra.net by default
 ```
@@ -56,7 +56,7 @@ The node URL is editable in the top bar (defaults to the public testnet; point i
 To package: `npm run tauri build`. App icons ship in `src-tauri/icons/` (regenerate from a new
 source with `npm run tauri icon app-icon.png`).
 
-CI builds installers for Linux, macOS, and Windows on every push that touches `helix-gui/`
+CI builds installers for Linux, macOS, and Windows on every push that touches `gui/`
 (and on demand via *Actions → Build Helix Wallet → Run workflow*). Download them from the
 run's **Artifacts**.
 

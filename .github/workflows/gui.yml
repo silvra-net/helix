@@ -1,14 +1,14 @@
 name: Build Helix Wallet
 
-# Builds the desktop wallet (helix-gui) for Linux, macOS, and Windows and uploads the installers
-# as downloadable artifacts. Runs on any push that touches helix-gui, and on demand.
+# Builds the desktop wallet (gui) for Linux, macOS, and Windows and uploads the installers
+# as downloadable artifacts. Runs on any push that touches gui, and on demand.
 # Separate from ci.yml / release.yml (which build the node) — the GUI is excluded from the
 # Cargo workspace, so those pipelines never see it and this one never touches the node.
 on:
   push:
     branches: [master]
     paths:
-      - 'helix-gui/**'
+      - 'gui/**'
       - '.github/workflows/gui.yml'
   workflow_dispatch:
 
@@ -41,18 +41,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: 'helix-gui/src-tauri -> target'
+          workspaces: 'gui/src-tauri -> target'
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install frontend dependencies
-        working-directory: helix-gui
+        working-directory: gui
         run: npm install
 
       - name: Build the app
-        working-directory: helix-gui
+        working-directory: gui
         run: npm run tauri build
 
       - name: Upload installers
@@ -60,5 +60,5 @@ jobs:
         with:
           name: helix-wallet-${{ matrix.name }}
           path: |
-            helix-gui/src-tauri/target/release/bundle/**
+            gui/src-tauri/target/release/bundle/**
           if-no-files-found: warn
