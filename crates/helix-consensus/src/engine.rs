@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use helix_core::{Block, BlockHeader, Transaction};
@@ -43,6 +43,24 @@ pub const PROPOSAL_TIMEOUT_TICKS: u32 = 2;
 /// would silently regress to the old behavior while every test still passed. Compile-time so
 /// tuning either constant can't quietly break the ordering they depend on.
 const _: () = assert!(PROPOSAL_TIMEOUT_TICKS < ROUND_TIMEOUT_TICKS);
+
+/// Consecutive missed rounds (neither a prevote nor a precommit seen from a validator, see
+/// `record_round_liveness`) before this node stops counting that validator's power toward
+/// its own quorum threshold — see `liveness_adjusted_validator_set`. At `ROUND_TIMEOUT_TICKS`
+/// (30s) per round, 20 rounds is ~10 minutes of total silence: long enough that a brief
+/// restart or gossip hiccup never trips it (those resolve within one or two rounds), short
+/// enough that a validator that is genuinely gone (crashed, network-partitioned, never
+/// actually running) doesn't freeze the chain indefinitely. Found live 2026-07-20: a staked
+/// address with no running node at all crossed an epoch rotation and froze block production
+/// for hours, because quorum required its vote and nothing ever excused its absence.
+pub const LIVENESS_JAIL_ROUNDS: u32 = 20;
+
+/// Ticks this node waits, under-connected (`peer_count < peers_needed_for_quorum()`), before
+/// ticking the round clock anyway — see `note_peer_wait_tick`. 300 ticks × `BLOCK_TIME_MS`
+/// (2s) = 10 minutes, matching `LIVENESS_JAIL_ROUNDS`'s window: by the time this fires, the
+/// round-timeout/liveness-jail machinery is what actually restores block production, this
+/// constant only stops the engine from refusing to even try.
+pub const PEER_WAIT_TIMEOUT_TICKS: u32 = 300;
 
 /// Cap on votes buffered ahead of the round they belong to (see
 /// `BftEngine::buffered_votes`). Bounds the memory a peer can make us hold by
@@ -117,6 +135,18 @@ pub struct BftEngine {
     /// proposal is rejected unless its header carries exactly this value, so a proposer can't
     /// pick an arbitrary base fee.
     current_base_fee_per_byte: u64,
+    /// Consecutive rounds (see `record_round_liveness`) each other validator has gone
+    /// without casting a prevote or precommit this node saw. Purely local/observational —
+    /// never persisted, never part of `ChainState`/`state_hash`, and not something nodes are
+    /// expected to agree on. Drives `liveness_adjusted_validator_set` (see its doc comment for
+    /// the safety argument). Reset to 0 for a validator the instant it votes again; entries
+    /// below `LIVENESS_JAIL_ROUNDS` are absent rather than stored as 0.
+    missed_rounds: HashMap<Address, u32>,
+    /// Consecutive ticks this node has been held back by the peer-count gate in
+    /// `block_production_loop` (`peer_count < peers_needed_for_quorum()`) — see
+    /// `note_peer_wait_tick`. Reset via `reset_peer_wait` the moment enough peers are
+    /// connected again.
+    peer_wait_ticks: u32,
 }
 
 impl BftEngine {
@@ -137,7 +167,30 @@ impl BftEngine {
             locked_pol: Vec::new(),
             pending_round: 0,
             current_base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
+            missed_rounds: HashMap::new(),
+            peer_wait_ticks: 0,
         }
+    }
+
+    /// Record a tick spent waiting for peers below `peers_needed_for_quorum()` (the gate in
+    /// `block_production_loop`). Returns `true` once `PEER_WAIT_TIMEOUT_TICKS` has been
+    /// reached — the caller should stop waiting and tick the round clock anyway. Without this,
+    /// a validator that never reconnects (or never existed as a running node in the first
+    /// place — see `LIVENESS_JAIL_ROUNDS`'s doc comment) holds this node in the `continue`
+    /// branch forever: the round clock never runs, so `advance_round`'s liveness tracking
+    /// never gets a chance to exclude the missing validator either. The peer-count gate itself
+    /// stays in place for the cold-start case it was built for (letting late-joining
+    /// validators catch up at round 0 instead of finding this node many rounds ahead) — this
+    /// only bounds how long that grace period lasts.
+    pub fn note_peer_wait_tick(&mut self) -> bool {
+        self.peer_wait_ticks += 1;
+        self.peer_wait_ticks >= PEER_WAIT_TIMEOUT_TICKS
+    }
+
+    /// Enough peers are connected again — clear the wait counter so a future disconnect gets
+    /// the full grace period, not whatever was left over from an earlier one.
+    pub fn reset_peer_wait(&mut self) {
+        self.peer_wait_ticks = 0;
     }
 
     /// The base fee (nano-HLX per tx byte) the next block must carry. Exposed so the node can
@@ -369,9 +422,10 @@ impl BftEngine {
             return;
         };
 
-        let round = self.round.get_or_insert_with(|| {
-            RoundState::new(height, round_num, self.validator_set.clone())
-        });
+        let adjusted_validator_set = self.liveness_adjusted_validator_set();
+        let round = self
+            .round
+            .get_or_insert_with(|| RoundState::new(height, round_num, adjusted_validator_set));
         if round.open_for_nil_prevote().is_err() {
             return;
         }
@@ -410,6 +464,7 @@ impl BftEngine {
         let height = self.current_height + 1;
         let from_round = match self.round.take() {
             Some(stalled) => {
+                self.record_round_liveness(&stalled);
                 self.pending_evidence.extend(stalled.evidence);
                 stalled.round
             }
@@ -458,7 +513,7 @@ impl BftEngine {
         let block_hash = block.hash();
 
         // Start round: Propose → Prevote
-        let mut round = RoundState::new(height, round_num, self.validator_set.clone());
+        let mut round = RoundState::new(height, round_num, self.liveness_adjusted_validator_set());
         round.set_proposal(block.clone(), valid_round, pol)?;
 
         // Cast own prevote for our proposal.
@@ -621,7 +676,7 @@ impl BftEngine {
         }
 
         let block_hash = block.hash();
-        let mut round = RoundState::new(height, round_num, self.validator_set.clone());
+        let mut round = RoundState::new(height, round_num, self.liveness_adjusted_validator_set());
         round.set_proposal(block, valid_round, pol)?;
         self.round_ticks = 0;
         // Adopt this round as the pending one — a proposal for a *newer* round than we'd
@@ -905,6 +960,65 @@ impl BftEngine {
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
+
+    /// Update `missed_rounds` from a round that just timed out (via `advance_round`) without
+    /// reaching quorum. Every other validator in `self.validator_set` who cast neither a
+    /// prevote nor a precommit this node saw in `stalled` gets its counter bumped; anyone who
+    /// voted — even nil — is reset. A single missed round proves nothing (gossip delay, a
+    /// node mid-restart); only sustained silence does.
+    fn record_round_liveness(&mut self, stalled: &RoundState) {
+        for v in &self.validator_set.validators {
+            if v.address == self.address {
+                continue;
+            }
+            let voted = stalled.prevotes.has_voted(&v.address) || stalled.precommits.has_voted(&v.address);
+            if voted {
+                self.missed_rounds.remove(&v.address);
+            } else {
+                *self.missed_rounds.entry(v.address.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// `self.validator_set`, but with any validator at or past `LIVENESS_JAIL_ROUNDS`
+    /// consecutive missed rounds (see `record_round_liveness`) zeroed out for voting-power
+    /// purposes. This is what a new `RoundState`/`VoteSet` is actually built against — never
+    /// `self.validator_set` directly — so a validator that has gone dark long enough stops
+    /// counting toward *this node's own* `quorum_threshold()`.
+    ///
+    /// **Why this cannot fork the chain.** It only ever *removes* power from the quorum
+    /// calculation, never redirects it — so it can only make a hash cross a threshold sooner,
+    /// never make two conflicting hashes both cross a threshold in the same round (`VoteSet`
+    /// still enforces one vote per validator, and equivocation is still caught and slashed).
+    /// It never mutates `ChainState`, persisted stake, or the real validator set — an excluded
+    /// validator is still fully staked and rejoins the effective set the instant this node
+    /// observes it vote again (`record_round_liveness` resets on any vote). Cross-round
+    /// Tendermint locking (`locked_round`/`should_prevote`) reasons only about "2/3+1 of
+    /// whatever power participated in that round" — it never references validator-set size —
+    /// so a lock formed under a liveness-reduced quorum is exactly as safe as one formed under
+    /// the full one.
+    ///
+    /// **What it costs.** Nodes are not required to agree on who they've locally excluded —
+    /// this is deliberate, since agreeing would need the very quorum that's missing. While a
+    /// validator is excluded, this node's notion of quorum reflects less than the chain's full
+    /// staked power: for a 2-of-2 set, that means one validator can produce blocks alone for as
+    /// long as the other stays dark — the same trust level Helix already ran under for most of
+    /// its life as a single-validator devnet. That is an explicit, bounded (`LIVENESS_JAIL_ROUNDS`
+    /// × ~30s) trade of some safety margin for liveness, not a silent one: a chain that can
+    /// freeze forever the moment any one validator's operator walks away is not more secure for
+    /// having refused to make that trade, it is just less useful.
+    fn liveness_adjusted_validator_set(&self) -> ValidatorSet {
+        if self.missed_rounds.values().all(|&n| n < LIVENESS_JAIL_ROUNDS) {
+            return self.validator_set.clone();
+        }
+        let mut adjusted = self.validator_set.clone();
+        for v in adjusted.validators.iter_mut() {
+            if self.missed_rounds.get(&v.address).copied().unwrap_or(0) >= LIVENESS_JAIL_ROUNDS {
+                v.voting_power = 0;
+            }
+        }
+        adjusted
+    }
 
     fn build_signed_block(
         &self,
@@ -2013,5 +2127,135 @@ mod tests {
             "a proposal for the round we already advanced past must be ignored"
         );
         assert!(!engine.has_active_round());
+    }
+
+    /// A 2-validator set with equal stake — the case that actually froze prod on 2026-07-20:
+    /// `quorum_threshold()` needs `2/3+1` of total power, so with two equal validators neither
+    /// can ever reach it alone until liveness exclusion kicks in.
+    struct TwoValidators {
+        self_kp: KeyPair,
+        self_addr: Address,
+        peer_kp: KeyPair,
+        validator_set: ValidatorSet,
+    }
+
+    fn two_validators() -> TwoValidators {
+        let self_kp = KeyPair::generate();
+        let peer_kp = KeyPair::generate();
+        let self_addr = Address::from_public_key(&self_kp.public);
+        let peer_addr = Address::from_public_key(&peer_kp.public);
+        // self_addr at index 1 so it's the proposer for height 1, round 0
+        // (proposer_for_round uses (height + round) % len).
+        let validator_set = ValidatorSet::new(
+            vec![
+                Validator::new(peer_addr, 1_000, true),
+                Validator::new(self_addr.clone(), 1_000, true),
+            ],
+            0,
+        );
+        TwoValidators { self_kp, self_addr, peer_kp, validator_set }
+    }
+
+    /// Runs this node's round clock to its timeout (exactly as `block_production_loop` does,
+    /// tick by tick) and then calls `advance_round` once — mirroring the real production loop
+    /// rather than poking engine internals directly.
+    fn tick_to_timeout_and_advance(engine: &mut BftEngine, kp: &KeyPair) {
+        loop {
+            if engine.note_round_tick(kp) {
+                break;
+            }
+        }
+        engine.take_outbound_votes();
+        let _ = engine.advance_round(kp, Hash::digest(b"genesis"), vec![]);
+        engine.take_outbound_votes();
+    }
+
+    /// The point of the 2026-07-20 liveness fix: found live when a staked validator with no
+    /// running node at all crossed an epoch rotation and froze block production for hours,
+    /// because a 2-of-2 quorum requires both no matter how long one has been silent. After
+    /// `LIVENESS_JAIL_ROUNDS` consecutive rounds without a single vote from the peer, this
+    /// node's own vote must become sufficient — driven entirely through the same
+    /// `note_round_tick`/`advance_round` path the real node uses, not by inspecting private
+    /// state, so this proves the observable behavior a stalled prod node actually needs.
+    #[test]
+    fn a_completely_silent_validator_eventually_stops_blocking_quorum() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 0);
+
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        engine.take_outbound_votes();
+        assert_eq!(engine.current_height(), 0, "peer's vote is still required at first");
+
+        let mut rounds_driven = 0u32;
+        while engine.current_height() == 0 {
+            tick_to_timeout_and_advance(&mut engine, &v.self_kp);
+            rounds_driven += 1;
+            assert!(
+                rounds_driven <= LIVENESS_JAIL_ROUNDS + 4,
+                "must finalize once the peer crosses LIVENESS_JAIL_ROUNDS, not hang forever"
+            );
+        }
+
+        assert!(
+            rounds_driven >= LIVENESS_JAIL_ROUNDS,
+            "must not exclude a silent peer before the full {LIVENESS_JAIL_ROUNDS}-round \
+             threshold — only {rounds_driven} rounds were driven"
+        );
+        assert_eq!(engine.current_height(), 1, "self alone must finalize once excluded");
+    }
+
+    /// A peer that goes quiet for a while but votes again before crossing the jail threshold
+    /// must not be excluded — and the counter must not carry over any "credit" into a later,
+    /// separate silence. Proves the reset in `record_round_liveness`, not just its increment.
+    #[test]
+    fn a_vote_partway_through_resets_the_missed_round_counter() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 0);
+
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        engine.take_outbound_votes();
+
+        // Drive right up to (but not across) the jail threshold in silence.
+        for _ in 0..LIVENESS_JAIL_ROUNDS - 1 {
+            tick_to_timeout_and_advance(&mut engine, &v.self_kp);
+        }
+        assert_eq!(engine.current_height(), 0, "not jailed yet");
+
+        // Open (or confirm) a round for the current pending round, exactly as `prevote_nil`
+        // would by `PROPOSAL_TIMEOUT_TICKS` — needed to know the real round number to target;
+        // `active_round_num()` is `None` right after the loop above, since the last
+        // `advance_round` call always clears `self.round` before returning.
+        for _ in 0..PROPOSAL_TIMEOUT_TICKS {
+            engine.note_round_tick(&v.self_kp);
+        }
+        engine.take_outbound_votes();
+
+        // Peer reconnects and votes for whatever this node currently has active — nil if
+        // self is mid-wait, the real value if self is mid-proposal; either counts as "voted".
+        let active_round = engine.active_round_num().expect("a round must be open by now");
+        let target_hash = engine
+            .pending_proposal()
+            .map(|b| b.hash())
+            .unwrap_or(NIL_BLOCK_HASH);
+        let peer_prevote = peer_vote(&v.peer_kp, VoteType::Prevote, 1, active_round, target_hash);
+        let _ = engine.add_vote(&v.self_kp, peer_prevote);
+        engine.take_outbound_votes();
+
+        // Finish out this round (now including the peer's vote) and advance — one more silent
+        // round after the reset must NOT be enough to finalize; if the counter hadn't reset,
+        // this round would already be at the threshold.
+        loop {
+            if engine.note_round_tick(&v.self_kp) {
+                break;
+            }
+        }
+        engine.take_outbound_votes();
+        let _ = engine.advance_round(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        engine.take_outbound_votes();
+        assert_eq!(
+            engine.current_height(),
+            0,
+            "a single vote must reset the counter, not just delay jailing by one round"
+        );
     }
 }

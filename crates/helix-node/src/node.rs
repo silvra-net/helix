@@ -1343,10 +1343,20 @@ async fn block_production_loop(
             // the exact cold-start desync that otherwise stalls a multi-validator
             // chain at height 1 forever. A single-validator set needs 0 peers, so
             // this never gates production on the live devnet.
+            //
+            // Bounded, not indefinite: a validator that never (re)connects at all —
+            // no P2P peer, so `note_round_tick`'s own timeout/liveness-jail machinery
+            // never even runs — would otherwise hold this node here forever. Past
+            // `PEER_WAIT_TIMEOUT_TICKS`, stop waiting and tick anyway; see
+            // `note_peer_wait_tick`'s doc comment.
             if peer_count.load(std::sync::atomic::Ordering::Relaxed)
                 < engine.read().await.peers_needed_for_quorum()
             {
-                continue;
+                if !engine.write().await.note_peer_wait_tick() {
+                    continue;
+                }
+            } else {
+                engine.write().await.reset_peer_wait();
             }
 
             let timed_out = { engine.write().await.note_round_tick(&keypair) };
@@ -1368,13 +1378,19 @@ async fn block_production_loop(
             // meaningful in a multi-validator set; a sole validator (peers_needed == 0) always
             // proposes and never waits, so it skips this and produce_block finalizes as before.
             let needed = engine.read().await.peers_needed_for_quorum();
+            let under_connected =
+                peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed;
             if needed == 0 {
                 false
-            } else if peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed {
+            } else if under_connected && !engine.write().await.note_peer_wait_tick() {
                 // Under-connected — don't burn rounds getting ahead of validators still
                 // joining at round 0 (the same guard the active-round branch applies).
+                // Bounded the same way: see `note_peer_wait_tick`'s doc comment.
                 continue;
             } else {
+                if !under_connected {
+                    engine.write().await.reset_peer_wait();
+                }
                 let timed_out = { engine.write().await.note_round_tick(&keypair) };
                 // Same reason as the active-round branch: a nil prevote cast here has to go
                 // out this tick. (This branch falls through to the end-of-body drain rather
