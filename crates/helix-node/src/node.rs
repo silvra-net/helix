@@ -1307,12 +1307,22 @@ async fn block_production_loop(
             if needed == 0 {
                 mesh_ready = true;
             } else if peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed {
-                continue; // still waiting for enough validators to connect
-            } else if settle_ticks_left > 0 {
-                settle_ticks_left -= 1;
-                continue; // peers here — let the mesh settle before first use
-            } else {
+                if !engine.write().await.note_peer_wait_tick() {
+                    continue; // still waiting for enough validators to connect
+                }
+                // Past PEER_WAIT_TIMEOUT_TICKS — a validator that never connects at all
+                // would otherwise hold this node here forever (this gate runs before the
+                // has_active_round loop's own peer-wait checks even see a tick). Nothing to
+                // settle for a mesh that was never formed, so skip the settle-tick wait too.
                 mesh_ready = true;
+            } else {
+                engine.write().await.reset_peer_wait();
+                if settle_ticks_left > 0 {
+                    settle_ticks_left -= 1;
+                    continue; // peers here — let the mesh settle before first use
+                } else {
+                    mesh_ready = true;
+                }
             }
         }
 
