@@ -1,0 +1,42 @@
+[package]
+name = "helix-mobile"
+version = "0.7.3"
+edition = "2021"
+authors = ["SILVRA"]
+license = "MIT"
+description = "UniFFI bindings exposing Helix's real transaction signing to mobile apps (Spark), so they stop reimplementing it"
+
+# Own workspace root, same reason as gui/src-tauri: uniffi's dependency tree (and its
+# proc-macro/build-script machinery) has no business being pulled into `cargo build/test
+# --workspace` for the chain itself. Path-depends on helix-core/helix-crypto from ../crates,
+# which still resolve fine from here.
+[workspace]
+
+[lib]
+# cdylib for Android (.so, what UniFFI's Kotlin bindings load at runtime), lib for the Rust
+# unit tests below (`cargo test` needs an rlib, not just a cdylib).
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+helix-core = { path = "../crates/helix-core" }
+helix-crypto = { path = "../crates/helix-crypto" }
+serde_json = "1.0"
+uniffi = "0.32"
+thiserror = "1.0"
+
+[build-dependencies]
+uniffi = { version = "0.32", features = ["build"] }
+
+[dev-dependencies]
+uniffi = { version = "0.32", features = ["bindgen-tests"] }
+
+[features]
+# Off by default so `cargo ndk build` (the Android cdylib) doesn't drag in uniffi's bindgen/CLI
+# dependency tree (clap, askama templates, …) — those only matter for the host-side tool below
+# that generates Kotlin source, never for the on-device library itself.
+uniffi-cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi-cli"]

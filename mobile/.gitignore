@@ -1,0 +1,6 @@
+target/
+# Generated Kotlin bindings + cross-compiled Android libs — reproducible from src/lib.rs via
+# `cargo ndk build` + uniffi-bindgen, never hand-edited, and android-libs/ is the same kind of
+# platform-specific build artifact gui/src-tauri/binaries/ excludes for the same reason.
+android-libs/
+kotlin-bindings/
