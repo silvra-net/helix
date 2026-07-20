@@ -1166,4 +1166,59 @@ mod tests {
         assert_eq!(activated, vec![(addr(1), 250)]);
         assert!(state.pending_validators.is_empty());
     }
+
+    /// The point of persisted downtime-jailing: a validator missing from `last_commit` for
+    /// `DOWNTIME_JAIL_THRESHOLD_BLOCKS` consecutive blocks gets jailed and immediately
+    /// disappears from `stakers()` — regardless of stake — until it explicitly unjails.
+    #[test]
+    fn sustained_absence_jails_and_removes_from_stakers() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 1_000);
+        stake(&mut state, 2, 1_000);
+        let validators = vec![addr(1), addr(2)];
+        let signers_without_2: std::collections::HashSet<Address> = [addr(1)].into_iter().collect();
+
+        let mut newly_jailed = Vec::new();
+        for height in 0..DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 {
+            newly_jailed = state.record_block_participation(&validators, &signers_without_2, height);
+        }
+
+        assert_eq!(newly_jailed, vec![addr(2)], "exactly the silent validator must be jailed");
+        assert!(state.jailed_until.contains_key(&addr(2).to_string()));
+        let staker_addrs: Vec<Address> = state.stakers().into_iter().map(|(a, _)| a).collect();
+        assert_eq!(staker_addrs, vec![addr(1)], "jailed validator must vanish from stakers() despite its stake");
+    }
+
+    /// A validator that goes quiet for a while but signs again before crossing the threshold
+    /// must NOT be jailed — and a later silent stretch must start counting from zero, not
+    /// carry over "credit" from the earlier near-miss. Mirrors the equivalent guarantee
+    /// already proven for the RAM-only round-based mechanism in helix-consensus.
+    #[test]
+    fn a_signature_partway_through_resets_the_miss_counter() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 1_000);
+        stake(&mut state, 2, 1_000);
+        let validators = vec![addr(1), addr(2)];
+        let silent: std::collections::HashSet<Address> = [addr(1)].into_iter().collect();
+        let both_sign: std::collections::HashSet<Address> = [addr(1), addr(2)].into_iter().collect();
+
+        for height in 0..DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 - 1 {
+            state.record_block_participation(&validators, &silent, height);
+        }
+        assert!(!state.jailed_until.contains_key(&addr(2).to_string()), "not jailed yet");
+
+        // addr(2) signs once — counter must reset to zero, not just decrement.
+        state.record_block_participation(&validators, &both_sign, DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 - 1);
+        assert!(!state.missed_blocks.contains_key(&addr(2).to_string()));
+
+        // One more silent block after the reset must NOT be enough to jail.
+        let newly_jailed = state.record_block_participation(
+            &validators,
+            &silent,
+            DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64,
+        );
+        assert!(newly_jailed.is_empty(), "a single miss right after a reset must not jail");
+    }
 }

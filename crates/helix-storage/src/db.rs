@@ -1324,4 +1324,55 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn missed_blocks_and_jailed_until_survive_reopening_the_database() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.missed_blocks.insert(addr(1).to_string(), 42);
+        state.jailed_until.insert(addr(2).to_string(), 9_999);
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert_eq!(loaded.missed_blocks.get(&addr(1).to_string()), Some(&42));
+        assert_eq!(loaded.jailed_until.get(&addr(2).to_string()), Some(&9_999));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same failure mode as pending validators / redelegations: a validator whose miss count
+    /// was reset (it signed again) or who successfully unjailed must not come back from the
+    /// dead on the next restart — insert-only persistence would silently re-jail (or re-count
+    /// downtime for) a validator that is actually fine.
+    #[test]
+    fn a_cleared_jail_does_not_resurrect_after_reopening() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.missed_blocks.insert(addr(1).to_string(), 100);
+        state.jailed_until.insert(addr(1).to_string(), 500);
+        db.save_chain_state(&state).unwrap();
+
+        // addr(1) signs again (miss count reset), then successfully unjails.
+        state.missed_blocks.remove(&addr(1).to_string());
+        state.jailed_until.remove(&addr(1).to_string());
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert!(
+            !loaded.missed_blocks.contains_key(&addr(1).to_string()),
+            "a reset miss count resurrected after reopening"
+        );
+        assert!(
+            !loaded.jailed_until.contains_key(&addr(1).to_string()),
+            "an unjailed validator came back jailed after reopening"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

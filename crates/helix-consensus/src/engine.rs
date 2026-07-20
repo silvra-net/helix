@@ -2232,6 +2232,64 @@ mod tests {
         engine.take_outbound_votes();
     }
 
+    /// `last_commit` is how downtime-jailing (`helix-executor::ChainState::
+    /// record_block_participation`) learns who actually signed the parent block — a forged
+    /// entry could otherwise let a malicious proposer manufacture "X signed" (shielding a
+    /// colluding validator from a miss) or, just as bad, get accepted as proof that an
+    /// innocent validator signed something it never did. `verify_last_commit` must reject a
+    /// signature that doesn't actually verify.
+    #[test]
+    fn verify_last_commit_rejects_a_forged_signature() {
+        let v = two_validators();
+        let engine = BftEngine::new(v.validator_set, v.self_addr, 5);
+        let parent_hash = Hash::digest(b"parent");
+
+        let mut sig = peer_vote(&v.peer_kp, VoteType::Precommit, 5, 0, parent_hash);
+        // Tamper with the signed content after signing — the signature no longer matches.
+        sig.round = 1;
+        let commit_sig = helix_core::CommitSig {
+            validator: sig.validator,
+            public_key: sig.public_key,
+            crypto_version: sig.crypto_version,
+            round: sig.round,
+            signature: sig.signature,
+        };
+
+        let err = engine.verify_last_commit(&[commit_sig], 6, &parent_hash).unwrap_err();
+        assert!(matches!(err, ConsensusError::InvalidBlock { .. }));
+    }
+
+    /// The same validator can't be counted twice toward participation by repeating its
+    /// signature in `last_commit`.
+    #[test]
+    fn verify_last_commit_rejects_a_duplicate_validator() {
+        let v = two_validators();
+        let engine = BftEngine::new(v.validator_set, v.self_addr, 5);
+        let parent_hash = Hash::digest(b"parent");
+        let vote = peer_vote(&v.peer_kp, VoteType::Precommit, 6, 0, parent_hash);
+        let commit_sig = helix_core::CommitSig {
+            validator: vote.validator,
+            public_key: vote.public_key,
+            crypto_version: vote.crypto_version,
+            round: vote.round,
+            signature: vote.signature,
+        };
+
+        let err = engine
+            .verify_last_commit(&[commit_sig.clone(), commit_sig], 7, &parent_hash)
+            .unwrap_err();
+        assert!(matches!(err, ConsensusError::InvalidBlock { .. }));
+    }
+
+    #[test]
+    fn verify_last_commit_is_a_no_op_at_genesis() {
+        let v = two_validators();
+        let engine = BftEngine::new(v.validator_set, v.self_addr, 0);
+        // Height 0 has no parent to attest — an empty (or even non-empty) last_commit must
+        // not be rejected for "missing" a parent that doesn't exist.
+        assert!(engine.verify_last_commit(&[], 0, &Hash::ZERO).is_ok());
+    }
+
     /// The point of the 2026-07-20 liveness fix: found live when a staked validator with no
     /// running node at all crossed an epoch rotation and froze block production for hours,
     /// because a 2-of-2 quorum requires both no matter how long one has been silent. After

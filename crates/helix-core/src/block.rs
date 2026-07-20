@@ -323,4 +323,68 @@ mod tests {
         );
         assert!(block.merkle_proof_for(0).is_none());
     }
+
+    fn signed_commit_sig(kp: &helix_crypto::KeyPair, height: u64, round: u32, block_hash: Hash) -> CommitSig {
+        let addr = Address::from_public_key(&kp.public);
+        let bytes = precommit_signing_bytes(height, round, &block_hash, kp.scheme);
+        CommitSig {
+            validator: addr,
+            public_key: kp.public.clone(),
+            crypto_version: kp.scheme,
+            round,
+            signature: kp.sign(&bytes).unwrap(),
+        }
+    }
+
+    #[test]
+    fn commit_sig_verify_accepts_a_genuine_precommit() {
+        use helix_crypto::KeyPair;
+        let kp = KeyPair::generate();
+        let block_hash = Hash::digest(b"parent block");
+        let sig = signed_commit_sig(&kp, 41, 0, block_hash);
+        assert!(sig.verify(41, &block_hash).is_ok());
+    }
+
+    /// A `CommitSig` can't be reused for a different height/round/block than it actually
+    /// signed — this is the property `verify_last_commit` (helix-consensus) relies on to
+    /// stop a proposer from fabricating "X signed the parent" to shield X from a downtime
+    /// miss (see `CommitSig`'s doc comment).
+    #[test]
+    fn commit_sig_verify_rejects_a_sig_replayed_at_a_different_height() {
+        use helix_crypto::KeyPair;
+        let kp = KeyPair::generate();
+        let block_hash = Hash::digest(b"parent block");
+        let sig = signed_commit_sig(&kp, 41, 0, block_hash);
+        assert!(sig.verify(42, &block_hash).is_err());
+    }
+
+    #[test]
+    fn commit_sig_verify_rejects_a_forged_validator_address() {
+        use helix_crypto::KeyPair;
+        let signer = KeyPair::generate();
+        let claimed = KeyPair::generate();
+        let block_hash = Hash::digest(b"parent block");
+        let mut sig = signed_commit_sig(&signer, 41, 0, block_hash);
+        // Claim to be a different validator than the one who actually signed.
+        sig.validator = Address::from_public_key(&claimed.public);
+        assert!(sig.verify(41, &block_hash).is_err());
+    }
+
+    /// A block's `last_commit` doesn't change what it commits to sign — `signing_hash` folds
+    /// it in as a fixed-length digest (see its own doc comment), but the digest still has to
+    /// actually depend on the content, or two blocks differing only in `last_commit` would
+    /// collide.
+    #[test]
+    fn signing_hash_changes_when_last_commit_changes() {
+        use helix_crypto::KeyPair;
+        let proposer = KeyPair::generate();
+        let mut block = signed_test_block(&proposer);
+        let before = block.header.signing_hash();
+
+        let signer = KeyPair::generate();
+        let commit_sig = signed_commit_sig(&signer, block.header.height.saturating_sub(1), 0, block.header.prev_hash);
+        block.header.last_commit.push(commit_sig);
+
+        assert_ne!(before, block.header.signing_hash());
+    }
 }

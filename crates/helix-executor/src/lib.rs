@@ -3122,6 +3122,61 @@ mod tests {
     }
 
     #[test]
+    fn unjail_rejects_when_not_jailed() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 100_000);
+
+        let tx = signed_tx_simple(&kp, &addr, TxType::Unjail, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
+        assert!(!receipt.success, "an address that was never jailed has nothing to unjail");
+    }
+
+    #[test]
+    fn unjail_rejects_before_the_minimum_wait_has_elapsed() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        state.update_account(&addr, |acc| {
+            acc.balance = 100_000;
+            acc.staked = 1_000;
+        });
+        state.jailed_until.insert(addr.to_string(), 500);
+
+        let tx = signed_tx_simple(&kp, &addr, TxType::Unjail, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 499, 0);
+        assert!(!receipt.success, "one block short of jailed_until must still be rejected");
+        assert!(state.jailed_until.contains_key(&addr.to_string()), "must remain jailed");
+    }
+
+    #[test]
+    fn unjail_succeeds_after_the_wait_and_restores_stakers_eligibility() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        state.update_account(&addr, |acc| {
+            acc.balance = 100_000;
+            acc.staked = 1_000;
+        });
+        state.jailed_until.insert(addr.to_string(), 500);
+        state.missed_blocks.insert(addr.to_string(), 999);
+        assert!(state.stakers().is_empty(), "jailed validator must not be a staker yet");
+
+        let tx = signed_tx_simple(&kp, &addr, TxType::Unjail, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 500, 0);
+        assert!(receipt.success, "{:?}", receipt.error);
+        assert!(!state.jailed_until.contains_key(&addr.to_string()));
+        assert!(!state.missed_blocks.contains_key(&addr.to_string()), "miss count must not carry over past an unjail");
+        assert_eq!(state.stakers(), vec![(addr, 1_000)], "must be a staker again immediately");
+    }
+
+    #[test]
     fn slash_hits_both_staked_and_unbonding() {
         let addr = Address::from_public_key(&KeyPair::generate().public);
         let mut state = ChainState::new(0);
