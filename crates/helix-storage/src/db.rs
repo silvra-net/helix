@@ -59,6 +59,18 @@ const GENESIS_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("
 /// the next restart and make it wait out the delay a second time — or never activate at all if
 /// it was promoted and the promotion itself hasn't landed in a later block's save yet.
 const PENDING_VALIDATORS: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_validators");
+/// address string → 4-byte little-endian u32 consecutive-miss count — see
+/// `ChainState::missed_blocks`'s doc comment. Removed (not just left stale) the instant a
+/// validator's signature is seen again, so needs the same stale-key pruning as
+/// `PENDING_VALIDATORS`/`RECOVERY_REQUESTS` — insert-only persistence would resurrect an
+/// already-reset miss count on the next restart, letting a validator's downtime clock run
+/// further than it actually has.
+const MISSED_BLOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("missed_blocks");
+/// address string → 8-byte little-endian u64 height (the earliest an `Unjail` tx is valid) —
+/// see `ChainState::jailed_until`'s doc comment. Removed on `Unjail`, so needs the same
+/// stale-key pruning as `MISSED_BLOCKS` — without it, a validator that legitimately unjailed
+/// would come back jailed on the next node restart.
+const JAILED_UNTIL: TableDefinition<&str, &[u8]> = TableDefinition::new("jailed_until");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// address string → (block height, tx index within block), both big-endian so a
 /// key's values sort in ascending chain order for free. Lets `address_transactions`
@@ -111,6 +123,8 @@ impl HelixDb {
         tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -138,6 +152,8 @@ impl HelixDb {
             let mut delegator_shares = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut redelegations = tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut pending_validators = tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut missed_blocks = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut jailed_until = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut contract_storage = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut genesis_extra_validators = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut genesis_allocations = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -317,6 +333,52 @@ impl HelixDb {
                 pending_validators.insert(addr.as_str(), &[][..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // Same stale-key pruning as PENDING_VALIDATORS — see MISSED_BLOCKS' doc comment.
+            {
+                let current: std::collections::HashSet<&str> =
+                    state.missed_blocks.keys().map(|s| s.as_str()).collect();
+                let stale: Vec<String> = missed_blocks
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!current.contains(key.as_str())).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    missed_blocks
+                        .remove(key.as_str())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
+            for (addr, count) in &state.missed_blocks {
+                missed_blocks.insert(addr.as_str(), &count.to_le_bytes()[..])
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+            // Same stale-key pruning again — see JAILED_UNTIL's doc comment.
+            {
+                let current: std::collections::HashSet<&str> =
+                    state.jailed_until.keys().map(|s| s.as_str()).collect();
+                let stale: Vec<String> = jailed_until
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!current.contains(key.as_str())).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    jailed_until
+                        .remove(key.as_str())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
+            for (addr, height) in &state.jailed_until {
+                jailed_until.insert(addr.as_str(), &height.to_le_bytes()[..])
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
         }
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))
     }
@@ -338,6 +400,8 @@ impl HelixDb {
         let redelegations_table = tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         let contract_storage_table = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
         let pending_validators_table = tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let missed_blocks_table = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let jailed_until_table = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_extra_validators_table = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_allocations_table = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -498,6 +562,28 @@ impl HelixDb {
             pending_validators.insert(address);
         }
 
+        let mut missed_blocks = std::collections::HashMap::new();
+        let missed_blocks_iter =
+            missed_blocks_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        for entry in missed_blocks_iter {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let count_bytes: [u8; 4] = v.value().try_into().map_err(|_| {
+                StorageError::Serialization("missed block count must be 4 bytes".to_string())
+            })?;
+            missed_blocks.insert(k.value().to_string(), u32::from_le_bytes(count_bytes));
+        }
+
+        let mut jailed_until = std::collections::HashMap::new();
+        let jailed_until_iter =
+            jailed_until_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        for entry in jailed_until_iter {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let height_bytes: [u8; 8] = v.value().try_into().map_err(|_| {
+                StorageError::Serialization("jailed_until height must be 8 bytes".to_string())
+            })?;
+            jailed_until.insert(k.value().to_string(), u64::from_le_bytes(height_bytes));
+        }
+
         let read_meta_u64 = |key: &str| -> Option<u64> {
             meta_table.get(key).ok().flatten().and_then(|v| {
                 let bytes: [u8; 8] = v.value().try_into().ok()?;
@@ -552,6 +638,8 @@ impl HelixDb {
             genesis_validator_stake,
             genesis_allocations,
             pending_validators,
+            missed_blocks,
+            jailed_until,
         })
     }
 

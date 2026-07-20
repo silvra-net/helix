@@ -43,6 +43,11 @@ pub struct BlockReceipt {
     /// `genesis::scheduled_block_reward`), on top of `validator_reward`'s fee share. 0 once
     /// the schedule has decayed to nothing or the `TOTAL_SUPPLY_HLX` cap is reached.
     pub block_reward_minted: u64,
+    /// Validators downtime-jailed by this block's `record_block_participation` call — the
+    /// caller (`helix-node`'s `apply_finalized_block`) fast-jails them out of the live
+    /// `BftEngine::validator_set` immediately, the same way it already does for
+    /// `SubmitDoubleSignEvidence`, rather than waiting for the next epoch rotation.
+    pub newly_jailed: Vec<helix_crypto::Address>,
 }
 
 impl BlockReceipt {

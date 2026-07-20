@@ -1120,7 +1120,7 @@ async fn apply_finalized_block(
     // record of whether a committed transaction did anything, and warning about the count in the
     // log while dropping them left `hlx tx status`, the explorer and Spark all reporting a
     // rejected transfer as `confirmed`.
-    let tx_receipts = {
+    let (tx_receipts, newly_jailed_for_downtime) = {
         let mut state = chain_state.write().await;
         let receipt = execute_block(&mut state, &block, reward_address.as_deref());
         if receipt.failed_txs() > 0 {
@@ -1133,7 +1133,7 @@ async fn apply_finalized_block(
         // wants to compare running nodes without trawling logs. See ChainState::state_hash's
         // doc comment for exactly what this is and isn't.
         debug!(height, state_hash = %state.state_hash().to_hex(), "Block applied");
-        receipt.tx_receipts
+        (receipt.tx_receipts, receipt.newly_jailed)
     };
 
     // Double-sign slashing does NOT happen here. It used to: this function unconditionally
@@ -1175,6 +1175,22 @@ async fn apply_finalized_block(
                     "Validator jailed immediately after double-sign slash — excluded from BFT rounds from here on, not just at the next epoch rotation"
                 );
             }
+        }
+    }
+
+    // Same immediate-jail treatment for downtime — `execute_block` (via
+    // `ChainState::record_block_participation`) already decided who crossed
+    // `DOWNTIME_JAIL_THRESHOLD_BLOCKS` deterministically (every node that applies this block
+    // reaches the same list from the same verified `last_commit` data), this just keeps the
+    // live `BftEngine`'s quorum math in sync with it immediately rather than waiting up to
+    // `EPOCH_LENGTH` blocks for the next rotation to notice `stakers()` shrank.
+    for addr in &newly_jailed_for_downtime {
+        if engine.write().await.validator_set.remove(addr) {
+            warn!(
+                validator = %addr,
+                height,
+                "Validator downtime-jailed — excluded from BFT rounds until it submits Unjail"
+            );
         }
     }
 

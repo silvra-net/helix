@@ -59,6 +59,24 @@ pub fn execute_block(
 
     let height = block.height();
     let base_fee_per_byte = block.header.base_fee_per_byte;
+
+    // Downtime-jailing bookkeeping, against the validator set as it stood *entering* this
+    // block (i.e. the set `last_commit` — the parent block's precommits — was actually voted
+    // by), before any of this block's own transactions (Stake/Unstake/SubmitDoubleSignEvidence,
+    // etc.) can change who qualifies. Only independently-verified signatures count as
+    // "signed" — `execute_block` doesn't trust the header's claim, the same defense-in-depth
+    // every transaction's own signature already gets (see `CommitSig::verify`'s doc comment
+    // on why a proposer can't fabricate participation either direction).
+    let current_validators: Vec<Address> = state.stakers().into_iter().map(|(a, _)| a).collect();
+    let signers: std::collections::HashSet<Address> = block
+        .header
+        .last_commit
+        .iter()
+        .filter(|sig| sig.verify(height.saturating_sub(1), &block.header.prev_hash).is_ok())
+        .map(|sig| sig.validator.clone())
+        .collect();
+    let newly_jailed = state.record_block_participation(&current_validators, &signers, height);
+
     for tx in &block.transactions {
         let receipt = execute_transaction(state, tx, fee_recipient, height, base_fee_per_byte);
         total_burned += receipt.fee_burned;
@@ -88,6 +106,7 @@ pub fn execute_block(
         total_burned,
         validator_reward: total_validator_reward,
         block_reward_minted,
+        newly_jailed,
     }
 }
 
@@ -173,6 +192,7 @@ pub fn execute_transaction(
         TxType::Undelegate => execute_undelegate(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::Redelegate => execute_redelegate(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::SetCommission => execute_set_commission(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::Unjail => execute_unjail(state, tx, validator, tx_hash, height, base_fee_amount),
     };
 
     if receipt.success {
@@ -463,6 +483,49 @@ fn execute_claim_unbonded(
         // explicitly), but an empty queue that still names a validator is a lie about the
         // account's state and exactly the kind of thing a later reader would trust.
         acc.unbonding_source = None;
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// `tx.from` explicitly rejoins the active validator set after downtime-jailing — see
+/// `TxType::Unjail`'s doc comment for why this isn't automatic. No payload.
+fn execute_unjail(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+    height: u64,
+    base_fee_amount: u64,
+) -> Receipt {
+    let key = tx.from.to_string();
+    let Some(&unlock_height) = state.jailed_until.get(&key) else {
+        return Receipt::failure(tx_hash, "not jailed", 0, 0);
+    };
+    if height < unlock_height {
+        return Receipt::failure(
+            tx_hash,
+            &format!("still jailed until height {unlock_height}, current {height}"),
+            0,
+            0,
+        );
+    }
+    if state.effective_stake(&tx.from) < state.governance_params.min_validator_stake {
+        return Receipt::failure(
+            tx_hash,
+            "stake below the minimum validator stake — unjailing would not requalify",
+            0,
+            0,
+        );
+    }
+
+    state.jailed_until.remove(&key);
+    state.missed_blocks.remove(&key);
+    state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
         acc.nonce += 1;
     });

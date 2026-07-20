@@ -13,6 +13,24 @@ use crate::governance::{GovernanceParams, GovernanceProposal};
 /// time. After this many blocks past the unstake tx, `ClaimUnbonded` releases the funds.
 pub const UNBONDING_PERIOD: u64 = 302_400;
 
+/// Consecutive blocks a validator's precommit must be absent from `BlockHeader::last_commit`
+/// (see `record_block_participation`) before persisted downtime-jailing kicks in. Sized to
+/// fire only once blocks are already flowing again — the RAM-only, per-node
+/// `helix-consensus::LIVENESS_JAIL_ROUNDS` mechanism is what actually keeps the chain
+/// producing during the outage itself; this is the follow-up, on-chain layer that makes the
+/// exclusion survive node restarts and requires an explicit `Unjail` to undo. 150 blocks ≈
+/// 5 minutes at the 2s block time.
+pub const DOWNTIME_JAIL_THRESHOLD_BLOCKS: u32 = 150;
+
+/// Minimum blocks a downtime-jailed validator must wait before `TxType::Unjail` is accepted —
+/// see its doc comment for why unjailing isn't automatic. 300 blocks ≈ 10 minutes at the 2s
+/// block time, matching Cosmos SDK's own default downtime-jail duration (600s). Deliberately
+/// carries **no slash**: downtime alone isn't proof of malice (a validator's node crashing
+/// and restarting is the common case, not the adversarial one) — slashing stays reserved for
+/// provable misbehavior (`SLASH_FRACTION_BPS`, double-signing). Jailing alone is real
+/// friction: while jailed, that stake earns nothing and casts no vote.
+pub const MIN_JAIL_BLOCKS: u64 = 300;
+
 /// Per-account ledger state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
@@ -316,6 +334,23 @@ pub struct ChainState {
     /// immediately on the way out but never early on the way in).
     #[serde(default)]
     pub pending_validators: std::collections::HashSet<Address>,
+    /// Consecutive blocks (address string -> count) a validator's precommit has been absent
+    /// from `BlockHeader::last_commit`, as counted by `record_block_participation`. Reset to
+    /// absent the instant a signature from that validator is seen again — a handful of missed
+    /// blocks proves nothing (a proposer momentarily behind on gossip, a validator mid-restart),
+    /// only sustained absence does. Not the same mechanism as `helix-consensus`'s local,
+    /// RAM-only `missed_rounds`/`LIVENESS_JAIL_ROUNDS` (which exists purely to keep blocks
+    /// producing at all during an outage) — this is the persisted, on-chain layer that survives
+    /// node restarts and has an actual consequence (`jailed_until`).
+    #[serde(default)]
+    pub missed_blocks: HashMap<String, u32>,
+    /// Address string -> height at which a downtime-jailed validator may submit
+    /// `TxType::Unjail`. Presence in this map (regardless of whether that height has passed)
+    /// is what `stakers()` excludes on — jailing is never automatic-undone, an explicit
+    /// `Unjail` transaction removes the entry. See `TxType::Unjail`'s doc comment for why
+    /// auto-rejoining the instant a validator reappears would defeat the point.
+    #[serde(default)]
+    pub jailed_until: HashMap<String, u64>,
 }
 
 impl ChainState {
@@ -344,6 +379,8 @@ impl ChainState {
             genesis_validator_stake: 0,
             genesis_allocations: Vec::new(),
             pending_validators: std::collections::HashSet::new(),
+            missed_blocks: HashMap::new(),
+            jailed_until: HashMap::new(),
         }
     }
 
@@ -543,6 +580,40 @@ impl ChainState {
         total
     }
 
+    /// Update `missed_blocks` from a newly-applied block's `last_commit`, jailing any address
+    /// that crosses `DOWNTIME_JAIL_THRESHOLD_BLOCKS`. Called once per block, after the block's
+    /// own transactions have executed (see `execute_block`) — `current_validators` is the
+    /// active set as of the height being applied (the set the block was actually proposed and
+    /// voted against), `signers` is who `BlockHeader::last_commit` proves participated in
+    /// finalizing the *previous* block.
+    ///
+    /// Returns the addresses newly jailed this call — the caller (`helix-node`'s
+    /// `apply_finalized_block`) also fast-jails them out of the live `BftEngine`'s
+    /// `ValidatorSet` immediately, the same way `SubmitDoubleSignEvidence` already does for
+    /// slashing, rather than waiting for the next epoch rotation to notice `stakers()` shrank.
+    pub fn record_block_participation(
+        &mut self,
+        current_validators: &[Address],
+        signers: &std::collections::HashSet<Address>,
+        height: u64,
+    ) -> Vec<Address> {
+        let mut newly_jailed = Vec::new();
+        for addr in current_validators {
+            let key = addr.to_string();
+            if signers.contains(addr) {
+                self.missed_blocks.remove(&key);
+                continue;
+            }
+            let count = self.missed_blocks.entry(key.clone()).or_insert(0);
+            *count += 1;
+            if *count >= DOWNTIME_JAIL_THRESHOLD_BLOCKS && !self.jailed_until.contains_key(&key) {
+                self.jailed_until.insert(key, height + MIN_JAIL_BLOCKS);
+                newly_jailed.push(addr.clone());
+            }
+        }
+        newly_jailed
+    }
+
     /// Drop redelegation entries whose source-slashing window has closed. Called once per block
     /// (see `execute_block`) — without it every redelegation ever made would stay in consensus
     /// state forever, and each source validator's slash would walk a list that only grows.
@@ -634,6 +705,12 @@ impl ChainState {
             .accounts
             .values()
             .filter_map(|acc| {
+                // Downtime-jailed: excluded until an explicit `Unjail` tx removes the entry,
+                // regardless of stake — jailing never touches the stake itself, only
+                // eligibility. See `jailed_until`'s doc comment.
+                if self.jailed_until.contains_key(&acc.address) {
+                    return None;
+                }
                 let addr = Address::from_str(&acc.address).ok()?;
                 let effective = self.effective_stake(&addr);
                 (effective >= min_stake).then_some((addr, effective))
@@ -793,6 +870,8 @@ impl ChainState {
             genesis_validator_stake: u64,
             genesis_allocations: BTreeMap<&'a str, u64>,
             pending_validators: std::collections::BTreeSet<&'a str>,
+            missed_blocks: BTreeMap<&'a str, u32>,
+            jailed_until: BTreeMap<&'a str, u64>,
         }
 
         let canonical = Canonical {
@@ -856,6 +935,8 @@ impl ChainState {
                 .map(|(a, b)| (a.as_str(), *b))
                 .collect(),
             pending_validators: self.pending_validators.iter().map(|a| a.as_str()).collect(),
+            missed_blocks: self.missed_blocks.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
+            jailed_until: self.jailed_until.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
         };
 
         let bytes = bincode::serialize(&canonical).expect("canonical chain state serialization is infallible");

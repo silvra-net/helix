@@ -114,6 +114,15 @@ pub enum TxType {
     /// commission to attract delegators, then raise it to 100% after the fact and keep every
     /// future reward, with delegators locked in until they notice and unbond.
     SetCommission,
+    /// `tx.from` explicitly rejoins the active validator set after being downtime-jailed
+    /// (see `ChainState::jailed_until`). No payload. Deliberately not automatic — jailing
+    /// exists so a validator that goes dark stops silently counting toward quorum forever
+    /// (see `helix_core::CommitSig`'s doc comment); auto-rejoining the instant a node comes
+    /// back would undo that with the same downtime recurring every time the same flaky
+    /// connection drops again. Requires `jailed_until <= current height` (the minimum jail
+    /// window has actually elapsed) and that `tx.from` still meets `min_validator_stake` —
+    /// jailing never touches stake itself, only eligibility.
+    Unjail,
 }
 
 /// Payload embedded in `Transaction::data` for `TxType::ProvePersonhood`.
