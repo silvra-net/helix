@@ -861,6 +861,20 @@ mutually exclusive:
 height/round) burns 5% of your stake *and* 5% of your delegators' pooled stake, and jails you
 from BFT rounds immediately — not just at the next epoch. Run one node per key. Ever.
 
+**Downtime risk (no slash, but real friction):** a validator whose precommit is missing from
+`last_commit` for ~150 consecutive blocks (~5 minutes) is downtime-jailed — excluded from
+`stakers()`, earning nothing, until it explicitly rejoins:
+```bash
+helix tx unjail --key validator-key.json   # only once your node is actually back and connected
+```
+Requires the minimum jail window (~300 blocks, ~10 minutes) to have passed and your stake to
+still meet the minimum. Unlike double-sign slashing this costs no HLX — going offline isn't
+proof of malice, only sustained silence is treated as a liveness problem — but it isn't
+automatic either: the same reasoning that makes an ordinary restart safe (jailing survives it,
+so the same flaky connection can't refreeze the chain every time you reboot) is exactly why
+rejoining needs a deliberate transaction, not a timer. Check whether you're currently jailed
+with `helix account <your-address>`.
+
 ### Delegating to a Validator
 
 Earn a share of a validator's block rewards without running any infrastructure:
@@ -976,7 +990,18 @@ cannot manufacture two competing quorums for the same round. The cost is honest,
 as long as a validator is excluded, the remaining set's effective fault tolerance is lower — the
 same trust level Helix already ran under for most of its life as a single-validator devnet, now
 entered automatically instead of via a permanent freeze. Nothing here touches `ChainState`,
-stake, or the persisted validator set.
+stake, or the persisted validator set — it exists purely to keep blocks producing *during* an
+outage, restarting from zero on every node restart.
+
+**What makes that exclusion stick is a second, persisted layer on top.** Every block header
+carries `last_commit` — the precommit signatures that finalized its *parent* (see
+`helix_core::CommitSig`) — and `ChainState` counts, per validator, how many consecutive blocks
+its signature was actually absent from that. After ~150 blocks (~5 minutes) of confirmed,
+continued absence, the validator is **downtime-jailed**: removed from `stakers()` outright,
+independent of stake, until it submits an explicit `Unjail` transaction (see
+[Staking](#staking)). Unlike the RAM-only mechanism above, this survives node restarts and
+carries no slash — downtime alone isn't proof of malice, only lost quorum weight and rewards
+while jailed.
 
 **Proof of Personhood** caps how much voting power a single identity can accumulate:
 - Without verification: voting power capped at 0.5% of the network
@@ -1247,10 +1272,12 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
   nonces, and money-path arithmetic is overflow-checked; delegation uses shares-based accounting
   hardened against rounding/inflation loss
 - Double-signing is provable on-chain and slashed; misbehaving peers are scored and banned
-- A validator that goes completely silent for a sustained period (~10 minutes) stops counting
-  toward this node's own BFT quorum, so a permanently or temporarily unreachable validator
-  degrades liveness instead of freezing the chain forever — see the
-  [Consensus](#consensus) section
+- A validator that goes silent stops blocking the chain rather than freezing it forever, in
+  two layers: a local, RAM-only exclusion keeps blocks producing within the first ~10 minutes
+  of an outage, and a persisted, on-chain **downtime-jailing** mechanism (`last_commit` +
+  `ChainState::jailed_until`) takes over from there — surviving node restarts and requiring an
+  explicit `Unjail` transaction to rejoin, with no slash for downtime alone. See
+  [Consensus](#consensus) and [Staking](#staking)
 
 **Known limitations (honest status, not finished guarantees):**
 
