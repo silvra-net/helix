@@ -1150,7 +1150,7 @@ async fn apply_finalized_block(
 
     // Immediately jail any validator whose double-sign slash just landed in this block,
     // instead of leaving them at full, stale voting power until the next epoch rotation
-    // (up to EPOCH_LENGTH blocks / ~20 min away). Scans the block's own transactions —
+    // (up to EPOCH_LENGTH blocks / ~3.3 min away at BLOCK_TIME_MS). Scans the block's own transactions —
     // rather than engine.take_evidence(), which is per-node/asymmetric — so every node
     // reaches the identical jailing decision, matching the deterministic slash itself:
     // membership in `slashed_double_sign_incidents` is only ever true after the incident
@@ -1183,9 +1183,17 @@ async fn apply_finalized_block(
     // PersonhoodStatus::Verified, which unlocks the 1% voting-power cap
     // (instead of the 0.5% cap for unverified validators).
     if height % helix_consensus::EPOCH_LENGTH == 0 {
-        let state_guard = chain_state.read().await;
-        let stakers = state_guard.stakers();
-        let validators: Vec<Validator> = stakers
+        let previously_active: std::collections::HashSet<Address> = {
+            engine.read().await.validator_set().validators.iter().map(|v| v.address.clone()).collect()
+        };
+        let mut state_guard = chain_state.write().await;
+        // A `Stake` tx alone would otherwise be enough to become quorum-critical the moment
+        // this rotation hits, with no online-check and no warning — see
+        // `pending_validators`' doc comment. New entrants sit out this rotation instead of
+        // joining `validators` below; still-current members are never delayed.
+        let activated = state_guard.stakers_after_delayed_activation(&previously_active);
+        let deferred: Vec<Address> = state_guard.pending_validators.iter().cloned().collect();
+        let validators: Vec<Validator> = activated
             .into_iter()
             .map(|(addr, stake)| {
                 let has_personhood = state_guard.has_personhood(&addr);
@@ -1193,6 +1201,17 @@ async fn apply_finalized_block(
             })
             .collect();
         drop(state_guard);
+        for addr in &deferred {
+            warn!(
+                height,
+                validator = %addr,
+                "New stake crossed the validator threshold — held out of the active set until \
+                 the next epoch rotation (~{} blocks) instead of becoming quorum-critical \
+                 immediately; make sure this validator's node is actually running and \
+                 connected before then",
+                helix_consensus::EPOCH_LENGTH
+            );
+        }
         let had = validators.len();
         let mut eng = engine.write().await;
         eng.rotate_validator_set(validators);
@@ -2666,6 +2685,66 @@ mod handle_p2p_event_tests {
             "the racing duplicate must not mint the block reward a second time"
         );
         assert_eq!(store.read().await.latest_height(), 3, "the racing duplicate must not re-touch storage either");
+    }
+
+    /// Wiring-level regression test for the new-entrant delay in epoch rotation — the pure
+    /// promotion logic itself (`ChainState::stakers_after_delayed_activation`) has exhaustive
+    /// unit coverage in `helix_executor::state`; this proves `apply_finalized_block`'s rotation
+    /// block actually threads `engine.validator_set()` through as `previously_active` and holds
+    /// a brand-new staker out of the active set for one full epoch. Closes the gap found live
+    /// on 2026-07-20: a `Stake` tx alone made a second validator quorum-critical the moment the
+    /// epoch rotated, with no online-check and no warning, freezing the chain for hours because
+    /// their node wasn't actually connected yet.
+    #[tokio::test]
+    async fn epoch_rotation_defers_a_brand_new_staker_by_one_epoch() {
+        let genesis_kp = KeyPair::generate();
+        let genesis_addr = Address::from_public_key(&genesis_kp.public);
+        let new_staker_addr = Address::from_public_key(&KeyPair::generate().public);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            cs.governance_params.min_validator_stake = 1;
+            cs.update_account(&genesis_addr, |acc| acc.staked = 1_000_000);
+            // Staked directly rather than via a `Stake` tx — the rotation only cares about
+            // `stakers()`, and this keeps the test focused on the rotation wiring itself.
+            cs.update_account(&new_staker_addr, |acc| acc.staked = 1_000_000);
+        }
+        let validator_set = ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, genesis_addr.clone(), 0)));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        let last_applied_height = Arc::new(Mutex::new(0u64));
+
+        // First epoch boundary: both accounts already qualify, but new_staker_addr was never
+        // part of the active set before — it must not appear in the rotated set yet.
+        let block_at_epoch = signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH, Hash::ZERO);
+        apply_finalized_block(
+            block_at_epoch, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+        )
+        .await;
+
+        assert!(
+            engine.read().await.validator_set().get(&genesis_addr).is_some(),
+            "the already-active validator must remain active"
+        );
+        assert!(
+            engine.read().await.validator_set().get(&new_staker_addr).is_none(),
+            "a brand-new staker must not become quorum-critical on the very rotation it first qualifies"
+        );
+
+        // Second epoch boundary, one full epoch later: the new staker must now be promoted.
+        let block_at_second_epoch = signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * 2, Hash::ZERO);
+        apply_finalized_block(
+            block_at_second_epoch, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+        )
+        .await;
+
+        assert!(
+            engine.read().await.validator_set().get(&new_staker_addr).is_some(),
+            "the staker must be promoted at the next epoch rotation"
+        );
     }
 }
 

@@ -51,6 +51,14 @@ const GENESIS_EXTRA_VALIDATORS: TableDefinition<&str, &[u8]> = TableDefinition::
 /// `ChainState::genesis_allocations`'s doc comment for why this is recorded rather than left to
 /// the `GENESIS_PREFUND` compile-time default.
 const GENESIS_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("genesis_allocations");
+/// address string → unused, same set-as-table pattern as `PERSONHOOD_AUTHORITIES` — see
+/// `ChainState::pending_validators`'s doc comment. Entries are removed as well as added (on
+/// promotion to active, or on dropping back below the stake threshold before ever being
+/// promoted), so this needs the same stale-key pruning as `RECOVERY_REQUESTS`/`REDELEGATIONS`:
+/// insert-only persistence would resurrect an already-promoted (or already-dropped) address on
+/// the next restart and make it wait out the delay a second time — or never activate at all if
+/// it was promoted and the promotion itself hasn't landed in a later block's save yet.
+const PENDING_VALIDATORS: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_validators");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// address string → (block height, tx index within block), both big-endian so a
 /// key's values sort in ascending chain order for free. Lets `address_transactions`
@@ -102,6 +110,7 @@ impl HelixDb {
         tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -128,6 +137,7 @@ impl HelixDb {
             let mut validator_pools = tx.open_table(VALIDATOR_POOLS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut delegator_shares = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut redelegations = tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut pending_validators = tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut contract_storage = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut genesis_extra_validators = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut genesis_allocations = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -283,6 +293,30 @@ impl HelixDb {
                 genesis_allocations.insert(addr.as_str(), &balance.to_le_bytes()[..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // Same stale-key pruning as RECOVERY_REQUESTS/REDELEGATIONS — see
+            // PENDING_VALIDATORS' doc comment for why insert-only isn't safe here.
+            {
+                let current: std::collections::HashSet<&str> =
+                    state.pending_validators.iter().map(|a| a.as_str()).collect();
+                let stale: Vec<String> = pending_validators
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!current.contains(key.as_str())).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    pending_validators
+                        .remove(key.as_str())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
+            for addr in &state.pending_validators {
+                pending_validators.insert(addr.as_str(), &[][..])
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
         }
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))
     }
@@ -303,6 +337,7 @@ impl HelixDb {
         let delegator_shares_table = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
         let redelegations_table = tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         let contract_storage_table = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
+        let pending_validators_table = tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_extra_validators_table = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_allocations_table = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -453,6 +488,16 @@ impl HelixDb {
             genesis_allocations.push((address, u64::from_le_bytes(balance_bytes)));
         }
 
+        let mut pending_validators = std::collections::HashSet::new();
+        let pending_validators_iter =
+            pending_validators_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        for entry in pending_validators_iter {
+            let (k, _v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let address = Address::from_str(k.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            pending_validators.insert(address);
+        }
+
         let read_meta_u64 = |key: &str| -> Option<u64> {
             meta_table.get(key).ok().flatten().and_then(|v| {
                 let bytes: [u8; 8] = v.value().try_into().ok()?;
@@ -506,6 +551,7 @@ impl HelixDb {
             genesis_extra_validators,
             genesis_validator_stake,
             genesis_allocations,
+            pending_validators,
         })
     }
 
@@ -1137,6 +1183,55 @@ mod tests {
             loaded.redelegations.is_empty(),
             "an expired redelegation resurrected from the DB after reopening"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pending_validators_survive_reopening_the_database() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.pending_validators.insert(addr(1));
+        state.pending_validators.insert(addr(2));
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert_eq!(loaded.pending_validators.len(), 2);
+        assert!(loaded.pending_validators.contains(&addr(1)));
+        assert!(loaded.pending_validators.contains(&addr(2)));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same failure mode as `pruned_redelegation_does_not_resurrect_after_reopening`: a
+    /// promoted (or dropped) pending validator must not come back from the dead on restart —
+    /// that would either make it wait out the delay a second time, or worse, silently exclude
+    /// an already-active validator the next time the in-memory `pending_validators` set is
+    /// consulted for a fresh promotion decision.
+    #[test]
+    fn a_promoted_pending_validator_does_not_resurrect_after_reopening() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.pending_validators.insert(addr(1));
+        state.pending_validators.insert(addr(2));
+        db.save_chain_state(&state).unwrap();
+
+        // addr(1) gets promoted (removed from pending), addr(2) stays pending.
+        state.pending_validators.remove(&addr(1));
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert!(
+            !loaded.pending_validators.contains(&addr(1)),
+            "a promoted validator resurrected as pending after reopening"
+        );
+        assert!(loaded.pending_validators.contains(&addr(2)));
 
         let _ = std::fs::remove_file(&path);
     }

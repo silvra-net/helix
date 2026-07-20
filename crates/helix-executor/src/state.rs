@@ -301,6 +301,21 @@ pub struct ChainState {
     /// genesis. Chains launching from here on store whatever they actually allocated.
     #[serde(default)]
     pub genesis_allocations: Vec<(Address, u64)>,
+    /// Addresses that currently meet `min_validator_stake` but have never yet been part of
+    /// the active BFT validator set — waiting out one full epoch (`EPOCH_LENGTH` blocks)
+    /// before `rotate_validator_set` admits them.
+    ///
+    /// Without this, a `Stake` transaction alone is enough to become quorum-critical the
+    /// moment the next epoch boundary hits — no online-check, no advance warning, whether
+    /// or not the staker has a node running at all. In a small validator set that can freeze
+    /// the whole chain instantly (2-of-2 quorum needs both; found live on 2026-07-20 when a
+    /// second validator staked and the epoch rotated before their node ever connected).
+    /// Existing validators dropping below the threshold are NOT delayed — only entry is,
+    /// since holding back a departure is the direction that risks an empty/stuck set, not
+    /// this one (mirrors the asymmetry already established for slashing/jailing, which acts
+    /// immediately on the way out but never early on the way in).
+    #[serde(default)]
+    pub pending_validators: std::collections::HashSet<Address>,
 }
 
 impl ChainState {
@@ -328,6 +343,7 @@ impl ChainState {
             genesis_extra_validators: Vec::new(),
             genesis_validator_stake: 0,
             genesis_allocations: Vec::new(),
+            pending_validators: std::collections::HashSet::new(),
         }
     }
 
@@ -627,6 +643,39 @@ impl ChainState {
         stakers
     }
 
+    /// `stakers()`, but with new entries held out of the active set for one full epoch — see
+    /// `pending_validators`' doc comment for why. `previously_active` is the validator set
+    /// about to be replaced (i.e. still-current members are never delayed, only genuinely new
+    /// ones); mutates `self.pending_validators` in place and returns exactly the addresses
+    /// that should make up the new active set this rotation.
+    ///
+    /// Pure aside from that one mutation, so it's fully unit-testable without a chain, an
+    /// engine, or block production — call it repeatedly with the previous call's own state to
+    /// simulate consecutive rotations.
+    pub fn stakers_after_delayed_activation(
+        &mut self,
+        previously_active: &std::collections::HashSet<Address>,
+    ) -> Vec<(Address, u64)> {
+        let current = self.stakers();
+        let qualifying: std::collections::HashSet<&Address> = current.iter().map(|(a, _)| a).collect();
+        // Anyone who no longer qualifies gets no credit for a wait they didn't finish —
+        // re-crossing the threshold later starts the delay over.
+        self.pending_validators.retain(|addr| qualifying.contains(addr));
+
+        let mut activated = Vec::with_capacity(current.len());
+        let mut still_new = std::collections::HashSet::new();
+        for (addr, stake) in &current {
+            if previously_active.contains(addr) || self.pending_validators.contains(addr) {
+                activated.push((addr.clone(), *stake));
+            } else {
+                // First time crossing the threshold — sit out this rotation, eligible next time.
+                still_new.insert(addr.clone());
+            }
+        }
+        self.pending_validators = still_new;
+        activated
+    }
+
     /// An address's total stake-weighted backing for validator-set eligibility and BFT
     /// voting power: its own `AccountState::staked` plus whatever its delegation pool (if
     /// any) currently holds. This is deliberately *not* what counts for governance voting
@@ -743,6 +792,7 @@ impl ChainState {
             genesis_extra_validators: BTreeMap<&'a str, u64>,
             genesis_validator_stake: u64,
             genesis_allocations: BTreeMap<&'a str, u64>,
+            pending_validators: std::collections::BTreeSet<&'a str>,
         }
 
         let canonical = Canonical {
@@ -805,6 +855,7 @@ impl ChainState {
                 .iter()
                 .map(|(a, b)| (a.as_str(), *b))
                 .collect(),
+            pending_validators: self.pending_validators.iter().map(|a| a.as_str()).collect(),
         };
 
         let bytes = bincode::serialize(&canonical).expect("canonical chain state serialization is infallible");
@@ -959,5 +1010,79 @@ mod tests {
         let after = state.state_hash();
 
         assert_ne!(before, after);
+    }
+
+    fn stake(state: &mut ChainState, seed: u8, amount: u64) {
+        state.update_account(&addr(seed), |acc| acc.staked = amount);
+    }
+
+    /// The core property this whole mechanism exists for: a brand-new staker must sit out
+    /// the rotation in which they first qualify, and only activate on the *next* one — never
+    /// immediately, no matter how large their stake.
+    #[test]
+    fn a_new_staker_is_deferred_one_rotation_then_activated() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 100); // already active
+        stake(&mut state, 2, 100); // just crossed the threshold
+
+        let previously_active: std::collections::HashSet<Address> = [addr(1)].into_iter().collect();
+
+        let first_rotation = state.stakers_after_delayed_activation(&previously_active);
+        assert_eq!(first_rotation, vec![(addr(1), 100)], "the new staker must not appear yet");
+        assert!(
+            state.pending_validators.contains(&addr(2)),
+            "the new staker must be recorded as pending"
+        );
+
+        // Simulate the next rotation — the active set hasn't changed (addr(2) never got
+        // promoted), so `previously_active` is unchanged too.
+        let second_rotation = state.stakers_after_delayed_activation(&previously_active);
+        let mut addrs: Vec<Address> = second_rotation.into_iter().map(|(a, _)| a).collect();
+        addrs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(addrs, vec![addr(1), addr(2)], "the staker must activate on the second rotation");
+        assert!(state.pending_validators.is_empty(), "a promoted staker must leave the pending set");
+    }
+
+    /// A staker that drops back below the threshold before ever being promoted gets no
+    /// credit for the wait already spent — re-crossing later must start the delay over, not
+    /// pick up where it left off (otherwise a stake/unstake/restake cycle timed around
+    /// rotations could shortcut the whole mechanism).
+    #[test]
+    fn dropping_below_the_threshold_before_promotion_forfeits_the_wait() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 2, 100);
+        let empty: std::collections::HashSet<Address> = std::collections::HashSet::new();
+
+        state.stakers_after_delayed_activation(&empty);
+        assert!(state.pending_validators.contains(&addr(2)));
+
+        // Unstakes back below the threshold before the next rotation ever promotes it.
+        stake(&mut state, 2, 0);
+        let after_drop = state.stakers_after_delayed_activation(&empty);
+        assert!(after_drop.is_empty());
+        assert!(state.pending_validators.is_empty(), "no longer qualifying — forgotten, not retained");
+
+        // Re-crosses the threshold — must defer again, not activate immediately just
+        // because it was pending once before.
+        stake(&mut state, 2, 100);
+        let after_restake = state.stakers_after_delayed_activation(&empty);
+        assert!(after_restake.is_empty(), "re-crossing the threshold must restart the delay");
+        assert!(state.pending_validators.contains(&addr(2)));
+    }
+
+    /// A validator already in the active set is never delayed, regardless of pending-set
+    /// state — being currently active always takes priority.
+    #[test]
+    fn an_already_active_validator_is_never_delayed() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 250); // stake changed since last rotation, still qualifies
+        let previously_active: std::collections::HashSet<Address> = [addr(1)].into_iter().collect();
+
+        let activated = state.stakers_after_delayed_activation(&previously_active);
+        assert_eq!(activated, vec![(addr(1), 250)]);
+        assert!(state.pending_validators.is_empty());
     }
 }
