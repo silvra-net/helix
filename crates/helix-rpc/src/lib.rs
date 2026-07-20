@@ -183,6 +183,15 @@ pub struct AccountResponse {
     pub unbonding_source: Option<String>,
     pub nonce: u64,
     pub has_code: bool,
+    /// Height at which this address may submit `Unjail`, or `null` if it isn't
+    /// downtime-jailed. Presence (not the height itself) is what excludes it from
+    /// `stakers()` — see `ChainState::jailed_until`'s doc comment.
+    pub jailed_until: Option<u64>,
+    /// Consecutive blocks this address's precommit has been absent from `last_commit`, or
+    /// `null` if it currently has none — resets to `null` the instant it's seen signing
+    /// again. 0 while jailed only if it was jailed and immediately unjailed without ever
+    /// having signed since (rare in practice; `execute_unjail` clears both together).
+    pub missed_blocks: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

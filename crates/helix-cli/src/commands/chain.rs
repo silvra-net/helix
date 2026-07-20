@@ -79,6 +79,11 @@ pub async fn show_account(address: &str, node: &str) -> Result<()> {
             None => println!("             still slashable if you double-sign"),
         }
     }
+    if let Some(unlock_height) = res["jailed_until"].as_u64() {
+        println!("  Jailed   : downtime-jailed, can submit `tx unjail` at block #{unlock_height}");
+    } else if let Some(missed) = res["missed_blocks"].as_u64() {
+        println!("  Missed   : {missed} consecutive blocks without a signature seen (resets on the next one)");
+    }
     println!("  Nonce    : {}", res["nonce"]);
 
     let delegations: serde_json::Value = reqwest::get(format!("{}/accounts/{}/delegations", node, address))

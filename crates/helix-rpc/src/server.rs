@@ -471,6 +471,8 @@ async fn get_account(
                 unbonding_source: acc.unbonding_source.clone(),
                 nonce: acc.nonce,
                 has_code: acc.code.is_some(),
+                jailed_until: chain.jailed_until.get(&address).copied(),
+                missed_blocks: chain.missed_blocks.get(&address).copied(),
             })),
         ),
         None => (

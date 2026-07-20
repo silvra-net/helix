@@ -53,6 +53,20 @@ pub enum TxCmd {
         #[arg(long)]
         nonce: Option<u64>,
     },
+    /// Rejoin the active validator set after being downtime-jailed — see `helix account
+    /// <address>` for whether you're jailed and the height you can unjail from. Not
+    /// automatic on purpose: submit this once your node is actually back and connected,
+    /// not before, or you'll just get jailed again once the same downtime resumes counting.
+    Unjail {
+        /// Wallet key file
+        #[arg(short, long, default_value = "wallet.json")]
+        key: PathBuf,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
     /// Claim unbonded stake back to liquid balance (after 7-day unbonding period)
     ClaimUnbonded {
         /// Wallet key file
@@ -142,6 +156,7 @@ pub async fn run(cmd: TxCmd, node: &str) -> Result<()> {
         TxCmd::Unstake { amount, key, fee, nonce } => {
             simple_amount_tx(TxType::Unstake, amount, key, fee, nonce, node).await
         }
+        TxCmd::Unjail { key, fee, nonce } => zero_amount_tx(TxType::Unjail, key, fee, nonce, node).await,
         TxCmd::ClaimUnbonded { key, fee, nonce } => {
             zero_amount_tx(TxType::ClaimUnbonded, key, fee, nonce, node).await
         }
