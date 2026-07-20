@@ -1,13 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Helix Wallet",
-  "version": "0.7.1",
   "identifier": "net.silvra.helix.wallet",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": "node scripts/sync-version.mjs && npm run dev",
+    "beforeBuildCommand": "node scripts/sync-version.mjs && npm run build"
   },
   "app": {
     "windows": [

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { api } from "../api";
 
 // Settings: the deliberate backup path. A wallet created before you wrote the 24 words down would
@@ -12,9 +13,15 @@ export default function Settings({ address }: { address: string }) {
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [logDir, setLogDir] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   useEffect(() => {
     api.logDirPath().then(setLogDir).catch(() => setLogDir(null));
+    // Read at runtime from the compiled binary (Tauri's own app-info API), not a string typed
+    // into the UI somewhere — the number a bug report needs is the one this specific install was
+    // actually built with, which is now synced from the workspace version at every build (see
+    // gui/scripts/sync-version.mjs) instead of the three-file manual bump that used to drift.
+    getVersion().then(setAppVersion).catch(() => setAppVersion(null));
   }, []);
 
   const reveal = async () => {
@@ -127,6 +134,10 @@ export default function Settings({ address }: { address: string }) {
           If something goes wrong, this file has the details — attach it when reporting a bug.
           It never contains your passphrase, mnemonic, or private key.
         </p>
+        <div className="kv">
+          <span className="muted">Wallet app version</span>
+          <span className="mono">{appVersion ?? "…"}</span>
+        </div>
         {logDir ? (
           <>
             <div className="kv">

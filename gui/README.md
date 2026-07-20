@@ -89,6 +89,16 @@ automatically (see below).
 App icons ship in `src-tauri/icons/` (regenerate from a new source with
 `npm run tauri icon app-icon.png`).
 
+**Version:** the GUI's version number is not maintained by hand — `gui/src-tauri` is a
+deliberately separate Cargo workspace (see its `Cargo.toml`), so it can't use `version.workspace
+= true` against the root one. Instead, `scripts/sync-version.mjs` runs automatically as the first
+step of both `npm run tauri dev` and `npm run tauri build` (wired into `tauri.conf.json`'s
+`beforeDevCommand`/`beforeBuildCommand`) and copies the version straight from the root
+`Cargo.toml` into `gui/package.json` and `gui/src-tauri/Cargo.toml`; `tauri.conf.json` itself has
+no version field, so it falls back to `src-tauri/Cargo.toml`. The version shown in Settings
+(and baked into the installer filename) is therefore always the version this specific build was
+actually made from — never a manually-bumped number left stale from a previous release.
+
 CI builds full installers (with the sidecar bundled in) for Linux, macOS, and Windows on every
 push that touches `gui/` (and on demand via *Actions → Build Helix Wallet → Run workflow*).
 Download them from the run's **Artifacts** — this is a plain CI build, not a tagged release, so

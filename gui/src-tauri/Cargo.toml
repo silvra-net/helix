@@ -1,6 +1,6 @@
 [package]
 name = "helix-gui"
-version = "0.1.0"
+version = "0.7.3"
 edition = "2021"
 description = "Helix Wallet — desktop client for the Helix blockchain"
 authors = ["SILVRA"]
