@@ -30,7 +30,7 @@ resolver = "2"
 # format three times. 1.0 is a promise about stability that nothing here can keep yet. It costs
 # nothing to say so, and claiming otherwise cost credibility that the rest of the project works
 # hard to earn.
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 authors = ["SILVRA"]
 license = "MIT"
