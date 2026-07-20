@@ -87,6 +87,11 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: helix-wallet-${{ matrix.name }}
+          # An explicit `--target` (needed above so the sidecar's target-triple filename
+          # matches) makes cargo/tauri nest output under target/<triple>/ even for the host's
+          # own triple — plain target/release/bundle/ is empty and the upload silently warns
+          # instead of failing. Learned the hard way: the first run of this workflow "succeeded"
+          # with zero files uploaded.
           path: |
-            gui/src-tauri/target/release/bundle/**
+            gui/src-tauri/target/${{ matrix.target }}/release/bundle/**
           if-no-files-found: warn

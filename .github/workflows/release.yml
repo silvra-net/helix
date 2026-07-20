@@ -168,7 +168,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p gui-dist
-          find gui/src-tauri/target/release/bundle -type f \
+          # An explicit `--target` above (needed so the sidecar's target-triple filename
+          # matches) makes cargo/tauri nest output under target/<triple>/, even for the
+          # host's own triple — target/release/bundle/ alone is empty.
+          find gui/src-tauri/target/${{ matrix.target }}/release/bundle -type f \
             \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.dmg' \) \
             -exec cp {} gui-dist/ \;
           # Tauri names bundles after `productName` ("Helix Wallet") — rename to the same
@@ -187,7 +190,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path gui-dist | Out-Null
-          Get-ChildItem -Recurse gui/src-tauri/target/release/bundle -Include *.msi,*.exe |
+          # Same target/<triple>/ nesting note as the unix step above.
+          Get-ChildItem -Recurse gui/src-tauri/target/${{ matrix.target }}/release/bundle -Include *.msi,*.exe |
             Copy-Item -Destination gui-dist
           # Same rename as the unix step — see its comment.
           Get-ChildItem gui-dist | ForEach-Object {
