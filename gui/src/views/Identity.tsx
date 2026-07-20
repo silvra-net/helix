@@ -3,18 +3,34 @@ import { api } from "../api";
 import type { GuardianInfo, RecoveryStatus, SubmitResult } from "../types";
 import { shortAddr, shortHash } from "../format";
 
-// Social recovery: guardians that can together rotate a lost account to a new key — the thing a
-// seed phrase alone can't give you, and something Bitcoin has no notion of. Three jobs on one page:
-// manage your own guardians, help recover an account you're a guardian for, and (if you're the one
-// recovering) hand your new public key to your guardians.
-export default function Recovery({ node, address }: { node: string; address: string }) {
+// Everything about who you are on-chain: your .hlx name, and social recovery (the guardians who
+// can rotate a lost account, and helping recover someone else's). Two previously separate tabs —
+// merged because both answer the same underlying question ("how does this address represent me,
+// and what happens if I lose it"), not because either shrank.
+export default function Identity({ node, address }: { node: string; address: string }) {
+  const [myName, setMyName] = useState<string | null>(null);
+  const [nameLoaded, setNameLoaded] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [nameBusy, setNameBusy] = useState(false);
+
   const [guardians, setGuardians] = useState<GuardianInfo | null>(null);
   const [mine, setMine] = useState<RecoveryStatus | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const [recoveryLoaded, setRecoveryLoaded] = useState(false);
+
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
+  const loadName = useCallback(async () => {
+    try {
+      setMyName(await api.myName(node));
+    } catch {
+      setMyName(null);
+    } finally {
+      setNameLoaded(true);
+    }
+  }, [node]);
+
+  const loadRecovery = useCallback(async () => {
     try {
       const [g, r] = await Promise.all([
         api.getGuardians(node),
@@ -25,15 +41,19 @@ export default function Recovery({ node, address }: { node: string; address: str
     } catch (e) {
       setError(String(e));
     } finally {
-      setLoaded(true);
+      setRecoveryLoaded(true);
     }
   }, [node, address]);
 
   useEffect(() => {
-    load();
-    const id = setInterval(load, 8000);
+    loadName();
+    loadRecovery();
+    const id = setInterval(() => {
+      loadName();
+      loadRecovery();
+    }, 8000);
     return () => clearInterval(id);
-  }, [load]);
+  }, [loadName, loadRecovery]);
 
   const run = async (fn: () => Promise<SubmitResult>) => {
     setError(null);
@@ -41,12 +61,30 @@ export default function Recovery({ node, address }: { node: string; address: str
     try {
       const r = await fn();
       setNotice(`Submitted ${shortHash(r.tx_hash)} · ${r.status}`);
-      load();
+      loadName();
+      loadRecovery();
     } catch (e) {
       setError(String(e));
     }
   };
 
+  const registerName = async () => {
+    setNameBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const r = await api.registerName(node, newName.trim());
+      setNotice(`Submitted (${r.status}) — your name appears once it lands in a block.`);
+      setNewName("");
+      loadName();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setNameBusy(false);
+    }
+  };
+
+  const cleanedName = newName.trim().replace(/\.hlx$/, "");
   const pendingOnMe = mine && mine.pending_approvals != null;
 
   return (
@@ -68,9 +106,112 @@ export default function Recovery({ node, address }: { node: string; address: str
         </div>
       )}
 
-      <GuardianCard node={node} loaded={loaded} guardians={guardians} onRun={run} />
+      <div className="card">
+        <div className="section-title">Your name</div>
+        {!nameLoaded ? (
+          <div className="muted">…</div>
+        ) : myName ? (
+          <>
+            <div className="your-name mono">{myName}.hlx</div>
+            <p className="muted small">
+              This name resolves to your address across Helix. Registering another name replaces it.
+            </p>
+          </>
+        ) : (
+          <p className="muted small" style={{ marginTop: -4 }}>
+            You don't have a name yet. Register one so people can send to <code>you.hlx</code>
+            {" "}instead of a raw address.
+          </p>
+        )}
+
+        <label className="field" style={{ marginTop: 12 }}>
+          <span>Register a name</span>
+          <div className="name-input">
+            <input
+              value={newName}
+              spellCheck={false}
+              placeholder="alice"
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && cleanedName && registerName()}
+            />
+            <span className="suffix">.hlx</span>
+          </div>
+        </label>
+        <button className="primary" disabled={nameBusy || !cleanedName} onClick={registerName}>
+          {nameBusy ? "Signing…" : cleanedName ? `Register ${cleanedName}.hlx` : "Register"}
+        </button>
+      </div>
+
+      <NameResolver node={node} />
+
+      <div className="card">
+        <div className="section-title">Recovering a lost account into this wallet?</div>
+        <p className="muted small" style={{ marginTop: -4 }}>
+          This wallet's public key — the one your guardians rotate the old account to — is in
+          <strong> Settings → Wallet identity</strong>.
+        </p>
+      </div>
+
+      <GuardianCard node={node} loaded={recoveryLoaded} guardians={guardians} onRun={run} />
       <ApproveCard node={node} onRun={run} />
-      <RecoveringCard />
+    </div>
+  );
+}
+
+function NameResolver({ node }: { node: string }) {
+  const [query, setQuery] = useState("");
+  const [result, setResult] = useState<{ name: string; address: string | null } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const resolve = async () => {
+    const name = query.trim().replace(/\.hlx$/, "");
+    if (!name) return;
+    setBusy(true);
+    try {
+      const address = await api.resolveName(node, name);
+      setResult({ name, address });
+    } catch {
+      setResult({ name, address: null });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="card">
+      <div className="section-title">Look up a name</div>
+      <label className="field">
+        <span>Name</span>
+        <div className="name-input">
+          <input
+            value={query}
+            spellCheck={false}
+            placeholder="alice"
+            onChange={(e) => {
+              setResult(null);
+              setQuery(e.target.value);
+            }}
+            onKeyDown={(e) => e.key === "Enter" && resolve()}
+          />
+          <span className="suffix">.hlx</span>
+        </div>
+      </label>
+      <button disabled={busy || !query.trim()} onClick={resolve}>
+        {busy ? "Resolving…" : "Resolve"}
+      </button>
+
+      {result && (
+        <div className="resolve-result">
+          {result.address ? (
+            <div className="kv">
+              <span className="mono">{result.name}.hlx</span>
+              <span className="mono" title={result.address}>→ {shortAddr(result.address)}</span>
+            </div>
+          ) : (
+            <span className="muted">{result.name}.hlx is not registered.</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -163,41 +304,6 @@ function ApproveCard({ node, onRun }: { node: string; onRun: (fn: () => Promise<
           Approve recovery
         </button>
       </div>
-    </div>
-  );
-}
-
-function RecoveringCard() {
-  const [pubkey, setPubkey] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
-
-  const show = async () => setPubkey(await api.myPublicKey());
-  const copy = async () => {
-    if (!pubkey) return;
-    await navigator.clipboard.writeText(pubkey);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1200);
-  };
-
-  return (
-    <div className="card">
-      <div className="section-title">Recovering an account?</div>
-      <p className="muted small" style={{ marginTop: -4 }}>
-        If you're rebuilding a lost account into this fresh wallet, give this wallet's public key to
-        your guardians — it's the key they rotate the old account to. Safe to share.
-      </p>
-      {pubkey ? (
-        <>
-          <div className="receive-address mono small">{pubkey}</div>
-          <div className="row-actions end">
-            <button onClick={copy}>{copied ? "Copied" : "Copy public key"}</button>
-          </div>
-        </>
-      ) : (
-        <div className="row-actions">
-          <button onClick={show}>Show my public key</button>
-        </div>
-      )}
     </div>
   );
 }

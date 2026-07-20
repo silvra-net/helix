@@ -7,20 +7,22 @@ import Unlock from "./views/Unlock";
 import Overview from "./views/Overview";
 import Send from "./views/Send";
 import Receive from "./views/Receive";
-import Staking from "./views/Staking";
-import Names from "./views/Names";
-import Recovery from "./views/Recovery";
+import Validate from "./views/Validate";
+import Earn from "./views/Earn";
+import Identity from "./views/Identity";
 import Governance from "./views/Governance";
-import NodeView from "./views/Node";
 import Settings from "./views/Settings";
 import MnemonicReveal from "./views/MnemonicReveal";
 
-type Route = "overview" | "send" | "receive" | "staking" | "names" | "recovery" | "governance" | "node" | "settings";
+// "send"/"receive" are actions, not places to browse — reachable only via the buttons on Home,
+// deliberately not in the sidebar. Validate/Earn/Identity replace the old flat Node/Staking/
+// Names/Recovery split; see each file's own doc comment for why they're grouped this way.
+type Route = "home" | "send" | "receive" | "validate" | "earn" | "identity" | "governance" | "settings";
 
 export default function App() {
   const [meta, setMeta] = useState<WalletMeta | null>(null);
   const [node, setNode] = useState<string>(localStorage.getItem("helix-node") || DEFAULT_NODE);
-  const [route, setRoute] = useState<Route>("overview");
+  const [route, setRoute] = useState<Route>("home");
   const [net, setNet] = useState<NetworkStatus | null>(null);
   const [newMnemonic, setNewMnemonic] = useState<string | null>(null);
 
@@ -102,14 +104,11 @@ export default function App() {
           <span>Helix Wallet</span>
         </div>
         <nav>
-          <NavItem label="Overview" active={route === "overview"} onClick={() => setRoute("overview")} />
-          <NavItem label="Send" active={route === "send"} onClick={() => setRoute("send")} />
-          <NavItem label="Receive" active={route === "receive"} onClick={() => setRoute("receive")} />
-          <NavItem label="Staking" active={route === "staking"} onClick={() => setRoute("staking")} />
-          <NavItem label="Names" active={route === "names"} onClick={() => setRoute("names")} />
-          <NavItem label="Recovery" active={route === "recovery"} onClick={() => setRoute("recovery")} />
+          <NavItem label="Home" active={route === "home"} onClick={() => setRoute("home")} />
+          <NavItem label="Validate" active={route === "validate"} onClick={() => setRoute("validate")} />
+          <NavItem label="Earn" active={route === "earn"} onClick={() => setRoute("earn")} />
+          <NavItem label="Identity" active={route === "identity"} onClick={() => setRoute("identity")} />
           <NavItem label="Governance" active={route === "governance"} onClick={() => setRoute("governance")} />
-          <NavItem label="Node" active={route === "node"} onClick={() => setRoute("node")} />
           <NavItem label="Settings" active={route === "settings"} onClick={() => setRoute("settings")} />
         </nav>
         <div className="sidebar-foot">
@@ -141,14 +140,13 @@ export default function App() {
         </header>
 
         <section className="view">
-          {route === "overview" && <Overview node={node} onSend={() => setRoute("send")} onReceive={() => setRoute("receive")} />}
-          {route === "send" && <Send node={node} baseFee={net?.base_fee_per_byte} onDone={() => setRoute("overview")} />}
+          {route === "home" && <Overview node={node} onSend={() => setRoute("send")} onReceive={() => setRoute("receive")} />}
+          {route === "send" && <Send node={node} baseFee={net?.base_fee_per_byte} onDone={() => setRoute("home")} />}
           {route === "receive" && <Receive address={meta.address ?? ""} />}
-          {route === "staking" && <Staking node={node} height={net?.height ?? 0} />}
-          {route === "names" && <Names node={node} />}
-          {route === "recovery" && <Recovery node={node} address={meta.address ?? ""} />}
+          {route === "validate" && <Validate node={node} net={net} />}
+          {route === "earn" && <Earn node={node} />}
+          {route === "identity" && <Identity node={node} address={meta.address ?? ""} />}
           {route === "governance" && <Governance node={node} />}
-          {route === "node" && <NodeView node={node} net={net} />}
           {route === "settings" && <Settings address={meta.address ?? ""} />}
         </section>
 

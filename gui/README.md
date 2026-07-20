@@ -6,13 +6,37 @@ send HLX, and run your own node or validator, all without touching a shell. Back
 
 **CLI/GUI parity:** `helix-cli` and `helix-gui` are two front ends over the same node/wallet
 core — neither is a subset of the other. The GUI bundles the real `helix` binary as a sidecar
-(see [Node/validator panel](#node--validator-panel) below), so installing the wallet alone is a
-complete validator setup — no separate CLI download needed, and vice versa.
+(see [Validate](#validate) below), so installing the wallet alone is a complete validator setup —
+no separate CLI download needed, and vice versa.
 
 > **Status:** wallet create/restore/unlock, overview (balance/staked/history), receive, and
 > locally-signed transactions — transfers, staking/delegation, `.hlx` names, social recovery
-> (guardians), governance, a node/validator panel with a live console, and persistent
-> application logging for bug reports.
+> (guardians), governance, a validator panel with a live console, and persistent application
+> logging for bug reports.
+
+## Navigation: six tabs, not nine
+
+Earlier versions had a flat `Overview / Send / Receive / Staking / Names / Recovery / Governance
+/ Node / Settings` sidebar, which put the same number — your own stake — in two unrelated-looking
+places at once: a "Staking" tab framed around a generic delegate-to-earn product, and a "Node" tab
+framed around running a validator. If you *are* the validator, those are the same money, and
+seeing it twice under different framings was the actual bug, not a display glitch. Current
+grouping:
+
+- **Home** — balance, address, recent activity. Send/Receive are actions reached from here, not
+  their own sidebar entries (nobody browses to "send", they decide to send and then do it).
+- **Validate** — connected-node status, *your own* stake (stake/unstake, unbonding, jailed/unjail,
+  the entry-threshold progress bar), your validator pool if delegators back you, and the bundled
+  local-node console. Everything about being or becoming a validator, in one place.
+- **Earn** — delegating to *other* validators. Deliberately separate: it's a passive-income choice
+  with zero relation to running anything, unlike Validate.
+- **Identity** — `.hlx` name (register/resolve) and social recovery (guardians, approving a
+  recovery). Merged because both answer "how does this address represent me, and what happens if
+  I lose it" — not because either one shrank.
+- **Governance**, **Settings** — unchanged.
+
+`StakeActionPanel` (`src/components/`) is shared between Validate (stake/unstake/commission) and
+Earn (delegate/undelegate/redelegate) — one sign-and-submit form shape, not six bespoke ones.
 
 ## Why Tauri (not a browser page)
 
@@ -34,8 +58,10 @@ Rust backend and **never crosses into the webview**:
 gui/
 ├── src/                 React + TypeScript frontend
 │   ├── api.ts           typed wrappers over the Tauri commands
-│   ├── App.tsx          shell: onboarding / unlock / main (overview, send, receive)
-│   └── views/           Setup, Unlock, MnemonicReveal, Overview, Send, Receive, Node, Settings
+│   ├── App.tsx          shell: onboarding / unlock / main (Home, Validate, Earn, Identity, …)
+│   ├── components/      StakeActionPanel — shared by Validate and Earn
+│   └── views/           Setup, Unlock, MnemonicReveal, Overview (Home), Send, Receive, Validate,
+│                         Earn, Identity, Governance, Settings
 └── src-tauri/           Rust backend
     └── src/
         ├── wallet.rs        create / restore / unlock via KeyFile + bip39 (pure, unit-tested)
@@ -46,25 +72,26 @@ gui/
         └── state.rs         the in-memory unlocked wallet
 ```
 
-## Node / validator panel
+## Validate
 
-The **Node** tab runs `helix start` as a real child process (the bundled sidecar binary, built
-from the same `helix-node` crate as the standalone CLI — not a reimplementation) and streams its
-stdout/stderr as a live console, exactly like running the CLI in a terminal. This is what makes
-the GUI a full validator setup on its own: start/stop the node, watch it sync and propose blocks,
-and — if it ever gets jailed for downtime — unjail it, all from the same window as the wallet.
+The **Validate** tab's "Local node" card runs `helix start` as a real child process (the bundled
+sidecar binary, built from the same `helix-node` crate as the standalone CLI — not a
+reimplementation) and streams its stdout/stderr as a live console, exactly like running the CLI in
+a terminal. This is what makes the GUI a full validator setup on its own: start/stop the node,
+watch it sync and propose blocks, stake toward the entry threshold, and — if it ever gets jailed
+for downtime — unjail it, all from the same window as the wallet.
 
 ## Diagnostics / logging
 
 Two independent logging layers, for two different questions:
-- **Node tab console** — the bundled node's own stdout/stderr, live, for "what is my node doing
-  right now."
+- **Validate tab console** — the bundled node's own stdout/stderr, live, for "what is my node
+  doing right now."
 - **Settings → Diagnostics** — a persistent, rotating log file (`tauri-plugin-log`) covering the
   wallet app itself: node spawn/stop/crash, wallet create/restore/unlock failures, and every
   transaction submission (never passphrase/mnemonic/private key), plus uncaught frontend errors.
   This is what to attach to a bug report — it survives after the console tab has scrolled past
-  the moment something went wrong, and it's there even if nobody was watching the Node tab when
-  it happened. Settings shows the log folder path with a copy button.
+  the moment something went wrong, and it's there even if nobody was watching the Validate tab
+  when it happened. Settings shows the log folder path with a copy button.
 
 ## Run it
 
@@ -114,7 +141,7 @@ signing — is covered by unit tests in `wallet.rs` and `pricing.rs` that run ag
 `helix-crypto`/`helix-core` crates (including the pinned Spark-compatibility vector). The Rust
 backend (`cargo check`/`clippy`) and the frontend (`tsc --noEmit`, `npm run build`) both compile
 clean, and CI builds the full installer for all three platforms — but no window system is
-available in the authoring sandbox, so the actual running app (sidecar spawn, the Node tab
+available in the authoring sandbox, so the actual running app (sidecar spawn, the Validate tab
 console, click-through UX) was never seen rendered. Run `npm run tauri dev` on a machine with the
 Tauri prerequisites installed to check that by eye.
 
@@ -123,13 +150,16 @@ Tauri prerequisites installed to check that by eye.
 - **SA1** ✅ read-only explorer — served by the node (`GET /`)
 - **SA2/SA3** ✅ local wallet + balance/history + signed send
 - **SA4** ✅ staking / delegation UI — stake, unstake, claim, delegate, redelegate, commission
-- **Names** ✅ `.hlx` — register, resolve, send to a name, name shown on Overview
-- **Recovery** ✅ social recovery — register guardians, approve/cancel a recovery, share your key
+- **Identity** ✅ `.hlx` names (register, resolve) + social recovery (guardians, approve/cancel a
+  recovery)
 - **Governance** ✅ view parameters + proposals, vote, propose a change
 - **Settings** ✅ re-reveal the recovery phrase (re-auth'd), view address / public key, view the
   diagnostic log folder
-- **Node** ✅ run a bundled node/validator as a sidecar with a live console (start/stop, unjail),
-  or connect to a remote one — status (height/peers/sync), validator standing vs the stake
-  threshold with a stake-toward-validator assistant, live "blocks you proposed" signal
+- **Validate** ✅ run a bundled node/validator as a sidecar with a live console (start/stop,
+  unjail), or connect to a remote one — status (height/peers/sync), your own stake vs the entry
+  threshold with a stake-toward-validator assistant, live "blocks you proposed" signal, your
+  validator pool if delegators back you
+- **Earn** ✅ delegating to other validators, separate from Validate — see
+  [Navigation](#navigation-six-tabs-not-nine) for why
 - smart-contract deploy/call is a developer feature left out of the wallet, and proof-of-personhood
   is deferred (verification is authority-gated and can't be a self-serve wallet flow)

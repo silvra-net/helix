@@ -1,26 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import type { LogLine, NetworkStatus, NodeProcessStatus, Overview, SubmitResult, ValidatorStatus } from "../types";
-import { hlx, shortHash } from "../format";
+import { StakeActionPanel, type StakeAction } from "../components/StakeActionPanel";
+import type { LogLine, NetworkStatus, NodeProcessStatus, Overview, SubmitResult, ValidatorPool, ValidatorStatus } from "../types";
+import { hlx, shortAddr, shortHash } from "../format";
 
-// The Node panel shows the status of the node you're *connected to* (top card — could be the
-// public one, could be your own), where your stake stands against the validator threshold, and
-// whether you're actually producing blocks (the only proof a client has that your node is up).
-// Becoming a validator is still two things — enough stake, and a node actually running with this
-// key — but as of the "Local node" card below, the second one no longer needs a terminal: the
-// same `helix` binary the CLI ships is bundled into this app and can be started right here (see
-// `node_process.rs`). Running your own node externally (a server, `helix start` in a terminal)
-// works exactly the same and this panel doesn't need to know about it either way — it only ever
-// reflects chain state, never assumes who's actually proposing blocks.
+// Everything to do with being (or becoming) a validator lives here, in one place — status of the
+// node you're connected to, your own stake against the eligibility threshold (stake, unstake,
+// unbonding, jailed/unjail), your pool if delegators back you, and running the bundled node
+// itself. Earlier this was split across a "Node" tab and a "Staking" tab's self-stake card, which
+// put the same number (your own stake) in two different mental categories for no reason — if
+// you're a validator, staking IS the validator operation, not a separate generic product.
+// Delegating to *other* validators (Earn.tsx) is the one genuinely separate concept: you can do
+// that without ever touching this page.
 
-// Console lines are capped rather than kept forever — a validator node can run for weeks, and
-// nothing here needs full scrollback history; it's a live tail, not a log file (the real one is
-// still on disk, wherever the node's data dir is).
 const MAX_CONSOLE_LINES = 2000;
-export default function Node({ node, net }: { node: string; net: NetworkStatus | null }) {
+
+export default function Validate({ node, net }: { node: string; net: NetworkStatus | null }) {
   const [vs, setVs] = useState<ValidatorStatus | null>(null);
   const [ov, setOv] = useState<Overview | null>(null);
+  const [pool, setPool] = useState<ValidatorPool | null>(null);
   const [amount, setAmount] = useState("");
+  const [action, setAction] = useState<StakeAction | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -31,9 +31,6 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
   const consoleRef = useRef<HTMLDivElement | null>(null);
   const autoScroll = useRef(true);
 
-  // Local node lifecycle: poll status once on mount (in case one is already running from a
-  // previous session), then rely entirely on events (node-log / node-exited) for live state —
-  // polling the log itself would either miss lines between polls or re-fetch a growing buffer.
   useEffect(() => {
     api.nodeProcessStatus().then(setProcStatus).catch(() => {});
     const unlistenLog = api.onNodeLog((l) => {
@@ -52,8 +49,6 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
     };
   }, []);
 
-  // Auto-scroll the console to the newest line, but only if the user hasn't scrolled up to
-  // read earlier output — the same convention every terminal/log viewer uses.
   useEffect(() => {
     if (autoScroll.current && consoleRef.current) {
       consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
@@ -86,26 +81,16 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
     }
   };
 
-  const submitUnjail = async () => {
-    setError(null);
-    setNotice(null);
-    try {
-      const r = await api.unjail(node);
-      setNotice(`Submitted ${shortHash(r.tx_hash)} · ${r.status}`);
-      load();
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
   const load = useCallback(async () => {
     try {
-      const [v, o] = await Promise.all([
+      const [v, o, p] = await Promise.all([
         api.getValidatorStatus(node),
         api.getOverview(node).catch(() => null),
+        api.getValidatorPool(node).catch(() => null),
       ]);
       setVs(v);
       setOv(o);
+      setPool(p);
     } catch (e) {
       setError(String(e));
     }
@@ -117,18 +102,21 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
     return () => clearInterval(id);
   }, [load]);
 
-  const stake = async (fn: () => Promise<SubmitResult>) => {
+  const run = async (fn: () => Promise<SubmitResult>) => {
     setError(null);
     setNotice(null);
     try {
       const r = await fn();
       setNotice(`Submitted ${shortHash(r.tx_hash)} · ${r.status}`);
+      setAction(null);
       setAmount("");
       load();
     } catch (e) {
       setError(String(e));
     }
   };
+
+  const submitUnjail = () => run(() => api.unjail(node));
 
   const shortfall = vs ? Math.max(0, vs.min_validator_stake_hlx - vs.effective_stake_hlx) : 0;
   const pct = vs && vs.min_validator_stake_hlx > 0
@@ -138,10 +126,18 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
   const amtValid = amount.trim() !== "" && Number.isFinite(amt) && amt > 0;
   const balance = ov?.balance_hlx ?? 0;
 
+  const unbonding = ov?.unbonding_hlx ?? 0;
+  const blocksLeft = ov ? Math.max(0, ov.unbonding_unlock_height - (net?.height ?? 0)) : 0;
+  const claimable = unbonding > 0 && blocksLeft === 0;
+
   return (
     <div className="stack">
       {notice && <div className="notice">{notice}</div>}
       {error && <div className="error">{error}</div>}
+
+      {action && (
+        <StakeActionPanel action={action} node={node} onCancel={() => setAction(null)} onRun={run} />
+      )}
 
       {/* Connected node */}
       <div className="card">
@@ -177,12 +173,12 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
         )}
       </div>
 
-      {/* Your validator standing */}
+      {/* Your stake */}
       <div className="card">
-        <div className="section-title">Your validator standing</div>
+        <div className="section-title">Your stake</div>
 
         <div className="kv">
-          <span className="muted">Effective stake (self + delegated)</span>
+          <span className="muted">Effective stake (self + delegated in)</span>
           <span className="mono">{vs ? hlx(vs.effective_stake_hlx) : "…"} HLX</span>
         </div>
         <div className="kv">
@@ -229,6 +225,28 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
           </p>
         )}
 
+        {unbonding > 0 && (
+          <div className="unbonding-note">
+            <div>
+              <strong>{hlx(unbonding)} HLX</strong> unbonding
+              {ov?.unbonding_source ? (
+                <span className="muted"> · still slashable for {shortAddr(ov.unbonding_source)}</span>
+              ) : (
+                <span className="muted"> · your own unstake</span>
+              )}
+            </div>
+            <div className="row-actions">
+              {claimable ? (
+                <button className="primary" onClick={() => run(() => api.claimUnbonded(node))}>Claim</button>
+              ) : (
+                <span className="muted small">
+                  claimable at height {ov?.unbonding_unlock_height.toLocaleString()} (~{blocksLeft.toLocaleString()} blocks · ~{Math.ceil((blocksLeft * 2) / 60)} min)
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="field" style={{ marginTop: 12 }}>
           <span>Stake toward validator (HLX)</span>
           <input inputMode="decimal" value={amount} placeholder={shortfall > 0 ? hlx(shortfall) : "0.0"} onChange={(e) => setAmount(e.target.value)} />
@@ -239,12 +257,44 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
               Fill the gap ({hlx(Math.min(shortfall, balance))})
             </button>
           )}
-          <button className="primary" disabled={!amtValid} onClick={() => stake(() => api.stake(node, amt))}>
+          <button onClick={() => setAction({ kind: "unstake" })}>Unstake…</button>
+          <button className="primary" disabled={!amtValid} onClick={() => run(() => api.stake(node, amt))}>
             Stake
           </button>
         </div>
-        <p className="muted small">Available to stake: {ov ? hlx(ov.balance_hlx) : "…"} HLX. Stake also earns you a governance vote.</p>
+        <p className="muted small">
+          Available to stake: {ov ? hlx(ov.balance_hlx) : "…"} HLX. Stake also earns you a
+          governance vote. Unstaking begins a 7-day unbonding period; the stake stays slashable
+          until you claim it.
+        </p>
       </div>
+
+      {/* Validator pool (only shown once you actually have delegators or self-stake) */}
+      {pool && (pool.has_pool || pool.self_staked_hlx > 0) && (
+        <div className="card">
+          <div className="section-title">Your validator pool</div>
+          <p className="muted small" style={{ marginTop: -6 }}>
+            Delegators who back this validator — separate from your own stake above.
+          </p>
+          <div className="metric-row">
+            <div className="metric">
+              <div className="metric-label">Effective stake</div>
+              <div className="metric-value">{hlx(pool.effective_stake_hlx)} <span className="metric-unit">HLX</span></div>
+            </div>
+            <div className="metric">
+              <div className="metric-label">Delegated in</div>
+              <div className="metric-value">{hlx(pool.delegated_stake_hlx)} <span className="metric-unit">HLX</span></div>
+            </div>
+            <div className="metric">
+              <div className="metric-label">Commission</div>
+              <div className="metric-value">{pool.commission_bps == null ? "—" : (pool.commission_bps / 100).toFixed(2) + "%"}</div>
+            </div>
+          </div>
+          <div className="row-actions" style={{ marginTop: 12 }}>
+            <button onClick={() => setAction({ kind: "commission" })}>Set commission</button>
+          </div>
+        </div>
+      )}
 
       {/* Local node */}
       <div className="card">
@@ -276,8 +326,6 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
           className="console"
           onScroll={(e) => {
             const el = e.currentTarget;
-            // Within ~24px of the bottom counts as "still following" — keeps auto-scroll on
-            // through minor rounding/animation jitter instead of needing a pixel-perfect match.
             autoScroll.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
           }}
         >
