@@ -8,6 +8,7 @@
 /validator-wallet.json
 # Chain-Datenbank — Laufzeitdaten, kein Quellcode
 /helix-data.redb
+/helix-data.redb.*.bak
 # Scripts (Cron/Dev-Loop — nur lokal)
 /scripts/
 /CLAUDE.md

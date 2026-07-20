@@ -20,10 +20,13 @@ jobs:
         include:
           - os: ubuntu-22.04
             name: linux
+            target: x86_64-unknown-linux-gnu
           - os: macos-latest
             name: macos-arm64
+            target: aarch64-apple-darwin
           - os: windows-latest
             name: windows
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -38,10 +41,13 @@ jobs:
             rpm libfuse2
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: 'gui/src-tauri -> target'
+          key: gui-${{ matrix.name }}
 
       - uses: actions/setup-node@v7
         with:
@@ -51,9 +57,31 @@ jobs:
         working-directory: gui
         run: npm install
 
+      # The GUI bundles a real `helix` node as a Tauri "sidecar" (see node_process.rs) so a
+      # Helix Wallet install alone is a working validator setup — no separate CLI download.
+      # Tauri's sidecar convention: the binary must sit at `src-tauri/binaries/<name>-<target-
+      # triple>[.exe]`; it then copies/renames it into the bundle automatically at build time.
+      # Mirrors release.yml's build-gui job — keep the two in sync.
+      - name: Build the bundled node/CLI sidecar
+        run: cargo build --release --target ${{ matrix.target }} --bin helix
+
+      - name: Place the sidecar binary (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p gui/src-tauri/binaries
+          cp target/${{ matrix.target }}/release/helix "gui/src-tauri/binaries/helix-${{ matrix.target }}"
+
+      - name: Place the sidecar binary (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path gui/src-tauri/binaries | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/helix.exe" "gui/src-tauri/binaries/helix-${{ matrix.target }}.exe"
+
       - name: Build the app
         working-directory: gui
-        run: npm run tauri build
+        run: npm run tauri build -- --target ${{ matrix.target }}
 
       - name: Upload installers
         uses: actions/upload-artifact@v7
