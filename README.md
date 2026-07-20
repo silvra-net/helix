@@ -45,12 +45,14 @@ layout) lives further down for when you need it.
 **New here? Pick your path:**
 
 - 🖱️ **Prefer a desktop app?** → [Desktop wallet](#desktop-wallet) — download, no shell:
-  balance, send, receive, and staking.
+  balance, send, receive, staking, and even running a validator, console included.
 - 🧑‍💻 **Just want to try it?** → [Quick Start](#quick-start) gets you from clone to first
   transaction in five commands.
 - 💰 **Holding HLX / want to earn rewards?** → [Using the CLI](#using-the-cli-helix) and
   [Staking](#staking) (you can delegate without running a node).
-- 🖥️ **Running a validator?** → [Installation](#installation) → [Running a Node](#running-a-node).
+- 🖥️ **Running a validator?** → [Installation](#installation) → [Running a Node](#running-a-node)
+  (terminal), or the desktop app's **Node** tab if you'd rather not touch a shell — both run the
+  identical `helix` binary.
 - 🔬 **Here for the internals?** → [Consensus](#consensus), [Cryptography](#cryptography--determinism),
   and the [Reference](#reference).
 
@@ -205,23 +207,31 @@ cargo build --release
 
 ## Desktop wallet
 
-Prefer not to touch a shell? **Helix Wallet** is a small desktop app (Linux, macOS, Windows)
-that does the everyday things without the CLI: create or restore a wallet, watch your balance
-and transaction history, receive, send, and stake or delegate.
+Prefer not to touch a shell? **Helix Wallet** (`helix-gui`) is a desktop app (Linux, macOS,
+Windows) that does everything the CLI does — wallet, send/receive, staking/delegation, names,
+recovery, governance — **including running a full validator node**, with a live console. Pick
+either the GUI or the [CLI](#using-the-cli-helix); neither is missing functionality the other has.
 
 - **Download** the installer for your OS from the
   [latest release](https://github.com/silvra-net/helix/releases/latest) —
-  `.AppImage` / `.deb` (Linux), `.dmg` (macOS), `.msi` (Windows).
+  `helix-gui-*.AppImage` / `.deb` (Linux), `.dmg` (macOS), `.msi` (Windows). The paired CLI
+  archive is named `helix-cli-*` — same versioning, same release, consistent naming.
 - **Your key stays on your machine.** It is generated locally, encrypted at rest with the same
   `KeyFile` format the CLI uses, and never leaves the app — the wallet signs transactions itself
   and only talks to a node over its public REST API. The 24-word recovery phrase is shown once
   and also works in the Spark mobile app.
+- **Run a node without a terminal.** The exact `helix` binary the CLI ships is bundled into the
+  app as a companion process (a Tauri "sidecar" — same code, not a reimplementation). The
+  **Node** tab starts/stops it and streams its output live, so becoming a validator is: stake
+  enough (same tab), click Start, watch the console for `Block committed`. Prefer a server
+  instead? `helix start` in a terminal does the same thing — the two are interchangeable, and
+  switching between them later costs nothing (same `validator-key.json`/wallet file either way).
 - Same honest caveat as everywhere: it points at the public **testnet** by default, and HLX
   there is a valueless test token that does not survive a chain reset.
 
-It's an early MVP (wallet, send/receive, staking); source and build steps are in
-[`gui/`](gui/README.md). There is also a browser **block explorer** served by every node at its
-root URL — open [helix.silvra.net](https://helix.silvra.net).
+Source and build steps are in [`gui/`](gui/README.md). There is also a browser **block
+explorer** served by every node at its root URL — open
+[helix.silvra.net](https://helix.silvra.net).
 
 ---
 

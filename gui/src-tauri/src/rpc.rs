@@ -47,6 +47,13 @@ pub struct Account {
     #[serde(default)]
     pub unbonding_source: Option<String>,
     pub nonce: u64,
+    /// Height this address may submit `Unjail` at, or `None` if it isn't downtime-jailed.
+    #[serde(default)]
+    pub jailed_until: Option<u64>,
+    /// Consecutive blocks this address's precommit has been absent from `last_commit`, or
+    /// `None` if it currently has none.
+    #[serde(default)]
+    pub missed_blocks: Option<u32>,
 }
 
 /// One delegation this account holds — mirrors the node's `/accounts/:address/delegations` rows.

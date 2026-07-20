@@ -23,6 +23,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# Spawns the bundled `helix` sidecar as a real child process and streams its stdout/stderr —
+# see node_process.rs. The reliable, officially-supported way to locate a bundled companion
+# executable across Linux/macOS/Windows app-bundle layouts, which is genuinely fiddly to get
+# right by hand (different resource-directory conventions per platform).
+tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -164,6 +164,18 @@ textarea { resize: vertical; }
 }
 
 .error { background: var(--bad-bg); color: var(--bad); border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 12px; }
+
+/* Live node console (Node panel) — a real terminal, not a styled log list, so it reads exactly
+   like `helix start` running in a shell: dark regardless of app theme, monospace, stderr picked
+   out in a warmer color the way most terminals distinguish it. */
+.console {
+  background: #0d1117; color: #c9d1d9; border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  height: 260px; overflow-y: auto; margin: 10px 0; white-space: pre-wrap; word-break: break-all;
+}
+.console-line + .console-line { margin-top: 1px; }
+.console-stderr { color: #f0a868; }
+.console-empty { padding: 4px 0; }
 .kv { display: flex; justify-content: space-between; padding: 6px 0; }
 .receive-address { background: var(--surface-2); border-radius: 8px; padding: 14px; word-break: break-all; margin: 12px 0; }
 .receive-card, .form-card, .success-card { max-width: 560px; }

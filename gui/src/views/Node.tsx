@@ -1,19 +1,102 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import type { NetworkStatus, Overview, SubmitResult, ValidatorStatus } from "../types";
+import type { LogLine, NetworkStatus, NodeProcessStatus, Overview, SubmitResult, ValidatorStatus } from "../types";
 import { hlx, shortHash } from "../format";
 
-// The Node panel is honest about what a wallet is: a client, not a node. It shows the status of the
-// node you're connected to, where your stake stands against the validator threshold, and whether
-// you're actually producing blocks (the only proof a client has that your node is up). Becoming a
-// validator is two things — enough stake (you can do that here) AND running `helix start` with this
-// key (you do that on your own machine).
+// The Node panel shows the status of the node you're *connected to* (top card — could be the
+// public one, could be your own), where your stake stands against the validator threshold, and
+// whether you're actually producing blocks (the only proof a client has that your node is up).
+// Becoming a validator is still two things — enough stake, and a node actually running with this
+// key — but as of the "Local node" card below, the second one no longer needs a terminal: the
+// same `helix` binary the CLI ships is bundled into this app and can be started right here (see
+// `node_process.rs`). Running your own node externally (a server, `helix start` in a terminal)
+// works exactly the same and this panel doesn't need to know about it either way — it only ever
+// reflects chain state, never assumes who's actually proposing blocks.
+
+// Console lines are capped rather than kept forever — a validator node can run for weeks, and
+// nothing here needs full scrollback history; it's a live tail, not a log file (the real one is
+// still on disk, wherever the node's data dir is).
+const MAX_CONSOLE_LINES = 2000;
 export default function Node({ node, net }: { node: string; net: NetworkStatus | null }) {
   const [vs, setVs] = useState<ValidatorStatus | null>(null);
   const [ov, setOv] = useState<Overview | null>(null);
   const [amount, setAmount] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const [procStatus, setProcStatus] = useState<NodeProcessStatus | null>(null);
+  const [procBusy, setProcBusy] = useState(false);
+  const [procError, setProcError] = useState<string | null>(null);
+  const [lines, setLines] = useState<LogLine[]>([]);
+  const consoleRef = useRef<HTMLDivElement | null>(null);
+  const autoScroll = useRef(true);
+
+  // Local node lifecycle: poll status once on mount (in case one is already running from a
+  // previous session), then rely entirely on events (node-log / node-exited) for live state —
+  // polling the log itself would either miss lines between polls or re-fetch a growing buffer.
+  useEffect(() => {
+    api.nodeProcessStatus().then(setProcStatus).catch(() => {});
+    const unlistenLog = api.onNodeLog((l) => {
+      setLines((prev) => {
+        const next = prev.length >= MAX_CONSOLE_LINES ? prev.slice(prev.length - MAX_CONSOLE_LINES + 1) : prev;
+        return [...next, l];
+      });
+    });
+    const unlistenExit = api.onNodeExited((e) => {
+      setProcStatus({ running: false });
+      setLines((prev) => [...prev, { stream: "stderr", line: `[process exited, code ${e.code ?? "unknown"}]` }]);
+    });
+    return () => {
+      unlistenLog.then((f) => f());
+      unlistenExit.then((f) => f());
+    };
+  }, []);
+
+  // Auto-scroll the console to the newest line, but only if the user hasn't scrolled up to
+  // read earlier output — the same convention every terminal/log viewer uses.
+  useEffect(() => {
+    if (autoScroll.current && consoleRef.current) {
+      consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
+    }
+  }, [lines]);
+
+  const startLocalNode = async () => {
+    setProcError(null);
+    setProcBusy(true);
+    setLines([]);
+    try {
+      await api.nodeStart({});
+      setProcStatus({ running: true });
+    } catch (e) {
+      setProcError(String(e));
+    } finally {
+      setProcBusy(false);
+    }
+  };
+
+  const stopLocalNode = async () => {
+    setProcBusy(true);
+    try {
+      await api.nodeStop();
+      setProcStatus({ running: false });
+    } catch (e) {
+      setProcError(String(e));
+    } finally {
+      setProcBusy(false);
+    }
+  };
+
+  const submitUnjail = async () => {
+    setError(null);
+    setNotice(null);
+    try {
+      const r = await api.unjail(node);
+      setNotice(`Submitted ${shortHash(r.tx_hash)} · ${r.status}`);
+      load();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   const load = useCallback(async () => {
     try {
@@ -126,6 +209,26 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
           )
         )}
 
+        {ov?.jailed_until != null && (
+          <div className="error" style={{ marginTop: 10 }}>
+            ⚠ Downtime-jailed until block #{ov.jailed_until.toLocaleString()} — excluded from the
+            validator set, earning nothing, until you submit an unjail transaction. Only do this
+            once your node is actually running and connected, or the same downtime just jails you
+            again.
+            {net && net.height >= ov.jailed_until && (
+              <div className="row-actions end" style={{ marginTop: 8 }}>
+                <button className="primary" onClick={submitUnjail}>Submit Unjail</button>
+              </div>
+            )}
+          </div>
+        )}
+        {ov?.jailed_until == null && (ov?.missed_blocks ?? 0) > 0 && (
+          <p className="muted small" style={{ marginTop: 10 }}>
+            {ov!.missed_blocks} consecutive blocks missed without a signature seen — resets the
+            moment your node signs one again.
+          </p>
+        )}
+
         <div className="field" style={{ marginTop: 12 }}>
           <span>Stake toward validator (HLX)</span>
           <input inputMode="decimal" value={amount} placeholder={shortfall > 0 ? hlx(shortfall) : "0.0"} onChange={(e) => setAmount(e.target.value)} />
@@ -143,16 +246,54 @@ export default function Node({ node, net }: { node: string; net: NetworkStatus |
         <p className="muted small">Available to stake: {ov ? hlx(ov.balance_hlx) : "…"} HLX. Stake also earns you a governance vote.</p>
       </div>
 
-      {/* Run a node */}
+      {/* Local node */}
       <div className="card">
-        <div className="section-title">Run a node</div>
+        <div className="section-title">Local node</div>
         <p className="muted small" style={{ marginTop: -4 }}>
-          This wallet is a client — it can't validate for you. To actually produce blocks, run a node
-          on your own machine with this wallet's key. With no configuration it joins this network,
-          verifies genesis itself, and syncs; once your effective stake clears the threshold it rotates
-          into the validator set within an epoch.
+          Runs the exact same <span className="mono">helix</span> node the CLI ships, bundled into
+          this app — starting it here is running a real validator, with this wallet's key, on this
+          machine. With no configuration it joins the public network, verifies genesis itself, and
+          syncs; once your effective stake clears the threshold above it rotates into the validator
+          set within an epoch. Prefer running it on a server instead? `helix start` in a terminal
+          does the same thing — this panel and a standalone CLI node are interchangeable, not a
+          choice you're locked into.
         </p>
-        <pre className="codeblock">helix start</pre>
+
+        <div className="row-actions" style={{ marginTop: 10 }}>
+          <span className={`dot ${procStatus?.running ? "ok" : "off"}`} aria-hidden />
+          <span className="muted small">{procStatus?.running ? "Running" : "Stopped"}</span>
+          <div style={{ flex: 1 }} />
+          {procStatus?.running ? (
+            <button onClick={stopLocalNode} disabled={procBusy}>Stop</button>
+          ) : (
+            <button className="primary" onClick={startLocalNode} disabled={procBusy}>Start local node</button>
+          )}
+        </div>
+        {procError && <div className="error" style={{ marginTop: 8 }}>{procError}</div>}
+
+        <div
+          ref={consoleRef}
+          className="console"
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            // Within ~24px of the bottom counts as "still following" — keeps auto-scroll on
+            // through minor rounding/animation jitter instead of needing a pixel-perfect match.
+            autoScroll.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+          }}
+        >
+          {lines.length === 0 ? (
+            <div className="console-empty muted small">
+              {procStatus?.running ? "Waiting for output…" : "Start the node to see its console output here."}
+            </div>
+          ) : (
+            lines.map((l, i) => (
+              <div key={i} className={`console-line ${l.stream === "stderr" ? "console-stderr" : ""}`}>
+                {l.line}
+              </div>
+            ))
+          )}
+        </div>
+
         <p className="muted small">
           Behind a home connection or Cloudflare, it gossips over WebSocket on port 443 — no open
           inbound port needed. Full guide at <span className="mono">github.com/silvra-net/helix</span>.

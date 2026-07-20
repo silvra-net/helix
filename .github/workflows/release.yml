@@ -68,7 +68,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          staging="helix-${{ github.ref_name }}-${{ matrix.label }}"
+          staging="helix-cli-${{ github.ref_name }}-${{ matrix.label }}"
           mkdir -p "$staging"
           cp target/${{ matrix.target }}/release/helix "$staging/"
           cp README.md "$staging/"
@@ -79,7 +79,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $staging = "helix-${{ github.ref_name }}-${{ matrix.label }}"
+          $staging = "helix-cli-${{ github.ref_name }}-${{ matrix.label }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/helix.exe" "$staging/"
           Copy-Item "README.md" "$staging/"
@@ -102,10 +102,13 @@ jobs:
         include:
           - os: ubuntu-22.04
             name: linux
+            target: x86_64-unknown-linux-gnu
           - os: macos-latest
             name: macos-arm64
+            target: aarch64-apple-darwin
           - os: windows-latest
             name: windows
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v7
 
@@ -119,6 +122,8 @@ jobs:
             rpm libfuse2
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -133,9 +138,30 @@ jobs:
         working-directory: gui
         run: npm install
 
+      # The GUI bundles a real `helix` node as a Tauri "sidecar" (see node_process.rs) so a
+      # Helix Wallet install alone is a working validator setup — no separate CLI download.
+      # Tauri's sidecar convention: the binary must sit at `src-tauri/binaries/<name>-<target-
+      # triple>[.exe]`; it then copies/renames it into the bundle automatically at build time.
+      - name: Build the bundled node/CLI sidecar
+        run: cargo build --release --target ${{ matrix.target }} --bin helix
+
+      - name: Place the sidecar binary (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p gui/src-tauri/binaries
+          cp target/${{ matrix.target }}/release/helix "gui/src-tauri/binaries/helix-${{ matrix.target }}"
+
+      - name: Place the sidecar binary (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path gui/src-tauri/binaries | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/helix.exe" "gui/src-tauri/binaries/helix-${{ matrix.target }}.exe"
+
       - name: Build the wallet
         working-directory: gui
-        run: npm run tauri build
+        run: npm run tauri build -- --target ${{ matrix.target }}
 
       - name: Collect installers (unix)
         if: runner.os != 'Windows'
@@ -145,6 +171,15 @@ jobs:
           find gui/src-tauri/target/release/bundle -type f \
             \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.dmg' \) \
             -exec cp {} gui-dist/ \;
+          # Tauri names bundles after `productName` ("Helix Wallet") — rename to the same
+          # `helix-gui-<tag>-<platform>` scheme the CLI archive uses, so the two release
+          # assets read as a consistent pair instead of two differently-branded downloads.
+          # The app's own display name (title bar, Start Menu/Applications entry) is
+          # untouched — this only renames the downloadable file.
+          for f in gui-dist/*; do
+            ext="${f##*.}"
+            mv "$f" "gui-dist/helix-gui-${{ github.ref_name }}-${{ matrix.name }}.$ext"
+          done
           ls -la gui-dist
 
       - name: Collect installers (windows)
@@ -154,6 +189,11 @@ jobs:
           New-Item -ItemType Directory -Path gui-dist | Out-Null
           Get-ChildItem -Recurse gui/src-tauri/target/release/bundle -Include *.msi,*.exe |
             Copy-Item -Destination gui-dist
+          # Same rename as the unix step — see its comment.
+          Get-ChildItem gui-dist | ForEach-Object {
+            $newName = "helix-gui-${{ github.ref_name }}-${{ matrix.name }}$($_.Extension)"
+            Rename-Item -Path $_.FullName -NewName $newName
+          }
           Get-ChildItem gui-dist
 
       - name: Upload wallet installers

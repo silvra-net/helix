@@ -51,6 +51,8 @@ pub struct Overview {
     pub unbonding_unlock_height: u64,
     pub unbonding_source: Option<String>,
     pub nonce: u64,
+    pub jailed_until: Option<u64>,
+    pub missed_blocks: Option<u32>,
 }
 
 #[tauri::command]
@@ -117,6 +119,8 @@ pub async fn get_overview(state: State<'_, WalletState>, node: String) -> Result
         unbonding_unlock_height: account.unbonding_unlock_height,
         unbonding_source: account.unbonding_source,
         nonce: account.nonce,
+        jailed_until: account.jailed_until,
+        missed_blocks: account.missed_blocks,
     })
 }
 
@@ -221,6 +225,15 @@ pub async fn unstake(state: State<'_, WalletState>, node: String, amount_hlx: f6
 #[tauri::command]
 pub async fn claim_unbonded(state: State<'_, WalletState>, node: String) -> Result<rpc::SubmitResult, String> {
     build_sign_submit(&state, &node, TxType::ClaimUnbonded, None, 0, vec![], None).await
+}
+
+/// Rejoin the active validator set after downtime-jailing — see `helix_account.jailed_until`
+/// (surfaced in `Overview`/`ValidatorStatus`) for whether this account is currently jailed and
+/// the height it can submit this from. Deliberately explicit, not automatic — see
+/// `TxType::Unjail`'s doc comment.
+#[tauri::command]
+pub async fn unjail(state: State<'_, WalletState>, node: String) -> Result<rpc::SubmitResult, String> {
+    build_sign_submit(&state, &node, TxType::Unjail, None, 0, vec![], None).await
 }
 
 #[tauri::command]

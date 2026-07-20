@@ -21,6 +21,27 @@ export interface Overview {
   unbonding_unlock_height: number;
   unbonding_source: string | null;
   nonce: number;
+  jailed_until: number | null;
+  missed_blocks: number | null;
+}
+
+export interface LogLine {
+  stream: "stdout" | "stderr";
+  line: string;
+}
+
+export interface NodeExited {
+  code: number | null;
+}
+
+export interface NodeProcessStatus {
+  running: boolean;
+}
+
+export interface NodeStartConfig {
+  data_dir?: string | null;
+  validator_key_path?: string | null;
+  sync_peer?: string | null;
 }
 
 export interface Delegation {

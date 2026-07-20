@@ -7,18 +7,25 @@
 //! shape.
 
 mod commands;
+mod node_process;
 mod pricing;
 mod rpc;
 mod state;
 mod wallet;
 
+use node_process::NodeProcessState;
 use state::WalletState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .manage(WalletState::default())
+        .manage(NodeProcessState::default())
         .invoke_handler(tauri::generate_handler![
+            node_process::node_start,
+            node_process::node_stop,
+            node_process::node_process_status,
             commands::wallet_status,
             commands::create_wallet,
             commands::restore_wallet,
@@ -52,7 +59,18 @@ pub fn run() {
             commands::get_proposals,
             commands::get_gov_params,
             commands::get_validator_status,
+            commands::unjail,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Helix Wallet");
+        .build(tauri::generate_context!())
+        .expect("error while building Helix Wallet")
+        .run(|app_handle, event| {
+            // A node started from this app is this app's responsibility to stop — otherwise
+            // closing the window leaves a validator process running invisibly in the
+            // background, still holding the redb lock, until the user finds and kills it
+            // manually (or it's still there next launch, blocking a fresh start).
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                let _ = node_process::node_stop(app_handle.state::<NodeProcessState>());
+            }
+        });
 }

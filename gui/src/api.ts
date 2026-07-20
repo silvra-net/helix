@@ -1,11 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   Delegation,
   GovParams,
   GuardianInfo,
   HistoryEntry,
+  LogLine,
   NetworkStatus,
   NewWallet,
+  NodeExited,
+  NodeProcessStatus,
+  NodeStartConfig,
   Overview,
   Proposal,
   RecoveryStatus,
@@ -109,6 +114,24 @@ export const api = {
   // node / validator panel
   getValidatorStatus: (node: string) =>
     invoke<ValidatorStatus>("get_validator_status", { node }),
+
+  unjail: (node: string) => invoke<SubmitResult>("unjail", { node }),
+
+  // local node process — see node_process.rs. `config` fields are all optional; the backend
+  // fills in sensible defaults (app data dir, public network) when omitted.
+  nodeStart: (config: NodeStartConfig) => invoke<void>("node_start", { config }),
+
+  nodeStop: () => invoke<void>("node_stop"),
+
+  nodeProcessStatus: () => invoke<NodeProcessStatus>("node_process_status"),
+
+  // Live console output — each event is one line. Returns the unsubscribe function, same
+  // shape as Tauri's own `listen()`, so a view can wire it up in a `useEffect` cleanup.
+  onNodeLog: (handler: (line: LogLine) => void) =>
+    listen<LogLine>("node-log", (e) => handler(e.payload)),
+
+  onNodeExited: (handler: (e: NodeExited) => void) =>
+    listen<NodeExited>("node-exited", (e) => handler(e.payload)),
 };
 
 export const DEFAULT_NODE = "https://helix.silvra.net";

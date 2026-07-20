@@ -2,5 +2,8 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+# Sidecar binary CI places here before `tauri build` (see release.yml) — platform-specific,
+# rebuilt every release, never something to commit.
+src-tauri/binaries/
 *.local
 .DS_Store
