@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use helix_core::{Block, BlockHeader, Transaction};
+use helix_core::{Block, BlockHeader, CommitSig, Transaction};
 use helix_crypto::{merkle_root, Address, Hash, KeyPair, Signature};
 use tracing::info;
 
@@ -142,6 +142,14 @@ pub struct BftEngine {
     /// the safety argument). Reset to 0 for a validator the instant it votes again; entries
     /// below `LIVENESS_JAIL_ROUNDS` are absent rather than stored as 0.
     missed_rounds: HashMap<Address, u32>,
+    /// The precommit quorum certificate that finalized `current_height`, carried forward one
+    /// height so the *next* block this engine proposes can attach it as `last_commit` — see
+    /// `BlockHeader::last_commit`'s doc comment for why it travels one block late. Empty after
+    /// `sync_to_externally_finalized_block` (a block adopted from gossip/RPC catch-up, not
+    /// tallied by this engine's own `VoteSet` — nothing to attach then; the next block this
+    /// node proposes simply attests no signers for that one height, which the executor's
+    /// downtime counter tolerates as a single miss, not a jailing trigger).
+    last_commit: Vec<Vote>,
     /// Consecutive ticks this node has been held back by the peer-count gate in
     /// `block_production_loop` (`peer_count < peers_needed_for_quorum()`) — see
     /// `note_peer_wait_tick`. Reset via `reset_peer_wait` the moment enough peers are
@@ -169,6 +177,7 @@ impl BftEngine {
             current_base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
             missed_rounds: HashMap::new(),
             peer_wait_ticks: 0,
+            last_commit: Vec::new(),
         }
     }
 
@@ -819,6 +828,42 @@ impl BftEngine {
         Ok(())
     }
 
+    /// Verify a block's `last_commit` — the precommit signatures it claims finalized its
+    /// parent (`prev_hash`, at `height - 1`). Unlike `verify_pol`, this does NOT require the
+    /// combined power to reach quorum: `last_commit` exists to feed downtime-jailing (see
+    /// `CommitSig`'s doc comment), not to re-prove the parent's finality — that's already
+    /// established by `prev_hash` chaining and this engine's own live quorum tracking of the
+    /// round that actually committed it. What IS enforced: every signature must be genuine (a
+    /// proposer can't invent "X signed" to shield X from a miss) and no validator can be
+    /// double-counted. An address no longer in the *current* validator set is dropped rather
+    /// than rejected outright — the parent height's actual set could differ slightly around an
+    /// epoch rotation boundary, and a stale-but-genuine signature shouldn't fail the block.
+    fn verify_last_commit(
+        &self,
+        last_commit: &[CommitSig],
+        height: u64,
+        parent_hash: &Hash,
+    ) -> ConsensusResult<()> {
+        if height == 0 {
+            return Ok(()); // genesis has no parent to attest
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        for sig in last_commit {
+            sig.verify(height - 1, parent_hash)
+                .map_err(|e| ConsensusError::InvalidBlock {
+                    height,
+                    reason: format!("invalid last_commit signature from {}: {e}", sig.validator),
+                })?;
+            if !seen.insert(sig.validator.to_string()) {
+                return Err(ConsensusError::InvalidBlock {
+                    height,
+                    reason: format!("duplicate last_commit signature from {}", sig.validator),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Validate a block proposed by another validator (used when receiving from peers).
     ///
     /// `valid_round`/`pol` carry a re-proposal's proof-of-lock (see `Proposal`). For a fresh
@@ -898,6 +943,8 @@ impl BftEngine {
                 ),
             });
         }
+
+        self.verify_last_commit(&block.header.last_commit, h, &block.header.prev_hash)?;
 
         self.validator_set
             .get(&block.header.validator)
@@ -1035,6 +1082,18 @@ impl BftEngine {
         let tx_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
         let merkle = merkle_root(&tx_hashes);
 
+        let last_commit = self
+            .last_commit
+            .iter()
+            .map(|vote| helix_core::CommitSig {
+                validator: vote.validator.clone(),
+                public_key: vote.public_key.clone(),
+                crypto_version: vote.crypto_version,
+                round: vote.round,
+                signature: vote.signature.clone(),
+            })
+            .collect();
+
         let mut header = BlockHeader {
             version: 1,
             height,
@@ -1045,6 +1104,7 @@ impl BftEngine {
             public_key: keypair.public.clone(),
             crypto_version: keypair.scheme,
             base_fee_per_byte: self.current_base_fee_per_byte,
+            last_commit,
             signature: Signature::from_bytes(vec![]),
         };
 
@@ -1060,6 +1120,7 @@ impl BftEngine {
         self.current_height = height;
         self.last_committed = round.committed_hash().cloned();
         self.last_committed_round = Some(round.round);
+        self.last_commit = round.precommits.quorum_votes();
         self.pending_evidence.extend(round.evidence);
         self.round = None;
         self.round_ticks = 0;
@@ -1100,6 +1161,7 @@ impl BftEngine {
         self.round = None;
         self.round_ticks = 0;
         self.buffered_votes.clear();
+        self.last_commit.clear();
         self.clear_locks();
     }
 

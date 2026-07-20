@@ -49,15 +49,25 @@ impl Vote {
     /// `crypto_version` so a vote can't be replayed under a different scheme tag
     /// than the one it was actually signed with.
     pub fn signing_bytes(&self) -> Vec<u8> {
+        // Precommit delegates to `helix_core::precommit_signing_bytes` — the same function
+        // `CommitSig::verify()` uses to check a precommit carried in a block's `last_commit`.
+        // The two must never define "what a precommit signs" differently, or a genuine
+        // precommit vote could fail to verify as a CommitSig (or vice versa) purely from
+        // byte-layout drift, not an actual signature mismatch.
+        if self.vote_type == VoteType::Precommit {
+            return helix_core::precommit_signing_bytes(
+                self.height,
+                self.round,
+                &self.block_hash,
+                self.crypto_version,
+            );
+        }
         let mut bytes = Vec::new();
         // Domain separation: a signature over a vote can never be reinterpreted as a
         // signature over a block header or transaction (which carry their own distinct
         // domain tags), even if the remaining bytes happened to line up.
         bytes.extend_from_slice(b"helix-vote-v1:");
-        bytes.extend_from_slice(match self.vote_type {
-            VoteType::Prevote => b"prevote:",
-            VoteType::Precommit => b"precommit:",
-        });
+        bytes.extend_from_slice(b"prevote:");
         bytes.extend_from_slice(&self.height.to_le_bytes());
         bytes.extend_from_slice(&self.round.to_le_bytes());
         bytes.extend_from_slice(self.block_hash.as_bytes());

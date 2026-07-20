@@ -8,6 +8,73 @@ use crate::transaction::Transaction;
 /// for the schemes themselves and how verification dispatches on this tag.
 pub use helix_crypto::CryptoScheme as CryptoVersion;
 
+/// The exact bytes a **precommit** vote signs, given the (height, round, block_hash,
+/// crypto_version) it committed to. Lives here — not in `helix-consensus`, where the real
+/// `Vote` type and its `signing_bytes()` live — because `CommitSig` (below) needs it and
+/// `helix-core` cannot depend back on `helix-consensus` (the dependency already runs the other
+/// way). `helix-consensus::Vote::signing_bytes()`'s `Precommit` arm calls this directly so the
+/// two can never drift apart into two different "what a precommit signs" definitions.
+pub fn precommit_signing_bytes(
+    height: u64,
+    round: u32,
+    block_hash: &Hash,
+    crypto_version: CryptoVersion,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"helix-vote-v1:");
+    bytes.extend_from_slice(b"precommit:");
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&round.to_le_bytes());
+    bytes.extend_from_slice(block_hash.as_bytes());
+    bytes.push(crypto_version as u8);
+    bytes
+}
+
+/// One validator's precommit signature, carried in the *next* block's header as proof that
+/// this validator participated in finalizing the block this header's `prev_hash` points to.
+/// Self-verifying (like a `Vote`, which this is a trimmed copy of) — `height`/`block_hash`
+/// aren't stored here because they're always the parent block's, known to the verifier from
+/// context, not from the signer's say-so.
+///
+/// This is the data downtime-jailing counts from: `helix-executor::ChainState` walks a new
+/// block's `last_commit`, and any current validator whose address is absent gets a miss
+/// recorded against it. A proposer can only ever hurt an honest validator's count by omitting
+/// a real signature it holds — it can't fabricate one, `verify()` below is the reason why —
+/// and round-robin proposer rotation means that omission can't persist past the next honest
+/// proposer's turn, which will include the real signature and reset the count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitSig {
+    pub validator: Address,
+    /// Travels with the signature for the same reason `Vote::public_key`/
+    /// `BlockHeader::public_key` do — `Address` is one-way.
+    pub public_key: PublicKey,
+    pub crypto_version: CryptoVersion,
+    /// The round (within the parent height) this precommit was cast in.
+    pub round: u32,
+    pub signature: Signature,
+}
+
+impl CommitSig {
+    /// Verify this signature is a genuine precommit for `(height, block_hash)` — i.e. that
+    /// `public_key` derives `validator` and really signed this exact commitment. Doesn't check
+    /// that `validator` was actually a validator at that height, or that enough `CommitSig`s
+    /// together reach quorum — callers with access to the validator set check membership
+    /// themselves (same accepted-approximation pattern as proof-of-lock verification: the
+    /// *current* validator set is used, not a historical snapshot, since Helix doesn't keep
+    /// one — see `verify_pol`'s doc comment). `last_commit` exists to feed the downtime
+    /// counter, not to re-prove the parent block's finality (that's already established by
+    /// `prev_hash` chaining and the engine's own live quorum tracking).
+    pub fn verify(&self, height: u64, block_hash: &Hash) -> helix_crypto::CryptoResult<()> {
+        if Address::from_public_key(&self.public_key) != self.validator {
+            return Err(helix_crypto::CryptoError::InvalidPublicKey(
+                "commit sig public key does not derive declared validator address".into(),
+            ));
+        }
+        let bytes = precommit_signing_bytes(height, self.round, block_hash, self.crypto_version);
+        helix_crypto::verify_with_scheme(self.crypto_version, &self.public_key, &bytes, &self.signature)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHeader {
     /// Helix protocol version
@@ -35,6 +102,13 @@ pub struct BlockHeader {
     /// so every node computes the same value — it is part of the signed header and re-checked
     /// on validation, not something the proposer may pick freely.
     pub base_fee_per_byte: u64,
+    /// The precommit signatures that finalized the *parent* block (`prev_hash`) — proof of
+    /// who actually participated, carried one block late because a block can't contain its
+    /// own not-yet-formed commit. Empty for genesis (no parent to attest) and, in practice,
+    /// for any single-validator height (a lone validator's own precommit is enough for
+    /// quorum without needing to prove it to anyone). Feeds downtime-jailing in
+    /// `helix-executor::ChainState` — see `CommitSig`'s doc comment for the trust model.
+    pub last_commit: Vec<CommitSig>,
     /// Signature over the canonical signing hash (excludes `signature` itself)
     pub signature: Signature,
 }
@@ -46,8 +120,14 @@ impl BlockHeader {
         // transaction signature (each has its own tag). The field layout stays
         // unambiguous — every field is fixed-length except `validator`, which is the
         // only variable-length field and is followed only by fixed-length fields
-        // (crypto_version byte + base_fee_per_byte), so the concatenation has a single
-        // possible parse.
+        // (crypto_version byte + base_fee_per_byte + the last_commit hash below), so the
+        // concatenation has a single possible parse. `last_commit` itself is variable-length
+        // (a `Vec<CommitSig>`) — rather than extend that "only one variable field" argument to
+        // a second field, it's folded in as its own fixed-size (32-byte) digest, exactly like
+        // `merkle_root` already stands in for the variable-length transaction list.
+        let last_commit_bytes = bincode::serialize(&self.last_commit)
+            .expect("CommitSig vec serialization is infallible");
+        let last_commit_hash = Hash::digest(&last_commit_bytes);
         Hash::digest_many(&[
             b"helix-block-header-v1:",
             &self.version.to_le_bytes(),
@@ -58,6 +138,7 @@ impl BlockHeader {
             self.validator.as_str().as_bytes(),
             &[self.crypto_version as u8],
             &self.base_fee_per_byte.to_le_bytes(),
+            last_commit_hash.as_bytes(),
         ])
     }
 
@@ -132,6 +213,7 @@ pub fn genesis_block(validator: Address, public_key: PublicKey, signature: Signa
         public_key,
         crypto_version: CryptoVersion::MlDsa,
         base_fee_per_byte: crate::fee::INITIAL_BASE_FEE_PER_BYTE,
+        last_commit: vec![],
         signature,
     };
     Block {
@@ -182,6 +264,7 @@ mod tests {
                 public_key: PublicKey::from_bytes(vec![9]),
                 crypto_version: CryptoVersion::MlDsa,
                 base_fee_per_byte: crate::fee::INITIAL_BASE_FEE_PER_BYTE,
+                last_commit: vec![],
                 signature: Sig::from_bytes(vec![]),
             },
             transactions,
