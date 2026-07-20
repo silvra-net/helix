@@ -132,6 +132,10 @@ export const api = {
 
   onNodeExited: (handler: (e: NodeExited) => void) =>
     listen<NodeExited>("node-exited", (e) => handler(e.payload)),
+
+  // Where tauri-plugin-log wrote this app's diagnostic trail — see lib.rs. Surfaced in
+  // Settings so a community member hitting a bug can find it and attach it to a report.
+  logDirPath: () => invoke<string>("log_dir_path"),
 };
 
 export const DEFAULT_NODE = "https://helix.silvra.net";

@@ -20,6 +20,23 @@ use state::WalletState;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                // File + stdout, not the webview target — this is a diagnostic trail for a
+                // human to read later (or attach to a bug report), not something the frontend
+                // is meant to poll. The Node tab's own live console (node_process.rs) already
+                // covers "watch this in real time".
+                .target(tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                    file_name: None,
+                }))
+                .target(tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout))
+                .level(log::LevelFilter::Info)
+                // Keep a handful of past runs instead of one file that grows forever or gets
+                // silently truncated on the crash that's actually worth reading about.
+                .max_file_size(5_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                .build(),
+        )
         .manage(WalletState::default())
         .manage(NodeProcessState::default())
         .invoke_handler(tauri::generate_handler![
@@ -60,6 +77,7 @@ pub fn run() {
             commands::get_gov_params,
             commands::get_validator_status,
             commands::unjail,
+            commands::log_dir_path,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Helix Wallet")

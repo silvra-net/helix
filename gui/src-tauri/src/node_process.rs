@@ -96,7 +96,11 @@ pub async fn node_start(
         cmd = cmd.env("HELIX_SYNC_PEER", peer);
     }
 
-    let (mut rx, child) = cmd.spawn().map_err(|e| e.to_string())?;
+    let (mut rx, child) = cmd.spawn().map_err(|e| {
+        log::error!("failed to spawn the bundled node sidecar: {e}");
+        e.to_string()
+    })?;
+    log::info!("local node started, data_dir={}", data_dir.display());
     *state.child.lock().unwrap() = Some(child);
 
     // Stream output for the lifetime of the process. Runs on Tauri's async runtime, not the
@@ -113,15 +117,20 @@ pub async fn node_start(
                     );
                 }
                 CommandEvent::Stderr(bytes) => {
-                    let _ = app_for_task.emit(
-                        "node-log",
-                        LogLine { stream: "stderr", line: String::from_utf8_lossy(&bytes).to_string() },
-                    );
+                    let text = String::from_utf8_lossy(&bytes).to_string();
+                    // Persisted (unlike stdout, which the live console already covers and which
+                    // would otherwise flood the app log with a routine "Block committed" line
+                    // every ~2s) — stderr is the node's own signal that something is off, and is
+                    // exactly what's missing after the fact if nobody was watching the console
+                    // tab when it happened.
+                    log::warn!("[node stderr] {text}");
+                    let _ = app_for_task.emit("node-log", LogLine { stream: "stderr", line: text });
                 }
                 CommandEvent::Terminated(payload) => {
                     if let Some(state) = app_for_task.try_state::<NodeProcessState>() {
                         *state.child.lock().unwrap() = None;
                     }
+                    log::info!("local node exited, code={:?}", payload.code);
                     let _ = app_for_task.emit("node-exited", NodeExited { code: payload.code });
                 }
                 _ => {}
@@ -139,7 +148,11 @@ pub async fn node_start(
 pub fn node_stop(state: State<'_, NodeProcessState>) -> Result<(), String> {
     let child = state.child.lock().unwrap().take();
     if let Some(child) = child {
-        child.kill().map_err(|e| e.to_string())?;
+        child.kill().map_err(|e| {
+            log::error!("failed to kill the local node process: {e}");
+            e.to_string()
+        })?;
+        log::info!("local node stopped by user");
     }
     Ok(())
 }

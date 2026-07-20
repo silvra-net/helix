@@ -74,9 +74,14 @@ pub fn create_wallet(app: AppHandle, state: State<'_, WalletState>, passphrase: 
     if wallet::exists_at(&path) {
         return Err("a wallet already exists — remove it before creating a new one".into());
     }
-    let created = wallet::create_at(&path, passphrase.as_deref())?;
+    // Never log `passphrase`/the mnemonic — only that creation succeeded or failed, and why,
+    // same discipline as every other wallet command below.
+    let created = wallet::create_at(&path, passphrase.as_deref()).inspect_err(|e| {
+        log::error!("wallet creation failed: {e}");
+    })?;
     let address = created.address.clone();
     let mnemonic = created.mnemonic.clone();
+    log::info!("wallet created: {address}");
     *state.inner.lock().unwrap() = Some(UnlockedWallet { keypair: created.keypair, address: address.clone() });
     Ok(NewWallet { address, mnemonic })
 }
@@ -84,7 +89,10 @@ pub fn create_wallet(app: AppHandle, state: State<'_, WalletState>, passphrase: 
 #[tauri::command]
 pub fn restore_wallet(app: AppHandle, state: State<'_, WalletState>, mnemonic: String, passphrase: Option<String>) -> Result<String, String> {
     let path = wallet_path(&app)?;
-    let (keypair, address) = wallet::restore_at(&path, &mnemonic, passphrase.as_deref())?;
+    let (keypair, address) = wallet::restore_at(&path, &mnemonic, passphrase.as_deref()).inspect_err(|e| {
+        log::error!("wallet restore failed: {e}");
+    })?;
+    log::info!("wallet restored: {address}");
     *state.inner.lock().unwrap() = Some(UnlockedWallet { keypair, address: address.clone() });
     Ok(address)
 }
@@ -92,7 +100,13 @@ pub fn restore_wallet(app: AppHandle, state: State<'_, WalletState>, mnemonic: S
 #[tauri::command]
 pub fn unlock_wallet(app: AppHandle, state: State<'_, WalletState>, passphrase: Option<String>) -> Result<String, String> {
     let path = wallet_path(&app)?;
-    let (keypair, address) = wallet::load_at(&path, passphrase.as_deref())?;
+    // The most common "why won't this work" support question in practice (wrong passphrase,
+    // a wallet.json copied over from elsewhere) — worth its own line rather than relying on
+    // the generic tx-submission logging below, which this never reaches if unlock fails.
+    let (keypair, address) = wallet::load_at(&path, passphrase.as_deref()).inspect_err(|e| {
+        log::error!("wallet unlock failed: {e}");
+    })?;
+    log::info!("wallet unlocked: {address}");
     *state.inner.lock().unwrap() = Some(UnlockedWallet { keypair, address: address.clone() });
     Ok(address)
 }
@@ -100,6 +114,15 @@ pub fn unlock_wallet(app: AppHandle, state: State<'_, WalletState>, passphrase: 
 #[tauri::command]
 pub fn lock_wallet(state: State<'_, WalletState>) {
     *state.inner.lock().unwrap() = None;
+}
+
+/// Where `tauri-plugin-log` is writing the app's log file — shown (with a copy button) in
+/// Settings, so "something went wrong" has an actual answer to "where do I even look" beyond
+/// the transient in-app error toast. The one thing this app can't self-diagnose is itself not
+/// starting at all; a fixed, documented location is what makes that reportable too.
+#[tauri::command]
+pub fn log_dir_path(app: AppHandle) -> Result<String, String> {
+    Ok(app.path().app_log_dir().map_err(|e| e.to_string())?.display().to_string())
 }
 
 #[tauri::command]
@@ -151,6 +174,10 @@ async fn build_sign_submit(
         None => rpc::fetch_base_fee(node).await?,
     };
 
+    // Captured before `tx_type` moves into `build_tx` below — just for the log line, so it
+    // doesn't need `TxType: Copy`/an extra clone of anything bigger.
+    let tx_type_label = format!("{tx_type:?}");
+
     let signed = {
         let guard = state.inner.lock().unwrap();
         let wallet = guard.as_ref().ok_or("wallet is locked")?;
@@ -159,7 +186,20 @@ async fn build_sign_submit(
         tx
     };
 
-    rpc::submit_tx(node, &signed).await
+    // Central logging point for every transaction command (send, stake, delegate, unjail,
+    // governance, …) rather than one call per command — this is the one place they all
+    // actually go through, so it's also the one place that needs a log line to cover all of
+    // them without touching every command individually.
+    match rpc::submit_tx(node, &signed).await {
+        Ok(result) => {
+            log::info!("tx {tx_type_label} submitted: {} ({})", result.tx_hash, result.status);
+            Ok(result)
+        }
+        Err(e) => {
+            log::error!("tx {tx_type_label} submission failed: {e}");
+            Err(e)
+        }
+    }
 }
 
 fn parse_validator(addr: &str) -> Result<Address, String> {

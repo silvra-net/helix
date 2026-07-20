@@ -28,6 +28,12 @@ tauri = { version = "2", features = [] }
 # executable across Linux/macOS/Windows app-bundle layouts, which is genuinely fiddly to get
 # right by hand (different resource-directory conventions per platform).
 tauri-plugin-shell = "2"
+# Persistent, file-backed application logging (distinct from node_process.rs's console
+# streaming, which only ever shows the bundled node's own output) — so a wallet-side failure
+# (unlock, a send that failed, the sidecar refusing to spawn) leaves something on disk a user
+# can find and attach to a bug report, not just a toast that's gone the moment they dismiss it.
+tauri-plugin-log = "2"
+log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

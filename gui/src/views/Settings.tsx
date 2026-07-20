@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../api";
 
 // Settings: the deliberate backup path. A wallet created before you wrote the 24 words down would
@@ -11,6 +11,11 @@ export default function Settings({ address }: { address: string }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const [logDir, setLogDir] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.logDirPath().then(setLogDir).catch(() => setLogDir(null));
+  }, []);
 
   const reveal = async () => {
     setBusy(true);
@@ -113,6 +118,27 @@ export default function Settings({ address }: { address: string }) {
           <div className="row-actions" style={{ marginTop: 10 }}>
             <button onClick={showPubkey}>Show public key</button>
           </div>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="section-title">Diagnostics</div>
+        <p className="muted small" style={{ marginTop: -4 }}>
+          If something goes wrong, this file has the details — attach it when reporting a bug.
+          It never contains your passphrase, mnemonic, or private key.
+        </p>
+        {logDir ? (
+          <>
+            <div className="kv">
+              <span className="muted">Log folder</span>
+              <span className="mono small" style={{ wordBreak: "break-all", textAlign: "right", maxWidth: "70%" }}>{logDir}</span>
+            </div>
+            <div className="row-actions end">
+              <button onClick={() => copy("logdir", logDir)}>{copied === "logdir" ? "Copied" : "Copy path"}</button>
+            </div>
+          </>
+        ) : (
+          <p className="muted small">Log folder unavailable.</p>
         )}
       </div>
     </div>
