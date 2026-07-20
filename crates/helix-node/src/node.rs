@@ -850,10 +850,40 @@ async fn handle_p2p_event(
                 // behind until the next block arrives.
                 warn!(our_height, block_height, "Block gap detected — attempting catch-up sync");
                 if let Some(peer_url) = sync_peer {
-                    let mut s = store.write().await;
-                    let mut cs = chain_state.write().await;
-                    match sync_blocks_from_peer(peer_url, our_height, &mut s, &mut cs).await {
-                        Ok(n) => info!("Gap filled: applied {} blocks", n),
+                    // Hold `last_applied_height` for the whole sync, exactly like
+                    // `rpc_sync_loop` does — without it, this path calls `execute_block`
+                    // (via `sync_blocks_from_peer`) completely outside the guard that
+                    // `apply_finalized_block` checks, so a concurrent BFT-finalize or
+                    // another gossip event for the same height(s) can double-mint the
+                    // block reward. `sync_blocks_from_peer` itself never touches this
+                    // lock, so the re-check under it (`base`) is required, not redundant:
+                    // another path may have already caught us up while we waited for it.
+                    let mut last = last_applied_height.lock().await;
+                    let base = store.read().await.latest_height();
+                    if block_height <= base {
+                        return; // another path already applied this in the meantime
+                    }
+                    let result = {
+                        let mut s = store.write().await;
+                        let mut cs = chain_state.write().await;
+                        sync_blocks_from_peer(peer_url, base, &mut s, &mut cs)
+                            .await
+                            .map(|n| (n, s.latest_height(), s.latest_hash()))
+                    };
+                    match result {
+                        Ok((n, new_height, new_hash)) if n > 0 => {
+                            *last = new_height;
+                            // This apply bypassed receive_proposal/add_vote and
+                            // apply_finalized_block entirely — keep the engine's height
+                            // tracking and EIP-1559 base fee in step, same as
+                            // rpc_sync_loop does after its own sync_blocks_from_peer call.
+                            engine.write().await.sync_to_externally_finalized_block(new_height, new_hash);
+                            if let Ok(tip) = store.read().await.get_block_by_height(new_height) {
+                                publish_base_fee(engine, mempool, base_fee_for_next_block(&tip)).await;
+                            }
+                            info!("Gap filled: applied {} blocks", n);
+                        }
+                        Ok(_) => {}
                         Err(e) => warn!("Gap sync failed: {}", e),
                     }
                 }
@@ -2534,6 +2564,108 @@ mod handle_p2p_event_tests {
         let issued_after_second = chain_state.read().await.total_issued;
         assert_eq!(issued_after_second, issued_after_first, "the block reward must not be minted twice for the same height");
         assert_eq!(store.read().await.latest_height(), 1, "the duplicate must not re-touch storage either");
+    }
+
+    /// The bug this closes: `NewCommittedBlock`'s gap-fill branch called
+    /// `sync_blocks_from_peer` — which mints block rewards via `execute_block` — entirely
+    /// outside `last_applied_height`. A concurrent BFT-finalize or gossip apply for a height
+    /// inside the just-synced range would see a guard that still read its pre-sync value and
+    /// double-mint. Reproduces the real race end-to-end: gap-fill via `handle_p2p_event`,
+    /// then a racing `apply_finalized_block` for one of the heights it just applied.
+    #[tokio::test]
+    async fn gap_fill_sync_is_covered_by_the_shared_height_guard() {
+        use axum::{extract::Query, routing::get, Json, Router};
+        use std::collections::HashMap;
+
+        let kp = KeyPair::generate();
+        let mut prev_hash = Hash::ZERO;
+        let chained: Vec<Block> = (1u64..=3)
+            .map(|h| {
+                let b = signed_block(&kp, h, prev_hash);
+                prev_hash = b.hash();
+                b
+            })
+            .collect();
+
+        let served = Arc::new(chained.clone());
+        let app = Router::new().route(
+            "/sync/blocks",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let served = served.clone();
+                async move {
+                    let from: u64 = params.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let count: usize = params.get("count").and_then(|s| s.parse().ok()).unwrap_or(200);
+                    let page: Vec<Block> =
+                        served.iter().filter(|b| b.height() >= from).take(count).cloned().collect();
+                    Json(page)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let peer_count = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        // Empty validator set — mirrors the same bootstrap fallback `sync_blocks_from_peer`
+        // already relies on (`chain_state.stakers().is_empty()`), same as its own test suite.
+        let validator_set = ValidatorSet::new(vec![], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, Address::from_public_key(&kp.public), 0)));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        let last_applied_height = Arc::new(Mutex::new(0u64));
+
+        // A gossiped block far ahead of our tip — triggers the gap-fill branch. Its own
+        // content is irrelevant; it's never applied directly, only used to detect the gap.
+        let far_ahead = signed_block(&kp, 5, Hash::ZERO);
+        handle_p2p_event(
+            P2PEvent::NewCommittedBlock(far_ahead),
+            &mempool,
+            &peer_count,
+            &store,
+            &chain_state,
+            &engine,
+            &kp,
+            &p2p_tx,
+            &Some(peer_url),
+            &last_applied_height,
+        )
+        .await;
+
+        assert_eq!(store.read().await.latest_height(), 3, "all three blocks from the peer must be applied");
+        assert_eq!(
+            *last_applied_height.lock().await,
+            3,
+            "gap-fill must advance the shared guard to the new tip — before this fix it never \
+             touched it at all, leaving it at its pre-sync value"
+        );
+        let issued_after_gap_fill = chain_state.read().await.total_issued;
+        assert!(issued_after_gap_fill > 0, "gap-fill must have minted the block rewards for heights 1-3");
+
+        // Now the actual race: some other ingestion path (BFT-finalize, direct gossip)
+        // finalizes one of the heights the gap-fill just applied. Before this fix, this
+        // would see `last_applied_height` still at its pre-sync value and double-mint.
+        let racing_duplicate = chained[2].clone(); // height 3, same block gap-fill already applied
+        apply_finalized_block(
+            racing_duplicate,
+            false,
+            &store,
+            &mempool,
+            &chain_state,
+            &engine,
+            &p2p_tx,
+            None,
+            &last_applied_height,
+        )
+        .await;
+
+        assert_eq!(
+            chain_state.read().await.total_issued,
+            issued_after_gap_fill,
+            "the racing duplicate must not mint the block reward a second time"
+        );
+        assert_eq!(store.read().await.latest_height(), 3, "the racing duplicate must not re-touch storage either");
     }
 }
 
