@@ -62,7 +62,7 @@ layout) lives further down for when you need it.
 - [Roadmap to Mainnet](#roadmap-to-mainnet) — what's done, what's live, what's next
 - [Quick Start](#quick-start) — clone → node → first transaction
 - [Desktop wallet](#desktop-wallet) — the GUI app, no shell needed
-- [Installation](#installation) — prerequisites, release download, build from source
+- [Installation](#installation) — system requirements, prerequisites, release download, build from source
 
 **Running & operating a node**
 - [Running a Node](#running-a-node) — config file, environment variables, chain data
@@ -226,6 +226,25 @@ root URL — open [helix.silvra.net](https://helix.silvra.net).
 ---
 
 ## Installation
+
+### System Requirements
+
+These are measured against the live `helix.silvra.net` deployment (currently a single
+validator, testnet-scale traffic — the chain is still almost entirely empty blocks), not
+synthetic benchmarks. Treat them as a starting point, not a ceiling: they will need
+revisiting once the network carries real transaction volume.
+
+| Resource | Minimum | Recommended | Notes |
+|---|---|---|---|
+| **CPU** | 1 vCPU | 2+ vCPU | Block production/validation itself is cheap (ML-DSA-65 sign/verify, one block every 2s) — the prod node runs at ~0% CPU most of the time. Extra headroom matters if you also serve a busy RPC endpoint or process contract calls. STARK proof *generation* for Proof of Personhood happens client-side (`helix identity prove-personhood`), not on the node — it doesn't count against validator sizing. |
+| **RAM** | 512 MB | 1 GB+ | Observed: ~19 MB right after startup, growing to the low hundreds of MB during normal operation as the redb page cache and gossipsub mesh state fill in. |
+| **Disk** | 5 GB free to start | 20 GB+, monitored | `helix-data.redb` grows continuously — there is no pruning or archival mode yet (see [Security](#security)). Measured on prod: ~387 MB accumulated over ~15.6 hours of block production (roughly 25 MB/hour at the current near-empty-block rate) — expect this to change substantially, in either direction, once real traffic and/or pruning land. **Never delete the file to reclaim space** — renaming it forces a fresh genesis, exactly like a chain reset. |
+| **Network** | Outbound HTTPS (443) | — | A *following/validating* node needs only outbound access — RPC sync and the WebSocket P2P transport both ride over standard HTTPS/WSS, so no inbound port-forwarding or public IP is required, even behind NAT/CGNAT (see [Validating from behind a reverse proxy](#validating-from-behind-a-reverse-proxy--cloudflare-tunnel)). Running your own public seed instead needs inbound `8545/tcp` (RPC) and, if you want raw-TCP P2P reachable directly, `8546/tcp`. |
+| **OS / Arch** | Linux x86_64, macOS (Apple Silicon), Windows x86_64 | — | The platforms [CI](.github/workflows/release.yml) builds and publishes releases for. Other platforms need building from source (`cargo build --release`) and are untested. |
+
+Storage growth is the one number worth watching yourself rather than trusting a table: run
+`du -h helix-data.redb` periodically, or check free space on the data directory (`df -h`)
+alongside your node's own `GET /status`.
 
 ### Prerequisites
 
@@ -943,6 +962,22 @@ much of the validator set is down to form any majority).
 Nil is only ever a prevote. Helix never *precommits* nil, so "precommit quorum" keeps meaning
 exactly one thing: a real block is final.
 
+**When a validator stays silent for good** (crashed, never actually running, network-
+partitioned — not just a slow round), nil-prevote round-advancement alone isn't enough: with a
+small, equal-stake validator set, `2/3+1` quorum can require *every* validator's vote, and no
+amount of round-timeouts changes that. Each node tracks, purely locally, how many consecutive
+rounds a given validator has cast neither a prevote nor a precommit it saw; past a threshold
+(~10 minutes of total silence) that validator's voting power stops counting toward *this node's
+own* quorum calculation — a lone remaining validator can then finalize with just its own vote,
+and the excluded validator rejoins instantly the moment its votes reappear. This is deliberately
+local and not something nodes are required to agree on (agreeing would need the very quorum
+that's missing); it only ever *removes* power from the calculation, never redirects it, so it
+cannot manufacture two competing quorums for the same round. The cost is honest, not hidden: for
+as long as a validator is excluded, the remaining set's effective fault tolerance is lower — the
+same trust level Helix already ran under for most of its life as a single-validator devnet, now
+entered automatically instead of via a permanent freeze. Nothing here touches `ChainState`,
+stake, or the persisted validator set.
+
 **Proof of Personhood** caps how much voting power a single identity can accumulate:
 - Without verification: voting power capped at 0.5% of the network
 - With verification: voting power capped at 1% of the network
@@ -1212,6 +1247,10 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
   nonces, and money-path arithmetic is overflow-checked; delegation uses shares-based accounting
   hardened against rounding/inflation loss
 - Double-signing is provable on-chain and slashed; misbehaving peers are scored and banned
+- A validator that goes completely silent for a sustained period (~10 minutes) stops counting
+  toward this node's own BFT quorum, so a permanently or temporarily unreachable validator
+  degrades liveness instead of freezing the chain forever — see the
+  [Consensus](#consensus) section
 
 **Known limitations (honest status, not finished guarantees):**
 
@@ -1246,6 +1285,10 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 - The personhood *authority* is a trust anchor: any one configured authority can vouch for a
   human. This removes a single point of failure for availability, but is not (yet) M-of-N
   threshold issuance.
+- **No pruning or archival mode.** `helix-data.redb` keeps every block and every piece of state
+  forever and grows without bound — see [System Requirements](#system-requirements) for measured
+  growth on prod. Fine for a young, low-traffic testnet; a real capacity plan (pruning, snapshot
+  sync, or a separate archival tier) is needed before disk growth becomes anyone's problem.
 
 Report security issues privately before public disclosure.
 
