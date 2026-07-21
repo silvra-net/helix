@@ -15,6 +15,7 @@ import type {
   Proposal,
   RecoveryStatus,
   SubmitResult,
+  ValidatorList,
   ValidatorPool,
   ValidatorStatus,
   WalletMeta,
@@ -70,6 +71,10 @@ export const api = {
   getDelegations: (node: string) => invoke<Delegation[]>("get_delegations", { node }),
 
   getValidatorPool: (node: string) => invoke<ValidatorPool>("get_validator_pool", { node }),
+
+  // Everyone eligible to validate — the list a delegator picks from. Without it the wallet
+  // could offer a delegate button and nothing to delegate to.
+  listValidators: (node: string) => invoke<ValidatorList>("list_validators", { node }),
 
   // names
   registerName: (node: string, name: string) =>

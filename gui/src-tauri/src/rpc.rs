@@ -277,6 +277,22 @@ pub async fn get_delegations(node: &str, address: &str) -> Result<Vec<Delegation
     serde_json::from_value(arr).map_err(err)
 }
 
+/// Everyone eligible to validate, as the node reports them. Passed through as raw JSON: the
+/// wallet only displays these fields, so mirroring the struct here would mean editing two files
+/// every time the node adds one, with a deserialization failure as the penalty for forgetting.
+pub async fn list_validators(node: &str) -> Result<serde_json::Value, String> {
+    let resp = client().get(format!("{node}/validators")).send().await.map_err(err)?;
+    if !resp.status().is_success() {
+        // A node too old to have this endpoint 404s. Say so plainly — "the wallet is broken" is
+        // the wrong conclusion, and the fix is upgrading the node it is pointed at.
+        if resp.status().as_u16() == 404 {
+            return Err("this node does not offer a validator list — it predates Helix 0.8.4".into());
+        }
+        return Err(format!("node returned {}", resp.status()));
+    }
+    resp.json::<serde_json::Value>().await.map_err(err)
+}
+
 pub async fn get_validator_pool(node: &str, validator: &str) -> Result<ValidatorPool, String> {
     let resp = client()
         .get(format!("{node}/validators/{validator}/pool"))

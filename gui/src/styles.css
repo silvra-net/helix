@@ -231,3 +231,12 @@ button.mini { padding: 4px 9px; font-size: 12px; }
 }
 .resolve-line { margin: -8px 0 12px 2px; }
 .resolve-result { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+
+/* Validator picker rows are buttons, so they need the list-row look without the button look. */
+.picker-row {
+  width: 100%; text-align: left; background: transparent; border: none;
+  border-bottom: 1px solid var(--border); cursor: pointer; font: inherit; color: inherit;
+}
+.picker-row:hover:not(:disabled) { background: var(--surface-2); }
+.picker-row.active { background: rgba(34, 211, 238, 0.12); }
+.picker-row:disabled { opacity: 0.45; cursor: not-allowed; }

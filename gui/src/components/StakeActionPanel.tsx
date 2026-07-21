@@ -15,6 +15,8 @@ export type StakeAction =
   | { kind: "redelegate"; validator: string }
   | { kind: "commission" };
 
+import { ValidatorPicker } from "./ValidatorPicker";
+
 export function StakeActionPanel({
   action,
   node,
@@ -80,10 +82,7 @@ export function StakeActionPanel({
       <div className="section-title">{title[action.kind]}</div>
 
       {action.kind === "delegate" && (
-        <label className="field">
-          <span>Validator address</span>
-          <input className="mono" value={validator} spellCheck={false} placeholder="hlx…" onChange={(e) => setValidator(e.target.value)} />
-        </label>
+        <ValidatorPicker node={node} value={validator} onChange={setValidator} />
       )}
 
       {(action.kind === "undelegate" || action.kind === "redelegate") && (
@@ -91,10 +90,12 @@ export function StakeActionPanel({
       )}
 
       {action.kind === "redelegate" && (
-        <label className="field">
-          <span>To validator</span>
-          <input className="mono" value={toValidator} spellCheck={false} placeholder="hlx…" onChange={(e) => setToValidator(e.target.value)} />
-        </label>
+        <ValidatorPicker
+          node={node}
+          value={toValidator}
+          onChange={setToValidator}
+          exclude={action.validator}
+        />
       )}
 
       {action.kind === "commission" ? (

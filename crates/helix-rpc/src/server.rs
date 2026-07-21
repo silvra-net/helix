@@ -93,6 +93,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/accounts/:address/recovery", get(get_account_recovery))
         .route("/accounts/:address/delegations", get(get_account_delegations))
         .route("/accounts/:address/storage/:key_hex", get(get_contract_storage))
+        .route("/validators", get(get_validators))
         .route("/validators/:address/pool", get(get_validator_pool))
         .route(
             "/accounts/:address/transactions",
@@ -207,6 +208,7 @@ fn api_index() -> Json<Value> {
             "GET  /validators/{address}/pool",
             "GET  /names/{name}",
             "GET  /governance/params",
+            "GET  /validators",
             "GET  /governance/proposals",
             "GET  /governance/proposals/{id}",
             "GET  /mempool",
@@ -727,6 +729,90 @@ async fn get_validator_pool(
             "effective_stake_hlx": chain.effective_stake(&address) as f64 / 1_000_000_000.0,
             "total_shares": pool.map(|p| p.total_shares).unwrap_or(0),
             "commission_bps": pool.map(|p| p.commission_bps),
+        })),
+    )
+}
+
+/// `GET /validators` — everyone currently eligible to validate, with what a delegator needs in
+/// order to choose between them.
+///
+/// This did not exist, and its absence made delegation unusable rather than merely awkward:
+/// `/validators/:address/pool` answers questions about a validator you already know, and there
+/// was no way to find one. The wallet could offer a "delegate" button and no list to delegate
+/// to, so the only people who could use the feature were those who already had an address from
+/// somewhere else.
+///
+/// Jailed validators are included and marked, not hidden — a delegator with stake already
+/// placed there needs to see the reason their rewards stopped, and one about to delegate needs
+/// to see why they should not. `active` distinguishes "currently in the BFT set" from "meets the
+/// stake threshold and will be at the next rotation".
+///
+/// Sorted by effective stake, largest first, which is the order these are usually compared in.
+/// Bounded by validator count, so no pagination: a set large enough to need it would have
+/// stopped fitting in a single BFT round long before.
+async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
+    let chain = state.chain_state.read().await;
+
+    let mut out: Vec<_> = chain
+        .stakers()
+        .into_iter()
+        .map(|(addr, effective)| {
+            let key = addr.to_string();
+            let pool = chain.validator_pools.get(&key);
+            json!({
+                "address": key,
+                "effective_stake_hlx": effective as f64 / 1_000_000_000.0,
+                "self_staked_hlx": chain.get(&addr).map(|a| a.staked).unwrap_or(0) as f64 / 1_000_000_000.0,
+                "delegated_stake_hlx": pool.map(|p| p.total_delegated_stake).unwrap_or(0) as f64 / 1_000_000_000.0,
+                // `None` means the validator has never had a delegator and so has not set a
+                // rate — not that it takes zero. Rendering that difference is the client's job.
+                "commission_bps": pool.map(|p| p.commission_bps),
+                "accepts_delegation": pool.is_some(),
+                // `null` before the first rotation of a fresh chain: `active_validators` is
+                // empty then, and reporting `false` would call a validator that is visibly
+                // producing blocks inactive. Unknown is the truthful answer, not "no".
+                "active": if chain.active_validators.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::Bool(chain.active_validators.contains(&addr))
+                },
+                "jailed_until": chain.jailed_until.get(&key),
+                "missed_blocks": chain.missed_blocks.get(&key),
+            })
+        })
+        .collect();
+
+    // Jailed addresses are filtered out of `stakers()`, so add them back explicitly — hiding a
+    // validator that someone has already delegated to is how a delegator ends up wondering why
+    // their rewards stopped with nothing on screen to explain it.
+    for (key, until) in &chain.jailed_until {
+        if let Ok(addr) = Address::from_str(key) {
+            let pool = chain.validator_pools.get(key);
+            out.push(json!({
+                "address": key,
+                "effective_stake_hlx": chain.effective_stake(&addr) as f64 / 1_000_000_000.0,
+                "self_staked_hlx": chain.get(&addr).map(|a| a.staked).unwrap_or(0) as f64 / 1_000_000_000.0,
+                "delegated_stake_hlx": pool.map(|p| p.total_delegated_stake).unwrap_or(0) as f64 / 1_000_000_000.0,
+                "commission_bps": pool.map(|p| p.commission_bps),
+                "accepts_delegation": pool.is_some(),
+                "active": false,
+                "jailed_until": Some(until),
+                "missed_blocks": chain.missed_blocks.get(key),
+            }));
+        }
+    }
+
+    out.sort_by(|a, b| {
+        let sa = a["effective_stake_hlx"].as_f64().unwrap_or(0.0);
+        let sb = b["effective_stake_hlx"].as_f64().unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "validators": out,
+            "min_validator_stake_hlx": chain.governance_params.min_validator_stake as f64 / 1_000_000_000.0,
         })),
     )
 }

@@ -62,6 +62,7 @@ pub fn run() {
             commands::set_commission,
             commands::get_delegations,
             commands::get_validator_pool,
+            commands::list_validators,
             commands::register_name,
             commands::resolve_name,
             commands::my_name,

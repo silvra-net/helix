@@ -318,6 +318,11 @@ pub async fn get_validator_pool(state: State<'_, WalletState>, node: String) -> 
     rpc::get_validator_pool(&node, &address).await
 }
 
+#[tauri::command]
+pub async fn list_validators(node: String) -> Result<serde_json::Value, String> {
+    rpc::list_validators(&node).await
+}
+
 // ---------- settings / backup ----------
 
 /// Re-derive and return the 24-word recovery phrase, re-authenticating with the passphrase. This

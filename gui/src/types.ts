@@ -77,6 +77,25 @@ export interface HistoryEntry {
   error?: string | null;
 }
 
+export interface ValidatorSummary {
+  address: string;
+  effective_stake_hlx: number;
+  self_staked_hlx: number;
+  delegated_stake_hlx: number;
+  /** null when the validator has never had a delegator and so never set a rate. */
+  commission_bps: number | null;
+  accepts_delegation: boolean;
+  /** null before a fresh chain's first rotation — unknown, not "no". */
+  active: boolean | null;
+  jailed_until: number | null;
+  missed_blocks: number | null;
+}
+
+export interface ValidatorList {
+  validators: ValidatorSummary[];
+  min_validator_stake_hlx: number;
+}
+
 export interface NetworkStatus {
   version: string;
   height: number;
