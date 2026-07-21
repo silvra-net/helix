@@ -214,14 +214,36 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Needed for the release body: the static "which download do I need" section lives in
+      # the repo, and the per-version part is the annotated tag's own message.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
+      # A release page that lists nine assets and explains none of them makes people pick the
+      # wrong one — or ask. (It did.) The body is assembled from three parts: a fixed section
+      # telling each kind of user which single file they want, the annotated tag's message for
+      # what changed in this specific version (git's own release notes, otherwise never shown
+      # anywhere), and GitHub's generated commit list appended below by the action.
+      - name: Assemble release body
+        run: |
+          set -euo pipefail
+          cat .github/release-body.md > body.md
+          printf '## What'"'"'s in %s\n\n' "${GITHUB_REF_NAME}" >> body.md
+          # Strip the tag's own summary line ("v1.2.3 — headline"), since the heading above
+          # already says which version this is.
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" \
+            | sed "1s/^${GITHUB_REF_NAME} — //" >> body.md
+
       - name: Create release and upload assets
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
+          body_path: body.md
           generate_release_notes: true
