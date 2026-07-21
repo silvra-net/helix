@@ -1669,7 +1669,40 @@ async fn resolve_seed_peer_multiaddr(peer_url: &str) -> Result<String> {
         .json()
         .await?;
 
+    if let Some(warning) = peer_version_warning(&status, env!("CARGO_PKG_VERSION")) {
+        warn!(peer = %peer_url, "{warning}");
+    }
+
     seed_multiaddr_from_status(&status, &host)
+}
+
+/// Compares our build against the sync peer's reported one, returning a warning when they
+/// differ. Pure so it can be tested without a live peer.
+///
+/// Nothing in the P2P layer refuses a version mismatch — `Peer::protocol_version` exists as a
+/// field and is never checked — so two nodes running different consensus rules will peer
+/// happily and then disagree in silence. That is not hypothetical: the downtime-accounting fix
+/// in 0.8.1 changes which validators are scored for missed blocks, so an un-upgraded node jails
+/// a validator that an upgraded one considers fine, stops voting with it, and stalls the chain
+/// until the liveness jail fires — while both keep producing perfectly valid-looking blocks.
+///
+/// This only catches the mismatch at join time, which is where it usually starts (an operator
+/// brings up a node against an already-upgraded network). It cannot see a peer that upgrades
+/// while we keep running; catching that needs a real handshake (libp2p `identify`, or version
+/// in peer exchange) and is tracked separately. Warning rather than refusing is deliberate:
+/// most version differences are harmless, and a node that refuses to start because a peer is
+/// one patch ahead would be worse than one that says so loudly.
+fn peer_version_warning(status: &serde_json::Value, ours: &str) -> Option<String> {
+    let theirs = status.get("version")?.as_str()?;
+    if theirs == ours {
+        return None;
+    }
+    Some(format!(
+        "Sync peer runs Helix {theirs}, this node runs {ours}. Nothing enforces a match, and a \
+         consensus-rule difference between them shows up as silent disagreement — mismatched \
+         jailing, votes that never count, a chain that stalls without an error. Run the same \
+         version as the network you are joining."
+    ))
 }
 
 /// Pure `/status` → dialable multiaddr mapping, split out so it can be unit-tested without a
@@ -2866,4 +2899,23 @@ mod genesis_verification_tests {
         assert!(verify_genesis_reconstruction(&pg, &state).is_ok());
     }
 
+    /// Joining a network that runs different consensus rules has to be *said*, since nothing
+    /// prevents it — see `peer_version_warning`'s doc comment for what the silence costs.
+    #[test]
+    fn a_sync_peer_on_a_different_version_produces_a_warning() {
+        let status = serde_json::json!({ "version": "0.8.1", "height": 5 });
+
+        assert!(
+            peer_version_warning(&status, "0.8.1").is_none(),
+            "matching versions must stay quiet"
+        );
+
+        let warning = peer_version_warning(&status, "0.8.0")
+            .expect("a version difference must be reported");
+        assert!(warning.contains("0.8.1") && warning.contains("0.8.0"), "name both versions: {warning}");
+
+        // A peer too old to report a version leaves us no worse off than before the check —
+        // same reasoning as the genesis hash above, so no false alarm either.
+        assert!(peer_version_warning(&serde_json::json!({ "height": 5 }), "0.8.1").is_none());
+    }
 }
