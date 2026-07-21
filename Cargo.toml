@@ -65,7 +65,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP server
 axum = "0.7"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
 
 # P2P networking
 libp2p = { version = "0.54", features = [
@@ -93,7 +93,10 @@ wasmi = "0.31"
 
 # CLI
 clap = { version = "4.4", features = ["derive", "env"] }
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+# `gzip` so the historical sync actually asks for the compression the RPC server now offers —
+# without it reqwest sends no `Accept-Encoding` and every catch-up pulls full-size JSON (7.6 MB
+# per 200 blocks instead of 2.0 MB, measured 2026-07-21).
+reqwest = { version = "0.12", features = ["json", "blocking", "gzip"] }
 
 # Internal crates
 helix-crypto = { path = "crates/helix-crypto" }

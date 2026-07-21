@@ -17,6 +17,7 @@ use helix_p2p::P2PCommand;
 use helix_storage::{db::HelixDb, BlockStore};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, RwLock};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
@@ -97,6 +98,19 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         )
         .route("/transactions/:hash", get(get_transaction_status))
         .layer(CorsLayer::permissive())
+        // Compress responses for any client that asks (`Accept-Encoding: gzip`). The chain's
+        // bulk payloads are dominated by ML-DSA signatures and public keys, which serde renders
+        // as JSON arrays of decimal numbers — `[56, 87, 212, …]`. A 3,309-byte signature becomes
+        // ~13,000 characters that way, so an *empty* block costs ~38 KB on the wire. Measured
+        // 2026-07-21: 200 empty blocks = 7.6 MB uncompressed, 2.0 MB gzipped — a 3.8x cut on
+        // every historical sync, which is the single largest thing this node serves.
+        //
+        // Until now that saving only existed for nodes sitting behind a CDN that compresses for
+        // them (ours does; a self-hosted one does not), which is exactly backwards: the operator
+        // without a proxy is the one paying for their own bandwidth. Doing it here makes it
+        // uniform. gzip is HTTP content negotiation, so a client that does not ask, or an older
+        // one that cannot decode it, still gets plain JSON.
+        .layer(CompressionLayer::new())
         .layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
         .with_state(state);
 
