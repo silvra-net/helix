@@ -12,4 +12,5 @@
 # Scripts (Cron/Dev-Loop — nur lokal)
 /scripts/
 /CLAUDE.md
+/CLAUDE-archiv.md
 /.claude-session-state*.md
