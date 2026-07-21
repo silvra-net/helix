@@ -133,6 +133,11 @@ button.ghost { background: transparent; }
 .list-title { font-size: 14px; }
 .list-right { display: flex; align-items: center; gap: 12px; white-space: nowrap; }
 .amount { font-size: 14px; }
+/* Incoming is tinted, outgoing stays in the normal text colour rather than red: spending your
+   own coins is not an error, and colouring every payment like a warning trains people to
+   ignore the colour that should mean something. The +/- sign carries the direction. */
+.amount-in { color: var(--ok); }
+.amount-out { color: var(--text); }
 .empty { padding: 20px; text-align: center; }
 
 .pill { font-size: 12px; padding: 2px 9px; border-radius: 99px; }

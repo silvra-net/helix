@@ -339,6 +339,21 @@ pub fn my_public_key(state: State<'_, WalletState>) -> Result<String, String> {
     Ok(hex::encode(wallet.keypair.public.as_bytes()))
 }
 
+/// Whether `candidate` is a well-formed Helix address, checksum included.
+///
+/// The frontend cannot answer this itself — an address is base58 over a payload plus a
+/// truncated double-BLAKE3 checksum, so anything short of the real decoder would either reject
+/// valid input or, worse, accept a typo. Without this the wallet's only check was
+/// `startsWith("hlx")`, and a mistyped address surfaced after the user pressed send, as
+/// "neither a valid address nor a registered name" — which reads like the wrong problem when
+/// what you pasted plainly was an address.
+///
+/// Nothing here reaches the network: it is pure decoding, safe to call on every keystroke.
+#[tauri::command]
+pub fn is_valid_address(candidate: String) -> bool {
+    Address::from_str(candidate.trim()).is_ok()
+}
+
 // ---------- social recovery ----------
 
 /// Register (or replace) your guardian set. The chain derives the approval threshold from the set

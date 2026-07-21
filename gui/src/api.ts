@@ -86,6 +86,10 @@ export const api = {
 
   myPublicKey: () => invoke<string>("my_public_key"),
 
+  // Full address check including the checksum — the frontend cannot do this itself (base58 +
+  // double-BLAKE3). Pure decoding, no network, safe to call while typing.
+  isValidAddress: (candidate: string) => invoke<boolean>("is_valid_address", { candidate }),
+
   // social recovery
   registerGuardians: (node: string, guardians: string[]) =>
     invoke<SubmitResult>("register_guardians", { node, guardians }),

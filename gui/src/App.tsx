@@ -152,7 +152,7 @@ export default function App() {
         </header>
 
         <section className="view">
-          {route === "home" && <Overview node={node} onSend={() => setRoute("send")} onReceive={() => setRoute("receive")} />}
+          {route === "home" && <Overview node={node} height={net?.height} onSend={() => setRoute("send")} onReceive={() => setRoute("receive")} />}
           {route === "send" && <Send node={node} baseFee={net?.base_fee_per_byte} onDone={() => setRoute("home")} />}
           {route === "receive" && <Receive address={meta.address ?? ""} />}
           {route === "validate" && <Validate node={node} net={net} onNodeChange={onNodeChange} walletEncrypted={meta.encrypted} />}

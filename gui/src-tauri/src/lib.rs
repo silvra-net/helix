@@ -67,6 +67,7 @@ pub fn run() {
             commands::my_name,
             commands::reveal_mnemonic,
             commands::my_public_key,
+            commands::is_valid_address,
             commands::register_guardians,
             commands::approve_recovery,
             commands::cancel_recovery,
