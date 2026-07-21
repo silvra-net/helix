@@ -547,9 +547,12 @@ server / firewall, so this assumes the WebSocket-tunnel setup:
 
 1. **Generate a validator key** on the machine that will run the node, and never let the
    24-word phrase leave it: `helix wallet new -o validator-key.json`. Note the address.
-2. **Get that address staked** with at least `MIN_VALIDATOR_STAKE` (100,000 HLX) — either
-   pre-staked into genesis via `genesis_extra_validators` (for a brand-new network's launch),
-   or funded by transfer / accumulated block rewards (to join an existing one).
+2. **Fund that address** with at least `MIN_VALIDATOR_STAKE` (100,000 HLX) — either pre-staked
+   into genesis via `genesis_extra_validators` (for a brand-new network's launch), or by
+   transfer / accumulated block rewards (to join an existing one). Fund it now, but **do not
+   send the `Stake` transaction yet** — that is the last step, once the node is provably
+   connected. Budget somewhat above the minimum: a slash takes 5% of your stake, and landing
+   below `MIN_VALIDATOR_STAKE` drops you out of the set entirely.
 3. **Expose a P2P path in.** Behind a proxy/tunnel, forward an HTTPS hostname (e.g.
    `p2p.yourdomain.net`) to your local WebSocket port and set:
    ```bash
@@ -569,9 +572,14 @@ server / firewall, so this assumes the WebSocket-tunnel setup:
    HELIX_SYNC_PEER="https://helix.silvra.net"                 # history + auto WS discovery
    HELIX_P2P_SEED_PEERS="/dns4/p2p.bob.net/tcp/443/tls/ws,/dns4/p2p.carol.net/tcp/443/tls/ws"
    ```
-6. **Start and verify:** `helix start`, then confirm `peer_count` climbs and your address
-   appears in the active validator set. `helix chain status` shows height advancing with your
-   votes counted.
+6. **Start and verify:** `helix start`, then confirm `peer_count` climbs above zero and your
+   node is following the chain. `helix chain status` shows height advancing.
+7. **Only now, stake:** `helix tx stake <amount> --key validator-key.json`. Staking before the
+   node is connected is the one ordering mistake worth avoiding — the address becomes a
+   validator on schedule whether or not anything is listening, and a validator that never
+   answers is jailed for downtime (~5 minutes of missed blocks) and has to `tx unjail` to get
+   back. You join the active set one full epoch (~100 blocks / ~3.3 minutes) after the
+   rotation that first sees your stake; that wait is deliberate and is not counted against you.
 
 ### Docker Deployment
 
@@ -1012,6 +1020,11 @@ independent of stake, until it submits an explicit `Unjail` transaction (see
 [Staking](#staking)). Unlike the RAM-only mechanism above, this survives node restarts and
 carries no slash — downtime alone isn't proof of malice, only lost quorum weight and rewards
 while jailed.
+
+Only validators in the **active set** are scored this way. A validator that has staked but is
+still waiting out its one-epoch activation delay (see [Staking](#staking)) is not in the quorum
+yet — nothing solicits its precommit and none would be counted — so those blocks are not held
+against it. The wait the protocol imposes never counts as downtime.
 
 **Proof of Personhood** caps how much voting power a single identity can accumulate:
 - Without verification: voting power capped at 0.5% of the network
