@@ -45,11 +45,16 @@ pub struct NodeStartConfig {
     /// app's own data directory (same place `wallet.json` lives) if not given — a fresh
     /// install just works without the user ever choosing a path.
     pub data_dir: Option<String>,
-    /// Path to an existing key file to run as (typically the wallet's own `wallet.json` —
-    /// see `Node.tsx`'s doc comment on why the wallet key doubling as the validator key is
-    /// the point, not a shortcut). `None` lets the node generate/load its own
-    /// `validator-key.json` in `data_dir` as usual.
+    /// Key file the node runs as. `None` means the wallet's own `wallet.json` — the address
+    /// you staked from is the address that validates, which is the point of running the node
+    /// from the wallet rather than a shortcut.
+    ///
+    /// This used to fall through to the node generating its own `validator-key.json`, which
+    /// silently validated as a different, unstaked address. See the default in `node_start`.
     pub validator_key_path: Option<String>,
+    /// Passphrase for `validator_key_path`, when that file is encrypted. Only needed for an
+    /// encrypted wallet — the node reads a plaintext key file without one.
+    pub validator_key_passphrase: Option<String>,
     /// Passed through as `HELIX_SYNC_PEER` — `None` joins the public network via the
     /// built-in default seed, exactly like running the CLI with no flags.
     pub sync_peer: Option<String>,
@@ -89,8 +94,27 @@ pub async fn node_start(
         .args(["start"])
         .current_dir(&data_dir);
 
-    if let Some(key_path) = &config.validator_key_path {
-        cmd = cmd.env("HELIX_VALIDATOR_KEY", key_path);
+    // Default to the wallet's own key file, which is the whole point of running the node from
+    // the wallet: the address you staked from is the address that validates.
+    //
+    // Leaving this unset does NOT mean "no validator key" — the node generates a fresh one in
+    // its data directory and validates as *that* address instead. Everything then looks healthy
+    // (node running, peers connected, chain following) while the staked address never signs
+    // anything, because the running node does not hold its key. Found live on 2026-07-21: a
+    // second validator activated, produced no precommits, and stalled the chain for 11 minutes
+    // until the liveness jail excluded it — the node was fine the whole time, it was simply
+    // signing under a key nobody had staked.
+    //
+    // An encrypted wallet cannot be read by the node without its passphrase; it fails to start
+    // with that message rather than silently falling back to a generated key, which is the
+    // failure mode this replaces.
+    let key_path = match &config.validator_key_path {
+        Some(p) => p.clone(),
+        None => crate::commands::wallet_path(&app)?.to_string_lossy().into_owned(),
+    };
+    cmd = cmd.env("HELIX_VALIDATOR_KEY", &key_path);
+    if let Some(passphrase) = &config.validator_key_passphrase {
+        cmd = cmd.env("HELIX_VALIDATOR_KEY_PASSPHRASE", passphrase);
     }
     if let Some(peer) = &config.sync_peer {
         cmd = cmd.env("HELIX_SYNC_PEER", peer);

@@ -40,7 +40,10 @@ export interface NodeProcessStatus {
 
 export interface NodeStartConfig {
   data_dir?: string | null;
+  /** Omit to validate as this wallet's own address — see node_process.rs. */
   validator_key_path?: string | null;
+  /** Only needed when the wallet file is encrypted. */
+  validator_key_passphrase?: string | null;
   sync_peer?: string | null;
 }
 

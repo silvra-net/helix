@@ -18,7 +18,7 @@ use crate::state::{UnlockedWallet, WalletState};
 use crate::wallet;
 
 /// `wallet.json` under the app's data dir. Created on demand so a fresh install just works.
-fn wallet_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn wallet_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("wallet.json"))
