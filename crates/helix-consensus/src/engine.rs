@@ -56,11 +56,26 @@ const _: () = assert!(PROPOSAL_TIMEOUT_TICKS < ROUND_TIMEOUT_TICKS);
 pub const LIVENESS_JAIL_ROUNDS: u32 = 20;
 
 /// Ticks this node waits, under-connected (`peer_count < peers_needed_for_quorum()`), before
-/// ticking the round clock anyway — see `note_peer_wait_tick`. 300 ticks × `BLOCK_TIME_MS`
-/// (2s) = 10 minutes, matching `LIVENESS_JAIL_ROUNDS`'s window: by the time this fires, the
-/// round-timeout/liveness-jail machinery is what actually restores block production, this
-/// constant only stops the engine from refusing to even try.
-pub const PEER_WAIT_TIMEOUT_TICKS: u32 = 300;
+/// ticking the round clock anyway — see `note_peer_wait_tick`. 60 ticks × `BLOCK_TIME_MS`
+/// (2s) = 2 minutes.
+///
+/// This was 300 (10 minutes) on the theory that it "matched" `LIVENESS_JAIL_ROUNDS`'s window.
+/// It does not match it — the two run **in sequence**. Nothing starts the round clock until
+/// this expires, and only once rounds are running can twenty of them time out and let the
+/// liveness jail exclude the absent validator. So the real outage after a restart with no peer
+/// connected is this window *plus* that one.
+///
+/// Measured on the live chain, 2026-07-21, 2-of-2 with the other validator down: 10 min 57 s
+/// when the node had been running (its peer phase was long past), but over 20 minutes after a
+/// `pm2 restart` — because the restart put it back at the start of both. And since the liveness
+/// counter is RAM-only, restarting again resets it once more: an operator whose chain is stuck,
+/// doing the most natural thing in the world, makes it worse each time.
+///
+/// Two minutes still covers what this gate is for — letting a validator that starts a few
+/// seconds later join at round 0 rather than finding this node already ahead. A peer that has
+/// not appeared within two minutes is not about to, and the cost of assuming otherwise is paid
+/// in chain downtime.
+pub const PEER_WAIT_TIMEOUT_TICKS: u32 = 60;
 
 /// Cap on votes buffered ahead of the round they belong to (see
 /// `BftEngine::buffered_votes`). Bounds the memory a peer can make us hold by
@@ -2376,6 +2391,34 @@ mod tests {
             engine.current_height(),
             0,
             "a single vote must reset the counter, not just delay jailing by one round"
+        );
+    }
+
+    /// The peer-wait window and the liveness jail run **in sequence**, not in parallel: the
+    /// round clock does not tick until the first expires, and only ticking rounds let the
+    /// second one fire. A restart with no peer connected therefore stalls the chain for the
+    /// sum of both, which on 2026-07-21 was measured at over 20 minutes against a live 2-of-2
+    /// network — and every further restart began it again, because the liveness counter lives
+    /// only in memory.
+    ///
+    /// This pins the total, so raising `PEER_WAIT_TIMEOUT_TICKS` back toward the liveness
+    /// window (they were once both 10 minutes, on the mistaken idea that they "match") fails
+    /// here rather than in production.
+    #[test]
+    fn peer_wait_and_liveness_jail_together_stay_under_fifteen_minutes() {
+        // Counted in production ticks; helix-node drives one every BLOCK_TIME_MS (2s), so
+        // 450 ticks is 15 minutes. Kept in ticks because that constant lives in helix-node.
+        const MAX_STALL_TICKS: u32 = 450;
+
+        let peer_wait = PEER_WAIT_TIMEOUT_TICKS;
+        // Every round the absent validator misses runs its full timeout before the next starts.
+        let liveness = LIVENESS_JAIL_ROUNDS * ROUND_TIMEOUT_TICKS;
+        let worst_case = peer_wait + liveness;
+
+        assert!(
+            worst_case <= MAX_STALL_TICKS,
+            "worst-case stall after a restart is {worst_case} ticks ({peer_wait} waiting for \
+             peers + {liveness} of timing-out rounds) — these add up, they do not overlap"
         );
     }
 }

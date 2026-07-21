@@ -1417,6 +1417,8 @@ async fn block_production_loop(
 
     // Logged once rather than every tick — a full catch-up is thousands of ticks long.
     let mut announced_wait = false;
+    // Ticks spent waiting for peers, for the periodic "this is why nothing is happening" line.
+    let mut waited_ticks: u32 = 0;
 
     loop {
         interval.tick().await;
@@ -1440,9 +1442,31 @@ async fn block_production_loop(
             if needed == 0 {
                 mesh_ready = true;
             } else if peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed {
+                let have = peer_count.load(std::sync::atomic::Ordering::Relaxed);
                 if !engine.write().await.note_peer_wait_tick() {
+                    // Say what is happening. A stalled chain with a silent log is what makes an
+                    // operator restart the node — which resets both this counter and the
+                    // RAM-only liveness counter, and so lengthens exactly the outage they were
+                    // trying to end. Once a minute is enough to be visible without flooding.
+                    waited_ticks += 1;
+                    if waited_ticks % 30 == 1 {
+                        info!(
+                            peers = have,
+                            needed,
+                            "Waiting for validators to connect before producing — the chain does \
+                             not advance until quorum is reachable. Restarting the node does not \
+                             speed this up; it starts the wait over."
+                        );
+                    }
                     continue; // still waiting for enough validators to connect
                 }
+                warn!(
+                    peers = have,
+                    needed,
+                    "Not enough validators connected after the grace period — producing anyway. \
+                     Rounds will time out until the missing validators are excluded by the \
+                     liveness jail, then the chain advances without them."
+                );
                 // Past PEER_WAIT_TIMEOUT_TICKS — a validator that never connects at all
                 // would otherwise hold this node here forever (this gate runs before the
                 // has_active_round loop's own peer-wait checks even see a tick). Nothing to
