@@ -108,6 +108,24 @@ fn spawn_node(rpc_port: u16, p2p_port: u16, sync_peer_rpc_port: Option<u16>) -> 
 /// `validator-key.json` into the node's work dir so it starts with this exact validator
 /// identity instead of generating a random one, so a follower's address can be pre-staked in
 /// another node's genesis ahead of time and the follower still ends up controlling it.
+/// Panics with a diagnosis if `port` is taken, instead of letting the test start a node that
+/// cannot bind and then time out on a symptom far from the cause.
+fn assert_port_free(port: u16, label: &str) {
+    // The listener is dropped immediately; this only asks whether the port is claimable right
+    // now. A race against something else grabbing it in between is irrelevant here — the case
+    // being caught is a process that has been holding it since a previous run.
+    if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+        panic!(
+            "{label} port {port} is already in use — most likely a helix node left over from an \
+             aborted test run is still listening, and this test would talk to it instead of the \
+             node it starts (a different chain, so it fails later for a reason that looks like a \
+             consensus bug). Find it with `ss -tlnp | grep {port}` and kill it by PID.\n\
+             Note: `pkill -f \"target/debug/helix start\"` matches its own shell command line and \
+             kills the pkill itself before it gets to them — use the PID."
+        );
+    }
+}
+
 fn spawn_node_with(
     rpc_port: u16,
     p2p_port: u16,
@@ -115,6 +133,16 @@ fn spawn_node_with(
     extra_env: &[(&str, &str)],
     keypair: Option<&KeyPair>,
 ) -> NodeGuard {
+    // Fail here, with the actual reason, rather than 240 seconds later with "did not reach
+    // height N". These ports are fixed (they have to be — the tests build multiaddrs from
+    // them), so a node surviving an aborted run keeps listening and the next run silently talks
+    // to a leftover process carrying a foreign chain. That happened twice on 2026-07-21 and was
+    // misread both times as a consensus regression; the test itself had been green throughout.
+    // `ss -tlnp` eventually showed the zombies. One bind attempt turns an hour of misdiagnosis
+    // into a sentence.
+    assert_port_free(rpc_port, "RPC");
+    assert_port_free(p2p_port, "P2P");
+
     let work_dir = tempdir::TempDir::new().expect("create temp work dir for node");
     if let Some(kp) = keypair {
         KeyFile::from_keypair_plain(kp)
