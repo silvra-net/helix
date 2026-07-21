@@ -66,6 +66,16 @@ export default function Setup({
             />
           </label>
         )}
+        {tab === "restore" && mnemonic.trim() !== "" && (
+          <p className="muted small" style={{ marginTop: -6 }}>
+            {(() => {
+              const n = mnemonic.trim().split(/\s+/).length;
+              return n === 24
+                ? "24 words — looks complete."
+                : `${n} of 24 words. A phrase is only valid complete and in the original order.`;
+            })()}
+          </p>
+        )}
 
         <label className="field">
           <span>Passphrase (optional, encrypts the wallet file)</span>
@@ -76,6 +86,15 @@ export default function Setup({
             onChange={(e) => setPassphrase(e.target.value)}
           />
         </label>
+        {/* Both directions of this choice have a consequence people discover too late: a
+            forgotten passphrase locks a wallet whose 24 words still work elsewhere, and no
+            passphrase leaves the key readable to anything that can read the file. Say both
+            here rather than after the fact. */}
+        <p className="muted small" style={{ marginTop: -6 }}>
+          {passphrase
+            ? "Needed every time you open this wallet, and to run a node from it. It is not stored anywhere and cannot be reset — if you forget it, this file is unusable and only your 24 words can bring the wallet back."
+            : "Without one, anyone with access to this computer's files can use your wallet. Your 24 words still protect you from losing it, not from someone taking it."}
+        </p>
 
         {error && <div className="error">{error}</div>}
 
