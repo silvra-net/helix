@@ -43,6 +43,7 @@ pub fn run() {
             node_process::node_start,
             node_process::node_stop,
             node_process::node_process_status,
+            node_process::node_reset_chain,
             commands::wallet_status,
             commands::create_wallet,
             commands::restore_wallet,

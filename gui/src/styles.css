@@ -68,6 +68,11 @@ nav { display: flex; flex-direction: column; gap: 2px; }
 }
 .nav-item:hover { background: var(--surface-2); color: var(--text); }
 .nav-item.active { background: rgba(34, 211, 238, 0.12); color: var(--accent); }
+/* Section label between nav groups — quiet enough to read as structure, not as an entry. */
+.nav-group {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--muted); opacity: 0.65; padding: 16px 10px 4px;
+}
 .sidebar-foot { margin-top: auto; display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
 .key-note { font-size: 11px; color: var(--muted); line-height: 1.4; }
 

@@ -125,6 +125,10 @@ export const api = {
 
   nodeProcessStatus: () => invoke<NodeProcessStatus>("node_process_status"),
 
+  // Moves the local chain database aside (renamed, never deleted) so the next start
+  // re-syncs. Returns the backup path. Fails while the node is running — it holds the file.
+  nodeResetChain: () => invoke<string>("node_reset_chain"),
+
   // Live console output — each event is one line. Returns the unsubscribe function, same
   // shape as Tauri's own `listen()`, so a view can wire it up in a `useEffect` cleanup.
   onNodeLog: (handler: (line: LogLine) => void) =>
@@ -138,4 +142,19 @@ export const api = {
   logDirPath: () => invoke<string>("log_dir_path"),
 };
 
+/// Public seed node — what a fresh install talks to before it has one of its own, so the wallet
+/// works out of the box. A convenience, not the destination: every balance you read and every
+/// transaction you send passes through someone else's machine, which can misreport the former
+/// and observe the latter.
 export const DEFAULT_NODE = "https://helix.silvra.net";
+
+/// Where the bundled node's RPC lands. `node_process.rs` starts it without `HELIX_RPC_BIND`, so
+/// it takes the compiled-in default.
+///
+/// Running your own node and still reading your balance off a stranger's server is the wrong way
+/// round — not trusting anyone is the entire point of running one. `Validate.tsx` switches the
+/// wallet here when the local node starts, and back when it stops.
+export const LOCAL_NODE = "http://127.0.0.1:8545";
+
+export const isLocalNode = (url: string) =>
+  /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(url);

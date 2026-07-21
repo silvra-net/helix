@@ -14,9 +14,10 @@ import Governance from "./views/Governance";
 import Settings from "./views/Settings";
 import MnemonicReveal from "./views/MnemonicReveal";
 
-// "send"/"receive" are actions, not places to browse — reachable only via the buttons on Home,
-// deliberately not in the sidebar. Validate/Earn/Identity replace the old flat Node/Staking/
-// Names/Recovery split; see each file's own doc comment for why they're grouped this way.
+// Send and Receive sit in the sidebar rather than only behind buttons on Home: they are the two
+// things a holder does most, and burying the most common actions one level down to keep the nav
+// "clean" reads as tidy and behaves as friction. Validate/Earn/Identity replace the old flat
+// Node/Staking/Names/Recovery split; see each file's own doc comment for the grouping.
 type Route = "home" | "send" | "receive" | "validate" | "earn" | "identity" | "governance" | "settings";
 
 export default function App() {
@@ -103,12 +104,23 @@ export default function App() {
           <span className="brand-mark" aria-hidden>⛓</span>
           <span>Helix Wallet</span>
         </div>
+        {/* Grouped by how often you actually need it, not by how the features were built.
+            Send and Receive were previously reachable only as buttons inside Home, while
+            Validate — which most holders never touch — sat second in the list. What someone
+            does weekly belongs at the top; running a node belongs with the other operator
+            tools at the bottom. */}
         <nav>
-          <NavItem label="Home" active={route === "home"} onClick={() => setRoute("home")} />
-          <NavItem label="Validate" active={route === "validate"} onClick={() => setRoute("validate")} />
+          <NavItem label="Overview" active={route === "home"} onClick={() => setRoute("home")} />
+          <NavItem label="Send" active={route === "send"} onClick={() => setRoute("send")} />
+          <NavItem label="Receive" active={route === "receive"} onClick={() => setRoute("receive")} />
+
+          <div className="nav-group">Grow</div>
           <NavItem label="Earn" active={route === "earn"} onClick={() => setRoute("earn")} />
           <NavItem label="Identity" active={route === "identity"} onClick={() => setRoute("identity")} />
           <NavItem label="Governance" active={route === "governance"} onClick={() => setRoute("governance")} />
+
+          <div className="nav-group">Run a node</div>
+          <NavItem label="Validate" active={route === "validate"} onClick={() => setRoute("validate")} />
           <NavItem label="Settings" active={route === "settings"} onClick={() => setRoute("settings")} />
         </nav>
         <div className="sidebar-foot">
@@ -143,7 +155,7 @@ export default function App() {
           {route === "home" && <Overview node={node} onSend={() => setRoute("send")} onReceive={() => setRoute("receive")} />}
           {route === "send" && <Send node={node} baseFee={net?.base_fee_per_byte} onDone={() => setRoute("home")} />}
           {route === "receive" && <Receive address={meta.address ?? ""} />}
-          {route === "validate" && <Validate node={node} net={net} />}
+          {route === "validate" && <Validate node={node} net={net} onNodeChange={onNodeChange} walletEncrypted={meta.encrypted} />}
           {route === "earn" && <Earn node={node} />}
           {route === "identity" && <Identity node={node} address={meta.address ?? ""} />}
           {route === "governance" && <Governance node={node} />}

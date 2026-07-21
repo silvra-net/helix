@@ -83,6 +83,8 @@ export interface NetworkStatus {
   best_hash: string;
   peer_count: number;
   is_syncing: boolean;
+  /** Tip being synced towards, when known — pair with `height` for real progress. */
+  sync_target_height?: number | null;
   mempool_size: number;
   circulating_supply_hlx: number;
   base_fee_per_byte: number;

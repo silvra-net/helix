@@ -185,3 +185,47 @@ pub fn node_stop(state: State<'_, NodeProcessState>) -> Result<(), String> {
 pub fn node_process_status(state: State<'_, NodeProcessState>) -> NodeProcessStatus {
     NodeProcessStatus { running: state.child.lock().unwrap().is_some() }
 }
+
+/// Move this node's local chain database aside so the next start re-syncs from scratch.
+/// Returns where the old file went.
+///
+/// The case this exists for: a local chain that can no longer follow the network — a database
+/// from an incompatible build, or one left behind by a chain reset on the network side. Both
+/// leave a node that starts, refuses to join, and gives its owner no way forward from inside
+/// the app.
+///
+/// **Renamed, never deleted.** The same rule the project applies to production chain data: a
+/// reset is the one action where being wrong is unrecoverable, and a `.bak` costs a few hundred
+/// megabytes against losing the only copy of something. The wallet and its key are not touched
+/// — they live in the app data directory, the chain lives in `node/` beneath it, and this only
+/// ever renames `helix-data.redb*` inside the latter.
+#[tauri::command]
+pub async fn node_reset_chain(
+    app: AppHandle,
+    state: State<'_, NodeProcessState>,
+) -> Result<String, String> {
+    // Refusing rather than stopping it: the node holds an exclusive lock on the database, and
+    // silently killing someone's validator to clear disk state is not a decision this button
+    // gets to make on its own.
+    if state.child.lock().unwrap().is_some() {
+        return Err("Stop the node first — its chain database is in use while it runs.".into());
+    }
+
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("node");
+    let db = dir.join("helix-data.redb");
+    if !db.exists() {
+        return Err("No local chain database found — nothing to reset.".into());
+    }
+
+    // Unix seconds rather than a formatted date — sortable, collision-free across repeated
+    // resets, and not worth a date-formatting dependency for a backup filename.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let backup = dir.join(format!("helix-data.redb.pre-reset.{stamp}.bak"));
+    std::fs::rename(&db, &backup).map_err(|e| format!("could not move the chain database: {e}"))?;
+    log::info!("chain database moved aside to {}", backup.display());
+
+    Ok(backup.to_string_lossy().into_owned())
+}

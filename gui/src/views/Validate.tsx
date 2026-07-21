@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../api";
+import { api, DEFAULT_NODE, LOCAL_NODE, isLocalNode } from "../api";
 import { StakeActionPanel, type StakeAction } from "../components/StakeActionPanel";
 import type { LogLine, NetworkStatus, NodeProcessStatus, Overview, SubmitResult, ValidatorPool, ValidatorStatus } from "../types";
 import { hlx, shortAddr, shortHash } from "../format";
@@ -15,7 +15,7 @@ import { hlx, shortAddr, shortHash } from "../format";
 
 const MAX_CONSOLE_LINES = 2000;
 
-export default function Validate({ node, net }: { node: string; net: NetworkStatus | null }) {
+export default function Validate({ node, net, onNodeChange, walletEncrypted }: { node: string; net: NetworkStatus | null; onNodeChange: (url: string) => void; walletEncrypted: boolean }) {
   const [vs, setVs] = useState<ValidatorStatus | null>(null);
   const [ov, setOv] = useState<Overview | null>(null);
   const [pool, setPool] = useState<ValidatorPool | null>(null);
@@ -27,6 +27,8 @@ export default function Validate({ node, net }: { node: string; net: NetworkStat
   const [procStatus, setProcStatus] = useState<NodeProcessStatus | null>(null);
   const [procBusy, setProcBusy] = useState(false);
   const [procError, setProcError] = useState<string | null>(null);
+  const [procNotice, setProcNotice] = useState<string | null>(null);
+  const [nodePass, setNodePass] = useState("");
   const [lines, setLines] = useState<LogLine[]>([]);
   const consoleRef = useRef<HTMLDivElement | null>(null);
   const autoScroll = useRef(true);
@@ -60,8 +62,35 @@ export default function Validate({ node, net }: { node: string; net: NetworkStat
     setProcBusy(true);
     setLines([]);
     try {
-      await api.nodeStart({});
+      // The node runs as this wallet's key (see node_process.rs). An encrypted wallet file
+      // cannot be read without its passphrase, and the node has no terminal to ask on — so it
+      // has to come from here, or the node refuses to start.
+      await api.nodeStart(walletEncrypted ? { validator_key_passphrase: nodePass } : {});
+      setNodePass("");
       setProcStatus({ running: true });
+      // Point the wallet at the node it just started. Running one and then still asking a
+      // public server for your balance defeats the purpose — and that server can be wrong or
+      // simply gone. The node answers from its first second (it serves RPC while syncing, see
+      // helix-node's run()), so this does not strand the wallet: `Connected node` above shows
+      // `syncing` with the height climbing until it has caught up.
+      if (!isLocalNode(node)) {
+        onNodeChange(LOCAL_NODE);
+        setProcNotice(`Wallet now reading from your own node (${LOCAL_NODE}). It may show "syncing" until it has caught up.`);
+      }
+    } catch (e) {
+      setProcError(String(e));
+    } finally {
+      setProcBusy(false);
+    }
+  };
+
+  const resetLocalChain = async () => {
+    setProcError(null);
+    setProcNotice(null);
+    setProcBusy(true);
+    try {
+      const backup = await api.nodeResetChain();
+      setProcNotice(`Local chain moved aside. Start the node to re-sync. Old copy: ${backup}`);
     } catch (e) {
       setProcError(String(e));
     } finally {
@@ -74,6 +103,12 @@ export default function Validate({ node, net }: { node: string; net: NetworkStat
     try {
       await api.nodeStop();
       setProcStatus({ running: false });
+      // Back to the public seed, otherwise the wallet points at a node that is no longer there
+      // and every screen goes blank with a connection error.
+      if (isLocalNode(node)) {
+        onNodeChange(DEFAULT_NODE);
+        setProcNotice(`Local node stopped — wallet reading from ${DEFAULT_NODE} again.`);
+      }
     } catch (e) {
       setProcError(String(e));
     } finally {
@@ -154,22 +189,40 @@ export default function Validate({ node, net }: { node: string; net: NetworkStat
           <div className="metric">
             <div className="metric-label">Status</div>
             <div className="metric-value">
-              {!net ? "…" : net.is_syncing ? <span className="text-warn">syncing</span> : <span className="text-accent">live</span>}
+              {!net ? "…" : net.is_syncing ? (
+                <span className="text-warn">
+                  syncing{net.sync_target_height ? ` ${Math.min(99, Math.floor((net.height / net.sync_target_height) * 100))}%` : ""}
+                </span>
+              ) : <span className="text-accent">live</span>}
             </div>
           </div>
         </div>
         <div className="kv" style={{ marginTop: 8 }}>
           <span className="muted">Endpoint</span>
-          <span className="mono small">{node}</span>
+          <span className="mono small">
+            {node} {isLocalNode(node) ? "· your own node" : "· public node"}
+          </span>
         </div>
+        {/* Say plainly whose machine answers. Someone reading a balance off a public node is
+            trusting it to tell the truth; that is a reasonable default to start on and a poor
+            one to stay on without knowing. */}
+        {!isLocalNode(node) && (
+          <p className="muted small" style={{ marginTop: 6 }}>
+            Reading from a public node. Start your own below and the wallet switches to it —
+            then nobody else sees your queries or decides what your balance is.
+          </p>
+        )}
         {net && (
           <div className="kv">
             <span className="muted">Version · base fee</span>
             <span className="mono small">v{net.version} · {net.base_fee_per_byte} nano/byte</span>
           </div>
         )}
-        {net && net.peer_count === 0 && (
+        {net && net.peer_count === 0 && !isLocalNode(node) && (
           <p className="muted small">This network currently runs a single validator — decentralization is the goal, not yet the state.</p>
+        )}
+        {net && net.peer_count === 0 && isLocalNode(node) && net.is_syncing && (
+          <p className="muted small">Your node is fetching history and has not connected to peers yet — both are normal while syncing.</p>
         )}
       </div>
 
@@ -316,10 +369,58 @@ export default function Validate({ node, net }: { node: string; net: NetworkStat
           {procStatus?.running ? (
             <button onClick={stopLocalNode} disabled={procBusy}>Stop</button>
           ) : (
-            <button className="primary" onClick={startLocalNode} disabled={procBusy}>Start local node</button>
+            <button
+              className="primary"
+              onClick={startLocalNode}
+              disabled={procBusy || (walletEncrypted && nodePass.trim() === "")}
+            >
+              Start local node
+            </button>
           )}
         </div>
+        {walletEncrypted && !procStatus?.running && (
+          <div style={{ marginTop: 10 }}>
+            <label className="muted small" htmlFor="node-pass">
+              Wallet passphrase — the node signs blocks with this wallet's key and needs it to
+              read the key file. It is passed to the node process only, and not stored.
+            </label>
+            <input
+              id="node-pass"
+              type="password"
+              value={nodePass}
+              onChange={(e) => setNodePass(e.target.value)}
+              placeholder="Wallet passphrase"
+              autoComplete="off"
+              style={{ marginTop: 6 }}
+            />
+          </div>
+        )}
         {procError && <div className="error" style={{ marginTop: 8 }}>{procError}</div>}
+        {procNotice && <div className="notice" style={{ marginTop: 8 }}>{procNotice}</div>}
+
+        {/* Recovery for a local chain that can no longer follow the network — a database from
+            an incompatible build, or one left behind after the network reset its own chain.
+            Without this the only way out is finding the file by hand. Deliberately not offered
+            while the node runs (it holds the database open), and deliberately a rename rather
+            than a delete. */}
+        {!procStatus?.running && (
+          <details style={{ marginTop: 12 }}>
+            <summary className="muted small" style={{ cursor: "pointer" }}>
+              Node won't sync? Reset the local chain
+            </summary>
+            <p className="muted small" style={{ marginTop: 8 }}>
+              Moves this machine's copy of the chain aside and re-downloads it from scratch on the
+              next start. Use it if the node refuses to join the network — usually a database left
+              over from an older, incompatible build. Your wallet, your key and your balance are
+              untouched: they live on the chain, not in this file. The old database is{" "}
+              <strong>renamed, not deleted</strong>, so nothing is lost if this wasn't the problem.
+              Re-syncing takes a while — currently around half an hour.
+            </p>
+            <div className="row-actions end">
+              <button onClick={resetLocalChain} disabled={procBusy}>Reset local chain</button>
+            </div>
+          </details>
+        )}
 
         <div
           ref={consoleRef}
