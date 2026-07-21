@@ -334,6 +334,42 @@ pub struct ChainState {
     /// immediately on the way out but never early on the way in).
     #[serde(default)]
     pub pending_validators: std::collections::HashSet<Address>,
+    /// The addresses actually entitled to vote in the current epoch — the set every block is
+    /// proposed and precommitted against, rebuilt at each epoch boundary by
+    /// `rotate_active_validators`.
+    ///
+    /// This exists because `stakers()` is *not* the same question. A staker who is serving out
+    /// `pending_validators`' one-epoch delay qualifies by stake but is deliberately not in the
+    /// quorum, so no one expects its signature and its vote would not be counted. Charging it
+    /// with a missed block for that period punishes it for obeying the rule: found live on
+    /// 2026-07-21, when a second validator staked and `record_block_participation` — which read
+    /// `stakers()` — jailed it at 150 missed blocks, *before* the rotation that would have
+    /// activated it ever arrived. Because jailing drops an address from `stakers()`, it also
+    /// lost its accrued wait and re-entered as brand new after unjailing, so whether a new
+    /// validator could join at all came down to where in the 100-block epoch it happened to
+    /// stake.
+    ///
+    /// Empty means "no epoch boundary has been crossed under this field yet" (a state loaded
+    /// from a database written before this field existed). Nobody is charged with a missed
+    /// block until the next rotation fills it — deliberately the forgiving direction: a late
+    /// jail costs at most `EPOCH_LENGTH` blocks of downtime accounting, and
+    /// `helix-consensus::LIVENESS_JAIL_ROUNDS` keeps blocks flowing meanwhile, whereas an
+    /// early jail punishes the innocent.
+    ///
+    /// **Deliberately excluded from `state_hash`** (unlike `pending_validators`), and that is a
+    /// considered trade, not an oversight. `state_hash` is nominally a diagnostic, but
+    /// `verify_genesis_reconstruction` compares it when joining a chain — so adding a field to
+    /// it changes the reconstructed genesis and locks every existing chain out of the upgrade.
+    /// Measured on 2026-07-21: hashing this field made the binary rebuild genesis as
+    /// `c5474b79…` against the live chain's `44e1c9d9…`, i.e. a running devnet would have needed
+    /// a full reset purely to deploy a bug fix.
+    ///
+    /// Little detection is given up for that. This set has no effect of its own — it decides
+    /// who `record_block_participation` scores, and that shows up in `missed_blocks` and
+    /// `jailed_until`, which *are* hashed. Two nodes that disagreed here would diverge on those
+    /// within a block or two and be caught anyway, one step later.
+    #[serde(default)]
+    pub active_validators: std::collections::HashSet<Address>,
     /// Consecutive blocks (address string -> count) a validator's precommit has been absent
     /// from `BlockHeader::last_commit`, as counted by `record_block_participation`. Reset to
     /// absent the instant a signature from that validator is seen again — a handful of missed
@@ -379,6 +415,7 @@ impl ChainState {
             genesis_validator_stake: 0,
             genesis_allocations: Vec::new(),
             pending_validators: std::collections::HashSet::new(),
+            active_validators: std::collections::HashSet::new(),
             missed_blocks: HashMap::new(),
             jailed_until: HashMap::new(),
         }
@@ -587,6 +624,11 @@ impl ChainState {
     /// voted against), `signers` is who `BlockHeader::last_commit` proves participated in
     /// finalizing the *previous* block.
     ///
+    /// `current_validators` must come from `active_validators`, never from `stakers()`: the two
+    /// differ for exactly one epoch after a validator stakes, and charging a missed block in
+    /// that window jails a validator that was never allowed to vote in the first place. See
+    /// `active_validators`' doc comment for the live incident.
+    ///
     /// Returns the addresses newly jailed this call — the caller (`helix-node`'s
     /// `apply_finalized_block`) also fast-jails them out of the live `BftEngine`'s
     /// `ValidatorSet` immediately, the same way `SubmitDoubleSignEvidence` already does for
@@ -608,6 +650,10 @@ impl ChainState {
             *count += 1;
             if *count >= DOWNTIME_JAIL_THRESHOLD_BLOCKS && !self.jailed_until.contains_key(&key) {
                 self.jailed_until.insert(key, height + MIN_JAIL_BLOCKS);
+                // Out of the quorum from this block on, not merely at the next rotation — the
+                // node fast-jails it out of the live `BftEngine` for the same reason. Leaving
+                // it here would keep charging a validator that no longer counts.
+                self.active_validators.remove(addr);
                 newly_jailed.push(addr.clone());
             }
         }
@@ -753,6 +799,35 @@ impl ChainState {
         activated
     }
 
+    /// Advance to the next epoch's active validator set: promote whoever has served the
+    /// `pending_validators` delay, drop whoever no longer qualifies, and record the result in
+    /// `active_validators`. Returns the new set with each address's effective stake, so the
+    /// caller can build the consensus `ValidatorSet` from it.
+    ///
+    /// Called from `execute_block` at every epoch boundary rather than from the node, because
+    /// it mutates consensus state (`pending_validators`/`active_validators`, both folded into
+    /// `state_hash`). Rotating only where blocks are *produced* would leave a node that caught
+    /// up through `sync_blocks_from_peer` — which executes blocks but never rotated — computing
+    /// a different state from the same blocks.
+    ///
+    /// `previously_active` is taken from `active_validators` itself: a validator already in the
+    /// set is never made to wait again, and one that was jailed out of it is not in the set to
+    /// begin with, so it correctly re-enters as new.
+    pub fn rotate_active_validators(&mut self) -> Vec<(Address, u64)> {
+        // On the very first rotation under this field — a fresh chain, or a database written
+        // before `active_validators` existed — the set is empty and everyone qualifying is
+        // treated as new. That is deliberately *not* special-cased: an empty candidate list
+        // makes `rotate_validator_set` a no-op, so the validators already producing blocks
+        // simply keep their seats for one more epoch and are promoted at the next rotation,
+        // while a newcomer that happened to stake beforehand still serves its delay. Trusting
+        // `stakers()` here instead would hand a brand-new validator quorum weight the instant a
+        // node upgraded — the precise failure `pending_validators` exists to prevent.
+        let previously_active = self.active_validators.clone();
+        let activated = self.stakers_after_delayed_activation(&previously_active);
+        self.active_validators = activated.iter().map(|(addr, _)| addr.clone()).collect();
+        activated
+    }
+
     /// An address's total stake-weighted backing for validator-set eligibility and BFT
     /// voting power: its own `AccountState::staked` plus whatever its delegation pool (if
     /// any) currently holds. This is deliberately *not* what counts for governance voting
@@ -870,6 +945,7 @@ impl ChainState {
             genesis_validator_stake: u64,
             genesis_allocations: BTreeMap<&'a str, u64>,
             pending_validators: std::collections::BTreeSet<&'a str>,
+            // `active_validators` is deliberately NOT hashed — see the note below the struct.
             missed_blocks: BTreeMap<&'a str, u32>,
             jailed_until: BTreeMap<&'a str, u64>,
         }
@@ -960,6 +1036,39 @@ mod tests {
 
     fn addr(seed: u8) -> Address {
         Address::from_public_key(&helix_crypto::PublicKey::from_bytes(vec![seed; 8]))
+    }
+
+    /// `active_validators` must stay out of `state_hash`, and this pins that as a decision
+    /// rather than an accident. `verify_genesis_reconstruction` compares `state_hash` when a
+    /// node joins a chain, so any field added to it changes the reconstructed genesis and
+    /// locks every existing chain out of the upgrade — measured on 2026-07-21, where hashing
+    /// this one field alone would have forced a full devnet reset just to ship a bug fix.
+    ///
+    /// Whoever "fixes" this by adding the field back: read the field's doc comment first, and
+    /// be aware that doing so requires a chain reset. Nothing is lost by leaving it out —
+    /// `missed_blocks`/`jailed_until`, the state this set actually drives, remain hashed, so a
+    /// real disagreement still surfaces there within a block or two.
+    #[test]
+    fn active_validators_stays_out_of_the_state_hash() {
+        let mut state = ChainState::new(1_000_000);
+        stake(&mut state, 1, 1_000);
+        let before = state.state_hash();
+
+        state.active_validators.insert(addr(1));
+        assert_eq!(
+            state.state_hash(),
+            before,
+            "hashing active_validators would change genesis reconstruction and shut every \
+             running chain out of the upgrade — see the field's doc comment"
+        );
+
+        // The state it drives is still hashed, so a genuine divergence is not invisible.
+        state.missed_blocks.insert(addr(1).to_string(), 1);
+        assert_ne!(
+            state.state_hash(),
+            before,
+            "missed_blocks must stay in the hash — that is what makes the exclusion detectable"
+        );
     }
 
     #[test]

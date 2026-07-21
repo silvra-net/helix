@@ -59,6 +59,12 @@ const GENESIS_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("
 /// the next restart and make it wait out the delay a second time — or never activate at all if
 /// it was promoted and the promotion itself hasn't landed in a later block's save yet.
 const PENDING_VALIDATORS: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_validators");
+/// address string → empty value (a key-as-set table) — see `ChainState::active_validators`'s
+/// doc comment. Rewritten wholesale at every epoch rotation and pruned when a validator is
+/// jailed out mid-epoch, so it needs the same stale-key pruning as `PENDING_VALIDATORS`:
+/// insert-only persistence would keep a departed validator in the quorum-accounting set after
+/// a restart, and it would go on being charged with missed blocks it was never asked to sign.
+const ACTIVE_VALIDATORS: TableDefinition<&str, &[u8]> = TableDefinition::new("active_validators");
 /// address string → 4-byte little-endian u32 consecutive-miss count — see
 /// `ChainState::missed_blocks`'s doc comment. Removed (not just left stale) the instant a
 /// validator's signature is seen again, so needs the same stale-key pruning as
@@ -123,6 +129,7 @@ impl HelixDb {
         tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(ACTIVE_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -152,6 +159,7 @@ impl HelixDb {
             let mut delegator_shares = tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut redelegations = tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut pending_validators = tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut active_validators = tx.open_table(ACTIVE_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut missed_blocks = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut jailed_until = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut contract_storage = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -333,6 +341,29 @@ impl HelixDb {
                 pending_validators.insert(addr.as_str(), &[][..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // Same stale-key pruning, same reason — see ACTIVE_VALIDATORS' doc comment.
+            {
+                let current: std::collections::HashSet<&str> =
+                    state.active_validators.iter().map(|a| a.as_str()).collect();
+                let stale: Vec<String> = active_validators
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!current.contains(key.as_str())).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    active_validators
+                        .remove(key.as_str())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
+            for addr in &state.active_validators {
+                active_validators.insert(addr.as_str(), &[][..])
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
             // Same stale-key pruning as PENDING_VALIDATORS — see MISSED_BLOCKS' doc comment.
             {
                 let current: std::collections::HashSet<&str> =
@@ -400,6 +431,7 @@ impl HelixDb {
         let redelegations_table = tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         let contract_storage_table = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
         let pending_validators_table = tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let active_validators_table = tx.open_table(ACTIVE_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         let missed_blocks_table = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         let jailed_until_table = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_extra_validators_table = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -562,6 +594,16 @@ impl HelixDb {
             pending_validators.insert(address);
         }
 
+        let mut active_validators = std::collections::HashSet::new();
+        let active_validators_iter =
+            active_validators_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        for entry in active_validators_iter {
+            let (k, _v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let address = Address::from_str(k.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            active_validators.insert(address);
+        }
+
         let mut missed_blocks = std::collections::HashMap::new();
         let missed_blocks_iter =
             missed_blocks_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
@@ -638,6 +680,7 @@ impl HelixDb {
             genesis_validator_stake,
             genesis_allocations,
             pending_validators,
+            active_validators,
             missed_blocks,
             jailed_until,
         })
@@ -1272,6 +1315,37 @@ mod tests {
             loaded.redelegations.is_empty(),
             "an expired redelegation resurrected from the DB after reopening"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    /// `active_validators` decides who is charged with missed blocks, so losing it on restart
+    /// would stop downtime accounting until the next rotation — and keeping a stale entry
+    /// would charge a validator that has already left the set. Both directions checked in one
+    /// test: one address stays, one is dropped, then the database is reopened.
+    #[test]
+    fn active_validators_survive_reopening_and_stale_entries_are_pruned() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.active_validators.insert(addr(1));
+        state.active_validators.insert(addr(2));
+        db.save_chain_state(&state).unwrap();
+
+        // addr(2) is jailed out mid-epoch; the next save must not leave it behind.
+        state.active_validators.remove(&addr(2));
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert!(loaded.active_validators.contains(&addr(1)));
+        assert!(
+            !loaded.active_validators.contains(&addr(2)),
+            "a validator removed from the active set must not come back on restart"
+        );
+        assert_eq!(loaded.active_validators.len(), 1);
 
         let _ = std::fs::remove_file(&path);
     }

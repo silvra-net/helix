@@ -67,7 +67,7 @@ pub fn execute_block(
     // "signed" — `execute_block` doesn't trust the header's claim, the same defense-in-depth
     // every transaction's own signature already gets (see `CommitSig::verify`'s doc comment
     // on why a proposer can't fabricate participation either direction).
-    let current_validators: Vec<Address> = state.stakers().into_iter().map(|(a, _)| a).collect();
+    let current_validators: Vec<Address> = state.active_validators.iter().cloned().collect();
     let signers: std::collections::HashSet<Address> = block
         .header
         .last_commit
@@ -90,6 +90,18 @@ pub fn execute_block(
     // after the transactions so an entry created in this block is never pruned by it.
     state.prune_expired_redelegations(height);
 
+    // Epoch boundary: rebuild the active validator set from current stake. After this block's
+    // transactions, so a `Stake` in this very block is considered, and after
+    // `record_block_participation` above, which had to score the block against the set that
+    // actually voted on it. Lives here rather than in the node so that every path which
+    // executes a block — BFT finalize, gossip fast-path, `sync_blocks_from_peer` — rotates
+    // identically; `active_validators` and `pending_validators` are both part of `state_hash`.
+    let rotated_validators = if height.is_multiple_of(helix_consensus::EPOCH_LENGTH) {
+        Some(state.rotate_active_validators())
+    } else {
+        None
+    };
+
     // Block reward: minted independently of transaction volume, capped so `total_issued`
     // never crosses the `total_supply` hard cap regardless of what the schedule says.
     let scheduled = genesis::scheduled_block_reward(height);
@@ -107,6 +119,7 @@ pub fn execute_block(
         validator_reward: total_validator_reward,
         block_reward_minted,
         newly_jailed,
+        rotated_validators,
     }
 }
 
@@ -1175,6 +1188,14 @@ fn execute_submit_double_sign_evidence(
     }
 
     state.slash(&evidence.validator, helix_consensus::SLASH_FRACTION_BPS);
+    // Out of the active set from this block on, the same way a downtime jail removes it (see
+    // `record_block_participation`) and the same way the node drops it from the live
+    // `BftEngine` right after applying this block. Without this it stays in
+    // `active_validators` until the next rotation and keeps accruing missed blocks for rounds
+    // it is no longer allowed to vote in — the identical mistake this release fixes for
+    // validators awaiting activation, just from the other direction, and it would stack a
+    // downtime jail on top of a slash for one and the same offence.
+    state.active_validators.remove(&evidence.validator);
 
     state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
@@ -3638,6 +3659,53 @@ mod tests {
         assert_eq!(state.total_burned, expected_slash);
     }
 
+    /// A slashed double-signer leaves the active set immediately, exactly like a downtime jail
+    /// does — the node drops it from the live `BftEngine` right after this block, so leaving it
+    /// in `active_validators` would keep charging it with missed blocks for rounds it is no
+    /// longer allowed to vote in, and stack a downtime jail on top of the slash for the same
+    /// offence. Same defect as the one this release fixes for validators awaiting activation,
+    /// approached from the other side.
+    #[test]
+    fn a_slashed_double_signer_leaves_the_active_set_at_once() {
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        let reporter_kp = KeyPair::generate();
+        let reporter = Address::from_public_key(&reporter_kp.public);
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&validator_addr, |acc| acc.staked = 1_000_000);
+        state.update_account(&reporter, |acc| acc.balance = 1_000_000);
+        state.active_validators.insert(validator_addr.clone());
+
+        let mk = |h: &[u8]| {
+            signed_vote(
+                &validator_kp,
+                &validator_addr,
+                helix_consensus::VoteType::Precommit,
+                10,
+                0,
+                Hash::digest(h),
+            )
+        };
+        let evidence = DoubleSignEvidence {
+            validator: validator_addr.clone(),
+            height: 10,
+            round: 0,
+            vote_a: mk(b"block-a"),
+            vote_b: mk(b"block-b"),
+        };
+
+        let tx = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 0);
+        let receipt = execute_transaction(&mut state, &tx, &block_validator, 0, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert!(
+            !state.active_validators.contains(&validator_addr),
+            "a slashed double-signer must not stay in the set that decides who is scored for downtime"
+        );
+    }
+
     #[test]
     fn submit_double_sign_evidence_rejects_duplicate_incident() {
         let validator_kp = KeyPair::generate();
@@ -3848,6 +3916,145 @@ mod tests {
             second.block_reward_minted > 0,
             "the block reward IS minted again — this is the danger the node-side guard exists for"
         );
+    }
+
+    /// Regression for the live incident of 2026-07-21. A validator that has staked but is
+    /// still serving out `pending_validators`' one-epoch delay is deliberately outside the
+    /// quorum: nobody solicits its precommit and nobody would count it. It must therefore not
+    /// accrue missed blocks. `execute_block` used to hand `record_block_participation` the
+    /// output of `stakers()`, which includes exactly those waiting entrants — so the chain
+    /// jailed a validator for not signing blocks it was forbidden to sign, after 150 of the
+    /// 100-to-200 blocks it was required to wait.
+    ///
+    /// The unit tests around `record_block_participation` all passed throughout, because they
+    /// pass the validator list in by hand; only going through `execute_block` catches this.
+    #[test]
+    fn a_validator_awaiting_activation_is_never_charged_with_missed_blocks() {
+        let proposer = Address::from_public_key(&KeyPair::generate().public);
+        let newcomer = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.governance_params.min_validator_stake = 100;
+        // Exactly the live setup: one validator already running and signing, a second one
+        // staking alongside it. `last_commit` stays empty below, so the sitting validator is
+        // silent too — that one is genuinely at fault and may be jailed; the newcomer is not.
+        state.update_account(&proposer, |acc| acc.staked = 100_000);
+        state.active_validators.insert(proposer.clone());
+        state.update_account(&newcomer, |acc| acc.staked = 1_000);
+        // It qualifies by stake from here on, but has never been activated.
+        assert!(state.stakers().iter().any(|(a, _)| a == &newcomer));
+        assert!(!state.active_validators.contains(&newcomer));
+
+        // Well past the jail threshold, and past a full epoch, with an empty `last_commit`
+        // every time — under the old behaviour this jailed it at exactly 150.
+        for height in 1..=(state::DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 + 20) {
+            execute_block(&mut state, &empty_block(&proposer, height), None);
+        }
+
+        assert!(
+            !state.missed_blocks.contains_key(&newcomer.to_string()),
+            "a validator waiting out its activation delay must not accrue missed blocks"
+        );
+        assert!(
+            !state.jailed_until.contains_key(&newcomer.to_string()),
+            "and must certainly not be jailed for the wait the protocol imposed on it"
+        );
+    }
+
+    /// The other half: once a validator really is in the active set, silence must still be
+    /// punished exactly as before. Guards against "fixing" the case above by simply not
+    /// counting anyone.
+    #[test]
+    fn an_active_validator_that_goes_silent_is_still_jailed() {
+        let proposer = Address::from_public_key(&KeyPair::generate().public);
+        let silent = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.governance_params.min_validator_stake = 100;
+        state.update_account(&silent, |acc| acc.staked = 1_000);
+        state.active_validators.insert(silent.clone());
+
+        for height in 1..=state::DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 {
+            execute_block(&mut state, &empty_block(&proposer, height), None);
+        }
+
+        assert!(
+            state.jailed_until.contains_key(&silent.to_string()),
+            "an activated validator absent from every last_commit must be jailed"
+        );
+        assert!(
+            !state.active_validators.contains(&silent),
+            "and must leave the active set at once, not at the next rotation"
+        );
+    }
+
+    /// The rotation has to happen inside block execution, because it mutates consensus state
+    /// (`active_validators`/`pending_validators`, both hashed into `state_hash`). While it
+    /// lived in the node, a node catching up through `sync_blocks_from_peer` executed the very
+    /// same blocks without ever rotating, and drifted.
+    #[test]
+    fn the_epoch_rotation_happens_during_block_execution() {
+        let proposer = Address::from_public_key(&KeyPair::generate().public);
+        let newcomer = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.governance_params.min_validator_stake = 100;
+        // An already-running set, so this exercises a newcomer joining rather than the
+        // bootstrap case covered separately below.
+        state.update_account(&proposer, |acc| acc.staked = 5_000);
+        state.active_validators.insert(proposer.clone());
+        state.update_account(&newcomer, |acc| acc.staked = 1_000);
+
+        let epoch = helix_consensus::EPOCH_LENGTH;
+        let receipt = execute_block(&mut state, &empty_block(&proposer, epoch), None);
+        assert!(receipt.rotated_validators.is_some(), "an epoch boundary must report a rotation");
+        assert!(
+            state.pending_validators.contains(&newcomer) && !state.active_validators.contains(&newcomer),
+            "first rotation defers the newcomer"
+        );
+        assert!(state.active_validators.contains(&proposer), "the sitting validator is never deferred");
+
+        execute_block(&mut state, &empty_block(&proposer, epoch * 2), None);
+        assert!(
+            state.active_validators.contains(&newcomer),
+            "second rotation activates it"
+        );
+
+        let mid_epoch = execute_block(&mut state, &empty_block(&proposer, epoch * 2 + 1), None);
+        assert!(mid_epoch.rotated_validators.is_none(), "ordinary blocks must not rotate");
+    }
+
+    /// Upgrading a node must not hand out quorum weight. On the first rotation after the
+    /// upgrade `active_validators` is empty, and the tempting shortcut — "seed it from
+    /// `stakers()`, they must all be active already" — would promote a validator that staked
+    /// beforehand and never ran a node, instantly and with no delay: exactly the freeze
+    /// `pending_validators` was built to prevent. Everyone waits instead; the sitting
+    /// validators lose nothing, because an empty candidate list leaves their seats untouched
+    /// (`rotate_validator_set` is a no-op) and they are promoted one epoch later.
+    #[test]
+    fn the_first_rotation_after_an_upgrade_grants_nobody_instant_quorum_weight() {
+        let sitting = Address::from_public_key(&KeyPair::generate().public);
+        let never_ran_a_node = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.governance_params.min_validator_stake = 100;
+        state.update_account(&sitting, |acc| acc.staked = 100_000);
+        state.update_account(&never_ran_a_node, |acc| acc.staked = 100_000);
+        assert!(state.active_validators.is_empty(), "a state loaded from a pre-upgrade database");
+
+        let epoch = helix_consensus::EPOCH_LENGTH;
+        let receipt = execute_block(&mut state, &empty_block(&sitting, epoch), None);
+
+        assert_eq!(
+            receipt.rotated_validators.as_deref(),
+            Some(&[][..]),
+            "no candidate list — the live set stays exactly as it is for one more epoch"
+        );
+        assert!(
+            !state.active_validators.contains(&never_ran_a_node),
+            "an address that never validated must not be handed quorum weight by an upgrade"
+        );
+
+        // One epoch later both have served the delay and are promoted normally.
+        execute_block(&mut state, &empty_block(&sitting, epoch * 2), None);
+        assert!(state.active_validators.contains(&sitting));
+        assert!(state.active_validators.contains(&never_ran_a_node));
     }
 
     #[test]

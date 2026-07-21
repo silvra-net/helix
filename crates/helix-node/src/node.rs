@@ -1120,7 +1120,7 @@ async fn apply_finalized_block(
     // record of whether a committed transaction did anything, and warning about the count in the
     // log while dropping them left `hlx tx status`, the explorer and Spark all reporting a
     // rejected transfer as `confirmed`.
-    let (tx_receipts, newly_jailed_for_downtime) = {
+    let (tx_receipts, newly_jailed_for_downtime, rotated_validators) = {
         let mut state = chain_state.write().await;
         let receipt = execute_block(&mut state, &block, reward_address.as_deref());
         if receipt.failed_txs() > 0 {
@@ -1133,7 +1133,7 @@ async fn apply_finalized_block(
         // wants to compare running nodes without trawling logs. See ChainState::state_hash's
         // doc comment for exactly what this is and isn't.
         debug!(height, state_hash = %state.state_hash().to_hex(), "Block applied");
-        (receipt.tx_receipts, receipt.newly_jailed)
+        (receipt.tx_receipts, receipt.newly_jailed, receipt.rotated_validators)
     };
 
     // Double-sign slashing does NOT happen here. It used to: this function unconditionally
@@ -1194,20 +1194,17 @@ async fn apply_finalized_block(
         }
     }
 
-    // Epoch boundary: rebuild the validator set from current stake.
+    // Epoch boundary: mirror the freshly rotated set into the live BFT engine.
     // Personhood is read from chain state: ZK-STARK ProvePersonhood txs set
     // PersonhoodStatus::Verified, which unlocks the 1% voting-power cap
     // (instead of the 0.5% cap for unverified validators).
-    if height % helix_consensus::EPOCH_LENGTH == 0 {
-        let previously_active: std::collections::HashSet<Address> = {
-            engine.read().await.validator_set().validators.iter().map(|v| v.address.clone()).collect()
-        };
-        let mut state_guard = chain_state.write().await;
-        // A `Stake` tx alone would otherwise be enough to become quorum-critical the moment
-        // this rotation hits, with no online-check and no warning — see
-        // `pending_validators`' doc comment. New entrants sit out this rotation instead of
-        // joining `validators` below; still-current members are never delayed.
-        let activated = state_guard.stakers_after_delayed_activation(&previously_active);
+    if let Some(activated) = rotated_validators {
+        // The rotation itself already happened inside `execute_block` — it mutates consensus
+        // state (`active_validators`/`pending_validators`, both in `state_hash`) and so has to
+        // run on every path that applies a block, including `sync_blocks_from_peer`, which
+        // never reaches this function. All that is left here is mirroring the decision into
+        // the live `BftEngine` and telling the operator about it.
+        let state_guard = chain_state.read().await;
         let deferred: Vec<Address> = state_guard.pending_validators.iter().cloned().collect();
         let validators: Vec<Validator> = activated
             .into_iter()
@@ -2868,4 +2865,5 @@ mod genesis_verification_tests {
         let state = rebuilt(&pg);
         assert!(verify_genesis_reconstruction(&pg, &state).is_ok());
     }
+
 }
