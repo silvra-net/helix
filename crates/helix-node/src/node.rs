@@ -1282,6 +1282,26 @@ async fn apply_finalized_block(
         eng.rotate_validator_set(validators);
         if had > 0 {
             info!(height, epoch = eng.validator_set().epoch, validators = had, "Validator set rotated");
+        } else if !deferred.is_empty() {
+            // Everyone who qualifies is still serving the one-epoch activation delay — the
+            // normal state on the first rotation after an upgrade, when `active_validators`
+            // starts empty and even a long-running validator is treated as a new entrant once
+            // (see `ChainState::rotate_active_validators`). Nothing is wrong and nothing needs
+            // doing: the sitting set keeps its seats because the rotation is a no-op, and the
+            // candidates are promoted at the next one.
+            //
+            // Worth distinguishing, because the message below used to cover this case too and
+            // said the opposite of the truth — observed live during the 0.8.1 deploy at height
+            // 38900, claiming no account met min_validator_stake while the running validator
+            // met it comfortably. An operator reading that goes looking for a problem that
+            // does not exist.
+            info!(
+                height,
+                epoch = eng.validator_set().epoch,
+                waiting = deferred.len(),
+                "Epoch rotation deferred — every candidate is still serving its activation \
+                 epoch; the current set keeps its seats and they join at the next rotation"
+            );
         } else {
             // rotate_validator_set() is a deliberate no-op on an empty candidate list —
             // switching to zero validators would halt block production entirely, so the
@@ -1312,8 +1332,7 @@ async fn apply_finalized_block(
     {
         let mut s = store.write().await;
         if let Err(e) = s.put_block(block) {
-            error!("Failed to store block {}: {}", height, e);
-            return;
+            fatal_storage_failure("block", height, &e);
         }
         // A block whose receipts failed to write is still a valid block — the chain is not held
         // up for it. Their absence reads as `unknown` at the RPC, never as success.
@@ -1322,7 +1341,10 @@ async fn apply_finalized_block(
         }
         let state = chain_state.read().await;
         if let Err(e) = s.save_chain_state(&state) {
-            error!("Failed to persist chain state at height {}: {}", height, e);
+            // Worse than a lost block, because it leaves no gap to notice: the block is on disk
+            // and the state that belongs to it is not, so a restart loads a state that silently
+            // disagrees with the chain height above it.
+            fatal_storage_failure("chain state", height, &e);
         }
     }
 
@@ -1336,6 +1358,34 @@ async fn apply_finalized_block(
     if tx_count > 0 {
         info!(height, tx_count, "Block committed");
     }
+}
+
+/// Abort the process after a write to the chain database failed.
+///
+/// Logging and carrying on is what this used to do, and it is the worse option by a distance.
+/// Seen live on 2026-07-20 when the disk filled up: `Failed to store block 4108: No space left
+/// on device`, after which the consensus engine kept running while **nothing** was persisted.
+/// The node sat there for 7 minutes looking alive — RPC answering, no further errors — and did
+/// not recover on its own once space was free again. A `pm2 restart` fixed it instantly, which
+/// is the whole point: restarting *was* the working recovery, the node just refused to do it.
+///
+/// So do that deliberately. Exiting is louder than a log line nobody is watching, and every
+/// supervisor (pm2, systemd, Docker) restarts from here, which re-runs the startup sync and
+/// repairs whatever the failed write left behind. If the underlying cause persists the node
+/// restart-loops — visible, diagnosable, and still better than a process that claims to be
+/// producing blocks it is quietly dropping.
+///
+/// `std::process::exit` rather than `panic!`: this runs inside a Tokio task, and a panic there
+/// unwinds that task alone. The RPC server, P2P service and block production loop would all
+/// keep running — reproducing the exact failure this exists to prevent.
+fn fatal_storage_failure(what: &str, height: u64, e: &dyn std::fmt::Display) -> ! {
+    error!(
+        height,
+        error = %e,
+        "Failed to persist {what} — exiting so the supervisor restarts this node. Continuing \
+         would keep consensus running while the chain on disk silently stops advancing."
+    );
+    std::process::exit(1)
 }
 
 #[allow(clippy::too_many_arguments)]
