@@ -35,6 +35,19 @@ pub struct AppState {
     pub chain_state: Arc<RwLock<ChainState>>,
     pub node_address: String,
     pub peer_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// True while this node is still downloading history and is therefore **not** producing
+    /// blocks yet — see `helix-node`'s `SyncProgress`. Reported by `GET /status` as
+    /// `is_syncing`, which until 0.8.2 was hardcoded `false` and told every caller the node was
+    /// ready no matter what it was doing.
+    ///
+    /// A wallet must not treat a syncing node as authoritative: its balances are whatever the
+    /// partial chain says, which is usually zero. Rather than hide that, the status reports it
+    /// so a client can say "catching up, 12,400 of 44,000 blocks" instead of "you have nothing".
+    pub syncing: Arc<std::sync::atomic::AtomicBool>,
+    /// Height this node has applied so far, and the tip it is syncing towards (0 when unknown,
+    /// e.g. no sync peer configured). Together with `syncing` this is everything a client needs
+    /// to render honest progress.
+    pub sync_target_height: Arc<std::sync::atomic::AtomicU64>,
     /// This node's own libp2p listen port — surfaced via `GET /status` so a joining peer
     /// can derive a dialable seed address without needing mDNS. See `NodeStatus::p2p_port`.
     pub p2p_port: u16,
@@ -213,7 +226,11 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
         height: store.latest_height(),
         best_hash: store.latest_hash().to_hex(),
         peer_count: state.peer_count.load(Ordering::Relaxed),
-        is_syncing: false,
+        is_syncing: state.syncing.load(Ordering::Relaxed),
+        sync_target_height: match state.sync_target_height.load(Ordering::Relaxed) {
+            0 => None,
+            h => Some(h),
+        },
         mempool_size: mempool.len(),
         total_accounts: chain.account_count(),
         circulating_supply_hlx: chain.circulating_supply() as f64 / 1_000_000_000.0,
@@ -1140,6 +1157,8 @@ mod tests {
             chain_state: Arc::new(RwLock::new(ChainState::new(0))),
             node_address: String::new(),
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            syncing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sync_target_height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             p2p_port: 0,
             p2p_public_addr: None,
             p2p_command_tx,
@@ -1661,6 +1680,8 @@ mod tests {
             chain_state: Arc::new(RwLock::new(ChainState::new(0))),
             node_address: "test-node".to_string(),
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            syncing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sync_target_height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             p2p_port: 0,
             p2p_public_addr: None,
             p2p_command_tx,

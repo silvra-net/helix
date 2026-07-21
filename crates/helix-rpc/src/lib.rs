@@ -262,7 +262,15 @@ pub struct NodeStatus {
     pub height: u64,
     pub best_hash: String,
     pub peer_count: usize,
+    /// True while this node is still downloading history. It is **not** producing blocks in
+    /// that state and its balances reflect only the part of the chain it has, so a client
+    /// should show progress rather than present those numbers as final.
     pub is_syncing: bool,
+    /// Tip this node is syncing towards, when known — pair it with `height` for a real
+    /// progress figure ("12,400 of 44,000"). `None` when nothing is being synced, or when the
+    /// target isn't known yet (no sync peer configured, or the peer hasn't answered).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_target_height: Option<u64>,
     pub mempool_size: usize,
     pub total_accounts: usize,
     pub circulating_supply_hlx: f64,

@@ -270,6 +270,12 @@ pub struct HelixNode {
     /// raw-TCP address derived from `p2p_port`, which is unreachable for a tunnelled node.
     p2p_public_addr: Option<String>,
     rpc_bind: SocketAddr,
+    /// Set while the startup catch-up runs, cleared when it finishes. Shared with the RPC
+    /// server (so `GET /status` can report it) and with `block_production_loop`, which must
+    /// not propose anything until it clears — see `run`.
+    syncing: Arc<std::sync::atomic::AtomicBool>,
+    /// Tip the startup sync is working towards, 0 when unknown. Purely informational.
+    sync_target_height: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HelixNode {
@@ -390,7 +396,7 @@ impl HelixNode {
             }
         });
 
-        let mut chain_state = if store.get_block_by_height(0).is_ok() {
+        let chain_state = if store.get_block_by_height(0).is_ok() {
             info!("Loaded existing chain state from {}", db_path.display());
             store.load_chain_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX)?
         } else if let Some(peer_url) = &sync_peer {
@@ -444,17 +450,13 @@ impl HelixNode {
             state
         };
 
-        // Block sync — download historical blocks from a trusted peer if configured.
-        // Fetches all blocks this node is missing (from height 1 on — genesis, height 0, was
-        // either loaded above or adopted from this same peer just above).
-        if let Some(peer_url) = &sync_peer {
-            let local_tip = store.latest_height();
-            info!("Syncing blocks from {} (local tip: {})", peer_url, local_tip);
-            match sync_blocks_from_peer(peer_url, local_tip, &mut store, &mut chain_state).await {
-                Ok(synced) => info!("Block sync complete — applied {} new blocks", synced),
-                Err(e) => warn!("Block sync failed (continuing anyway): {}", e),
-            }
-        }
+        // NOTE: the historical catch-up does NOT happen here any more — it runs in `run`,
+        // after the RPC server is listening. Downloading it from inside the constructor meant
+        // the node answered nothing at all until it finished: no RPC, no P2P, no status. On the
+        // live chain that was 36 minutes (measured 2026-07-21) in which a healthy node and a
+        // broken one looked exactly alike, and the wallet had no way to tell it was making
+        // progress. Bitcoin Core serves its RPC from the first second and reports the sync as
+        // progress; this now does the same.
 
         // P2P setup — `p2p_listen_addr` in helix.toml (or HELIX_P2P_LISTEN) overrides
         // the default listen address; unset means keep P2PConfig::default().
@@ -548,6 +550,8 @@ impl HelixNode {
             None => Mempool::new(),
         };
 
+        let has_sync_peer = sync_peer.is_some();
+
         Ok(HelixNode {
             keypair: Arc::new(keypair),
             address,
@@ -562,6 +566,11 @@ impl HelixNode {
             p2p_port,
             p2p_public_addr,
             rpc_bind,
+            // Starts true whenever there is a peer to catch up from: `run` clears it once the
+            // sync finishes (or immediately, if there is nothing to sync from). Claiming
+            // "synced" before checking would be the same lie the old hardcoded `false` told.
+            syncing: Arc::new(std::sync::atomic::AtomicBool::new(has_sync_peer)),
+            sync_target_height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -575,17 +584,59 @@ impl HelixNode {
             chain_state: self.chain_state.clone(),
             node_address: self.address.to_string(),
             peer_count: peer_count.clone(),
+            syncing: self.syncing.clone(),
+            sync_target_height: self.sync_target_height.clone(),
             p2p_port: self.p2p_port,
             p2p_public_addr: self.p2p_public_addr.clone(),
             p2p_command_tx: self.p2p_command_tx.clone(),
         };
 
-        // Spawn RPC server
+        // Spawn RPC server — first, before any catch-up, so `GET /status` answers from the
+        // very first second and can report the sync as progress instead of the node being a
+        // black box until it finishes.
         let rpc_bind: SocketAddr = self.rpc_bind;
         info!("RPC bind address  : {}", rpc_bind);
         tokio::spawn(async move {
             start_rpc_server(rpc_state, rpc_bind).await;
         });
+
+        // Historical catch-up, now that the RPC is up. Runs to completion before consensus
+        // starts (see the wait in `block_production_loop`): a node that proposes while it is
+        // still missing history would build on a chain it hasn't seen, which on a
+        // single-validator network means immediately forking off its own.
+        if let Some(peer_url) = self.sync_peer.clone() {
+            let store = self.store.clone();
+            let chain_state = self.chain_state.clone();
+            let syncing = self.syncing.clone();
+            let target = self.sync_target_height.clone();
+            tokio::spawn(async move {
+                // Best-effort: the target is only for the progress display, so an old or
+                // unreachable peer just leaves it at 0 (reported as `null`) rather than
+                // holding up the sync itself.
+                if let Ok(client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                {
+                    if let Ok(tip) = fetch_peer_height(&client, &peer_url).await {
+                        target.store(tip, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                let local_tip = store.read().await.latest_height();
+                info!(peer = %peer_url, local_tip, "Syncing blocks from peer");
+                let result = {
+                    let mut s = store.write().await;
+                    let mut cs = chain_state.write().await;
+                    sync_blocks_from_peer(&peer_url, local_tip, &mut s, &mut cs).await
+                };
+                match result {
+                    Ok(synced) => info!(applied = synced, "Block sync complete"),
+                    // Same tolerance as before this moved out of the constructor: an
+                    // unreachable peer must not stop the node, it just starts from what it has.
+                    Err(e) => warn!(error = %e, "Block sync failed (continuing anyway)"),
+                }
+                syncing.store(false, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
 
         // Spawn P2P service
         let p2p_service = self.p2p_service.take().unwrap();
@@ -714,6 +765,7 @@ impl HelixNode {
             self.p2p_command_tx.clone(),
             self.reward_address.map(Arc::new),
             peer_count.clone(),
+            self.syncing.clone(),
         ));
 
         tokio::select! {
@@ -1297,6 +1349,7 @@ async fn block_production_loop(
     p2p_tx: mpsc::Sender<P2PCommand>,
     reward_address: Option<Arc<Address>>,
     peer_count: Arc<std::sync::atomic::AtomicUsize>,
+    syncing: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(BLOCK_TIME_MS));
 
@@ -1312,8 +1365,25 @@ async fn block_production_loop(
     let mut mesh_ready = false;
     let mut settle_ticks_left: u32 = MESH_SETTLE_TICKS;
 
+    // Logged once rather than every tick — a full catch-up is thousands of ticks long.
+    let mut announced_wait = false;
+
     loop {
         interval.tick().await;
+
+        // Nothing gets proposed while history is still downloading. The startup sync moved out
+        // of the constructor so the RPC can answer during it (see `run`), which means this loop
+        // now starts while the chain may still be at height 0 — and a validator proposing there
+        // would build its own fork of the network it is trying to join. On a single-validator
+        // set nothing else would stop it: `peers_needed_for_quorum` is 0, so the mesh gate
+        // below passes straight through.
+        if syncing.load(std::sync::atomic::Ordering::Relaxed) {
+            if !announced_wait {
+                info!("Block production held until the initial sync finishes");
+                announced_wait = true;
+            }
+            continue;
+        }
 
         if !mesh_ready {
             let needed = engine.read().await.peers_needed_for_quorum();
@@ -2817,6 +2887,65 @@ mod handle_p2p_event_tests {
             engine.read().await.validator_set().get(&new_staker_addr).is_some(),
             "the staker must be promoted at the next epoch rotation"
         );
+    }
+
+    /// The startup sync moved out of the constructor so the RPC can serve during it, which
+    /// means block production now starts while the chain may still be empty. A validator that
+    /// proposes there builds its own fork of the network it is trying to join — and on a
+    /// single-validator set nothing else stops it, since `peers_needed_for_quorum()` is 0 and
+    /// the mesh gate passes straight through.
+    ///
+    /// This pins that the sync flag alone holds it: with the flag set, the loop must not
+    /// advance the chain; with it cleared, it must.
+    #[tokio::test]
+    async fn block_production_waits_for_the_initial_sync() {
+        let kp = Arc::new(KeyPair::generate());
+        let addr = Address::from_public_key(&kp.public);
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            cs.governance_params.min_validator_stake = 1;
+            cs.update_account(&addr, |acc| acc.staked = 1_000_000);
+        }
+        let vset = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr.clone(), 0)));
+        let (p2p_tx, _rx) = mpsc::channel(64);
+        let last_applied = Arc::new(Mutex::new(0u64));
+        let peer_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let syncing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let loop_handle = tokio::spawn(block_production_loop(
+            store.clone(),
+            mempool.clone(),
+            chain_state.clone(),
+            kp.clone(),
+            engine.clone(),
+            last_applied.clone(),
+            p2p_tx.clone(),
+            None,
+            peer_count.clone(),
+            syncing.clone(),
+        ));
+
+        // Well past several block intervals: nothing may be produced while syncing.
+        tokio::time::sleep(Duration::from_millis(BLOCK_TIME_MS * 4)).await;
+        assert_eq!(
+            store.read().await.latest_height(),
+            0,
+            "a syncing node must not propose — it would fork off the chain it is still fetching"
+        );
+
+        // Sync finishes: the same loop, unchanged otherwise, must now make progress.
+        syncing.store(false, std::sync::atomic::Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while store.read().await.latest_height() == 0 {
+            assert!(std::time::Instant::now() < deadline, "production did not resume after sync");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        loop_handle.abort();
     }
 }
 
