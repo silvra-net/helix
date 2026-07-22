@@ -639,10 +639,7 @@ impl HelixNode {
                 // Best-effort: the target is only for the progress display, so an old or
                 // unreachable peer just leaves it at 0 (reported as `null`) rather than
                 // holding up the sync itself.
-                if let Ok(client) = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                {
+                if let Ok(client) = peer_http_client(Duration::from_secs(10)) {
                     if let Ok(tip) = fetch_peer_height(&client, &peer_url).await {
                         target.store(tip, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -1702,16 +1699,93 @@ struct PeerGenesis {
     state_hash: Option<String>,
 }
 
-async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let resp: serde_json::Value = client
-        .get(format!("{}/genesis", peer_url.trim_end_matches('/')))
+/// The HTTP client every outbound peer request uses.
+///
+/// Carries an honest `User-Agent` (`helix/<version>`). reqwest sends none at all by default, and
+/// a request with no user agent is exactly what bot-protection heuristics treat as suspicious —
+/// so this both identifies our traffic to a seed operator reading their logs and makes it less
+/// likely to be lumped in with anonymous scrapers.
+fn peer_http_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(concat!("helix/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("could not build the HTTP client for peer requests")
+}
+
+/// Say what a peer actually sent when it wasn't the JSON we asked for.
+///
+/// Returns a diagnosis to append to an error, not just the bytes: the raw body is usually a
+/// full HTML document, and pasting that into a terminal tells an operator nothing.
+fn diagnose_non_json(body: &str) -> String {
+    let lower = body.to_lowercase();
+    if lower.contains("just a moment")
+        || lower.contains("cf-mitigated")
+        || lower.contains("cdn-cgi/challenge-platform")
+        || (lower.contains("cloudflare") && lower.contains("challenge"))
+    {
+        return " — the peer answered with a Cloudflare bot challenge instead of data. That \
+                challenge can only be passed by a real browser running JavaScript, so no node \
+                can sync through it. This is a setting on the *peer's* side: its operator has to \
+                exempt the API paths (/status, /genesis, /sync/blocks, /blocks/*) from the \
+                WAF/bot protection, or serve them unproxied. Until then, point HELIX_SYNC_PEER \
+                at a different node."
+            .to_string();
+    }
+    if lower.trim_start().starts_with("<!doctype") || lower.trim_start().starts_with("<html") {
+        let snippet: String = body.chars().filter(|c| *c != '\n' && *c != '\r').take(160).collect();
+        return format!(
+            " — the peer answered with an HTML page, not JSON, so something is intercepting the \
+             request (a proxy, a captive portal, or an error page from a reverse proxy in front \
+             of the node). First bytes: {snippet}"
+        );
+    }
+    let snippet: String = body.chars().filter(|c| *c != '\n' && *c != '\r').take(160).collect();
+    if snippet.is_empty() {
+        " — the peer answered with an empty body".to_string()
+    } else {
+        format!(" — the peer answered with: {snippet}")
+    }
+}
+
+/// `GET url` and decode it as JSON, failing with something an operator can act on.
+///
+/// The obvious spelling — `client.get(url).send().await?.json().await?` — throws away both the
+/// HTTP status and the body, so anything that isn't JSON surfaces as serde's
+/// `expected value at line 1 column 1`. That is what a joining node reported on 2026-07-22:
+/// `helix.silvra.net` sat behind a Cloudflare bot challenge that answers datacenter IPs with a
+/// 403 HTML page, and the node's only output was `Error: error decoding response body`. The
+/// operator had to run `curl -v` themselves to discover the seed was fine and the WAF was not.
+/// Reproduced independently from an outside datacenter address: 403 there, 200 from the host
+/// itself — which is exactly why the seed's own operator could not see it.
+///
+/// So: check the status, look at what actually came back, and name the likely cause.
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T> {
+    let resp = client
+        .get(url)
         .send()
-        .await?
-        .json()
-        .await?;
+        .await
+        .with_context(|| format!("could not reach {url}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("could not read {url}'s response body"))?;
+
+    if !status.is_success() {
+        bail!("{url} answered HTTP {status}{}", diagnose_non_json(&body));
+    }
+    serde_json::from_str(&body)
+        .with_context(|| format!("{url} did not answer with valid JSON{}", diagnose_non_json(&body)))
+}
+
+async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
+    let client = peer_http_client(Duration::from_secs(30))?;
+    let resp: serde_json::Value =
+        fetch_json(&client, &format!("{}/genesis", peer_url.trim_end_matches('/'))).await?;
     let block: Block = serde_json::from_value(
         resp.get("block")
             .cloned()
@@ -1835,15 +1909,9 @@ async fn resolve_seed_peer_multiaddr(peer_url: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("sync peer URL has no host: {}", peer_url))?
         .to_string();
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
-    let status: serde_json::Value = client
-        .get(format!("{}/status", peer_url.trim_end_matches('/')))
-        .send()
-        .await?
-        .json()
-        .await?;
+    let client = peer_http_client(Duration::from_secs(10))?;
+    let status: serde_json::Value =
+        fetch_json(&client, &format!("{}/status", peer_url.trim_end_matches('/'))).await?;
 
     if let Some(warning) = peer_version_warning(&status, env!("CARGO_PKG_VERSION")) {
         warn!(peer = %peer_url, "{warning}");
@@ -1917,12 +1985,8 @@ fn seed_multiaddr_from_status(status: &serde_json::Value, host: &str) -> Result<
 /// Ask a peer (`GET /status`) for its current chain height. Cheap, lock-free probe used by
 /// [`rpc_sync_loop`] to decide whether the peer is ahead before taking any write locks.
 async fn fetch_peer_height(client: &reqwest::Client, peer_url: &str) -> Result<u64> {
-    let status: serde_json::Value = client
-        .get(format!("{}/status", peer_url.trim_end_matches('/')))
-        .send()
-        .await?
-        .json()
-        .await?;
+    let status: serde_json::Value =
+        fetch_json(client, &format!("{}/status", peer_url.trim_end_matches('/'))).await?;
     status
         .get("height")
         .and_then(|v| v.as_u64())
@@ -1964,10 +2028,7 @@ async fn rpc_sync_loop(
     let Some(peer_url) = sync_peer else {
         return; // standalone chain (HELIX_NEW_CHAIN) — nothing to catch up from
     };
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-    {
+    let client = match peer_http_client(Duration::from_secs(15)) {
         Ok(c) => c,
         Err(e) => {
             warn!("Could not build RPC sync client — periodic catch-up disabled: {e}");
@@ -2073,9 +2134,7 @@ async fn sync_blocks_from_peer(
     store: &mut HelixDb,
     chain_state: &mut ChainState,
 ) -> Result<u64> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = peer_http_client(Duration::from_secs(30))?;
 
     let mut from = local_tip + 1;
     let mut total_applied = 0u64;
@@ -2085,11 +2144,7 @@ async fn sync_blocks_from_peer(
 
     loop {
         let url = format!("{}/sync/blocks?from={}&count=200", peer_url.trim_end_matches('/'), from);
-        let resp = client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("peer returned HTTP {}", resp.status());
-        }
-        let blocks: Vec<Block> = resp.json().await?;
+        let blocks: Vec<Block> = fetch_json(&client, &url).await?;
         if blocks.is_empty() {
             break; // caught up
         }
@@ -3177,6 +3232,53 @@ mod genesis_verification_tests {
         // A peer too old to report a version leaves us no worse off than before the check —
         // same reasoning as the genesis hash above, so no false alarm either.
         assert!(peer_version_warning(&serde_json::json!({ "height": 5 }), "0.8.1").is_none());
+    }
+
+    /// The real incident, kept as a test: an operator on a Hetzner VPS could not start a node
+    /// because the seed answered their datacenter IP with a Cloudflare challenge, and all the
+    /// node said was `error decoding response body: expected value at line 1 column 1`. Whatever
+    /// else changes, that body must never again produce an error that points at our JSON.
+    #[test]
+    fn a_bot_challenge_is_named_instead_of_surfacing_as_a_json_error() {
+        let challenge = "<!DOCTYPE html><html lang=\"en-US\"><head><title>Just a moment...</title>\
+                         <script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page\">\
+                         </script></head><body>Enable JavaScript and cookies to continue</body></html>";
+
+        let d = diagnose_non_json(challenge);
+        assert!(d.contains("bot challenge"), "the cause has to be named: {d}");
+        assert!(
+            d.contains("/genesis") && d.contains("/sync/blocks"),
+            "an operator needs the concrete paths to exempt: {d}"
+        );
+        assert!(
+            d.contains("HELIX_SYNC_PEER"),
+            "and a way to get running now, since the fix is on someone else's server: {d}"
+        );
+        assert!(
+            !d.contains("cdn-cgi/challenge-platform"),
+            "the raw challenge markup helps nobody and buries the message: {d}"
+        );
+    }
+
+    /// A plain error page is a different situation from a bot challenge — a proxy in the way,
+    /// not a policy — so it must not be reported as the latter, and it must still show enough
+    /// of the body to recognise what answered.
+    #[test]
+    fn an_ordinary_html_error_page_is_distinguished_from_a_challenge() {
+        let d = diagnose_non_json("<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>");
+        assert!(!d.contains("bot challenge"), "not every HTML page is a challenge: {d}");
+        assert!(d.contains("HTML page"), "say what it was: {d}");
+        assert!(d.contains("502"), "show enough of it to identify the responder: {d}");
+    }
+
+    /// An empty body used to be indistinguishable from a short one at the end of a truncated
+    /// message; both are reported, neither panics on slicing a multi-byte boundary.
+    #[test]
+    fn an_empty_or_odd_body_is_still_described() {
+        assert!(diagnose_non_json("").contains("empty body"));
+        let unicode = "Fehler: Verbindung wurde zurückgesetzt — Grüße vom Proxy ✂".repeat(10);
+        let d = diagnose_non_json(&unicode);
+        assert!(d.contains("answered with"), "{d}");
     }
 }
 
