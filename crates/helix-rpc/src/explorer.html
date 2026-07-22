@@ -206,13 +206,14 @@
   footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--line);
     color: var(--dim); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
   footer .sep { opacity: .5; }
-  /* Directory listing — pushed to the far end. Quiet, but it has to be *readable*: at 14px and
-     half opacity the wordmark was a grey smudge, which serves nobody. A partner credential that
-     cannot be recognised is worse than none, since it still costs the space. */
-  .listing { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; opacity: .75;
+  /* Partner badge — pushed to the far end. Shown at the wordmark's own 220x43: it is a 220x43
+     PNG, so any other height either wastes resolution or upscales into a soft edge, and at the
+     14px it started at it was a grey smudge nobody could read. `max-width` keeps it inside a
+     narrow phone; the aspect ratio then does the rest. */
+  .listing { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; opacity: .85;
     transition: opacity .15s ease; }
   .listing:hover { opacity: 1; text-decoration: none; }
-  .listing img { height: 26px; width: auto; display: block; }
+  .listing img { width: 220px; max-width: 100%; height: auto; display: block; }
   @media (max-width: 560px) { .listing { margin-left: 0; } }
 </style>
 
