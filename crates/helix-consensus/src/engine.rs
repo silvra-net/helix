@@ -601,10 +601,21 @@ impl BftEngine {
         // Seen live on 2026-07-22: after a production restart, validator 2 reconnected
         // (`peer_count: 1`) and then sat idle for hundreds of blocks — never proposing, never in
         // a certificate — because it had been zeroed out during its absence and nothing could
-        // ever undo that. Deliberately before any validation below: an equivocating or otherwise
-        // malformed vote still proves the sender is present, and liveness is only about presence.
-        // Misbehavior is what slashing and `PeerReputation` are for.
-        self.missed_rounds.remove(&vote.validator);
+        // ever undo that.
+        //
+        // Gated on the height, and that gate is not optional — clearing on *any* vote deadlocked
+        // production within twenty minutes of shipping it. A peer stuck on a fork votes on its
+        // own tip forever: those votes can never be counted here, but they kept resetting the
+        // counter, so it stayed in the quorum as "alive" while this node waited for an agreement
+        // that could not arrive. The chain sat at height 66982 for 20 minutes on 2026-07-22 for
+        // exactly that reason.
+        //
+        // Presence is not the question — participation is. A validator voting on the height we
+        // are trying to decide is participating; one voting on a different history is not, and
+        // has to be allowed to age out so the chain can make progress without it.
+        if vote.height == self.current_height + 1 {
+            self.missed_rounds.remove(&vote.validator);
+        }
 
         // Helix never precommits nil (see `note_round_tick`), so a precommit carrying
         // `NIL_BLOCK_HASH` is not something an honest validator produces. Refuse it at the
@@ -693,10 +704,13 @@ impl BftEngine {
     pub fn receive_proposal(&mut self, keypair: &KeyPair, proposal: Proposal) -> ConsensusResult<Option<Block>> {
         let Proposal { round: round_num, valid_round, block, pol } = proposal;
 
-        // Proposing is participation, so it clears the proposer's liveness strikes — same
-        // reasoning as in `add_vote`, and needed for the same reason: a validator zeroed out
-        // during a brief absence has to be able to earn its way back in.
-        self.missed_rounds.remove(&block.header.validator);
+        // Proposing on the height we are deciding is participation, so it clears the proposer's
+        // liveness strikes — same reasoning, and the same height gate, as in `add_vote`: a
+        // proposal for a different history proves the sender is running, not that it is helping
+        // decide the block we are stuck on.
+        if block.height() == self.current_height + 1 {
+            self.missed_rounds.remove(&block.header.validator);
+        }
 
         if block.height() <= self.current_height {
             return Ok(None);
@@ -2434,6 +2448,43 @@ mod tests {
     /// The point of the 2026-07-20 liveness fix: found live when a staked validator with no
     /// running node at all crossed an epoch rotation and froze block production for hours,
     /// because a 2-of-2 quorum requires both no matter how long one has been silent. After
+    /// The regression that took production down for 20 minutes: a peer on a different history
+    /// must NOT be able to hold the quorum open forever.
+    ///
+    /// It votes continuously — on its own fork's tip — so it looks alive by any presence-based
+    /// test, while none of its votes can ever be counted here. If that resets its liveness
+    /// strikes, it never ages out, this node waits for an agreement that cannot exist, and the
+    /// chain stops. Only votes on the height actually being decided may count.
+    #[test]
+    fn a_peer_voting_on_a_different_history_still_ages_out_of_the_quorum() {
+        let v = two_validators();
+        // Start at 10 so the peer can be genuinely behind us, the way a forked node is: it keeps
+        // voting on its own tip while we have long moved past that height.
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 10);
+        let peer_addr = Address::from_public_key(&v.peer_kp.public);
+
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        for _ in 0..LIVENESS_JAIL_ROUNDS {
+            let stale = peer_vote(
+                &v.peer_kp,
+                VoteType::Prevote,
+                5, // we are deciding height 11
+                0,
+                Hash::digest(b"block-on-their-fork"),
+            );
+            let _ = engine.add_vote(&v.self_kp, stale);
+            tick_to_timeout_and_advance(&mut engine, &v.self_kp);
+        }
+
+        let adjusted = engine.liveness_adjusted_validator_set();
+        assert_eq!(
+            adjusted.get(&peer_addr).unwrap().voting_power,
+            0,
+            "a peer that only ever votes on another history must still age out — otherwise it \
+             pins the quorum open and the chain cannot advance without it"
+        );
+    }
+
     /// A validator excluded for silence has to be able to come back by simply voting again.
     ///
     /// Before this, `missed_rounds` was only ever cleared in `record_round_liveness`, which runs
