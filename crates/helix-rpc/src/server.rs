@@ -79,6 +79,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
     let app = Router::new()
         .route("/", get(root))
         .route("/logo.png", get(logo))
+        .route("/chainquiry.png", get(chainquiry_logo))
         .route("/status", get(get_status))
         .route("/blocks/latest", get(get_latest_block))
         .route("/blocks/height/:n", get(get_block_by_height))
@@ -150,6 +151,13 @@ const EXPLORER_HTML: &str = include_str!("explorer.html");
 /// listing directory, a chat, or anyone asking "where's the logo?" can point at directly.
 const LOGO_PNG: &[u8] = include_bytes!("logo.png");
 
+/// Chainquiry's wordmark, for the directory link in the explorer footer.
+///
+/// Served from here rather than hotlinked, because the footer promises "no external requests, no
+/// tracking" — pulling this from chainquiry.com would hand every explorer visitor's IP and
+/// referrer to a third party and make that promise false. 3 KB, cached like the main logo.
+const CHAINQUIRY_PNG: &[u8] = include_bytes!("chainquiry.png");
+
 /// `GET /logo.png` — the project logo at a stable, shareable URL. Cached for a day since the
 /// bytes only ever change with a new binary.
 async fn logo() -> impl IntoResponse {
@@ -159,6 +167,16 @@ async fn logo() -> impl IntoResponse {
             (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         LOGO_PNG,
+    )
+}
+
+async fn chainquiry_logo() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        CHAINQUIRY_PNG,
     )
 }
 
@@ -1889,6 +1907,36 @@ mod tests {
                 "explorer must be self-contained, found {needle:?}"
             );
         }
+
+        // The list above only catches sources someone thought of in advance — it would happily
+        // pass an `<img src="https://…">`, which is exactly the mistake waiting to be made when
+        // adding a badge or an icon. Any *loaded* resource must be same-origin; `href` links are
+        // fine, since a link fetches nothing until the reader chooses to follow it.
+        assert!(
+            !EXPLORER_HTML.contains("src=\"http"),
+            "every image/script the explorer loads must come from the node itself — the footer \
+             promises no external requests, and a hotlinked asset hands every visitor's IP and \
+             referrer to a third party"
+        );
+    }
+
+    /// The directory badge is served by the node like every other asset, for the reason the test
+    /// above pins down.
+    #[tokio::test]
+    async fn the_chainquiry_badge_is_served_locally_as_a_png() {
+        use axum::http::header;
+
+        let response = chainquiry_logo().await.into_response();
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "must be a real PNG");
+        assert!(
+            EXPLORER_HTML.contains("src=\"/chainquiry.png\""),
+            "the explorer must reference the locally served copy, not the origin"
+        );
     }
 
     /// The hash must describe the *genesis* state, not the node's current one. Serving the
