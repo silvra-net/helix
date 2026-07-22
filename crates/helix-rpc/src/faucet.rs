@@ -131,6 +131,12 @@ impl Faucet {
         self.topup_nano as f64 / NANO_PER_HLX as f64
     }
 
+    /// The ceiling in nano — what the account must still hold for the faucet to be worth
+    /// advertising. See `NodeStatus::faucet_topup_hlx`.
+    pub fn topup_nano(&self) -> u64 {
+        self.topup_nano
+    }
+
     /// What this address should receive, given what it already holds — `None` when it is
     /// already at or above the ceiling and is owed nothing.
     ///

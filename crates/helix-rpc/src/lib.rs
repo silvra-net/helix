@@ -323,11 +323,14 @@ pub struct NodeStatus {
     /// hardcoded fee is only ever right until the network gets busy enough to move this.
     pub base_fee_per_byte: u64,
     /// The balance this node's faucet tops an address up to, in HLX — `None` on any node that
-    /// does not run one, which is every node whose operator did not deliberately fund one (see
-    /// `crate::faucet`).
+    /// does not run one (see `crate::faucet`), **and also `None` while the faucet account is
+    /// too empty to pay a grant**.
     ///
-    /// Advertised so a client can offer the faucet only where it exists, rather than showing a
-    /// button that answers 404. `#[serde(default)]` keeps older nodes deserializing.
+    /// The second condition is the useful one: a client should offer the faucet only where it
+    /// will actually work, rather than show a button that answers "out of funds". Because it is
+    /// derived from the balance on every request, the offer appears by itself when someone tops
+    /// the account up and withdraws itself when it runs dry — no restart, no configuration
+    /// change, nobody having to notice. `#[serde(default)]` keeps older nodes deserializing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub faucet_topup_hlx: Option<f64>,
 }

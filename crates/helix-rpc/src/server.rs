@@ -176,13 +176,19 @@ const LOGO_PNG: &[u8] = include_bytes!("logo.png");
 /// referrer to a third party and make that promise false. 3 KB, cached like the main logo.
 const CHAINQUIRY_PNG: &[u8] = include_bytes!("chainquiry.png");
 
-/// `GET /logo.png` — the project logo at a stable, shareable URL. Cached for a day since the
-/// bytes only ever change with a new binary.
+/// `GET /logo.png` — the project logo at a stable, shareable URL.
+///
+/// An hour, not the day this used to say. The bytes only change with a new binary, so a long
+/// cache costs nothing *until* one changes — and then the old image is served by every CDN in
+/// front of the node for the rest of the day, with no way to tell from here. Swapping the
+/// Chainquiry badge on 2026-07-22 hit exactly that: the node served the new file, the public
+/// URL served the old one, and the only reason it did not matter was that the two rendered
+/// identically. An hour is still far longer than anyone reloads this page.
 async fn logo() -> impl IntoResponse {
     (
         [
             (axum::http::header::CONTENT_TYPE, "image/png"),
-            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         LOGO_PNG,
     )
@@ -192,7 +198,7 @@ async fn chainquiry_logo() -> impl IntoResponse {
     (
         [
             (axum::http::header::CONTENT_TYPE, "image/png"),
-            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         CHAINQUIRY_PNG,
     )
@@ -269,7 +275,17 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
             0 => None,
             h => Some(h),
         },
-        faucet_topup_hlx: state.faucet.as_ref().map(|f| f.topup_hlx()),
+        // Advertised only while the faucet can actually pay a grant. An offer that answers
+        // "out of funds" is worse than no offer, and gating it on the balance rather than on
+        // configuration means it appears the moment someone tops the account up and disappears
+        // when it runs dry — both without a restart, and without anyone having to notice.
+        faucet_topup_hlx: state.faucet.as_ref().and_then(|f| {
+            let funded = chain
+                .get(&f.address)
+                .map(|a| a.balance >= f.topup_nano())
+                .unwrap_or(false);
+            funded.then(|| f.topup_hlx())
+        }),
         mempool_size: mempool.len(),
         total_accounts: chain.account_count(),
         circulating_supply_hlx: chain.circulating_supply() as f64 / 1_000_000_000.0,
