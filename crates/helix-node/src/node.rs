@@ -63,6 +63,29 @@ pub const DEFAULT_SEED_PEER: &str = "https://helix.silvra.net";
 /// Interval between periodic RPC catch-up polls of the sync peer (see [`rpc_sync_loop`]).
 const RPC_SYNC_POLL_SECS: u64 = 4;
 
+/// How far behind the sync peer this node must be before the periodic RPC catch-up is allowed
+/// to interrupt a consensus round it is currently driving (see [`rpc_sync_loop`]).
+///
+/// Applying a block through the catch-up path calls
+/// [`BftEngine::sync_to_externally_finalized_block`], which drops the active round, its
+/// buffered votes and the collected `last_commit` — correct for a follower that was never in
+/// the round, ruinous for a validator that was. A validator waiting on precommits is *by
+/// definition* one height behind the proposer, so with no threshold at all the catch-up fires
+/// on essentially every poll and tears the round down before it can ever finish.
+///
+/// Measured on the live chain 2026-07-22: the second validator logged "Periodic RPC catch-up …
+/// applied=2" every few seconds for hours. It never emitted a single precommit, so validator 1
+/// liveness-jailed it, committed alone, and its address appeared in no block's `last_commit` —
+/// 150 missed blocks later it was downtime-jailed, over and over, through eight full cycles.
+/// The node was healthy and well-connected the entire time; it was being reset by its own
+/// catch-up loop. Any validator joining through the default seed hits this, which is why the
+/// network never had a working second validator.
+///
+/// Above this gap the round is genuinely stale (the chain moved on without us) and catching up
+/// is the right call — that is the follower case this loop exists for, and it still applies
+/// immediately when no round is in flight.
+const RPC_CATCHUP_ROUND_GRACE_BLOCKS: u64 = 3;
+
 /// True for the truthy env/config spellings `1`/`true`/`yes`/`on` (case-insensitive) — the
 /// same set already accepted for `HELIX_P2P_DISABLE_MDNS`, factored out so the new
 /// `HELIX_NEW_CHAIN` flag reads identically.
@@ -1910,6 +1933,15 @@ async fn fetch_peer_height(client: &reqwest::Client, peer_url: &str) -> Result<u
 /// Race-safe with the P2P/BFT apply path: it claims the shared `last_applied_height` guard
 /// (the same one `apply_finalized_block` uses) across the whole apply, so the two never
 /// double-apply a height — see `apply_finalized_block`'s doc comment for that race.
+/// Should the periodic RPC catch-up leave this poll alone and let consensus finish?
+///
+/// Split out of [`rpc_sync_loop`] so the rule can be tested without a peer, a store or a clock —
+/// the bug it fixes was a single missing condition that no test could reach while it lived
+/// inline in a network loop.
+fn catchup_defers_to_consensus(our_height: u64, peer_height: u64, round_in_flight: bool) -> bool {
+    round_in_flight && peer_height.saturating_sub(our_height) <= RPC_CATCHUP_ROUND_GRACE_BLOCKS
+}
+
 async fn rpc_sync_loop(
     sync_peer: Option<String>,
     store: Arc<RwLock<HelixDb>>,
@@ -1948,7 +1980,21 @@ async fn rpc_sync_loop(
                 continue;
             }
         };
-        if peer_height <= store.read().await.latest_height() {
+        let our_height = store.read().await.latest_height();
+        if peer_height <= our_height {
+            continue;
+        }
+
+        // Don't tear down a consensus round this node is in the middle of driving over a gap
+        // that round is about to close by itself — see `RPC_CATCHUP_ROUND_GRACE_BLOCKS` for the
+        // live incident this caused. A follower (no round in flight) is unaffected and still
+        // catches up on the very next poll.
+        if catchup_defers_to_consensus(our_height, peer_height, engine.read().await.has_active_round())
+        {
+            debug!(
+                our_height,
+                peer_height, "Periodic RPC catch-up: deferring to the consensus round in flight"
+            );
             continue;
         }
 
@@ -3120,5 +3166,42 @@ mod genesis_verification_tests {
         // A peer too old to report a version leaves us no worse off than before the check —
         // same reasoning as the genesis hash above, so no false alarm either.
         assert!(peer_version_warning(&serde_json::json!({ "height": 5 }), "0.8.1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod catchup_tests {
+    use super::*;
+
+    /// The 2026-07-22 incident, as a rule rather than a story: a validator driving a round is
+    /// always a block or two behind the proposer it is voting for, so an unconditional catch-up
+    /// fires on essentially every poll and calls `sync_to_externally_finalized_block`, which
+    /// drops the round, its buffered votes and the `last_commit` collected so far. The validator
+    /// then never precommits, gets liveness-jailed by its peers, appears in no certificate, and
+    /// is downtime-jailed 150 blocks later — while looking perfectly healthy in its own logs.
+    #[test]
+    fn the_catch_up_never_interrupts_a_round_over_a_gap_consensus_is_about_to_close() {
+        // Normal validator lag while a round is in flight: hands off.
+        for gap in 1..=RPC_CATCHUP_ROUND_GRACE_BLOCKS {
+            assert!(
+                catchup_defers_to_consensus(100, 100 + gap, true),
+                "a {gap}-block gap with a round in flight must defer to consensus"
+            );
+        }
+
+        // Genuinely left behind — the round is stale, catching up is the whole point.
+        assert!(
+            !catchup_defers_to_consensus(100, 100 + RPC_CATCHUP_ROUND_GRACE_BLOCKS + 1, true),
+            "past the grace window the round cannot close the gap and must not block the sync"
+        );
+
+        // A follower has no round to protect and must keep syncing exactly as before — this is
+        // the case the loop was built for (P2P unreachable behind the HTTPS tunnel).
+        for gap in 1..=(RPC_CATCHUP_ROUND_GRACE_BLOCKS + 5) {
+            assert!(
+                !catchup_defers_to_consensus(100, 100 + gap, false),
+                "a follower must never defer — nothing else will bring it the blocks"
+            );
+        }
     }
 }

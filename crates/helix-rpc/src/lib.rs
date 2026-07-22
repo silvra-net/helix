@@ -99,6 +99,18 @@ pub struct HeaderResponse {
     pub merkle_root: String,
     /// EIP-1559 base fee for this block, in nano-HLX per transaction byte.
     pub base_fee_per_byte: u64,
+    /// Who attested the *parent* block — the addresses in `BlockHeader::last_commit`.
+    ///
+    /// Omitting this was a real diagnostic hole. It is the only record of who participated in
+    /// consensus, the input the downtime counter is scored from, and the finality evidence a
+    /// light client would need to trust a header at all. Without it, investigating the
+    /// 2026-07-22 jailing loop through this endpoint showed every block as an empty
+    /// certificate — the healthy ones included — which points at the wrong bug entirely.
+    ///
+    /// Addresses only: the signatures themselves are ML-DSA and would dominate the response of
+    /// an endpoint whose whole purpose is to be small (they are what makes a full block ~37 KB).
+    /// A verifier wanting to check them fetches the block from `/sync/blocks`.
+    pub last_commit: Vec<String>,
 }
 
 impl From<&Block> for HeaderResponse {
@@ -111,6 +123,12 @@ impl From<&Block> for HeaderResponse {
             prev_hash: block.header.prev_hash.to_hex(),
             merkle_root: block.header.merkle_root.to_hex(),
             base_fee_per_byte: block.header.base_fee_per_byte,
+            last_commit: block
+                .header
+                .last_commit
+                .iter()
+                .map(|sig| sig.validator.to_string())
+                .collect(),
         }
     }
 }

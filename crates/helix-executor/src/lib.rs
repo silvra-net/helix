@@ -3960,29 +3960,113 @@ mod tests {
         );
     }
 
+    /// A block carrying a genuine quorum certificate — real precommit signatures from
+    /// `signers`, the way a proposer that actually ran the round would attach them.
+    fn block_with_commit(validator: &Address, height: u64, signers: &[&KeyPair]) -> Block {
+        let mut block = empty_block(validator, height);
+        block.header.last_commit = signers
+            .iter()
+            .map(|kp| {
+                // Must match what `execute_block` verifies against: the *parent* height and the
+                // block's own `prev_hash`.
+                let bytes = helix_core::precommit_signing_bytes(
+                    height.saturating_sub(1),
+                    0,
+                    &block.header.prev_hash,
+                    CryptoVersion::MlDsa,
+                );
+                helix_core::CommitSig {
+                    validator: Address::from_public_key(&kp.public),
+                    public_key: kp.public.clone(),
+                    crypto_version: CryptoVersion::MlDsa,
+                    round: 0,
+                    signature: kp.sign(&bytes).expect("sign precommit"),
+                }
+            })
+            .collect();
+        block
+    }
+
     /// The other half: once a validator really is in the active set, silence must still be
-    /// punished exactly as before. Guards against "fixing" the case above by simply not
-    /// counting anyone.
+    /// punished. Guards against "fixing" the case above by simply not counting anyone.
+    ///
+    /// Four validators, three of them signing every block: that is what it takes for the
+    /// certificate to carry 2/3+1 of the power, which is what
+    /// `commit_certificate_carries_quorum` now requires before anyone can be convicted on it.
+    /// The absent one is then genuinely provably absent, and gets jailed.
     #[test]
     fn an_active_validator_that_goes_silent_is_still_jailed() {
         let proposer = Address::from_public_key(&KeyPair::generate().public);
+        let witnesses: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
         let silent = Address::from_public_key(&KeyPair::generate().public);
         let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
         state.governance_params.min_validator_stake = 100;
+        for kp in &witnesses {
+            let addr = Address::from_public_key(&kp.public);
+            state.update_account(&addr, |acc| acc.staked = 1_000);
+            state.active_validators.insert(addr);
+        }
         state.update_account(&silent, |acc| acc.staked = 1_000);
         state.active_validators.insert(silent.clone());
 
+        let signing: Vec<&KeyPair> = witnesses.iter().collect();
         for height in 1..=state::DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 {
-            execute_block(&mut state, &empty_block(&proposer, height), None);
+            execute_block(&mut state, &block_with_commit(&proposer, height, &signing), None);
         }
 
         assert!(
             state.jailed_until.contains_key(&silent.to_string()),
-            "an activated validator absent from every last_commit must be jailed"
+            "an activated validator absent from a quorum-strength last_commit must be jailed"
         );
         assert!(
             !state.active_validators.contains(&silent),
             "and must leave the active set at once, not at the next rotation"
+        );
+        for kp in &witnesses {
+            let addr = Address::from_public_key(&kp.public);
+            assert!(
+                !state.jailed_until.contains_key(&addr.to_string()),
+                "a validator that signed every block must never be jailed"
+            );
+        }
+    }
+
+    /// The live 2026-07-22 failure, end to end through `execute_block`: a validator that is
+    /// active and doing its job, while every block on the chain carries a certificate too thin
+    /// to prove anything (validator 1 signing alone, validator 2 proposing with an empty one).
+    /// The old accounting jailed it after exactly 150 such blocks, on a loop, eight times over.
+    ///
+    /// Also the security property: the certificate's contents are chosen by the proposer, so if
+    /// omission convicted, a proposer could jail any rival at will.
+    #[test]
+    fn a_proposer_cannot_jail_a_rival_by_leaving_it_out_of_the_certificate() {
+        let hostile = KeyPair::generate();
+        let hostile_addr = Address::from_public_key(&hostile.public);
+        let victim = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.governance_params.min_validator_stake = 100;
+        for addr in [&hostile_addr, &victim] {
+            state.update_account(addr, |acc| acc.staked = 100_000);
+            state.active_validators.insert(addr.clone());
+        }
+
+        // Twice the threshold, every block proposed by the hostile validator and attesting only
+        // itself — precisely the shape the live chain showed.
+        for height in 1..=(state::DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 * 2) {
+            execute_block(
+                &mut state,
+                &block_with_commit(&hostile_addr, height, &[&hostile]),
+                None,
+            );
+        }
+
+        assert!(
+            !state.jailed_until.contains_key(&victim.to_string()),
+            "a proposer must not be able to jail a rival by omitting its precommit"
+        );
+        assert!(
+            state.active_validators.contains(&victim),
+            "and the victim must stay in the active set"
         );
     }
 

@@ -639,6 +639,13 @@ impl ChainState {
         signers: &std::collections::HashSet<Address>,
         height: u64,
     ) -> Vec<Address> {
+        // Absence from the certificate is only evidence of absence if the certificate is
+        // credible in the first place — see `commit_certificate_carries_quorum`. Nothing is
+        // recorded either way from one that isn't: no misses charged, no counters reset.
+        if !self.commit_certificate_carries_quorum(current_validators, signers) {
+            return Vec::new();
+        }
+
         let mut newly_jailed = Vec::new();
         for addr in current_validators {
             let key = addr.to_string();
@@ -658,6 +665,65 @@ impl ChainState {
             }
         }
         newly_jailed
+    }
+
+    /// Does `last_commit` prove that a real 2/3+1 majority signed the parent block?
+    ///
+    /// Downtime-jailing reads a validator's absence from the certificate as proof it was
+    /// offline. That inference only holds if the certificate is complete, and **nothing forces
+    /// it to be**: a proposer assembles `last_commit` from the precommits it happens to hold,
+    /// and `CommitSig::verify` (which `execute_block` applies to every entry) can only catch
+    /// *forged* signatures — never *omitted* ones. So the honest failure and the attack look
+    /// identical on the wire:
+    ///
+    /// * Honest — a proposer that finalized via the gossip/RPC fast path never collected the
+    ///   precommits at all and proposes with an empty certificate. Live on 2026-07-22: every
+    ///   block from validator 2 carried `last_commit=[]`, and every block from validator 1
+    ///   carried only validator 1, so validator 2 was charged a miss by *every* block on the
+    ///   chain and jailed on a loop while validating perfectly well.
+    /// * Hostile — a proposer simply leaves a rival's precommit out. Under the old
+    ///   unconditional accounting that jails the rival in 150 blocks at zero cost and with no
+    ///   evidence trail. With two validators it is a takeover; the victim's own node reports
+    ///   itself healthy throughout.
+    ///
+    /// Requiring quorum power in the certificate closes both: an omitting proposer can no
+    /// longer reach the threshold without including the very validators it is trying to
+    /// exclude, so the certificate either accuses nobody or proves its own accusation.
+    ///
+    /// The trade is deliberate and one-directional: a genuinely offline validator goes unjailed
+    /// for as long as certificates stay thin, which costs liveness nothing (the RAM-only
+    /// `LIVENESS_JAIL_ROUNDS` path is what keeps blocks flowing during an outage — this layer
+    /// only makes the exclusion persistent). Failing to punish the guilty is recoverable;
+    /// punishing the innocent, as the incident above shows, is not.
+    ///
+    /// Power is computed exactly as consensus computes it — same `ValidatorSet::new`, same
+    /// 1 % cap, same `quorum_threshold` — so this can never disagree with the set that actually
+    /// voted, and every node deriving it from identical state reaches the identical verdict.
+    fn commit_certificate_carries_quorum(
+        &self,
+        current_validators: &[Address],
+        signers: &std::collections::HashSet<Address>,
+    ) -> bool {
+        let set = helix_consensus::ValidatorSet::new(
+            current_validators
+                .iter()
+                .map(|addr| {
+                    helix_consensus::Validator::new(
+                        addr.clone(),
+                        self.effective_stake(addr),
+                        self.has_personhood(addr),
+                    )
+                })
+                .collect(),
+            0,
+        );
+        let signed_power: u64 = set
+            .validators
+            .iter()
+            .filter(|v| signers.contains(&v.address))
+            .map(|v| v.voting_power)
+            .sum();
+        signed_power >= set.quorum_threshold()
     }
 
     /// Drop redelegation entries whose source-slashing window has closed. Called once per block
@@ -1279,14 +1345,23 @@ mod tests {
     /// The point of persisted downtime-jailing: a validator missing from `last_commit` for
     /// `DOWNTIME_JAIL_THRESHOLD_BLOCKS` consecutive blocks gets jailed and immediately
     /// disappears from `stakers()` — regardless of stake — until it explicitly unjails.
+    ///
+    /// Four validators, not two: with two of equal weight a single signature is 1/2 of the
+    /// power and can never reach the 2/3+1 threshold, so the certificate proves nothing and
+    /// `commit_certificate_carries_quorum` (rightly) refuses to convict on it. Four is where a
+    /// set first survives one absence — the same threshold BFT itself needs — and therefore the
+    /// smallest set in which "this validator was absent" is a statement the chain can actually
+    /// substantiate.
     #[test]
     fn sustained_absence_jails_and_removes_from_stakers() {
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100;
-        stake(&mut state, 1, 1_000);
-        stake(&mut state, 2, 1_000);
-        let validators = vec![addr(1), addr(2)];
-        let signers_without_2: std::collections::HashSet<Address> = [addr(1)].into_iter().collect();
+        for n in 1..=4 {
+            stake(&mut state, n, 1_000);
+        }
+        let validators = vec![addr(1), addr(2), addr(3), addr(4)];
+        let signers_without_2: std::collections::HashSet<Address> =
+            [addr(1), addr(3), addr(4)].into_iter().collect();
 
         let mut newly_jailed = Vec::new();
         for height in 0..DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 {
@@ -1296,27 +1371,86 @@ mod tests {
         assert_eq!(newly_jailed, vec![addr(2)], "exactly the silent validator must be jailed");
         assert!(state.jailed_until.contains_key(&addr(2).to_string()));
         let staker_addrs: Vec<Address> = state.stakers().into_iter().map(|(a, _)| a).collect();
-        assert_eq!(staker_addrs, vec![addr(1)], "jailed validator must vanish from stakers() despite its stake");
+        let mut expected = vec![addr(1), addr(3), addr(4)];
+        expected.sort_by(|a, b| a.as_str().cmp(b.as_str())); // `stakers()` orders by address
+        assert_eq!(
+            staker_addrs, expected,
+            "jailed validator must vanish from stakers() despite its stake"
+        );
+    }
+
+    /// The defence from `commit_certificate_carries_quorum`, in the shape it actually appeared
+    /// on the live chain: every block carried a certificate too thin to prove anything, and the
+    /// old unconditional accounting jailed a perfectly healthy validator on a 250-block loop.
+    ///
+    /// Run far past the threshold, so this can't pass merely by being slow.
+    #[test]
+    fn a_certificate_without_quorum_power_convicts_nobody() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        for n in 1..=4 {
+            stake(&mut state, n, 1_000);
+        }
+        let validators = vec![addr(1), addr(2), addr(3), addr(4)];
+        // Two of four: a real majority of the *set*, still short of 2/3+1 of the power. Exactly
+        // what a proposer omitting two rivals would produce — and indistinguishable from an
+        // honest proposer that simply never collected their precommits.
+        let half: std::collections::HashSet<Address> = [addr(1), addr(2)].into_iter().collect();
+        let empty = std::collections::HashSet::new();
+
+        for height in 0..(DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 * 2) {
+            assert!(
+                state.record_block_participation(&validators, &half, height).is_empty(),
+                "an under-quorum certificate must never jail anyone — height {height}"
+            );
+            assert!(
+                state.record_block_participation(&validators, &empty, height).is_empty(),
+                "an empty certificate must never jail anyone — height {height}"
+            );
+        }
+
+        assert!(
+            state.jailed_until.is_empty(),
+            "no validator may be jailed on evidence that proves nothing"
+        );
+        assert!(
+            state.missed_blocks.is_empty(),
+            "an unproven certificate must not even accumulate misses — otherwise a proposer \
+             could still drive a rival most of the way to the threshold and finish the job \
+             with one honest block"
+        );
     }
 
     /// A validator that goes quiet for a while but signs again before crossing the threshold
     /// must NOT be jailed — and a later silent stretch must start counting from zero, not
     /// carry over "credit" from the earlier near-miss. Mirrors the equivalent guarantee
     /// already proven for the RAM-only round-based mechanism in helix-consensus.
+    ///
+    /// Four validators for the reason given on `sustained_absence_jails_and_removes_from_stakers`
+    /// — and here it matters twice over: with two, `commit_certificate_carries_quorum` would
+    /// suppress every conviction, and this test would pass without exercising the reset at all.
     #[test]
     fn a_signature_partway_through_resets_the_miss_counter() {
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100;
-        stake(&mut state, 1, 1_000);
-        stake(&mut state, 2, 1_000);
-        let validators = vec![addr(1), addr(2)];
-        let silent: std::collections::HashSet<Address> = [addr(1)].into_iter().collect();
-        let both_sign: std::collections::HashSet<Address> = [addr(1), addr(2)].into_iter().collect();
+        for n in 1..=4 {
+            stake(&mut state, n, 1_000);
+        }
+        let validators = vec![addr(1), addr(2), addr(3), addr(4)];
+        let silent: std::collections::HashSet<Address> =
+            [addr(1), addr(3), addr(4)].into_iter().collect();
+        let both_sign: std::collections::HashSet<Address> =
+            [addr(1), addr(2), addr(3), addr(4)].into_iter().collect();
 
         for height in 0..DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 - 1 {
             state.record_block_participation(&validators, &silent, height);
         }
         assert!(!state.jailed_until.contains_key(&addr(2).to_string()), "not jailed yet");
+        assert_eq!(
+            state.missed_blocks.get(&addr(2).to_string()).copied(),
+            Some(DOWNTIME_JAIL_THRESHOLD_BLOCKS - 1),
+            "the misses must actually have been counted — otherwise the reset below proves nothing"
+        );
 
         // addr(2) signs once — counter must reset to zero, not just decrement.
         state.record_block_participation(&validators, &both_sign, DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 - 1);
