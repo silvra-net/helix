@@ -1468,9 +1468,9 @@ async fn block_production_loop(
                 let have = peer_count.load(std::sync::atomic::Ordering::Relaxed);
                 if !engine.write().await.note_peer_wait_tick() {
                     // Say what is happening. A stalled chain with a silent log is what makes an
-                    // operator restart the node — which resets both this counter and the
-                    // RAM-only liveness counter, and so lengthens exactly the outage they were
-                    // trying to end. Once a minute is enough to be visible without flooding.
+                    // operator restart the node — which resets this counter and so lengthens
+                    // exactly the outage they were trying to end. Once a minute is enough to be
+                    // visible without flooding.
                     waited_ticks += 1;
                     if waited_ticks % 30 == 1 {
                         info!(
@@ -1483,12 +1483,18 @@ async fn block_production_loop(
                     }
                     continue; // still waiting for enough validators to connect
                 }
+                // This used to promise that "the missing validators are excluded by the liveness
+                // jail, then the chain advances without them". That jail was removed on
+                // 2026-07-22 (it forked the chain), so the sentence became a lie — and precisely
+                // the lie an operator reads while staring at a stalled node, which then sends
+                // them looking for a fault that does not exist. Seen in production the same day.
                 warn!(
                     peers = have,
                     needed,
-                    "Not enough validators connected after the grace period — producing anyway. \
-                     Rounds will time out until the missing validators are excluded by the \
-                     liveness jail, then the chain advances without them."
+                    "Not enough validators connected after the grace period — starting rounds \
+                     anyway, but they cannot finalize without the missing validators. The chain \
+                     stays where it is until they reconnect; each round now names who is \
+                     missing. Nothing on this node can shorten that wait."
                 );
                 // Past PEER_WAIT_TIMEOUT_TICKS — a validator that never connects at all
                 // would otherwise hold this node here forever (this gate runs before the
@@ -1850,8 +1856,10 @@ async fn resolve_seed_peer_multiaddr(peer_url: &str) -> Result<String> {
 /// field and is never checked — so two nodes running different consensus rules will peer
 /// happily and then disagree in silence. That is not hypothetical: the downtime-accounting fix
 /// in 0.8.1 changes which validators are scored for missed blocks, so an un-upgraded node jails
-/// a validator that an upgraded one considers fine, stops voting with it, and stalls the chain
-/// until the liveness jail fires — while both keep producing perfectly valid-looking blocks.
+/// a validator that an upgraded one considers fine and stops voting with it — while both keep
+/// producing perfectly valid-looking blocks. 0.8.5 raises the stakes again: a node still running
+/// the old local liveness exclusion will finalize blocks alone that an upgraded peer refuses to,
+/// which is how the chain split at height 66918.
 ///
 /// This only catches the mismatch at join time, which is where it usually starts (an operator
 /// brings up a node against an already-upgraded network). It cannot see a peer that upgrades
