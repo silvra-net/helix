@@ -1,3 +1,4 @@
+pub mod faucet;
 pub mod rate_limit;
 pub mod server;
 pub mod types;
@@ -321,4 +322,12 @@ pub struct NodeStatus {
     /// tx.size_bytes()`, and paying less means the transaction is rejected — so a flat,
     /// hardcoded fee is only ever right until the network gets busy enough to move this.
     pub base_fee_per_byte: u64,
+    /// The balance this node's faucet tops an address up to, in HLX — `None` on any node that
+    /// does not run one, which is every node whose operator did not deliberately fund one (see
+    /// `crate::faucet`).
+    ///
+    /// Advertised so a client can offer the faucet only where it exists, rather than showing a
+    /// button that answers 404. `#[serde(default)]` keeps older nodes deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faucet_topup_hlx: Option<f64>,
 }

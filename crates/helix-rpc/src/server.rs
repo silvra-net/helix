@@ -63,6 +63,10 @@ pub struct AppState {
     /// any single-node unit/integration test, since a lone node is always its own
     /// proposer and never needed this path.
     pub p2p_command_tx: mpsc::Sender<P2PCommand>,
+    /// The testnet faucet, when this operator deliberately configured one — see
+    /// `crate::faucet`. `None` on every node that did not, which is the default and must stay
+    /// the default: this binary ships to strangers.
+    pub faucet: Option<Arc<crate::faucet::Faucet>>,
 }
 
 /// Explicit request-body cap for `POST /transactions`, well above any plausible signed
@@ -75,6 +79,13 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
     // for normal wallet/explorer use, tight enough to blunt a single-source flood
     // against the publicly reachable RPC endpoint.
     let limiter = Arc::new(RateLimiter::new(30.0, 10.0));
+
+    // The faucet gets its own, far tighter bucket on top of the shared one: 3 up front, then
+    // one every five minutes. It spends real balance and writes to the mempool, so the cost of
+    // a request is nothing like that of a read. This only shapes the traffic — what actually
+    // bounds the damage is that a grant tops an address up rather than paying it out, and that
+    // the faucet account holds only what it was funded with.
+    let faucet_limiter = Arc::new(RateLimiter::new(3.0, 1.0 / 300.0));
 
     let app = Router::new()
         .route("/", get(root))
@@ -112,6 +123,13 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
             post(submit_transaction).layer(DefaultBodyLimit::max(TX_SUBMIT_BODY_LIMIT_BYTES)),
         )
         .route("/transactions/:hash", get(get_transaction_status))
+        .route(
+            "/faucet",
+            post(crate::faucet::request_funds).layer(middleware::from_fn_with_state(
+                faucet_limiter,
+                rate_limit_middleware,
+            )),
+        )
         .layer(CorsLayer::permissive())
         // Compress responses for any client that asks (`Accept-Encoding: gzip`). The chain's
         // bulk payloads are dominated by ML-DSA signatures and public keys, which serde renders
@@ -251,6 +269,7 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
             0 => None,
             h => Some(h),
         },
+        faucet_topup_hlx: state.faucet.as_ref().map(|f| f.topup_hlx()),
         mempool_size: mempool.len(),
         total_accounts: chain.account_count(),
         circulating_supply_hlx: chain.circulating_supply() as f64 / 1_000_000_000.0,
@@ -1266,6 +1285,7 @@ mod tests {
             p2p_port: 0,
             p2p_public_addr: None,
             p2p_command_tx,
+            faucet: None,
         };
         (state, path)
     }
@@ -1789,6 +1809,7 @@ mod tests {
             p2p_port: 0,
             p2p_public_addr: None,
             p2p_command_tx,
+            faucet: None,
         }
     }
 

@@ -6,6 +6,7 @@
 # Validator secret key — never commit
 /validator-key.json
 /validator-wallet.json
+/faucet-key.json
 # Chain-Datenbank — Laufzeitdaten, kein Quellcode
 /helix-data.redb
 /helix-data.redb.*.bak

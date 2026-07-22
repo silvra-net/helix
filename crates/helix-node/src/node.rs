@@ -612,6 +612,9 @@ impl HelixNode {
             p2p_port: self.p2p_port,
             p2p_public_addr: self.p2p_public_addr.clone(),
             p2p_command_tx: self.p2p_command_tx.clone(),
+            // `None` unless this operator set HELIX_FAUCET_KEY. The node's own address goes in
+            // so the faucet can refuse to be the validator key — see `helix_rpc::faucet`.
+            faucet: helix_rpc::faucet::Faucet::from_env(&self.address.to_string()),
         };
 
         // Spawn RPC server — first, before any catch-up, so `GET /status` answers from the
