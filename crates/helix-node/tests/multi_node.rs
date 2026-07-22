@@ -199,6 +199,94 @@ async fn status(rpc_port: u16) -> Option<serde_json::Value> {
         .ok()
 }
 
+async fn validators(rpc_port: u16) -> Option<serde_json::Value> {
+    reqwest::get(format!("http://127.0.0.1:{rpc_port}/validators"))
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()
+}
+
+/// Assert that all three nodes computed the same state, and — if they did not — say *which of
+/// two very different things* just happened before failing.
+///
+/// A bare `assert_eq!` on `state_hash` cannot tell these apart, and they could not matter more
+/// differently:
+///
+/// 1. **A read-skew in `/status`.** `height`/`best_hash` come from the block store while
+///    `state_hash` comes from the in-memory `ChainState`, and `apply_finalized_block` updates
+///    them in that order with `.await` points in between (`execute_block` at the top, `put_block`
+///    over a hundred lines later). A node sampled inside that window reports the *previous*
+///    height beside the *next* state. Nothing is wrong with the chain; the endpoint is simply
+///    not atomic across the two subsystems. Heals on the next sample.
+/// 2. **A real divergence.** `ChainState::active_validators` is deliberately excluded from
+///    `state_hash` (see its doc comment), and the argument for that exclusion is precisely that a
+///    disagreement would surface one step later in `missed_blocks`/`jailed_until`, which *are*
+///    hashed. So a persistent mismatch here is what that trade-off predicted, and it does not
+///    heal — it compounds.
+///
+/// Observed flaky on 2026-07-22 (`three_validators…`, height 10, A and B agreeing and C apart),
+/// green on the immediate re-run, with no way to tell from the failure output which of the two it
+/// had been. Hence: on mismatch, keep sampling. If every node lands on one state within the grace
+/// window it was (1) — still reported, because a `/status` that can contradict itself is worth
+/// knowing about, but not a consensus failure. If it persists, dump `/validators` from all three,
+/// because `missed_blocks` and `jailed_until` are where an `active_validators` split shows up.
+async fn assert_states_converge(rpc_ports: [u16; 3], grace: Duration) {
+    let deadline = std::time::Instant::now() + grace;
+    let mut first_mismatch: Option<(u64, [String; 3])> = None;
+
+    loop {
+        let (a, b, c) = match (status(rpc_ports[0]).await, status(rpc_ports[1]).await, status(rpc_ports[2]).await) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => {
+                assert!(std::time::Instant::now() < deadline, "nodes stopped answering /status");
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+        };
+        let heights = [&a, &b, &c].map(|s| s["height"].as_u64().unwrap_or(0));
+        let states = [&a, &b, &c].map(|s| s["state_hash"].as_str().unwrap_or("").to_string());
+        let hashes = [&a, &b, &c].map(|s| s["best_hash"].as_str().unwrap_or("").to_string());
+
+        let aligned = heights[0] == heights[1] && heights[1] == heights[2];
+        if aligned && states[0] == states[1] && states[1] == states[2] {
+            if let Some((h, seen)) = first_mismatch {
+                eprintln!(
+                    "note: nodes briefly reported different state at height {h} ({}, {}, {}) and \
+                     converged within the grace window — consistent with the /status read-skew \
+                     between the block store and the in-memory ChainState, not with divergence",
+                    &seen[0][..16.min(seen[0].len())],
+                    &seen[1][..16.min(seen[1].len())],
+                    &seen[2][..16.min(seen[2].len())],
+                );
+            }
+            assert_eq!(hashes[0], hashes[1], "node A and B disagree on the block hash at height {}", heights[0]);
+            assert_eq!(hashes[0], hashes[2], "node A and C disagree on the block hash at height {}", heights[0]);
+            return;
+        }
+        if aligned && first_mismatch.is_none() {
+            first_mismatch = Some((heights[0], states.clone()));
+        }
+
+        if std::time::Instant::now() >= deadline {
+            let mut report = String::new();
+            for (label, port) in ["A", "B", "C"].iter().zip(rpc_ports) {
+                let v = validators(port).await.unwrap_or(serde_json::Value::Null);
+                report.push_str(&format!("\n  node {label} (:{port}) validators = {v}"));
+            }
+            panic!(
+                "the three nodes never agreed on state within {grace:?} — this is the persistent \
+                 case, i.e. a real divergence rather than a /status read-skew.\n  heights = {heights:?}\
+                 \n  best_hash = {hashes:?}\n  state_hash = {states:?}\
+                 \n\nactive_validators is not covered by state_hash, so a split there surfaces as \
+                 missed_blocks/jailed_until — compare those:{report}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 /// Polls `/status` until the node responds at all (its RPC server is up) — startup involves
 /// genesis creation/adoption and, for a `sync_peer` node, a full historical sync, so this can
 /// take a few seconds longer than a bare process spawn.
@@ -357,20 +445,12 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
     );
 
     // Same convergence check as the single-validator test above — rotation happening across
-    // independent processes must not cost agreement on the result.
-    let (a, b, c) = wait_for_matching_snapshot([VAL_A_RPC, VAL_B_RPC, VAL_C_RPC], target_height, Duration::from_secs(120)).await;
-    assert_eq!(a["best_hash"], b["best_hash"], "node A and B disagree on the block hash at height {}", a["height"]);
-    assert_eq!(a["best_hash"], c["best_hash"], "node A and C disagree on the block hash at height {}", a["height"]);
-    assert_eq!(
-        a["state_hash"], b["state_hash"],
-        "node A and B agree on the block hash at height {} but computed different state from it",
-        a["height"]
-    );
-    assert_eq!(
-        a["state_hash"], c["state_hash"],
-        "node A and C agree on the block hash at height {} but computed different state from it",
-        a["height"]
-    );
+    // independent processes must not cost agreement on the result. Given a grace window rather
+    // than sampled once: see `assert_states_converge` for why a single sample cannot tell a
+    // `/status` read-skew from a real state divergence, and why that distinction is the whole
+    // point of this assertion.
+    wait_for_matching_snapshot([VAL_A_RPC, VAL_B_RPC, VAL_C_RPC], target_height, Duration::from_secs(120)).await;
+    assert_states_converge([VAL_A_RPC, VAL_B_RPC, VAL_C_RPC], Duration::from_secs(20)).await;
 }
 
 /// Fault tolerance: a 4-validator BFT set must survive one validator going offline, because
@@ -429,12 +509,12 @@ async fn four_validators_survive_one_going_offline() {
     wait_for_height(FT_A_RPC, target, Duration::from_secs(240)).await;
 
     // The three survivors must also stay in agreement — identical height, block hash, AND
-    // state hash — i.e. the outage caused no fork or execution divergence.
-    let (a, b, c) = wait_for_matching_snapshot([FT_A_RPC, FT_B_RPC, FT_C_RPC], target, Duration::from_secs(90)).await;
-    assert_eq!(a["best_hash"], b["best_hash"], "survivors A and B disagree on the block hash at height {}", a["height"]);
-    assert_eq!(a["best_hash"], c["best_hash"], "survivors A and C disagree on the block hash at height {}", a["height"]);
-    assert_eq!(a["state_hash"], b["state_hash"], "survivors A and B computed different state at height {}", a["height"]);
-    assert_eq!(a["state_hash"], c["state_hash"], "survivors A and C computed different state at height {}", a["height"]);
+    // state hash — i.e. the outage caused no fork or execution divergence. Same grace-window
+    // treatment as the 3-validator test: a single sample of `/status` cannot distinguish a
+    // read-skew between the block store and the in-memory ChainState from a genuine split, and
+    // this assertion failed that way roughly one run in three on 2026-07-22.
+    wait_for_matching_snapshot([FT_A_RPC, FT_B_RPC, FT_C_RPC], target, Duration::from_secs(90)).await;
+    assert_states_converge([FT_A_RPC, FT_B_RPC, FT_C_RPC], Duration::from_secs(20)).await;
 }
 
 /// A follower reaches a node and follows its chain over a **WebSocket** P2P transport
