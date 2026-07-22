@@ -14,12 +14,16 @@ use crate::governance::{GovernanceParams, GovernanceProposal};
 pub const UNBONDING_PERIOD: u64 = 302_400;
 
 /// Consecutive blocks a validator's precommit must be absent from `BlockHeader::last_commit`
-/// (see `record_block_participation`) before persisted downtime-jailing kicks in. Sized to
-/// fire only once blocks are already flowing again — the RAM-only, per-node
-/// `helix-consensus::LIVENESS_JAIL_ROUNDS` mechanism is what actually keeps the chain
-/// producing during the outage itself; this is the follow-up, on-chain layer that makes the
-/// exclusion survive node restarts and requires an explicit `Unjail` to undo. 150 blocks ≈
-/// 5 minutes at the 2s block time.
+/// (see `record_block_participation`) before persisted downtime-jailing kicks in. This is the
+/// *only* mechanism that removes a validator's power from the quorum, and it does so through
+/// the shared chain state, so every node reaches the same verdict from the same blocks. A
+/// per-node RAM-only exclusion used to sit in front of it (`helix-consensus`'s liveness jail);
+/// it was removed on 2026-07-22 after it forked the live chain, because nodes could and did
+/// disagree about who was excluded. 150 blocks ≈ 5 minutes at the 2s block time.
+///
+/// Note the consequence: jailing needs blocks, and blocks need quorum. A set that has lost
+/// more than a third of its power halts and stays halted until the missing validators return —
+/// `3f+1` arithmetic, not a gap. Tolerating one absence takes four validators.
 pub const DOWNTIME_JAIL_THRESHOLD_BLOCKS: u32 = 150;
 
 /// Minimum blocks a downtime-jailed validator must wait before `TxType::Unjail` is accepted —
@@ -352,9 +356,8 @@ pub struct ChainState {
     /// Empty means "no epoch boundary has been crossed under this field yet" (a state loaded
     /// from a database written before this field existed). Nobody is charged with a missed
     /// block until the next rotation fills it — deliberately the forgiving direction: a late
-    /// jail costs at most `EPOCH_LENGTH` blocks of downtime accounting, and
-    /// `helix-consensus::LIVENESS_JAIL_ROUNDS` keeps blocks flowing meanwhile, whereas an
-    /// early jail punishes the innocent.
+    /// jail costs at most `EPOCH_LENGTH` blocks of downtime accounting, whereas an early jail
+    /// punishes the innocent.
     ///
     /// **Deliberately excluded from `state_hash`** (unlike `pending_validators`), and that is a
     /// considered trade, not an oversight. `state_hash` is nominally a diagnostic, but
@@ -374,9 +377,9 @@ pub struct ChainState {
     /// from `BlockHeader::last_commit`, as counted by `record_block_participation`. Reset to
     /// absent the instant a signature from that validator is seen again — a handful of missed
     /// blocks proves nothing (a proposer momentarily behind on gossip, a validator mid-restart),
-    /// only sustained absence does. Not the same mechanism as `helix-consensus`'s local,
-    /// RAM-only `missed_rounds`/`LIVENESS_JAIL_ROUNDS` (which exists purely to keep blocks
-    /// producing at all during an outage) — this is the persisted, on-chain layer that survives
+    /// only sustained absence does. Not the same thing as `helix-consensus`'s local, RAM-only
+    /// `missed_rounds`, which since 2026-07-22 is purely a diagnostic (it decides what a
+    /// stalled node *logs*, nothing else) — this is the persisted, on-chain layer that survives
     /// node restarts and has an actual consequence (`jailed_until`).
     #[serde(default)]
     pub missed_blocks: HashMap<String, u32>,
@@ -691,10 +694,9 @@ impl ChainState {
     /// exclude, so the certificate either accuses nobody or proves its own accusation.
     ///
     /// The trade is deliberate and one-directional: a genuinely offline validator goes unjailed
-    /// for as long as certificates stay thin, which costs liveness nothing (the RAM-only
-    /// `LIVENESS_JAIL_ROUNDS` path is what keeps blocks flowing during an outage — this layer
-    /// only makes the exclusion persistent). Failing to punish the guilty is recoverable;
-    /// punishing the innocent, as the incident above shows, is not.
+    /// for as long as certificates stay thin, so it keeps its seat and its power longer than it
+    /// deserves. Failing to punish the guilty is recoverable; punishing the innocent, as the
+    /// incident above shows, is not.
     ///
     /// Power is computed exactly as consensus computes it — same `ValidatorSet::new`, same
     /// 1 % cap, same `quorum_threshold` — so this can never disagree with the set that actually
