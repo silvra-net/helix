@@ -373,6 +373,33 @@ pub struct ChainState {
     /// within a block or two and be caught anyway, one step later.
     #[serde(default)]
     pub active_validators: std::collections::HashSet<Address>,
+    /// Height of the block whose execution produced the state currently in memory.
+    ///
+    /// Exists so `GET /status` can report a `state_hash` together with the height it belongs to.
+    /// Without it that endpoint pairs a height read from the *block store* with a hash read from
+    /// this struct, and `apply_finalized_block` updates the two at different moments — the
+    /// `chain_state` write guard is released right after `execute_block`, while `put_block` runs
+    /// a hundred-odd lines and several `.await` points later. Sampled in between, `/status`
+    /// reports height N-1 beside the state of N: a pair that never logically existed.
+    ///
+    /// That is not cosmetic. A differing `state_hash` at the same height is the most alarming
+    /// signal this chain has, it is what the deploy ritual compares before and after a restart,
+    /// and it made two multi-validator integration tests fail roughly one run in three on
+    /// 2026-07-22 while nothing was wrong with the chain.
+    ///
+    /// Written inside the same `chain_state` write lock as the execution itself, so any reader
+    /// holding the read lock sees a height and a state hash that belong to each other. That is
+    /// the whole mechanism — no new lock ordering, so no deadlock risk against the
+    /// `store.write()` → `chain_state.read()` order used in the persist step.
+    ///
+    /// **Deliberately not part of `state_hash`**, for the same reason as `active_validators`
+    /// above: `state_hash` is compared by `verify_genesis_reconstruction`, so anything added to
+    /// the `Canonical` struct changes reconstructed genesis and locks every existing chain out
+    /// of the upgrade. Nothing is given up — this field is a label for the hash, not an input to
+    /// it, and two nodes at the same height disagreeing about *this* would already be
+    /// disagreeing about everything it labels.
+    #[serde(default)]
+    pub applied_height: u64,
     /// Consecutive blocks (address string -> count) a validator's precommit has been absent
     /// from `BlockHeader::last_commit`, as counted by `record_block_participation`. Reset to
     /// absent the instant a signature from that validator is seen again — a handful of missed
@@ -419,6 +446,7 @@ impl ChainState {
             genesis_allocations: Vec::new(),
             pending_validators: std::collections::HashSet::new(),
             active_validators: std::collections::HashSet::new(),
+            applied_height: 0,
             missed_blocks: HashMap::new(),
             jailed_until: HashMap::new(),
         }
@@ -1137,6 +1165,27 @@ mod tests {
             before,
             "missed_blocks must stay in the hash — that is what makes the exclusion detectable"
         );
+    }
+
+    /// `applied_height` labels the hash; it must not be an input to it. Hashing it would change
+    /// reconstructed genesis and lock every running chain out of the upgrade — the same trap
+    /// `active_validators` documents, and one that has already cost this project a near-reset.
+    #[test]
+    fn applied_height_stays_out_of_the_state_hash() {
+        let mut state = ChainState::new(1_000_000);
+        stake(&mut state, 1, 1_000);
+        let before = state.state_hash();
+
+        state.applied_height = 72_769;
+        assert_eq!(
+            state.state_hash(),
+            before,
+            "a label for the state must not alter the state's hash — see the field's doc comment"
+        );
+
+        // And it is not silently ignored either: it is readable, which is the entire point,
+        // since `/status` reports it alongside the hash it belongs to.
+        assert_eq!(state.applied_height, 72_769);
     }
 
     #[test]

@@ -290,7 +290,11 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
         total_accounts: chain.account_count(),
         circulating_supply_hlx: chain.circulating_supply() as f64 / 1_000_000_000.0,
         total_burned_hlx: chain.total_burned as f64 / 1_000_000_000.0,
+        // Both taken from `chain`, under the one read lock held for this whole response — that
+        // is what makes them a matched pair. `height`/`best_hash` above come from the block
+        // store and can legitimately be one behind mid-commit.
         state_hash: chain.state_hash().to_hex(),
+        state_height: chain.applied_height,
         p2p_port: state.p2p_port,
         p2p_public_addr: state.p2p_public_addr.clone(),
         // Read off the mempool, which the node keeps in lockstep with the consensus engine

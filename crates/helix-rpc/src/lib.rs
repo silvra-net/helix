@@ -294,12 +294,26 @@ pub struct NodeStatus {
     pub total_accounts: usize,
     pub circulating_supply_hlx: f64,
     pub total_burned_hlx: f64,
-    /// Deterministic hash of this node's full chain state at `height`
-    /// (`ChainState::state_hash`) — a diagnostic tool, not a protocol-level state root.
-    /// Compare this across nodes at the same `height` to notice execution divergence; it
-    /// isn't committed to a block or checked as part of consensus. See `state_hash`'s doc
-    /// comment for what it does and doesn't guarantee.
+    /// Deterministic hash of this node's full chain state (`ChainState::state_hash`) — a
+    /// diagnostic tool, not a protocol-level state root. It isn't committed to a block or
+    /// checked as part of consensus. See `state_hash`'s doc comment for what it does and
+    /// doesn't guarantee.
+    ///
+    /// **Compare it against `state_height`, not `height`.** This used to read "the state at
+    /// `height`", and that was wrong: `height` comes from the block store while this comes from
+    /// the in-memory `ChainState`, and the two advance at different moments inside
+    /// `apply_finalized_block`. A response sampled in between carries height N-1 next to the
+    /// state of N. Two nodes compared on that basis appear to have diverged when they have not —
+    /// which is exactly what happened to two integration tests, and to the endpoint's own author,
+    /// on 2026-07-22.
     pub state_hash: String,
+    /// Height of the block whose execution produced `state_hash`, read under the same lock, so
+    /// the two always belong together. This is the height to match on when comparing state
+    /// across nodes.
+    ///
+    /// Can legitimately differ from `height` by one for a moment while a block is being
+    /// committed. That is not a fault; it is the reason this field exists.
+    pub state_height: u64,
     /// This node's own libp2p listen port. Lets a joining node derive a dialable seed
     /// address from a `sync_peer` URL (same host, this port) instead of relying solely on
     /// mDNS — which only works within one local multicast segment and never finds a peer

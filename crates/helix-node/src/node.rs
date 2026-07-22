@@ -1201,6 +1201,11 @@ async fn apply_finalized_block(
         if receipt.failed_txs() > 0 {
             warn!(height, failed = receipt.failed_txs(), "Tx execution failures");
         }
+        // Stamp the state with the height that produced it, while still holding the write lock
+        // that produced it. This is what lets `GET /status` report a `state_hash` and the height
+        // it belongs to as a pair — see `ChainState::applied_height`. Any reader taking the read
+        // lock now sees both or neither; there is no moment where they disagree.
+        state.applied_height = height;
         // Not a protocol-level state root (not in BlockHeader, not signed, doesn't gate
         // consensus) — a diagnostic escape hatch. If two nodes' logs ever show different
         // state_hash values at the same height, something has silently diverged; grep for
@@ -2210,6 +2215,11 @@ async fn sync_blocks_from_peer(
                 );
             }
             execute_block(chain_state, block, None);
+            // Same stamp as the consensus path in `apply_finalized_block` — a node catching up
+            // over RPC serves `/status` throughout, and a state height frozen at whatever it was
+            // before the sync started would be worse than none at all. This function owns
+            // `chain_state` exclusively (`&mut`), so the pair is consistent here too.
+            chain_state.applied_height = h;
             store.put_block(block.clone())?;
             expected_prev_hash = block.hash();
             if h % 1000 == 0 {

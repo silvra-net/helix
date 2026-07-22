@@ -100,6 +100,9 @@ const META_MIN_VALIDATOR_STAKE: &str = "gov_min_validator_stake";
 const META_FUEL_PER_FEE_UNIT: &str = "gov_fuel_per_fee_unit";
 const META_NEXT_PROPOSAL_ID: &str = "gov_next_proposal_id";
 const META_GENESIS_VALIDATOR_STAKE: &str = "genesis_validator_stake";
+/// Height of the block whose execution produced the persisted state — see
+/// `ChainState::applied_height`. Written in the same transaction as the state itself.
+const META_APPLIED_HEIGHT: &str = "applied_height";
 
 /// Page cache redb is allowed to hold, in MiB, unless `HELIX_DB_CACHE_MB` says otherwise.
 ///
@@ -305,6 +308,8 @@ impl HelixDb {
                 &state.governance_params.fuel_per_fee_unit.to_le_bytes()[..],
             )
             .map_err(|e| StorageError::Db(e.to_string()))?;
+            meta.insert(META_APPLIED_HEIGHT, &state.applied_height.to_le_bytes()[..])
+                .map_err(|e| StorageError::Db(e.to_string()))?;
             meta.insert(META_NEXT_PROPOSAL_ID, &state.next_proposal_id.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
             for authority in &state.personhood_authorities {
@@ -688,6 +693,14 @@ impl HelixDb {
                 .unwrap_or(default_params.fuel_per_fee_unit),
         };
         let next_proposal_id = read_meta_u64(META_NEXT_PROPOSAL_ID).unwrap_or(0);
+        // Absent only for a database written before this key existed. `META_HEIGHT` is the right
+        // fallback rather than 0: `save_chain_state` and `put_block` run in the same write
+        // transaction, so the state on disk is by construction the state of the tip on disk.
+        // Falling back to 0 would make a node restarted on an older database report a state
+        // height of zero beside a real chain height — the exact false alarm this field exists to
+        // prevent.
+        let applied_height =
+            read_meta_u64(META_APPLIED_HEIGHT).or_else(|| read_meta_u64(META_HEIGHT)).unwrap_or(0);
         // Absent only for a chain that launched before this key existed, and such a chain can
         // only have used the compile-time default — so falling back to it recovers the true
         // historical value rather than guessing. The next `save_chain_state` (i.e. the next
@@ -703,6 +716,7 @@ impl HelixDb {
 
         Ok(ChainState {
             accounts,
+            applied_height,
             total_supply,
             total_issued,
             total_burned,
@@ -1418,6 +1432,55 @@ mod tests {
             "a validator removed from the active set must not come back on restart"
         );
         assert_eq!(loaded.active_validators.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_applied_height_survives_reopening_the_database() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.applied_height = 72_769;
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        assert_eq!(db.load_chain_state(1_000_000).unwrap().applied_height, 72_769);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A database written before `applied_height` existed has no such key. Falling back to 0
+    /// would make a restarted node report a state height of zero next to a real chain height —
+    /// precisely the false divergence signal this field was added to remove. The tip height is
+    /// the correct answer, because state and block are persisted in one transaction.
+    #[test]
+    fn an_older_database_reports_its_tip_rather_than_zero() {
+        let (db, path) = fresh_db();
+        // A state saved without ever setting applied_height, plus a block, exactly as a
+        // pre-upgrade node would have left it.
+        let state = ChainState::new(1_000_000);
+        assert_eq!(state.applied_height, 0, "precondition: the field is unset");
+        db.save_chain_state(&state).unwrap();
+
+        // Simulate the older layout by removing the key this version writes.
+        {
+            let txn = db.db.begin_write().unwrap();
+            {
+                let mut meta = txn.open_table(META).unwrap();
+                meta.remove(META_APPLIED_HEIGHT).unwrap();
+                meta.insert(META_HEIGHT, &41_u64.to_le_bytes()[..]).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        assert_eq!(
+            db.load_chain_state(1_000_000).unwrap().applied_height,
+            41,
+            "an upgraded node must adopt the persisted tip, not zero"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
