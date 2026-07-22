@@ -1170,13 +1170,42 @@ impl BftEngine {
         if height <= self.current_height {
             return;
         }
+        // Keep the precommits this node already collected for exactly this block, instead of
+        // discarding them along with the round.
+        //
+        // The round being torn down here is usually not an empty one: in a live multi-validator
+        // network this node was voting on the very block that just arrived finished, and it holds
+        // real, signature-verified precommits for it — it simply lost the race to finalize
+        // locally. Dropping them means the next block it proposes carries an empty `last_commit`,
+        // and that certificate is the only record of who participated. Measured on the live chain
+        // 2026-07-22, after two validators were finally both producing: **14 of 20 consecutive
+        // blocks carried an empty certificate**, i.e. participation went unrecorded for 70 % of
+        // the chain.
+        //
+        // Only votes for `block_hash` itself are kept, so the certificate still attests exactly
+        // the block it is attached to — a vote for any other hash would produce a `last_commit`
+        // that every receiving node's `verify_last_commit` would (correctly) reject.
+        //
+        // Deliberately local: no wire format changes, so this needs no coordinated upgrade
+        // (cf. #109). It cannot cause divergence either — jailing is scored from the certificate
+        // in a received block, which every node sees identically; this only affects how complete
+        // the certificates *this* node produces are. The remaining gap (a node that never saw the
+        // votes at all, e.g. one following purely over RPC) needs the commit certificate to
+        // travel with the gossiped block, which is a protocol change.
+        let salvaged = self
+            .round
+            .as_ref()
+            .filter(|round| round.height == height)
+            .map(|round| round.precommits.votes_for(&block_hash))
+            .unwrap_or_default();
+
         self.current_height = height;
         self.last_committed = Some(block_hash);
         self.last_committed_round = None;
         self.round = None;
         self.round_ticks = 0;
         self.buffered_votes.clear();
-        self.last_commit.clear();
+        self.last_commit = salvaged;
         self.clear_locks();
     }
 
@@ -1667,6 +1696,80 @@ mod tests {
         assert!(
             outbound.iter().any(|vt| vt.vote_type == VoteType::Precommit),
             "reaching prevote quorum via the buffered vote must make this node precommit"
+        );
+    }
+
+    /// A block this node was actively voting on can arrive already finalized (gossip won the
+    /// race). The round is torn down — but the precommits it collected for that exact block are
+    /// real, and they are the only evidence of who took part. Dropping them makes the next block
+    /// this node proposes carry an empty certificate, which is why 14 of 20 consecutive blocks on
+    /// the live chain recorded no participation at all on 2026-07-22.
+    #[test]
+    fn precommits_survive_a_block_that_arrives_already_finalized() {
+        let v = four_validators();
+
+        // b proposes height 2; this node joins the round and prevotes.
+        let mut proposer_engine =
+            BftEngine::new(v.validator_set.clone(), Address::from_public_key(&v.b_kp.public), 1);
+        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), vec![]);
+        let block = proposer_engine.pending_proposal().unwrap().clone();
+        let block_hash = block.hash();
+
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
+        // Prevote quorum makes this node cast its own precommit...
+        engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
+        engine.add_vote(&v.self_kp, peer_vote(&v.a_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
+        // ...and one peer precommit lands, still short of quorum locally.
+        engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Precommit, 2, 0, block_hash)).unwrap();
+        assert!(engine.has_active_round(), "the round must still be open for this to mean anything");
+
+        // The finished block overtakes us via the committed-block fast path.
+        engine.sync_to_externally_finalized_block(2, block_hash);
+
+        assert_eq!(engine.current_height(), 2);
+        let signers: Vec<&Address> = engine.last_commit.iter().map(|v| &v.validator).collect();
+        assert!(
+            signers.contains(&&v.self_addr),
+            "our own precommit for the committed block must survive the round teardown"
+        );
+        assert!(
+            signers.contains(&&Address::from_public_key(&v.b_kp.public)),
+            "and so must the peer precommit we had already verified"
+        );
+        assert!(
+            engine.last_commit.iter().all(|vote| vote.block_hash == block_hash),
+            "only votes for the block actually committed may be carried forward"
+        );
+    }
+
+    /// The safety half: precommits for some *other* block must never be salvaged. Attaching them
+    /// would build a `last_commit` attesting a block that was not committed, and every receiving
+    /// node's `verify_last_commit` would reject the resulting proposal — a self-inflicted stall.
+    #[test]
+    fn salvaged_precommits_never_include_a_different_block() {
+        let v = four_validators();
+
+        let mut proposer_engine =
+            BftEngine::new(v.validator_set.clone(), Address::from_public_key(&v.b_kp.public), 1);
+        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), vec![]);
+        let block = proposer_engine.pending_proposal().unwrap().clone();
+        let block_hash = block.hash();
+
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
+        engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
+        engine.add_vote(&v.self_kp, peer_vote(&v.a_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
+        engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Precommit, 2, 0, block_hash)).unwrap();
+
+        // A different block wins at this height (e.g. a later round we never saw).
+        let other_hash = Hash::digest(b"some-other-block");
+        engine.sync_to_externally_finalized_block(2, other_hash);
+
+        assert!(
+            engine.last_commit.is_empty(),
+            "no precommit we hold attests the block that was actually committed, so the \
+             certificate must stay empty rather than attest the wrong one"
         );
     }
 

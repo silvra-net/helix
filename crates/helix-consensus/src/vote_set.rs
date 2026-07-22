@@ -104,6 +104,21 @@ impl VoteSet {
         let Some(hash) = self.quorum_hash() else {
             return Vec::new();
         };
+        self.votes_for(&hash)
+    }
+
+    /// The votes backing one specific block hash, whether or not it reached quorum here.
+    ///
+    /// `quorum_votes` can only answer for the hash *this* vote set saw reach quorum. When a block
+    /// is finalized somewhere else and arrives already committed, this node may still hold real
+    /// precommits for it — collected in the round it was driving before the finished block
+    /// overtook it. Those are worth keeping (see
+    /// `BftEngine::sync_to_externally_finalized_block`), and the caller knows the hash even
+    /// though this set never tallied quorum for it.
+    ///
+    /// Same guarantee as `quorum_votes`: every vote returned went through `add`, so it is
+    /// signature-verified and from an in-set validator at the right height/round/type.
+    pub fn votes_for(&self, hash: &Hash) -> Vec<Vote> {
         let key = *hash.as_bytes();
         self.votes
             .values()
