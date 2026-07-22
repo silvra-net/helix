@@ -225,10 +225,17 @@ impl P2PService {
             info!(ws_listen = %ws_addr, "P2P WebSocket listener started");
         }
 
-        for peer_addr in &config.seed_peers {
-            if let Ok(addr) = peer_addr.parse::<Multiaddr>() {
-                let _ = swarm.dial(addr);
-            }
+        // Kept for the whole run, not just this first pass: these are the only addresses this
+        // node knows how to reach on its own, and it has to be able to dial them again after a
+        // disconnect (see the redial in the peer-exchange tick below).
+        let seed_addrs: Vec<Multiaddr> = config
+            .seed_peers
+            .iter()
+            .filter_map(|peer_addr| peer_addr.parse::<Multiaddr>().ok())
+            .collect();
+
+        for addr in &seed_addrs {
+            let _ = swarm.dial(addr.clone());
         }
 
         info!(listen = %config.listen_addr, peer_id = %local_peer_id, "P2P service started");
@@ -357,6 +364,32 @@ impl P2PService {
 
                 _ = peer_exchange_interval.tick() => {
                     broadcast_known_addrs(&mut swarm, &peer_exchange_topic, &known_addrs);
+
+                    // Redial the seeds while this node has no connection at all.
+                    //
+                    // Every other way back into the network needs a connection this node no
+                    // longer has: peer exchange is gossip (nobody is listening), and mDNS only
+                    // reaches the local segment. The initial dial above happens exactly once, at
+                    // startup, and `ConnectionClosed` only cleans up — so before this, a single
+                    // disconnect was permanent. Restarting the seed node dropped every validator
+                    // off the network until each operator manually restarted their own node.
+                    // Seen live on 2026-07-22: a routine `pm2 restart` of the production node
+                    // left the second validator disconnected indefinitely, `peer_count: 0`, while
+                    // its node reported itself healthy.
+                    //
+                    // Only while fully disconnected, so a node with a working mesh never dials on
+                    // a timer; one attempt per seed per interval, so a seed that stays down costs
+                    // one connection attempt every 30s and nothing else.
+                    // `info!`, not `debug!`: an operator staring at `peer_count: 0` needs to see
+                    // that the node is trying, and how often — the silent-wait failure mode from
+                    // the peer/liveness windows is exactly what made this class of problem so
+                    // hard to tell apart from a hung node.
+                    if swarm.connected_peers().next().is_none() && !seed_addrs.is_empty() {
+                        info!(seeds = seed_addrs.len(), "No peers connected — redialing seed peers");
+                        for addr in &seed_addrs {
+                            let _ = swarm.dial(addr.clone());
+                        }
+                    }
                 }
 
                 Some(cmd) = command_rx.recv() => {

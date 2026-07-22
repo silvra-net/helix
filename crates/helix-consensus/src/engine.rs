@@ -588,6 +588,24 @@ impl BftEngine {
     /// a precommit nobody ever sends when quorum is only reached step-by-step
     /// over the network instead of all at once.
     pub fn add_vote(&mut self, keypair: &KeyPair, vote: Vote) -> ConsensusResult<Option<Block>> {
+        // Any vote at all proves the sender is alive, so clear its liveness strikes here rather
+        // than only in `record_round_liveness`.
+        //
+        // That was the *only* place resetting the counter, and it runs exclusively when a round
+        // times out. But once a validator is zeroed out by `liveness_adjusted_validator_set`, the
+        // remaining power reaches quorum immediately and rounds stop timing out — so the counter
+        // could never be cleared again, and the exclusion became permanent for the lifetime of
+        // the process. A validator that dropped out for a moment stayed out until every *other*
+        // node restarted.
+        //
+        // Seen live on 2026-07-22: after a production restart, validator 2 reconnected
+        // (`peer_count: 1`) and then sat idle for hundreds of blocks — never proposing, never in
+        // a certificate — because it had been zeroed out during its absence and nothing could
+        // ever undo that. Deliberately before any validation below: an equivocating or otherwise
+        // malformed vote still proves the sender is present, and liveness is only about presence.
+        // Misbehavior is what slashing and `PeerReputation` are for.
+        self.missed_rounds.remove(&vote.validator);
+
         // Helix never precommits nil (see `note_round_tick`), so a precommit carrying
         // `NIL_BLOCK_HASH` is not something an honest validator produces. Refuse it at the
         // boundary rather than letting it accumulate power behind the nil key, where enough of
@@ -674,6 +692,11 @@ impl BftEngine {
     /// newer round state.
     pub fn receive_proposal(&mut self, keypair: &KeyPair, proposal: Proposal) -> ConsensusResult<Option<Block>> {
         let Proposal { round: round_num, valid_round, block, pol } = proposal;
+
+        // Proposing is participation, so it clears the proposer's liveness strikes — same
+        // reasoning as in `add_vote`, and needed for the same reason: a validator zeroed out
+        // during a brief absence has to be able to earn its way back in.
+        self.missed_rounds.remove(&block.header.validator);
 
         if block.height() <= self.current_height {
             return Ok(None);
@@ -2411,6 +2434,52 @@ mod tests {
     /// The point of the 2026-07-20 liveness fix: found live when a staked validator with no
     /// running node at all crossed an epoch rotation and froze block production for hours,
     /// because a 2-of-2 quorum requires both no matter how long one has been silent. After
+    /// A validator excluded for silence has to be able to come back by simply voting again.
+    ///
+    /// Before this, `missed_rounds` was only ever cleared in `record_round_liveness`, which runs
+    /// exclusively when a round times out. Zeroing a validator's power removes the very stall
+    /// that would have run it — so the exclusion could never be undone, and the peer stayed out
+    /// until this node restarted. Live on 2026-07-22: a reconnected validator sat idle for
+    /// hundreds of blocks, present but permanently ignored.
+    #[test]
+    fn a_reconnecting_validator_earns_its_way_back_into_the_quorum() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let peer_addr = Address::from_public_key(&v.peer_kp.public);
+
+        // Drive enough silent, timing-out rounds to exclude the peer.
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        for _ in 0..LIVENESS_JAIL_ROUNDS {
+            tick_to_timeout_and_advance(&mut engine, &v.self_kp);
+        }
+        let excluded = engine.liveness_adjusted_validator_set();
+        assert_eq!(
+            excluded.get(&peer_addr).unwrap().voting_power,
+            0,
+            "a peer silent for {LIVENESS_JAIL_ROUNDS} rounds must lose its voting power"
+        );
+
+        // It reconnects and votes on the round currently in flight.
+        let height = engine.current_height() + 1;
+        let round = engine.pending_round; // privat, aber der Test liegt im selben Modul
+        let block_hash = engine
+            .pending_proposal()
+            .map(|b| b.hash())
+            .unwrap_or_else(|| Hash::digest(b"whatever-is-in-flight"));
+        let _ = engine.add_vote(
+            &v.self_kp,
+            peer_vote(&v.peer_kp, VoteType::Prevote, height, round, block_hash),
+        );
+
+        let restored = engine.liveness_adjusted_validator_set();
+        assert!(
+            restored.get(&peer_addr).unwrap().voting_power > 0,
+            "one vote proves the peer is alive — its power must come back, or the exclusion \
+             is permanent and a brief outage costs a validator its seat until every other \
+             node restarts"
+        );
+    }
+
     /// `LIVENESS_JAIL_ROUNDS` consecutive rounds without a single vote from the peer, this
     /// node's own vote must become sufficient — driven entirely through the same
     /// `note_round_tick`/`advance_round` path the real node uses, not by inspecting private
