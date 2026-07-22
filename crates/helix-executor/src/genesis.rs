@@ -45,9 +45,23 @@ pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 100_000; // = MIN_VALIDATOR_STAKE
 ///
 /// Credited to whoever `GenesisConfig::validator` is, never a hardcoded address: this constant
 /// ships in a public repo, and naming one deployment's wallet here would prefund it on every
-/// chain anyone launches from this source. Deliberately modest — see `GENESIS_PREFUND` on why a
-/// founder allocation stays small; 100k is ~0.3% of the supply this chain eventually reaches.
-pub const VALIDATOR_GENESIS_LIQUID_HLX: u64 = 100_000;
+/// chain anyone launches from this source. See `GENESIS_PREFUND` on why a founder allocation
+/// stays small; 500k is ~1.5% of the supply this chain eventually reaches.
+///
+/// Raised from 100k on 2026-07-22, and the reason is arithmetic rather than appetite. A
+/// validator set needs **four** members before it survives one going offline (`3f + 1`), each
+/// needs `MIN_VALIDATOR_STAKE` (100k), and block rewards accrue at ~0.56 HLX per block — so
+/// nobody can earn their way in, and a bootstrap validator holding 100k cannot fund even one
+/// other operator. That is not a theoretical limit: this chain sat halted with two validators
+/// because the second one's operator was unreachable, and the whole circulating supply was
+/// short of what a third would have cost. 500k funds three additional validators (110k each,
+/// the extra 10k being fee headroom — an operator who stakes every coin cannot afford the
+/// `Unjail` transaction that gets them back) and leaves a working reserve.
+///
+/// It is a launch reserve to be handed out, not a holding. If a deployment ever wants a
+/// genuinely small founder balance, lower this *and* accept that its validator set grows only
+/// as fast as people arrive with their own 100k.
+pub const VALIDATOR_GENESIS_LIQUID_HLX: u64 = 500_000;
 
 /// Pre-funded genesis wallets beyond the validator's bootstrap stake: (address, balance_HLX).
 /// Empty by design (decision 2026-07-15, superseding the 2026-07-05 decision to liquid-dump
@@ -416,8 +430,22 @@ mod tests {
 
         // The load-bearing claim: this is a bootstrap, not a pre-mine. Anything approaching a
         // meaningful share of supply here would make the halving schedule decoration.
-        let genesis_share_percent = state.total_issued * 100 / (TOTAL_SUPPLY_HLX * NANO_PER_HLX);
-        assert_eq!(genesis_share_percent, 0, "genesis must round to 0% of total supply");
+        //
+        // This bound was "rounds to 0%" until 2026-07-22, when `VALIDATOR_GENESIS_LIQUID_HLX`
+        // went from 100k to 500k and genesis reached ~1.8%. That was a deliberate devnet
+        // decision by the CEO, not drift: a validator set needs four members to survive one
+        // outage, each needs `MIN_VALIDATOR_STAKE`, and the bootstrap validator is the only
+        // possible source of that capital on a chain nobody can mine their way into. The
+        // assertion is re-baselined rather than deleted, and deliberately left tight — 2% still
+        // fails on any further increase, so the next person to raise this has to come here and
+        // say so out loud. If this ever needs to move again, that is a monetary-policy call and
+        // belongs to whoever owns the tokenomics, not to whoever is editing genesis.
+        let genesis_share_permille = state.total_issued * 1_000 / (TOTAL_SUPPLY_HLX * NANO_PER_HLX);
+        assert!(
+            genesis_share_permille < 20,
+            "genesis is {genesis_share_permille}‰ of total supply — past 2% this stops being a \
+             bootstrap allocation and becomes a pre-mine"
+        );
         assert!(state.mintable_headroom() > 0, "the vast majority of supply must remain unminted");
     }
 }
