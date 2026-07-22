@@ -142,6 +142,11 @@
   tr:last-child td { border-bottom: 0; }
   td.num { font-variant-numeric: tabular-nums; }
   .hash { color: var(--dim); font-size: 12px; }
+  /* Age is secondary to the height it belongs to, and it re-renders every 4s — tabular figures
+     keep it from twitching as the digits change width. `help` cursor hints at the exact time
+     in the title attribute. */
+  td.age { color: var(--dim); font-size: 12px; white-space: nowrap;
+    font-variant-numeric: tabular-nums; cursor: help; }
 
   form { display: flex; gap: 8px; margin-bottom: 10px; }
   input {
@@ -283,8 +288,8 @@
         <div class="sub-title">Latest blocks</div>
         <div class="panel scroll">
           <table>
-            <thead><tr><th>Height</th><th>Txs</th><th>Proposer</th><th>Hash</th></tr></thead>
-            <tbody id="blocks"><tr><td colspan="4" class="hash">loading…</td></tr></tbody>
+            <thead><tr><th>Height</th><th>Age</th><th>Txs</th><th>Proposer</th><th>Hash</th></tr></thead>
+            <tbody id="blocks"><tr><td colspan="5" class="hash">loading…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -484,6 +489,27 @@
   // target is the URL fragment (not a click handler), so a lookup is shareable and reloadable.
   const link = (q, text) => `<a href="#${encodeURIComponent(q)}">${esc(text ?? q)}</a>`;
 
+  // Block timestamps are milliseconds since the epoch, stamped by the proposer.
+  //
+  // The list shows the age rather than the clock time, because the question people actually
+  // bring to a block list is "is this chain alive?", and "8s ago" answers it where
+  // "14:31:02" does not. The absolute time is one hover away, and in the block view.
+  const fmtAbs = (ms) => new Date(ms).toLocaleString();
+  const fmtAge = (ms) => {
+    const secs = Math.round((Date.now() - ms) / 1000);
+    // A block stamped in the future means the proposer's clock is ahead of the viewer's. Say so
+    // instead of clamping it to "0s ago": consensus depends on those clocks, so a skew big
+    // enough to notice is worth showing. A second or two is ordinary jitter, not news.
+    if (secs < -2) return 'clock ' + (-secs) + 's ahead';
+    const s = Math.max(0, secs);
+    if (s < 60) return s + 's ago';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ' + (s % 60) + 's ago';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ' + (m % 60) + 'm ago';
+    return Math.floor(h / 24) + 'd ' + (h % 24) + 'h ago';
+  };
+
   async function api(path) {
     const r = await fetch(path, { headers: { Accept: 'application/json' } });
     if (!r.ok) throw new Error(r.status === 404 ? 'not found' : 'HTTP ' + r.status);
@@ -512,10 +538,12 @@
       const blocks = await Promise.all(heights.map((h) => api('/blocks/height/' + h).catch(() => null)));
       $('blocks').innerHTML = blocks.filter(Boolean).map((b) => `<tr>
             <td class="num">${link(b.height, b.height.toLocaleString())}</td>
+            <td class="age" title="${b.timestamp != null ? esc(fmtAbs(b.timestamp)) : ''}">${
+              b.timestamp != null ? esc(fmtAge(b.timestamp)) : '—'}</td>
             <td class="num">${b.transactions ? b.transactions.length : 0}</td>
             <td class="hash">${link(b.validator, short(b.validator, 8))}</td>
             <td class="hash">${link(b.height, short(b.hash, 8))}</td>
-          </tr>`).join('') || '<tr><td colspan="4" class="hash">no blocks yet</td></tr>';
+          </tr>`).join('') || '<tr><td colspan="5" class="hash">no blocks yet</td></tr>';
     } catch (e) {
       $('strip').innerHTML = cell('Node', 'unreachable', true);
     }
@@ -550,6 +578,7 @@
     const txs = b.transactions || [];
     $('result').innerHTML =
       row('Block', b.height.toLocaleString()) +
+      (b.timestamp != null ? row('Time', fmtAbs(b.timestamp) + '  (' + fmtAge(b.timestamp) + ')') : '') +
       row('Hash', b.hash) +
       rowLink('Proposer', b.validator, b.validator) +
       row('Base fee', b.base_fee_per_byte + ' nano/byte') +
