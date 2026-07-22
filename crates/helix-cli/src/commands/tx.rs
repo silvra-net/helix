@@ -479,11 +479,19 @@ async fn submit_tx(tx: &Transaction, node: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read a passphrase without echoing it.
+/// Read a passphrase without echoing it. The one implementation for the whole CLI — import it,
+/// do not write another.
 ///
 /// Named `rpassword_read` and taking a `_prompt` it ignored, this used to be a plain
 /// `stdin().read_line` — so every wallet passphrase was typed in clear text and left sitting in
 /// the terminal's scrollback. The name described the intent; nothing implemented it.
+///
+/// Fixing it here fixed one of six call sites. `identity`, `name`, `recovery`, `contract` and
+/// `governance` each carried their own byte-identical copy of the broken version, so five
+/// commands went on echoing the passphrase — and, because the ignored `_prompt` was never
+/// printed, gave no sign they were waiting for one. Found on 2026-07-22 while walking the
+/// governance path end to end. Hence `pub(crate)` and this note: a private duplicate cannot be
+/// fixed once and stay fixed.
 pub(crate) fn rpassword_read(prompt: &str) -> Result<String> {
     Ok(rpassword::prompt_password(prompt)?.trim().to_string())
 }

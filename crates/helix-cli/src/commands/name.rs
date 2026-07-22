@@ -7,7 +7,7 @@ use helix_crypto::{Address, Signature};
 
 use crate::fee::price_and_sign;
 use crate::keyfile::KeyFile;
-
+use crate::commands::tx::rpassword_read;
 
 #[derive(Subcommand)]
 pub enum NameCmd {
@@ -106,12 +106,6 @@ async fn resolve(name: String, node: &str) -> Result<()> {
         res["address"].as_str().unwrap_or("?")
     );
     Ok(())
-}
-
-fn rpassword_read(_prompt: &str) -> Result<String> {
-    let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
-    Ok(s.trim().to_string())
 }
 
 async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {

@@ -8,7 +8,7 @@ use helix_executor::governance::{encode_proposal, encode_vote, GovernanceParam};
 
 use crate::fee::price_and_sign;
 use crate::keyfile::KeyFile;
-
+use crate::commands::tx::rpassword_read;
 
 #[derive(Clone, clap::ValueEnum)]
 pub enum GovParamArg {
@@ -239,12 +239,6 @@ async fn submit(tx: &Transaction, node: &str) -> Result<serde_json::Value> {
         bail!("Transaction rejected: {}", err);
     }
     Ok(res)
-}
-
-fn rpassword_read(_prompt: &str) -> Result<String> {
-    let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
-    Ok(s.trim().to_string())
 }
 
 async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {
