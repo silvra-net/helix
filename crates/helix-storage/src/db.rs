@@ -101,13 +101,58 @@ const META_FUEL_PER_FEE_UNIT: &str = "gov_fuel_per_fee_unit";
 const META_NEXT_PROPOSAL_ID: &str = "gov_next_proposal_id";
 const META_GENESIS_VALIDATOR_STAKE: &str = "genesis_validator_stake";
 
+/// Page cache redb is allowed to hold, in MiB, unless `HELIX_DB_CACHE_MB` says otherwise.
+///
+/// **redb's own default is 1 GiB**, and `Database::create` applies it silently. That is not a
+/// reservation that stays virtual: the cache fills with real pages as the database is read and
+/// written, so a node with a multi-GB chain settles at over 1.2 GB resident and stays there.
+/// Measured on the production node 2026-07-22: 1,239,692 kB RSS, of which 1,223,680 kB was
+/// private dirty anonymous memory — flat to the byte across 42 blocks, i.e. a startup-sized
+/// floor rather than a leak.
+///
+/// It cost us a validator. A node syncing the chain from scratch pays this on a machine that
+/// is also parsing sync batches, and on 2026-07-22 the second validator's node died with
+/// `memory allocation of 16400 bytes failed` — a 16 kB request failing means the process was
+/// already at its ceiling. Running a node must not require more RAM than the machines people
+/// actually have; a cache is a speed knob, and a default that makes the program abort is the
+/// wrong end of that trade.
+///
+/// 128 MiB (redb splits it 9:1 into read and write cache). Measured against the live chain on
+/// 2026-07-22, same binary, same 2.16 GB database, only this constant differing: a full
+/// 71,000-block sync from scratch peaked at **278 MB** RSS and settled there, against **469 MB**
+/// mid-sync and 1.53 GB at rest on the 1 GiB default. Sync speed did not regress — it reached
+/// the 1.08 GB mark in 464 s against 495 s. Raise it with `HELIX_DB_CACHE_MB` on a machine that
+/// has the memory to spare.
+const DEFAULT_CACHE_MB: usize = 128;
+
+/// Cache size in bytes from the raw `HELIX_DB_CACHE_MB` value, falling back to
+/// `DEFAULT_CACHE_MB` for anything unset, unparseable, or zero.
+///
+/// Split out from the environment lookup so the fallbacks are testable: a typo'd value silently
+/// becoming *redb's* 1 GiB default instead of ours would reintroduce exactly the footprint this
+/// exists to avoid, and would do it only on the machines whose operator tried to tune it.
+fn cache_bytes_from(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .unwrap_or(DEFAULT_CACHE_MB)
+        * 1024
+        * 1024
+}
+
+fn configured_cache_bytes() -> usize {
+    cache_bytes_from(std::env::var("HELIX_DB_CACHE_MB").ok().as_deref())
+}
+
 pub struct HelixDb {
     db: Database,
 }
 
 impl HelixDb {
     pub fn open(path: &Path) -> StorageResult<Self> {
-        let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+        let db = Database::builder()
+            .set_cache_size(configured_cache_bytes())
+            .create(path)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
         // Ensure tables exist
         let tx = db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -895,6 +940,33 @@ mod tests {
 
     fn addr(seed: u8) -> Address {
         Address::from_public_key(&PublicKey::from_bytes(vec![seed; 8]))
+    }
+
+    /// Every way `HELIX_DB_CACHE_MB` can fail to say a usable number has to land on *our*
+    /// default, never on redb's. Getting this wrong is invisible: the node starts, works, and
+    /// quietly holds a gigabyte — which is what took a validator's machine down on 2026-07-22.
+    #[test]
+    fn an_unusable_cache_setting_falls_back_to_our_default_not_redbs() {
+        let default_bytes = DEFAULT_CACHE_MB * 1024 * 1024;
+
+        assert_eq!(cache_bytes_from(None), default_bytes, "unset");
+        assert_eq!(cache_bytes_from(Some("")), default_bytes, "empty");
+        assert_eq!(cache_bytes_from(Some("lots")), default_bytes, "not a number");
+        assert_eq!(cache_bytes_from(Some("-64")), default_bytes, "negative");
+        assert_eq!(cache_bytes_from(Some("256MB")), default_bytes, "number with a unit suffix");
+        assert_eq!(
+            cache_bytes_from(Some("0")),
+            default_bytes,
+            "zero would mean 'no cache at all', which redb reads as a valid instruction and \
+             which would make every read hit the disk"
+        );
+
+        assert_eq!(cache_bytes_from(Some("256")), 256 * 1024 * 1024, "a real value is honored");
+        assert_eq!(cache_bytes_from(Some("  512 ")), 512 * 1024 * 1024, "whitespace is trimmed");
+        assert!(
+            default_bytes < 1024 * 1024 * 1024,
+            "the whole point is to sit below redb's 1 GiB default"
+        );
     }
 
     fn transfer(from: &Address, to: &Address, nonce: u64) -> helix_core::Transaction {
