@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{self, NodeConfig};
+use crate::signing_guard::{Decision, SigningGuard};
 
 /// Load the validator keypair from disk, or generate + persist a new one for
 /// `scheme_for_new` (the scheme to use only if no key file exists yet).
@@ -211,6 +212,18 @@ const BLOCK_TIME_MS: u64 = 2_000;
 const MESH_SETTLE_TICKS: u32 = 5;
 const MAX_TXS_PER_BLOCK: usize = 1_000;
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
+/// Validator health heartbeat cadence and thresholds (see `validator_health_loop`).
+const VALIDATOR_HEALTH_SECS: u64 = 60;
+/// How many recent blocks the signing check looks across. A healthy validator is legitimately
+/// absent from a large fraction of individual commit certificates (the gossip fast-path drops
+/// precommits it already had), so "not in the last block" is noise — "not in any of the last
+/// `HEALTH_SIGN_WINDOW`" is the real signal.
+const HEALTH_SIGN_WINDOW: u64 = 20;
+/// Height must be frozen at least this long before the heartbeat calls the chain stalled.
+const HEALTH_STALL_WARN_SECS: u64 = 15;
+/// Grace period after startup before the heartbeat is allowed to warn — avoids crying wolf while
+/// the node still has too little history or is settling into its first rounds.
+const HEALTH_START_GRACE_SECS: u64 = 90;
 
 /// Fee for the node-generated `SubmitDoubleSignEvidence` transaction — well above
 /// `helix_mempool`'s `DEFAULT_MIN_FEE` (1,000 nano-HLX), which isn't itself
@@ -299,6 +312,10 @@ pub struct HelixNode {
     syncing: Arc<std::sync::atomic::AtomicBool>,
     /// Tip the startup sync is working towards, 0 when unknown. Purely informational.
     sync_target_height: Arc<std::sync::atomic::AtomicU64>,
+    /// Where this node's double-sign high-water mark lives — next to `validator-key.json`. Loaded
+    /// into a [`SigningGuard`] in `run()`. See `signing_guard` for why the protection sits on the
+    /// broadcast path rather than in the consensus engine.
+    signing_state_path: PathBuf,
 }
 
 impl HelixNode {
@@ -309,6 +326,9 @@ impl HelixNode {
         let cfg = config::load_node_config()?;
 
         let key_path = resolve_validator_key_path(&cfg);
+        // Double-sign state lives beside the key it protects: validator-key.json ->
+        // validator-key.signing-state.json. See `signing_guard`.
+        let signing_state_path = key_path.with_extension("signing-state.json");
         let scheme_for_new = match config::resolve("HELIX_VALIDATOR_CRYPTO_SCHEME", &cfg.validator_crypto_scheme).as_deref() {
             Some("sphincs-plus") | Some("sphincsplus") => CryptoScheme::SphincsPlus,
             _ => CryptoScheme::MlDsa,
@@ -594,6 +614,7 @@ impl HelixNode {
             // "synced" before checking would be the same lie the old hardcoded `false` told.
             syncing: Arc::new(std::sync::atomic::AtomicBool::new(has_sync_peer)),
             sync_target_height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            signing_state_path,
         })
     }
 
@@ -703,6 +724,14 @@ impl HelixNode {
             self.address.clone(),
             genesis_height,
         )));
+        // Double-sign protection: every outbound vote is checked against a durable high-water
+        // mark before it is gossiped, so a restart or a stray second instance can't equivocate
+        // and get this validator slashed. Seeded with the persisted tip so it never re-signs an
+        // already-committed height even on a first run with no state file. See `signing_guard`.
+        let signing_guard = Arc::new(std::sync::Mutex::new(SigningGuard::load(
+            self.signing_state_path.clone(),
+            genesis_height,
+        )));
         // Seed the engine's chain-continuity check with the real tip hash — without
         // this, `validate_block`'s prev_hash check stays silently disabled until this
         // engine's own first `finalize()`, the exact restart window a diverged
@@ -745,6 +774,7 @@ impl HelixNode {
         let p2p_tx_for_p2p = self.p2p_command_tx.clone();
         let sync_peer_for_p2p = self.sync_peer.clone();
         let last_applied_height_for_p2p = last_applied_height.clone();
+        let signing_guard_for_p2p = signing_guard.clone();
         let mut p2p_event_rx = self.p2p_event_rx;
         tokio::spawn(async move {
             while let Some(event) = p2p_event_rx.recv().await {
@@ -759,6 +789,7 @@ impl HelixNode {
                     &p2p_tx_for_p2p,
                     &sync_peer_for_p2p,
                     &last_applied_height_for_p2p,
+                    &signing_guard_for_p2p,
                 )
                 .await;
             }
@@ -777,6 +808,17 @@ impl HelixNode {
             last_applied_height.clone(),
         ));
 
+        // Validator health heartbeat — logs "am I actually validating?" on its own timer, so an
+        // operator watching the console sees the truth even when the consensus loop has silently
+        // stalled. Independent of block production and purely observational.
+        tokio::spawn(validator_health_loop(
+            self.store.clone(),
+            self.chain_state.clone(),
+            self.address.clone(),
+            peer_count.clone(),
+            self.syncing.clone(),
+        ));
+
         // Block production loop
         let block_loop = tokio::spawn(block_production_loop(
             self.store.clone(),
@@ -789,6 +831,7 @@ impl HelixNode {
             self.reward_address.map(Arc::new),
             peer_count.clone(),
             self.syncing.clone(),
+            signing_guard,
         ));
 
         tokio::select! {
@@ -817,6 +860,7 @@ async fn handle_p2p_event(
     p2p_tx: &mpsc::Sender<P2PCommand>,
     sync_peer: &Option<String>,
     last_applied_height: &Arc<Mutex<u64>>,
+    signing_guard: &Arc<std::sync::Mutex<SigningGuard>>,
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
@@ -846,10 +890,7 @@ async fn handle_p2p_event(
             // receive_proposal() may have cast our prevote (and possibly a
             // follow-up precommit) for the received proposal — broadcast
             // those regardless of outcome, same as the NewVote arm below.
-            let outbound = { engine.write().await.take_outbound_votes() };
-            for v in outbound {
-                let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(v));
-            }
+            broadcast_outbound_votes(engine, p2p_tx, signing_guard).await;
             // Report any double-sign evidence this vote processing turned up — see
             // report_double_sign_evidence's doc comment for why this can't just slash
             // directly here.
@@ -882,10 +923,7 @@ async fn handle_p2p_event(
 
             // add_vote() may itself have cast our own follow-up precommit
             // (see its doc comment) — broadcast that regardless of outcome.
-            let outbound = { engine.write().await.take_outbound_votes() };
-            for v in outbound {
-                let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(v));
-            }
+            broadcast_outbound_votes(engine, p2p_tx, signing_guard).await;
             let evidence = { engine.write().await.take_evidence() };
             for ev in evidence {
                 report_double_sign_evidence(ev, keypair, chain_state, mempool, p2p_tx).await;
@@ -1416,6 +1454,182 @@ fn fatal_storage_failure(what: &str, height: u64, e: &dyn std::fmt::Display) -> 
     std::process::exit(1)
 }
 
+/// The decision the health heartbeat reports, factored out of the async loop so it can be
+/// unit-tested against the very failure it exists to catch — an active validator gone silent.
+#[derive(Debug, PartialEq)]
+enum HealthVerdict {
+    Following,
+    Jailed(u64),
+    WaitingActivation,
+    Validating { last_signed: u64, age: u64 },
+    NotValidating { last_signed: Option<u64>, stalled_secs: Option<u64> },
+    Settling,
+}
+
+/// Pure verdict for the health heartbeat. `last_signed` is `Some((height, age_secs))` if this node
+/// co-signed any block in the recent window; `stalled` is whether the chain height has been frozen
+/// past the warn threshold; `past_grace` gates warnings until there is enough history to trust one.
+fn health_verdict(
+    staked: bool,
+    in_active: bool,
+    jailed_until: Option<u64>,
+    last_signed: Option<(u64, u64)>,
+    stalled: bool,
+    stalled_secs: u64,
+    past_grace: bool,
+) -> HealthVerdict {
+    if !staked {
+        return HealthVerdict::Following;
+    }
+    if let Some(until) = jailed_until {
+        return HealthVerdict::Jailed(until);
+    }
+    if !in_active {
+        return HealthVerdict::WaitingActivation;
+    }
+    match (last_signed, stalled) {
+        // Co-signed recently and the chain is moving — the one healthy state.
+        (Some((h, age)), false) => HealthVerdict::Validating { last_signed: h, age },
+        // Active but silent (or the chain is stalled while we're active): the failure to shout
+        // about — but only once there's enough history that it isn't just startup settling.
+        (ls, _) if past_grace => HealthVerdict::NotValidating {
+            last_signed: ls.map(|(h, _)| h),
+            stalled_secs: if stalled { Some(stalled_secs) } else { None },
+        },
+        _ => HealthVerdict::Settling,
+    }
+}
+
+/// Heartbeat that answers "am I actually validating right now?" in the node's own log.
+///
+/// An operator watching the console — the GUI Node tab streams exactly this stdout — otherwise
+/// has no way to tell a healthy validator from one whose process is up but has silently stopped
+/// participating in consensus. That second state is what halts a small network until someone
+/// restarts the stuck node, and it was reported from the field as "it said it was still running,
+/// but it wasn't." This loop runs on its own timer, independent of the consensus loop, so it
+/// keeps reporting even when that loop has stalled.
+///
+/// Purely observational: it reads state and logs, never mutates consensus or the chain.
+async fn validator_health_loop(
+    store: Arc<RwLock<HelixDb>>,
+    chain_state: Arc<RwLock<ChainState>>,
+    address: Address,
+    peer_count: Arc<std::sync::atomic::AtomicUsize>,
+    syncing: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let started = std::time::Instant::now();
+    let mut ticker = tokio::time::interval(Duration::from_secs(VALIDATOR_HEALTH_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_height = 0u64;
+    let mut last_height_change = std::time::Instant::now();
+
+    loop {
+        ticker.tick().await;
+        // Still catching up — "am I validating?" isn't a meaningful question until we're current.
+        if syncing.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        let height = { store.read().await.latest_height() };
+        if height != last_height {
+            last_height = height;
+            last_height_change = std::time::Instant::now();
+        }
+        let stalled_secs = last_height_change.elapsed().as_secs();
+        let peers = peer_count.load(Ordering::Relaxed);
+        let addr_str = address.to_string();
+
+        let (staked, in_active, jailed_until) = {
+            let cs = chain_state.read().await;
+            let staked = cs.stakers().iter().any(|(a, _)| a == &address);
+            // An empty `active_validators` means the chain has never rotated yet (genesis /
+            // bootstrap), and in that state every staker is active — so don't read it as
+            // "waiting for activation". Once rotation has run, membership is explicit.
+            let in_active =
+                cs.active_validators.is_empty() || cs.active_validators.contains(&address);
+            let jailed = cs.jailed_until.get(&addr_str).copied().filter(|&h| h > height);
+            (staked, in_active, jailed)
+        };
+
+        // Scan the recent window for my own co-signature only when I'm an active validator —
+        // that's the only verdict that depends on it. last_commit in block h carries the precommits
+        // that finalized block h-1, so my address there means I signed h-1.
+        let scan_active = staked && in_active && jailed_until.is_none();
+        let last_signed: Option<(u64, u64)> = if scan_active {
+            let s = store.read().await;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let lo = height.saturating_sub(HEALTH_SIGN_WINDOW);
+            let mut found = None;
+            let mut h = height;
+            while h > lo {
+                if let Ok(block) = s.get_block_by_height(h) {
+                    if block.header.last_commit.iter().any(|c| c.validator == address) {
+                        let age = now_ms.saturating_sub(block.header.timestamp) / 1000;
+                        found = Some((h.saturating_sub(1), age));
+                        break;
+                    }
+                }
+                h -= 1;
+            }
+            found
+        } else {
+            None
+        };
+
+        let stalled = stalled_secs >= HEALTH_STALL_WARN_SECS;
+        // Enough history and past the startup settle before we're allowed to warn.
+        let past_grace =
+            started.elapsed().as_secs() >= HEALTH_START_GRACE_SECS && height > HEALTH_SIGN_WINDOW;
+
+        match health_verdict(staked, in_active, jailed_until, last_signed, stalled, stalled_secs, past_grace) {
+            HealthVerdict::Following => {
+                info!("Health: following the chain · height {} · peers {}", height, peers);
+            }
+            HealthVerdict::Jailed(until) => {
+                warn!(
+                    "Health: validator JAILED until #{} — submit an Unjail transaction to rejoin (height {}, peers {})",
+                    until, height, peers
+                );
+            }
+            HealthVerdict::WaitingActivation => {
+                info!(
+                    "Health: staked, waiting for activation — not yet in the active set (height {}, peers {})",
+                    height, peers
+                );
+            }
+            HealthVerdict::Validating { last_signed: signed_h, age } => {
+                info!(
+                    "Health: ✓ validating · last co-signed #{} ({}s ago) · height {} · peers {}",
+                    signed_h, age, height, peers
+                );
+            }
+            HealthVerdict::NotValidating { last_signed: ls, stalled_secs: st } => {
+                let last = match ls {
+                    Some(signed_h) => format!("last co-signed #{}", signed_h),
+                    None => format!("no block co-signed in the last {}", HEALTH_SIGN_WINDOW),
+                };
+                let chain = match st {
+                    Some(secs) => format!("chain STALLED at #{} for {}s", height, secs),
+                    None => format!("height {}", height),
+                };
+                warn!(
+                    "Health: ⚠ NOT validating — this node is an active validator but is not co-signing \
+                     ({}, {}, peers {}). The process is up but not participating in consensus; \
+                     restarting the node re-establishes its round.",
+                    last, chain, peers
+                );
+            }
+            HealthVerdict::Settling => {
+                info!("Health: validating (settling in) · height {} · peers {}", height, peers);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn block_production_loop(
     store: Arc<RwLock<HelixDb>>,
@@ -1428,6 +1642,7 @@ async fn block_production_loop(
     reward_address: Option<Arc<Address>>,
     peer_count: Arc<std::sync::atomic::AtomicUsize>,
     syncing: Arc<std::sync::atomic::AtomicBool>,
+    signing_guard: Arc<std::sync::Mutex<SigningGuard>>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(BLOCK_TIME_MS));
 
@@ -1565,7 +1780,7 @@ async fn block_production_loop(
             // the drain at the end of the loop body is unreachable from the `continue` below,
             // and a nil prevote that never leaves this node can't be tallied by anyone, so
             // nil quorum — the whole point of casting it — could never form.
-            broadcast_outbound_votes(&engine, &p2p_tx).await;
+            broadcast_outbound_votes(&engine, &p2p_tx, &signing_guard).await;
             if !timed_out {
                 continue;
             }
@@ -1596,7 +1811,7 @@ async fn block_production_loop(
                 // Same reason as the active-round branch: a nil prevote cast here has to go
                 // out this tick. (This branch falls through to the end-of-body drain rather
                 // than `continue`ing, but draining twice is free — the second is empty.)
-                broadcast_outbound_votes(&engine, &p2p_tx).await;
+                broadcast_outbound_votes(&engine, &p2p_tx, &signing_guard).await;
                 timed_out
             }
         };
@@ -1640,7 +1855,7 @@ async fn block_production_loop(
         // Broadcast any votes this node cast this tick (own prevote/precommit
         // from produce_block) so other validators can fold them into their
         // VoteSets.
-        broadcast_outbound_votes(&engine, &p2p_tx).await;
+        broadcast_outbound_votes(&engine, &p2p_tx, &signing_guard).await;
         // Report any double-sign evidence this tick's produce_block/advance_round
         // turned up (e.g. a stalled round's accumulated evidence).
         let evidence = { engine.write().await.take_evidence() };
@@ -1652,13 +1867,38 @@ async fn block_production_loop(
 
 /// Drain the votes this node has cast but not yet sent, and gossip them to the other
 /// validators. Safe to call more than once per tick — the second call finds an empty queue.
+///
+/// This is the single point where every own vote leaves the node, so it is also where the
+/// double-sign guard runs: a vote that would equivocate at a height/round this validator already
+/// signed (typically after a restart, or from a stray second instance sharing the key) is dropped
+/// here rather than gossiped, so it can never become slashable evidence. See `signing_guard`.
 async fn broadcast_outbound_votes(
     engine: &Arc<RwLock<BftEngine>>,
     p2p_tx: &mpsc::Sender<P2PCommand>,
+    signing_guard: &Arc<std::sync::Mutex<SigningGuard>>,
 ) {
     let outbound = { engine.write().await.take_outbound_votes() };
     for vote in outbound {
-        let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(vote));
+        let decision = {
+            // Short, synchronous critical section (a small fsync on advance) — no await held.
+            signing_guard.lock().unwrap().check(&vote)
+        };
+        match decision {
+            Decision::Allow => {
+                let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(vote));
+            }
+            Decision::Refuse => {
+                warn!(
+                    height = vote.height,
+                    round = vote.round,
+                    vote_type = ?vote.vote_type,
+                    "Double-sign guard withheld a vote: this key already signed a different value \
+                     at this height/round (most likely a restart). Not equivocating — this node \
+                     will resync instead. If this repeats, a second node may be running with a \
+                     copy of this validator key."
+                );
+            }
+        }
     }
 }
 
@@ -2447,6 +2687,46 @@ mod multiaddr_kind_tests {
 }
 
 #[cfg(test)]
+mod validator_health_tests {
+    use super::*;
+
+    // Positive control: the verdict must actually flag the failure this heartbeat exists for —
+    // an active, un-jailed validator that co-signed nothing in the window (a node "still running"
+    // but not participating). Without this, a green run only proves the healthy path.
+    #[test]
+    fn flags_a_silent_active_validator() {
+        let v = health_verdict(true, true, None, None, false, 0, true);
+        assert_eq!(v, HealthVerdict::NotValidating { last_signed: None, stalled_secs: None });
+    }
+
+    #[test]
+    fn flags_a_stall_while_active_even_if_it_once_signed() {
+        let v = health_verdict(true, true, None, Some((100, 5)), true, 40, true);
+        assert_eq!(v, HealthVerdict::NotValidating { last_signed: Some(100), stalled_secs: Some(40) });
+    }
+
+    #[test]
+    fn healthy_when_signed_recently_and_moving() {
+        let v = health_verdict(true, true, None, Some((100, 2)), false, 0, true);
+        assert_eq!(v, HealthVerdict::Validating { last_signed: 100, age: 2 });
+    }
+
+    #[test]
+    fn stays_quiet_within_the_startup_grace() {
+        // Same silent inputs as the warn case, but before grace elapses → no warning yet.
+        let v = health_verdict(true, true, None, None, false, 0, false);
+        assert_eq!(v, HealthVerdict::Settling);
+    }
+
+    #[test]
+    fn jailed_and_waiting_and_follower_take_precedence() {
+        assert_eq!(health_verdict(true, true, Some(500), None, true, 99, true), HealthVerdict::Jailed(500));
+        assert_eq!(health_verdict(true, false, None, None, true, 99, true), HealthVerdict::WaitingActivation);
+        assert_eq!(health_verdict(false, false, None, None, true, 99, true), HealthVerdict::Following);
+    }
+}
+
+#[cfg(test)]
 mod resolve_seed_peer_multiaddr_tests {
     use super::*;
     use axum::{routing::get, Json, Router};
@@ -2595,6 +2875,7 @@ mod handle_p2p_event_tests {
             &p2p_tx,
             &None,
             &Arc::new(Mutex::new(0)),
+            &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
         )
         .await;
 
@@ -2638,6 +2919,7 @@ mod handle_p2p_event_tests {
             &p2p_tx,
             &None,
             &Arc::new(Mutex::new(0)),
+            &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
         )
         .await;
 
@@ -2680,6 +2962,7 @@ mod handle_p2p_event_tests {
             &p2p_tx,
             &None,
             &Arc::new(Mutex::new(0)),
+            &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
         )
         .await;
 
@@ -2987,6 +3270,7 @@ mod handle_p2p_event_tests {
             &p2p_tx,
             &Some(peer_url),
             &last_applied_height,
+            &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
         )
         .await;
 
@@ -3123,6 +3407,7 @@ mod handle_p2p_event_tests {
             None,
             peer_count.clone(),
             syncing.clone(),
+            Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
         ));
 
         // Well past several block intervals: nothing may be produced while syncing.

@@ -4,6 +4,7 @@ use tracing::info;
 
 mod config;
 mod node;
+mod signing_guard;
 
 /// Helix — one binary for everything. `helix start` runs the node daemon; every other
 /// subcommand (`wallet`, `tx`, `chain`, …) is a thin RPC client against a node, defaulting
