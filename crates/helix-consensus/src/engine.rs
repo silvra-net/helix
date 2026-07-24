@@ -347,7 +347,16 @@ impl BftEngine {
         transactions: Vec<Transaction>,
     ) -> ConsensusResult<Block> {
         let height = self.current_height + 1;
-        let round_num = 0u32;
+        // The round the engine has actually reached for this height — NOT a hardcoded 0.
+        // The block loop calls `produce_block` whenever there is no active round and the
+        // round hasn't timed out yet; after the engine has timed out through several rounds
+        // (every proposer for them silent), `pending_round` is well past 0. Hardcoding 0
+        // here made a proposer re-propose round 0 after already reaching round N — a round
+        // regression that is self-equivocation, which the signing guard then withholds,
+        // silently freezing any set small enough to need every member (the 2026-07-24 stall,
+        // and the round-0 fingerprint of the #125 double-sign slashes). Using `pending_round`
+        // keeps propose/advance_round consistent: we only ever propose the round we're on.
+        let round_num = self.pending_round;
 
         self.assert_is_validator()?;
 
@@ -1437,6 +1446,41 @@ mod tests {
 
         let outbound = engine.take_outbound_votes();
         assert_eq!(outbound.len(), 1, "one nil prevote per round, not one per tick: {outbound:?}");
+    }
+
+    /// Reproduces the 2026-07-24 stall (#127): with the other proposers silent, a validator
+    /// times out through rounds, so the block loop reaches `produce_block` while `self.round`
+    /// is None and `pending_round` has advanced past 0. `produce_block` used to hardcode round
+    /// 0 — regressing the round, which is self-equivocation the signing guard then withholds,
+    /// silently freezing a set that needs every member. It must respect the round reached.
+    #[test]
+    fn produce_block_respects_the_advanced_round_and_never_regresses_to_zero() {
+        let v = four_validators();
+        // genesis_height 0 → we decide height 1. self (index 1) IS the round-0 proposer
+        // for height 1 ((1 + 0) % 4 == 1) but NOT the round-1 proposer ((1 + 1) % 4 == 2).
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let prev = Hash::digest(b"prev");
+
+        // Time out of round 0 onto round 1, where self isn't the proposer: this leaves
+        // self.round = None with pending_round = 1 — the exact state the block loop then
+        // calls produce_block in.
+        let advanced = engine.advance_round(&v.self_kp, prev, vec![]);
+        assert!(
+            matches!(advanced, Err(ConsensusError::NotProposer { height: 1, round: 1 })),
+            "advance_round should leave us waiting on round 1's proposer: {advanced:?}"
+        );
+
+        // The bug: produce_block hardcoded round 0, and self IS the round-0 proposer, so it
+        // would build a round-0 block — a regression from round 1.
+        let produced = engine.produce_block(&v.self_kp, prev, vec![]);
+        assert!(
+            matches!(produced, Err(ConsensusError::NotProposer { height: 1, round: 1 })),
+            "produce_block must respect pending_round (1), not regress to round 0: {produced:?}"
+        );
+        assert!(
+            engine.take_outbound_votes().iter().all(|vote| vote.round == 1),
+            "no round-0 vote may be produced after the engine has advanced to round 1"
+        );
     }
 
     /// Once 2/3+ of the power has prevoted nil, the round is abandoned immediately — this is
