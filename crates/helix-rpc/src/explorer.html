@@ -2,13 +2,18 @@
   Served by the node itself at `/` to browsers (see `root`). Deliberately ONE self-contained
   file with no external requests: a node has to work on a machine that cannot reach a CDN, and a
   page that quietly depends on someone else's font server is not one you can run air-gapped.
-  This is the front door of the project — a hub, not just a block explorer: what Helix is, how to
-  join, how to run a node, the tokenomics, the tech, and the live chain, all in one page.
+
+  This is a block explorer first. The project pitch lives in the README; anyone who reaches a
+  node already knows roughly what Helix is, so the top of the page is a thin masthead and
+  everything below it is the live chain: health, blocks, lookup, recent transactions, and the
+  validator set — all read straight from this node. Every list paginates (server-side over
+  height ranges for blocks/transactions, client-side for the validator set) so no list bursts
+  as the chain grows.
 -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Helix — the post-quantum blockchain</title>
-<meta name="description" content="Helix (HLX) — a post-quantum Layer-1 blockchain in Rust. Explore the chain, run a node, and learn how it works.">
+<title>Helix Explorer — the post-quantum blockchain</title>
+<meta name="description" content="Live block explorer for Helix (HLX), a post-quantum Layer-1 blockchain in Rust. Blocks, transactions, accounts and validators, straight from the node.">
 <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEfUlEQVR42u2XzY8UVRTFf/fVq/6qZoSeZiDoGIcZkI2RxGAEokEQ/FjIf4AbNyQuDHGr0cQdiVFMjCYkbPwP3LgANCGgiEGXCuPASFxAunvG0B8z1VXvuqiarh6mu2FwQUysZb26571377nnnpKbX7+hPMLH8IifRw7A3vcLEUAABX3Aaq0jZgQAAQGNllAXI8YitpBuqCNiJI2JEOOlMQyNscNuoC6CKCI3PoNXrBC3aoQLs4iXB/EGbCigMRqF5CrTeKUqcadBWJ8FzyLGDsyGHXQLjSOMX6T60glKk/tBDOpiWjfOU//xs+Sr/g1FUBeDsWze9x7B1IEEpDraty5Su/QJrttJYu4BbgfWz3Wp7v+A0uQ+UAfqEDGUpw+jLuTOdx9i/CBZS9Dgum22HPqYYPuhBFi6VnryRaricef8++D5a7KwGoAYNOqQG9+ZHh6DmD5COcrTR4jbdTRaTtdIANoiwdSh5GCRtMEUNKY0uY/c+E7CxnXEFjPggzKgLsYrVdNUrbA5I5iIYeOzxx6wybJu8EpVtPZbb7chABQxlrh1Ow10GZCU/eoiFq6eHpCBApueexsRrwc2iVXAELduPwAHVBFbIKzP0pw7S3n7K2t6++7v37DwyxlMLuirp+C6bfyxx9nw9Ju9yyRAPFo3zrPcmF3Nm6EkVEVsnvoPn6LREsHUQYwt4LptmrPfsnD1NLa8FRHpbwJMvkzjypcAlKcPI7aIRsu0bn5P/afPMV5+YBvK4GEkCBC17lB5/h027j5G48oXLPx6BhtsHSJGAupwUQd/bBKvWMEtLRL+/SfGDtOOoUqoIBbxS2gcJm+iMEkhBoiGxBhMrkzUuk109y8wXl+pdL1SrH0tleZZ3QgZpqf94vng5bI9/qPTUJI2W7mBuj5RYvQwikNwERgvmR0jSmCGbqQx2u0k0wwQW0C77RSQDBEdhwub2GCC/MQz+OVtuLCVKOoQ4Hbo4cYycfAjgqcOgDo27n4Lu2EbCz9/1ZPt7FYZP8ZfeJfy9BGMv7oNcfHATjADR3G8THXvCcozryUZEIPxS4ztOkplz3Fc1MnImca4qENlz3HGdh3F+MVEVW2e8syrVPeewMXLq2MGAkjNRK6yg2Dq5TR12hMo1FHe8Tr+Y5NJnSWruT/2BOUdb6TTU/sGWEwwdZB8ZQaNltaAMGu8gIvwgom1wyg9TIzFljYnJFtZdxE2mEi0XqTvkL5hFGxJTA4yugRiPOJ2LbtBr2apv9OYuFMH42XrxkveaXwP47V3kbhdQ4x3nxKkcz2sX6N961LqalIx0YR4zblzhIvzWXupIl6ecHGe5ty5tHXJSiEe7VuXCOvX1niBwSRUBeNTu3iS9vyFzKioozl3lvrlU5ieOc1ijC1Qv3yK5txZtKcZ0J6/QO3iSTD+OobRiimN7zWlfyBebrQpjUNym6bxgoc2pelIFgu+JWzMZrbcL41QtSTd4pcIF2+gjeuJLfdTW64PNYwSBZQ+Tzj60Z6fEAr/9sekjxOs8/91HTH//5z+AzC3Nft/pcWSAAAAAElFTkSuQmCC">
 <style>
   :root {
@@ -23,6 +28,8 @@
     --warn-bg: #fdf1ec;
     --warn-line: #e8c4b4;
     --warn-ink: #8a3d1c;
+    --ok: #1a7f37;
+    --ok-bg: #e7f6ec;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -37,17 +44,19 @@
       --warn-bg: #2a1710;
       --warn-line: #58301d;
       --warn-ink: #f0a883;
+      --ok: #4ac26b;
+      --ok-bg: #12241a;
     }
   }
   :root[data-theme="dark"] {
     --ground: #0f1218; --panel: #161a22; --panel-2: #10131a; --line: #262c38; --ink: #e9e6e0;
     --dim: #8a909e; --accent: #e0a44a; --accent-soft: #221a0e;
-    --warn-bg: #2a1710; --warn-line: #58301d; --warn-ink: #f0a883;
+    --warn-bg: #2a1710; --warn-line: #58301d; --warn-ink: #f0a883; --ok: #4ac26b; --ok-bg: #12241a;
   }
   :root[data-theme="light"] {
     --ground: #faf9f7; --panel: #ffffff; --panel-2: #f4f2ee; --line: #e2ded7; --ink: #1b1d21;
     --dim: #6f7480; --accent: #9a5b06; --accent-soft: #fdf3e2;
-    --warn-bg: #fdf1ec; --warn-line: #e8c4b4; --warn-ink: #8a3d1c;
+    --warn-bg: #fdf1ec; --warn-line: #e8c4b4; --warn-ink: #8a3d1c; --ok: #1a7f37; --ok-bg: #e7f6ec;
   }
 
   * { box-sizing: border-box; }
@@ -58,11 +67,11 @@
     color: var(--ink);
     font: 15px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  code, .mono, td.num, pre { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; }
+  code, .mono, td.num, .hash { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; }
   .num { font-variant-numeric: tabular-nums; }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
-  main { max-width: 1080px; margin: 0 auto; padding: 0 20px 72px; }
+  main { max-width: 100%; margin: 0 auto; padding: 0 clamp(18px, 3.2vw, 60px) 72px; overflow-x: clip; }
 
   /* ---------- top nav ---------- */
   .topnav {
@@ -72,69 +81,82 @@
     border-bottom: 1px solid var(--line);
   }
   .topnav-inner {
-    max-width: 1080px; margin: 0 auto; padding: 9px 20px;
+    max-width: 100%; margin: 0 auto; padding: 9px clamp(18px, 3.2vw, 60px);
     display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   }
   .topnav .logo { display: flex; align-items: center; gap: 8px; font-weight: 650; letter-spacing: .04em; }
   .topnav .logo img { border-radius: 6px; display: block; }
-  .topnav nav { display: flex; gap: 4px; flex-wrap: wrap; margin-left: auto; }
+  .topnav nav { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
   .topnav nav a {
-    color: var(--dim); font-size: 13px; padding: 5px 9px; border-radius: 6px; white-space: nowrap;
+    color: var(--ink); font-size: 13px; font-weight: 600; padding: 5px 10px; border-radius: 6px;
+    white-space: nowrap; border: 1px solid transparent;
   }
-  .topnav nav a:hover { color: var(--ink); background: var(--panel-2); text-decoration: none; }
+  .topnav nav a span { color: var(--dim); font-weight: 400; }
+  .topnav nav a:hover { color: var(--accent); background: var(--panel-2); border-color: var(--line); text-decoration: none; }
 
   section[id] { scroll-margin-top: 64px; }
   .lead { font-size: 11px; letter-spacing: .13em; text-transform: uppercase; color: var(--accent);
-          font-weight: 650; margin: 44px 0 10px; }
-  h2 { font-size: 23px; margin: 2px 0 10px; font-weight: 650; letter-spacing: -0.01em; }
-  h3 { font-size: 15px; margin: 22px 0 6px; font-weight: 650; }
+          font-weight: 650; margin: 40px 0 10px; }
+  h2 { font-size: 22px; margin: 2px 0 10px; font-weight: 650; letter-spacing: -0.01em; }
   p { margin: 8px 0; }
   .muted { color: var(--dim); }
 
-  /* ---------- hero ---------- */
-  .hero { padding: 40px 0 8px; }
-  .hero h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.08; margin: 0 0 12px; letter-spacing: -0.02em; }
-  .hero h1 .g { color: var(--accent); }
-  .hero .tagline { font-size: 17px; color: var(--dim); max-width: 640px; margin: 0 0 18px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 4px; }
+  /* ---------- masthead ---------- */
+  .intro { padding: 26px 0 4px; }
+  .intro h1 { font-size: clamp(23px, 3.4vw, 31px); line-height: 1.12; margin: 0 0 8px; letter-spacing: -0.02em; }
+  .intro h1 .g { color: var(--accent); }
+  .intro .desc { font-size: 15.5px; color: var(--dim); max-width: 720px; margin: 0 0 12px; }
+  .intro .desc b { color: var(--ink); font-weight: 600; }
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; margin: 14px 0 2px; }
   .chip {
-    font-size: 12.5px; padding: 5px 11px; border-radius: 999px;
-    background: var(--panel); border: 1px solid var(--line); color: var(--ink);
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--dim);
   }
-  .chip b { color: var(--accent); font-weight: 650; }
-  .cta { display: flex; flex-wrap: wrap; gap: 10px; margin: 22px 0 6px; }
-  .btn {
-    display: inline-block; padding: 10px 17px; border-radius: 8px; font-size: 14px; font-weight: 600;
-    background: var(--accent); color: var(--ground); border: 1px solid var(--accent);
-  }
-  .btn:hover { text-decoration: none; filter: brightness(1.06); }
-  .btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
-  .btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
+  .chip b { color: var(--ink); font-weight: 650; }
 
   .warn {
-    margin: 22px 0 6px; padding: 12px 14px;
+    margin: 16px 0 4px; padding: 10px 13px;
     background: var(--warn-bg); border: 1px solid var(--warn-line); border-left-width: 3px;
-    color: var(--warn-ink); font-size: 13.5px; border-radius: 4px;
+    color: var(--warn-ink); font-size: 13px; border-radius: 4px;
   }
   .warn strong { font-weight: 700; }
+
+  /* ---------- health bar ---------- */
+  .healthbar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px 22px;
+    padding: 13px 16px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; margin: 8px 0 14px;
+  }
+  .pill { display: inline-flex; align-items: center; gap: 7px; font-weight: 650; font-size: 13.5px;
+    padding: 5px 13px; border-radius: 999px; white-space: nowrap; }
+  .pill .dot { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
+  .pill.live { color: var(--ok); background: var(--ok-bg); }
+  .pill.slow { color: var(--accent); background: var(--accent-soft); }
+  .pill.stalled { color: var(--warn-ink); background: var(--warn-bg); }
+  .hstat { font-size: 13px; color: var(--dim); white-space: nowrap; }
+  .hstat b { color: var(--ink); font-weight: 650; font-variant-numeric: tabular-nums; margin-left: 5px; }
 
   /* ---------- live strip ---------- */
   .strip {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     gap: 1px; background: var(--line); border: 1px solid var(--line);
-    border-radius: 6px; overflow: hidden; margin: 10px 0 4px;
+    border-radius: 6px; overflow: hidden; margin: 0 0 4px;
   }
   .cell { background: var(--panel); padding: 12px 14px; }
   .cell .k { font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); margin-bottom: 4px; }
   .cell .v { font-size: 18px; font-variant-numeric: tabular-nums; font-weight: 600; }
-  .cell .v.small { font-size: 12px; font-weight: 400; word-break: break-all; }
+  .cell .v.small { font-size: 12px; font-weight: 400; word-break: break-all; font-family: ui-monospace, Menlo, Consolas, monospace; }
 
   /* ---------- explorer cols ---------- */
-  .cols { display: grid; grid-template-columns: 1.15fr 1fr; gap: 24px; align-items: start; margin-top: 14px; }
+  .cols { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(300px, 480px); gap: 24px; align-items: start; margin-top: 14px; }
+  /* Grid/flex children default to min-width:auto (min-content), which lets a nowrap table or a
+     wide input push the track past the viewport instead of shrinking. min-width:0 lets them
+     shrink so the inner .scroll container can take over the horizontal scrolling. */
+  .cols > * { min-width: 0; }
   @media (max-width: 820px) { .cols { grid-template-columns: 1fr; } }
   .sub-title { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin: 0 0 9px; font-weight: 650; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
-  .scroll { overflow-x: auto; }
+  .scroll { overflow-x: auto; max-width: 100%; -webkit-overflow-scrolling: touch; }
   table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
   th { text-align: left; font-weight: 600; color: var(--dim); font-size: 10.5px; letter-spacing: .08em;
        text-transform: uppercase; padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
@@ -142,11 +164,18 @@
   tr:last-child td { border-bottom: 0; }
   td.num { font-variant-numeric: tabular-nums; }
   .hash { color: var(--dim); font-size: 12px; }
-  /* Age is secondary to the height it belongs to, and it re-renders every 4s — tabular figures
-     keep it from twitching as the digits change width. `help` cursor hints at the exact time
-     in the title attribute. */
   td.age { color: var(--dim); font-size: 12px; white-space: nowrap;
     font-variant-numeric: tabular-nums; cursor: help; }
+
+  /* ---------- pagination ---------- */
+  .pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
+  .pg {
+    background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    padding: 6px 13px; font-size: 12.5px; font-weight: 600; border-radius: 6px; cursor: pointer;
+  }
+  .pg:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .pg:disabled { opacity: .4; cursor: default; }
+  .pg-info { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; text-align: center; }
 
   form { display: flex; gap: 8px; margin-bottom: 10px; }
   input {
@@ -154,7 +183,7 @@
     font-family: ui-monospace, Menlo, Consolas, monospace;
     background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
   }
-  input:focus-visible, button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input:focus-visible, button:focus-visible, .pg:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   button {
     padding: 10px 15px; font-size: 13px; font-weight: 600; cursor: pointer;
     background: var(--accent); color: var(--ground); border: 1px solid var(--accent); border-radius: 6px;
@@ -166,7 +195,7 @@
     font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
   #result .none { color: var(--dim); }
   #result .err { color: var(--warn-ink); }
-  #result .sub-h { font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
+  .sub-h { font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
     margin: 12px 0 2px; padding-top: 10px; border-top: 1px solid var(--line); }
   #result table { font-size: 12.5px; }
   #result td { padding: 5px 8px 5px 0; }
@@ -175,46 +204,22 @@
   .bad { color: var(--warn-ink); }
   .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
 
-  /* ---------- content ---------- */
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-  @media (max-width: 760px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
-  .card h3 { margin-top: 0; }
-  .card p { color: var(--dim); font-size: 14px; }
-  .step-num { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
-    border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 12px;
-    font-weight: 700; margin-right: 8px; }
-  pre {
-    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
-    padding: 12px 14px; overflow-x: auto; font-size: 12.5px; line-height: 1.55; margin: 8px 0;
-  }
-  pre .c { color: var(--dim); }
-  pre .p { color: var(--accent); }
-  .facts { width: 100%; border-collapse: collapse; font-size: 14px; }
-  .facts td { padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: normal; }
-  .facts tr:last-child td { border-bottom: 0; }
-  .facts td:first-child { color: var(--dim); width: 38%; }
-  .facts td.num, .facts b { font-variant-numeric: tabular-nums; }
-  ul.clean { margin: 8px 0; padding-left: 20px; }
-  ul.clean li { margin: 5px 0; color: var(--dim); }
-  ul.clean li b { color: var(--ink); }
+  /* ---------- validators + tx feed ---------- */
+  .sig-yes { color: var(--ok); font-weight: 600; font-size: 12.5px; }
+  .sig-no { color: var(--dim); font-size: 12.5px; }
+  .badge { font-size: 11px; font-weight: 650; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid transparent; white-space: nowrap; }
+  .badge.bond { color: var(--ok); background: var(--ok-bg); }
+  .badge.jail { color: var(--warn-ink); background: var(--warn-bg); }
+  .badge.off  { color: var(--dim); background: var(--panel-2); border-color: var(--line); }
+  .badge.pend { color: var(--accent); background: var(--accent-soft); }
+  .copy { cursor: pointer; color: var(--dim); font-size: 11px; margin-left: 6px; user-select: none; }
+  .copy:hover { color: var(--accent); }
+  .none { color: var(--dim); }
 
-  .links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
-  .linkcard {
-    display: flex; align-items: center; gap: 10px; padding: 11px 15px; border-radius: 8px;
-    background: var(--panel); border: 1px solid var(--line); color: var(--ink); font-size: 14px; font-weight: 600;
-  }
-  .linkcard:hover { border-color: var(--accent); text-decoration: none; }
-  .linkcard span { color: var(--dim); font-weight: 400; font-size: 12.5px; }
-
-  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--line);
+  footer { margin-top: 44px; padding-top: 16px; border-top: 1px solid var(--line);
     color: var(--dim); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
   footer .sep { opacity: .5; }
-  /* Partner badge — pushed to the far end. Shown at the wordmark's own 220x43: it is a 220x43
-     PNG, so any other height either wastes resolution or upscales into a soft edge, and at the
-     14px it started at it was a grey smudge nobody could read. `max-width` keeps it inside a
-     narrow phone; the aspect ratio then does the rest. */
   .listing { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; opacity: .85;
     transition: opacity .15s ease; }
   .listing:hover { opacity: 1; text-decoration: none; }
@@ -228,80 +233,70 @@
       <img src="/logo.png" alt="Helix" width="24" height="24">Helix
     </a>
     <nav>
-      <a href="#network">Network</a>
-      <a href="#explorer">Explorer</a>
-      <a href="#start">Get&nbsp;started</a>
-      <a href="#node">Run&nbsp;a&nbsp;node</a>
-      <a href="#tokenomics">Tokenomics</a>
-      <a href="#tech">Technology</a>
-      <a href="#resources">Resources</a>
+      <a href="https://github.com/silvra-net/helix">GitHub <span>· source &amp; releases</span></a>
+      <a href="https://github.com/silvra-net/helix#readme">README <span>· docs</span></a>
+      <a href="https://discord.gg/cUwz3fVHw">Discord <span>· community</span></a>
     </nav>
   </div>
 </div>
 
 <main id="top">
-  <!-- ===================== HERO ===================== -->
-  <section class="hero">
-    <h1>The <span class="g">post-quantum</span> blockchain.</h1>
-    <p class="tagline">
-      Helix (HLX) is a Layer-1 blockchain written in Rust. Every signature uses NIST&nbsp;FIPS&nbsp;204
-      (ML-DSA-65), so the ledger stays secure even against a quantum computer. Proof-of-stake, BFT
-      consensus, two-second blocks. Made in Germany 🇩🇪.
+  <!-- ===================== MASTHEAD ===================== -->
+  <section class="intro">
+    <h1>Helix <span class="g">block explorer</span></h1>
+    <p class="desc">
+      <b>Helix (HLX)</b> is a post-quantum Layer-1 blockchain in Rust — every signature is NIST
+      FIPS&nbsp;204 (ML-DSA-65), consensus is proof-of-stake BFT with ~2s blocks. Everything below
+      is read live from this node, no third party in between. New here? Start with the
+      <a href="https://github.com/silvra-net/helix#readme">README</a>.
     </p>
     <div class="chips">
-      <span class="chip">Signatures <b>ML-DSA-65</b> · FIPS&nbsp;204</span>
+      <span class="chip">Signatures <b>ML-DSA-65</b></span>
       <span class="chip">Hash <b>BLAKE3</b></span>
-      <span class="chip"><b>PoS + BFT</b> consensus</span>
+      <span class="chip"><b>PoS + BFT</b></span>
       <span class="chip"><b>~2s</b> blocks</span>
-      <span class="chip">Fixed cap <b>33M HLX</b></span>
+      <span class="chip">Cap <b>33M HLX</b></span>
       <span class="chip">Node <b id="ver">…</b></span>
     </div>
-    <div class="cta">
-      <a class="btn" href="#start">Get started</a>
-      <a class="btn ghost" href="#node">Run a node</a>
-      <a class="btn ghost" href="https://github.com/silvra-net/helix">Source on GitHub</a>
-    </div>
-
     <div class="warn">
       <strong>Public test network.</strong> HLX here is a <strong>test token with no monetary
-      value.</strong> The chain can be reset from genesis, and one validator currently secures the
-      network, so it tolerates zero faults today — decentralization is the goal, not yet the state.
-      There has been no external security audit. Explore it, run a node, build against it — just
-      don't hold anything you'd mind losing.
+      value.</strong> The chain can be reset from genesis and the validator set is small, so it
+      tolerates zero faults today — decentralization is the goal, not yet the state. No external
+      security audit. Explore it, run a node, build against it — just don't hold anything you'd mind losing.
     </div>
-  </section>
-
-  <!-- ===================== LIVE NETWORK ===================== -->
-  <section id="network">
-    <div class="lead">Live network</div>
-    <h2>The chain, right now</h2>
-    <p class="muted">Updates every few seconds, straight from this node — no third party in between.</p>
-    <div class="strip" id="strip"></div>
   </section>
 
   <!-- ===================== EXPLORER ===================== -->
   <section id="explorer">
-    <div class="lead">Explorer</div>
+    <div class="lead">Live chain</div>
     <h2>Follow the chain</h2>
+    <div class="healthbar" id="health"><span class="pill slow"><span class="dot"></span>loading…</span></div>
+    <div class="strip" id="strip"></div>
+
     <div class="cols">
       <div>
-        <div class="sub-title">Latest blocks</div>
+        <div class="sub-title">Blocks</div>
         <div class="panel scroll">
           <table>
             <thead><tr><th>Height</th><th>Age</th><th>Txs</th><th>Proposer</th><th>Hash</th></tr></thead>
             <tbody id="blocks"><tr><td colspan="5" class="hash">loading…</td></tr></tbody>
           </table>
         </div>
+        <div class="pager">
+          <button class="pg" id="blocks-newer" disabled>‹ Newer</button>
+          <span class="pg-info" id="blocks-info"></span>
+          <button class="pg" id="blocks-older">Older ›</button>
+        </div>
       </div>
       <div>
         <div class="sub-title">Look up</div>
         <form id="lookup">
-          <input id="q" placeholder="address, tx hash, or block height" autocomplete="off"
-                 aria-label="address, transaction hash, or block height">
+          <input id="q" placeholder="address, name.hlx, tx hash, or block height" autocomplete="off"
+                 aria-label="address, .hlx name, transaction hash, or block height">
           <button type="submit">Find</button>
         </form>
         <div class="panel" id="result">
-          <div class="none">An <code>hlx…</code> address, a 64-character transaction hash, or a block number.</div>
+          <div class="none">An <code>hlx…</code> address, a <code>name.hlx</code>, a 64-character transaction hash, or a block number.</div>
         </div>
         <div class="hint">Amounts are shown in HLX. One HLX is 1,000,000,000 nano-HLX, and the chain counts in nano.</div>
 
@@ -321,158 +316,56 @@
     </div>
   </section>
 
-  <!-- ===================== GET STARTED ===================== -->
-  <section id="start">
-    <div class="lead">Get started</div>
-    <h2>Send your first HLX in three steps</h2>
-    <p class="muted">
-      Everything runs from one binary, <code>helix</code>. Download it for your OS from the
-      <a href="https://github.com/silvra-net/helix/releases">latest release</a>
-      (<code>linux-x86_64</code>, <code>macos-arm64</code>, <code>windows-x86_64</code>). Out of the
-      box it talks to this network — no configuration needed.
-    </p>
-    <div class="grid3">
-      <div class="card">
-        <h3><span class="step-num">1</span>Make a wallet</h3>
-        <p>Creates a key and prints a 24-word recovery phrase. Write the phrase down once — it is the only backup.</p>
-        <pre><span class="p">helix</span> wallet new</pre>
-      </div>
-      <div class="card">
-        <h3><span class="step-num">2</span>Check your balance</h3>
-        <p>Look up any address — yours or someone else's — for balance, stake and history.</p>
-        <pre><span class="p">helix</span> account <span class="c">&lt;your-address&gt;</span></pre>
-      </div>
-      <div class="card">
-        <h3><span class="step-num">3</span>Send some HLX</h3>
-        <p>Pay a raw address or a <code>name.hlx</code>. The fee is priced from the chain automatically.</p>
-        <pre><span class="p">helix</span> tx send <span class="c">&lt;to&gt; &lt;amount&gt;</span>
-<span class="p">helix</span> tx status <span class="c">&lt;hash&gt;</span></pre>
-      </div>
+  <!-- ===================== TRANSACTIONS ===================== -->
+  <section id="transactions">
+    <div class="lead">Activity</div>
+    <h2>Transactions</h2>
+    <div class="panel" id="txs"><div class="none" style="padding:13px">loading…</div></div>
+    <div class="pager">
+      <button class="pg" id="tx-newer" disabled>‹ Newer</button>
+      <span class="pg-info" id="tx-info"></span>
+      <button class="pg" id="tx-older">Older ›</button>
     </div>
-    <p class="muted" style="margin-top:14px">
-      Lost a wallet? <code>helix wallet restore</code> rebuilds it from the 24 words. Point any command at
-      a different node with <code>--node&nbsp;&lt;url&gt;</code> — the default is
-      <code>https://helix.silvra.net</code>.
-    </p>
+    <div class="hint">This is a quiet devnet — most blocks are empty, so a page can hold no transactions. Page back through history with Older.</div>
   </section>
 
-  <!-- ===================== RUN A NODE ===================== -->
-  <section id="node">
-    <div class="lead">Run a node</div>
-    <h2>Join the network</h2>
-    <div class="grid2">
-      <div>
-        <p class="muted">
-          A node with no configuration joins <em>this</em> chain automatically: it fetches genesis
-          from a seed peer, <strong>recomputes the genesis state hash itself</strong> before trusting
-          anything, syncs the history, and then follows live.
-        </p>
-        <pre><span class="c"># download the binary, then just:</span>
-<span class="p">helix</span> start</pre>
-        <p class="muted">
-          Running from behind a home connection or Cloudflare? Helix speaks libp2p over WebSocket, so
-          a node can gossip through an HTTPS tunnel on port 443 — no open inbound port required. See
-          the README for the reverse-proxy setup.
-        </p>
-        <p class="muted">
-          Want your own private chain instead of joining this one? Start with
-          <code>HELIX_NEW_CHAIN=1</code> for a standalone genesis.
-        </p>
-      </div>
-      <div class="card">
-        <h3>Becoming a validator</h3>
-        <ul class="clean">
-          <li>Stake at least <b>100,000 HLX</b> to enter the validator set.</li>
-          <li>Don't have a machine to run? <b>Delegate</b> to a validator and earn a share of the rewards, auto-compounded.</li>
-          <li>Unstaking has a <b>7-day</b> unbonding period; double-signing is slashed <b>5%</b> and jailed immediately.</li>
-        </ul>
-        <pre><span class="p">helix</span> tx stake <span class="c">&lt;amount&gt;</span>
-<span class="p">helix</span> tx delegate <span class="c">&lt;validator&gt; &lt;amount&gt;</span></pre>
-      </div>
+  <!-- ===================== VALIDATORS ===================== -->
+  <section id="validators">
+    <div class="lead">Consensus</div>
+    <h2>Who secures the chain</h2>
+    <p class="muted"><span class="sig-yes">● signing</span> means the address attested one of the last blocks;
+      <span class="sig-no">— silent</span> means it did not — staked but not currently co-signing. Quorum needs
+      2/3 of the voting power, so a silent validator in a small set can halt the chain.</p>
+    <div class="panel scroll">
+      <table>
+        <thead><tr><th>Validator</th><th>Self-stake</th><th>Effective</th><th>Participation</th><th>Missed</th><th>Status</th></tr></thead>
+        <tbody id="vals"><tr><td colspan="6" class="hash">loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <button class="pg" id="vals-newer" disabled>‹ Prev</button>
+      <span class="pg-info" id="vals-info"></span>
+      <button class="pg" id="vals-older">Next ›</button>
     </div>
   </section>
 
-  <!-- ===================== TOKENOMICS ===================== -->
-  <section id="tokenomics">
-    <div class="lead">Tokenomics</div>
-    <h2>How HLX is issued</h2>
-    <div class="grid2">
-      <div>
-        <table class="facts">
-          <tr><td>Maximum supply</td><td><b>33,000,000 HLX</b> (a hard cap)</td></tr>
-          <tr><td>Block reward</td><td><b>1 HLX</b> per block, halving every 15,768,000 blocks (~1 year)</td></tr>
-          <tr><td>Block time</td><td>~2 seconds</td></tr>
-          <tr><td>Transaction fee</td><td>EIP-1559 base fee (per byte, <b>burned</b>) + tip to the validator</td></tr>
-          <tr><td>Min. validator stake</td><td>100,000 HLX</td></tr>
-          <tr><td>Unbonding period</td><td>7 days</td></tr>
-          <tr><td>Slashing</td><td>5% + immediate jail for double-signing</td></tr>
-        </table>
-      </div>
-      <div>
-        <p class="muted">
-          There was no pre-mine dumped to a founder wallet. The supply enters circulation gradually
-          through block rewards, Bitcoin-style — a halving schedule under a fixed 33M cap.
-        </p>
-        <p class="muted">
-          Fees follow Ethereum's model: a per-byte base fee is <strong>burned</strong> (removing HLX
-          from supply), and anything above it tips the validator. Higher demand burns more, so the
-          money supply is disinflationary by design.
-        </p>
-        <p class="muted">
-          Staking, delegation and governance are three separate rights: delegators earn yield but
-          governance votes stay with self-stakers. Validator commission is capped at 50%.
-        </p>
-      </div>
+  <!-- ===================== GOVERNANCE ===================== -->
+  <section id="governance">
+    <div class="lead">Governance</div>
+    <h2>Parameter proposals</h2>
+    <p class="muted">On-chain votes to change protocol parameters (like the minimum validator stake).
+      A proposal needs 2/3 of the stake in favour within the voting period to pass.</p>
+    <div class="panel scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Change</th><th>Proposer</th><th>Yes votes</th><th>Yes stake</th><th>Status</th></tr></thead>
+        <tbody id="gov"><tr><td colspan="6" class="hash">loading…</td></tr></tbody>
+      </table>
     </div>
-  </section>
-
-  <!-- ===================== TECHNOLOGY ===================== -->
-  <section id="tech">
-    <div class="lead">Technology</div>
-    <h2>What's under the hood</h2>
-    <div class="grid3">
-      <div class="card">
-        <h3>Post-quantum crypto</h3>
-        <p>Signatures are <b>ML-DSA-65</b> (NIST FIPS&nbsp;204); <b>SLH-DSA</b> (FIPS&nbsp;205) is available as a hash-based alternate. Hashing is <b>BLAKE3</b>. No home-rolled crypto — only vetted crates.</p>
-      </div>
-      <div class="card">
-        <h3>BFT consensus</h3>
-        <p>Proof-of-stake with a Tendermint-style BFT engine: 2/3+1 quorum per round, cross-round vote locking for safety, and deterministic slashing evidence on-chain.</p>
-      </div>
-      <div class="card">
-        <h3>Smart contracts</h3>
-        <p>Deterministic WASM (floats disabled by construction), fuel-metered, with host imports for storage and value transfer — no cross-contract calls, so reentrancy can't exist.</p>
-      </div>
-      <div class="card">
-        <h3>Human-readable names</h3>
-        <p>Register a <code>name.hlx</code> and receive to it instead of a raw address. Resolvable across the network and from the wallet.</p>
-      </div>
-      <div class="card">
-        <h3>Accounts that recover</h3>
-        <p>Social recovery via guardians, proof-of-personhood for sybil resistance, and on-chain governance over protocol parameters.</p>
-      </div>
-      <div class="card">
-        <h3>Honest by default</h3>
-        <p>Every transaction carries a verifiable receipt; the node exposes a deterministic state hash so any two nodes can prove they computed the same ledger.</p>
-      </div>
+    <div class="pager">
+      <button class="pg" id="gov-newer" disabled>‹ Newer</button>
+      <span class="pg-info" id="gov-info"></span>
+      <button class="pg" id="gov-older">Older ›</button>
     </div>
-  </section>
-
-  <!-- ===================== RESOURCES ===================== -->
-  <section id="resources">
-    <div class="lead">Resources</div>
-    <h2>Dig deeper</h2>
-    <div class="links">
-      <a class="linkcard" href="https://github.com/silvra-net/helix">GitHub <span>· source &amp; releases</span></a>
-      <a class="linkcard" href="https://discord.gg/cUwz3fVHw">Discord <span>· community</span></a>
-      <a class="linkcard" href="https://bitcointalk.org/index.php?topic=5588803">Bitcointalk <span>· announcement</span></a>
-      <a class="linkcard" href="/status">REST API <span>· /status, /genesis, …</span></a>
-      <a class="linkcard" href="/logo.png">Logo <span>· brand asset (PNG)</span></a>
-    </div>
-    <p class="muted" style="margin-top:14px">
-      The full CLI tour, node deployment guide and API reference live in the
-      <a href="https://github.com/silvra-net/helix#readme">README</a>.
-    </p>
   </section>
 
   <footer>
@@ -489,8 +382,21 @@
 </main>
 
 <script>
+  // Same-origin by default (the node serves this page). Set to an absolute node URL only for
+  // previewing the page off a node — the API sends permissive CORS, so a copy served elsewhere
+  // can point here and still load live data.
+  const API_BASE = '';
+
+  // Page sizes. Blocks and transactions paginate server-side over height ranges (they grow without
+  // bound); the validator set paginates client-side over one /validators response.
+  const BLOCK_PAGE = 15, TX_WINDOW = 25, VAL_PAGE = 20;
+
   const $ = (id) => document.getElementById(id);
-  const NANO = 1e9;
+
+  // Live state shared across renders. `tip` is the chain height from the last /status. Each list
+  // keeps its own page; page 0 follows the tip live, deeper pages are historical and static.
+  let tip = 0, blocksPage = 0, txPage = 0, valPage = 0, govPage = 0;
+  let valsCache = [], signersCache = new Set(), govCache = [];
 
   const fmtHlx = (n) => (n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 9 });
   const short = (s, n = 10) => (s && s.length > n * 2 ? s.slice(0, n) + '…' + s.slice(-6) : s || '');
@@ -503,16 +409,11 @@
   const link = (q, text) => `<a href="#${encodeURIComponent(q)}">${esc(text ?? q)}</a>`;
 
   // Block timestamps are milliseconds since the epoch, stamped by the proposer.
-  //
-  // The list shows the age rather than the clock time, because the question people actually
-  // bring to a block list is "is this chain alive?", and "8s ago" answers it where
-  // "14:31:02" does not. The absolute time is one hover away, and in the block view.
   const fmtAbs = (ms) => new Date(ms).toLocaleString();
   const fmtAge = (ms) => {
     const secs = Math.round((Date.now() - ms) / 1000);
     // A block stamped in the future means the proposer's clock is ahead of the viewer's. Say so
-    // instead of clamping it to "0s ago": consensus depends on those clocks, so a skew big
-    // enough to notice is worth showing. A second or two is ordinary jitter, not news.
+    // instead of clamping it to "0s ago": consensus depends on those clocks.
     if (secs < -2) return 'clock ' + (-secs) + 's ahead';
     const s = Math.max(0, secs);
     if (s < 60) return s + 's ago';
@@ -524,17 +425,189 @@
   };
 
   async function api(path) {
-    const r = await fetch(path, { headers: { Accept: 'application/json' } });
+    const r = await fetch(API_BASE + path, { headers: { Accept: 'application/json' } });
     if (!r.ok) throw new Error(r.status === 404 ? 'not found' : 'HTTP ' + r.status);
     return r.json();
   }
 
   const cell = (k, v, small) =>
     `<div class="cell"><div class="k">${esc(k)}</div><div class="v${small ? ' small' : ''}">${esc(v)}</div></div>`;
+  const hstat = (k, v) => `<span class="hstat">${esc(k)}<b>${esc(v)}</b></span>`;
+  // A click-to-copy affordance next to a full value. A single delegated listener (bottom of the
+  // script) does the copying, so this is just markup carrying the text in a data attribute.
+  const copyBtn = (text) => `<span class="copy" data-copy="${esc(text)}" title="Copy" role="button" tabindex="0">⧉</span>`;
 
+  function setPager(prefix, hasNewer, hasOlder, info) {
+    $(prefix + '-newer').disabled = !hasNewer;
+    $(prefix + '-older').disabled = !hasOlder;
+    $(prefix + '-info').textContent = info;
+  }
+
+  // ------- blocks (server-side height pagination) -------
+  function renderBlocks(blocks) {
+    const rows = blocks.slice().sort((a, b) => b.height - a.height);
+    $('blocks').innerHTML = rows.map((b) => `<tr>
+        <td class="num">${link(b.height, b.height.toLocaleString())}</td>
+        <td class="age" title="${b.timestamp != null ? esc(fmtAbs(b.timestamp)) : ''}">${
+          b.timestamp != null ? esc(fmtAge(b.timestamp)) : '—'}</td>
+        <td class="num">${b.tx_count != null ? b.tx_count : (b.transactions ? b.transactions.length : 0)}</td>
+        <td class="hash">${link(b.validator, short(b.validator, 8))}</td>
+        <td class="hash">${link(b.height, short(b.hash, 8))}</td>
+      </tr>`).join('') || '<tr><td colspan="5" class="hash">no blocks yet</td></tr>';
+  }
+
+  async function loadBlocks(page) {
+    if (page < 0) page = 0;
+    blocksPage = page;
+    const start = Math.max(0, tip - (page + 1) * BLOCK_PAGE + 1);
+    const count = Math.min(BLOCK_PAGE, tip - start + 1);
+    const blocks = await api(`/blocks/range?from=${start}&count=${count}`).catch(() => []);
+    renderBlocks(blocks);
+    const lo = blocks.length ? Math.min(...blocks.map((b) => b.height)) : start;
+    const hi = blocks.length ? Math.max(...blocks.map((b) => b.height)) : start;
+    setPager('blocks', page > 0, start > 0,
+      blocks.length ? `#${lo.toLocaleString()} – #${hi.toLocaleString()}` : '—');
+  }
+
+  // "Live / Slow / Stalled" answers the one question a block list is really asked — is this chain
+  // alive? — from the age of the newest block. Block time is the median gap over the window,
+  // robust to a single long round. Fed the recent block headers (they carry height + timestamp).
+  function renderHealth(headers, s) {
+    const el = $('health');
+    if (!headers || !headers.length) { el.innerHTML = `<span class="pill stalled"><span class="dot"></span>No blocks</span>`; return; }
+    const sorted = headers.slice().sort((a, b) => a.height - b.height);
+    const tipH = sorted[sorted.length - 1];
+    const deltas = [];
+    for (let i = 1; i < sorted.length; i++) {
+      const d = sorted[i].timestamp - sorted[i - 1].timestamp;
+      if (d > 0 && d < 600000) deltas.push(d);
+    }
+    deltas.sort((a, b) => a - b);
+    const med = deltas.length ? deltas[Math.floor(deltas.length / 2)] / 1000 : null;
+    const stale = (Date.now() - tipH.timestamp) / 1000;
+    let cls, label;
+    if (stale > 30) { cls = 'stalled'; label = 'Stalled'; }
+    else if (stale > 10 || (med != null && med > 6)) { cls = 'slow'; label = 'Slow'; }
+    else { cls = 'live'; label = 'Live'; }
+    el.innerHTML =
+      `<span class="pill ${cls}"><span class="dot"></span>${label}</span>` +
+      hstat('Height', s.height.toLocaleString()) +
+      hstat('Block time', med != null ? '~' + med.toFixed(1) + 's' : '—') +
+      hstat('Last block', fmtAge(tipH.timestamp)) +
+      hstat('Peers', s.peer_count.toLocaleString()) +
+      hstat('Mempool', (s.mempool_size != null ? s.mempool_size : 0).toLocaleString() + (s.mempool_size === 1 ? ' tx' : ' txs'));
+  }
+
+  // ------- transactions (paginate over block windows) -------
+  function renderLatestTx(blocks, fromH, toH) {
+    const txs = [];
+    for (const b of blocks.slice().sort((a, b) => b.height - a.height)) {
+      for (const t of (b.transactions || [])) txs.push(Object.assign({ _h: b.height }, t));
+    }
+    if (!txs.length) {
+      $('txs').innerHTML = `<div class="none" style="padding:13px">No transactions in blocks #${fromH.toLocaleString()}–#${toH.toLocaleString()}.</div>`;
+      return;
+    }
+    $('txs').innerHTML = '<div class="scroll"><table>' +
+      '<thead><tr><th>Tx</th><th>Type</th><th>From</th><th>To</th><th>Amount</th><th>Block</th></tr></thead><tbody>' +
+      txs.map((t) => {
+        const failed = t.status === 'failed';
+        return `<tr>
+          <td class="hash">${link(t.hash, short(t.hash, 6))}</td>
+          <td class="dir${failed ? ' bad' : ''}">${esc(t.tx_type || '')}${failed ? ' · failed' : ''}</td>
+          <td class="hash">${t.from ? link(t.from, short(t.from, 6)) : '—'}</td>
+          <td class="hash">${t.to ? link(t.to, short(t.to, 6)) : '—'}</td>
+          <td class="num${failed ? ' bad' : ''}">${t.amount_hlx != null ? esc(fmtHlx(t.amount_hlx)) : ''}</td>
+          <td class="num">${link(t._h, t._h.toLocaleString())}</td>
+        </tr>`;
+      }).join('') + '</tbody></table></div>';
+  }
+
+  async function loadTx(page) {
+    if (page < 0) page = 0;
+    txPage = page;
+    const start = Math.max(0, tip - (page + 1) * TX_WINDOW + 1);
+    const count = Math.min(TX_WINDOW, tip - start + 1);
+    const blocks = await api(`/blocks/range?from=${start}&count=${count}`).catch(() => []);
+    const hi = start + count - 1;
+    renderLatestTx(blocks, start, hi);
+    setPager('tx', page > 0, start > 0, `blocks #${start.toLocaleString()} – #${hi.toLocaleString()}`);
+  }
+
+  // ------- validators (client-side pagination over one /validators response) -------
+  // A validator "signed recently" if its address is in the last_commit of any of the last few
+  // blocks. That is the honest counterpart to the `active` flag, which only means "staked over
+  // the minimum", not "currently participating".
+  function renderValsPage(page) {
+    const total = valsCache.length;
+    const pages = Math.max(1, Math.ceil(total / VAL_PAGE));
+    if (page < 0) page = 0;
+    if (page > pages - 1) page = pages - 1;
+    valPage = page;
+    const slice = valsCache.slice(page * VAL_PAGE, page * VAL_PAGE + VAL_PAGE);
+    if (!slice.length) {
+      $('vals').innerHTML = '<tr><td colspan="6" class="hash">no validators</td></tr>';
+      setPager('vals', false, false, '—');
+      return;
+    }
+    $('vals').innerHTML = slice.map((v) => {
+      const jailed = v.jailed_until != null && v.jailed_until > tip;
+      let st, sc;
+      if (jailed) { st = 'Jailed · #' + v.jailed_until; sc = 'jail'; }
+      else if (v.active === false) { st = 'Inactive'; sc = 'off'; }
+      else { st = 'Bonded'; sc = 'bond'; }
+      const signed = signersCache.has(v.address);
+      return `<tr>
+        <td class="hash">${link(v.address, short(v.address, 10))}</td>
+        <td class="num">${fmtHlx(v.self_staked_hlx || 0)}</td>
+        <td class="num">${fmtHlx(v.effective_stake_hlx || 0)}</td>
+        <td>${signed ? '<span class="sig-yes">● signing</span>' : '<span class="sig-no">— silent</span>'}</td>
+        <td class="num">${v.missed_blocks != null ? v.missed_blocks : 0}</td>
+        <td><span class="badge ${sc}">${esc(st)}</span></td>
+      </tr>`;
+    }).join('');
+    const lo = page * VAL_PAGE + 1, hi = Math.min(total, page * VAL_PAGE + slice.length);
+    setPager('vals', page > 0, page < pages - 1, `${lo}–${hi} of ${total.toLocaleString()}`);
+  }
+
+  // ------- governance (client-side pagination over one fetch) -------
+  // new_value is a raw u64: nano-HLX for stake params, a plain number otherwise. Format the
+  // stake ones as HLX so a "min validator stake" proposal doesn't read as 5,000,000,000,000.
+  function govValue(param, v) {
+    return /stake/i.test(param) ? fmtHlx(v / 1e9) + ' HLX' : v.toLocaleString();
+  }
+  function renderGovPage(page) {
+    const total = govCache.length;
+    if (!total) {
+      $('gov').innerHTML = '<tr><td colspan="6" class="none" style="padding:13px">No governance proposals yet.</td></tr>';
+      setPager('gov', false, false, '—');
+      return;
+    }
+    const pages = Math.max(1, Math.ceil(total / VAL_PAGE));
+    if (page < 0) page = 0;
+    if (page > pages - 1) page = pages - 1;
+    govPage = page;
+    const slice = govCache.slice(page * VAL_PAGE, page * VAL_PAGE + VAL_PAGE);
+    $('gov').innerHTML = slice.map((p) => {
+      const st = p.executed ? '<span class="badge bond">Executed</span>' : '<span class="badge pend">Open</span>';
+      return `<tr>
+        <td class="num">${p.id.toLocaleString()}</td>
+        <td>${esc(p.param)} → <b>${esc(govValue(p.param, p.new_value))}</b></td>
+        <td class="hash">${link(p.proposer, short(p.proposer, 8))}</td>
+        <td class="num">${p.yes_votes.toLocaleString()}</td>
+        <td class="num">${fmtHlx(p.yes_stake_hlx)} HLX</td>
+        <td>${st}</td>
+      </tr>`;
+    }).join('');
+    const lo = page * VAL_PAGE + 1, hi = Math.min(total, page * VAL_PAGE + slice.length);
+    setPager('gov', page > 0, page < pages - 1, `${lo}–${hi} of ${total.toLocaleString()}`);
+  }
+
+  // ------- the 4s tick -------
   async function refresh() {
     try {
       const s = await api('/status');
+      tip = s.height;
       $('ver').textContent = 'v' + s.version;
       // Only offer the faucet where one exists. A node serving this page from someone else's
       // machine usually has none, and an offer that 404s is worse than no offer.
@@ -543,33 +616,41 @@
         $('faucet-box').hidden = false;
       }
       $('strip').innerHTML =
-        cell('Height', s.height.toLocaleString()) +
         cell('Circulating', fmtHlx(s.circulating_supply_hlx) + ' HLX') +
         cell('Burned', fmtHlx(s.total_burned_hlx) + ' HLX') +
         cell('Base fee', s.base_fee_per_byte + ' nano/byte') +
         cell('Accounts', s.total_accounts.toLocaleString()) +
-        cell('Peers', s.peer_count.toLocaleString()) +
         cell('State hash', short(s.state_hash, 8), true);
 
-      const top = s.height;
-      const heights = [];
-      for (let h = top; h > Math.max(-1, top - 12); h--) heights.push(h);
-      const blocks = await Promise.all(heights.map((h) => api('/blocks/height/' + h).catch(() => null)));
-      $('blocks').innerHTML = blocks.filter(Boolean).map((b) => `<tr>
-            <td class="num">${link(b.height, b.height.toLocaleString())}</td>
-            <td class="age" title="${b.timestamp != null ? esc(fmtAbs(b.timestamp)) : ''}">${
-              b.timestamp != null ? esc(fmtAge(b.timestamp)) : '—'}</td>
-            <td class="num">${b.transactions ? b.transactions.length : 0}</td>
-            <td class="hash">${link(b.validator, short(b.validator, 8))}</td>
-            <td class="hash">${link(b.height, short(b.hash, 8))}</td>
-          </tr>`).join('') || '<tr><td colspan="5" class="hash">no blocks yet</td></tr>';
+      // Recent headers drive both the health readout and the validator participation set.
+      const hs = [];
+      for (let h = tip; h > Math.max(-1, tip - 10); h--) hs.push(h);
+      const headers = (await Promise.all(hs.map((h) => api('/blocks/height/' + h + '/header').catch(() => null)))).filter(Boolean);
+      renderHealth(headers, s);
+      signersCache = new Set();
+      headers.forEach((hd) => (hd.last_commit || []).forEach((a) => signersCache.add(a)));
+
+      // Live-follow the tip only on page 0; a reader who paged back into history stays there.
+      if (blocksPage === 0) await loadBlocks(0);
+      if (txPage === 0) await loadTx(0);
+
+      const v = await api('/validators').catch(() => ({ validators: [] }));
+      valsCache = (v.validators || []).slice().sort((a, b) => (b.effective_stake_hlx || 0) - (a.effective_stake_hlx || 0));
+      renderValsPage(valPage);
+
+      const g = await api('/governance/proposals?limit=200').catch(() => ({ proposals: [] }));
+      govCache = (g.proposals || []).slice().sort((a, b) => b.id - a.id);
+      renderGovPage(govPage);
     } catch (e) {
-      $('strip').innerHTML = cell('Node', 'unreachable', true);
+      $('health').innerHTML = `<span class="pill stalled"><span class="dot"></span>Node unreachable</span>`;
     }
   }
 
+  // ------- lookup -------
   const row = (k, v) => `<div class="row"><span>${esc(k)}</span><span>${esc(v)}</span></div>`;
   const rowLink = (k, q, text) => `<div class="row"><span>${esc(k)}</span><span>${link(q, text)}</span></div>`;
+  // Like row(), but the value is already-safe HTML (for a copy button or a link next to a value).
+  const rowRaw = (k, vHtml) => `<div class="row"><span>${esc(k)}</span><span>${vHtml}</span></div>`;
 
   // The transactions in a block, or an account's history. `self` is the address being viewed, if
   // any: rows are then pointed in/out from it and name the other party. The type stays on every row
@@ -581,8 +662,6 @@
       const out = self && t.from === self;
       const other = self ? (out ? t.to : t.from) : t.from;
       const arrow = self ? (out ? '→ ' : '← ') : '';
-      // A rejected transaction is in the block and charged like any other; left unmarked it reads
-      // as a payment that went through.
       const failed = t.status === 'failed';
       return `<tr>
         <td class="hash">${link(t.hash, short(t.hash, 6))}</td>
@@ -593,15 +672,31 @@
     }).join('') + '</table></div>';
   }
 
-  function showBlock(b) {
+  // last_commit in block N attests block N-1, so to show who signed block H we read the certificate
+  // carried by H+1. `signers === null` means "not attested yet" — H is the tip, no next block exists.
+  function showBlock(b, signers) {
     const txs = b.transactions || [];
+    let sig = '';
+    if (signers === null) sig = `<div class="sub-h">Signed by</div><div class="row"><span></span><span class="none">not attested yet (chain tip)</span></div>`;
+    else if (!signers.length) sig = `<div class="sub-h">Signed by</div><div class="row"><span></span><span class="none">empty certificate</span></div>`;
+    else sig = `<div class="sub-h">Signed by (${signers.length})</div>` +
+      signers.map((a) => `<div class="row"><span></span><span>${link(a, short(a, 10))}</span></div>`).join('');
     $('result').innerHTML =
       row('Block', b.height.toLocaleString()) +
       (b.timestamp != null ? row('Time', fmtAbs(b.timestamp) + '  (' + fmtAge(b.timestamp) + ')') : '') +
-      row('Hash', b.hash) +
+      rowRaw('Hash', esc(b.hash) + copyBtn(b.hash)) +
       rowLink('Proposer', b.validator, b.validator) +
       row('Base fee', b.base_fee_per_byte + ' nano/byte') +
+      sig +
       `<div class="sub-h">Transactions (${txs.length})</div>` + txTable(txs);
+  }
+
+  // Fetches the certificate for block H from H+1's header, tolerating the tip (no next block).
+  async function signersOf(height) {
+    try {
+      const hd = await api('/blocks/height/' + (height + 1) + '/header');
+      return hd.last_commit || [];
+    } catch (e) { return null; }
   }
 
   async function lookup(q) {
@@ -610,15 +705,18 @@
     if (!q) return;
     out.innerHTML = '<div class="none">looking…</div>';
     try {
-      if (/^\d+$/.test(q)) { showBlock(await api('/blocks/height/' + q)); return; }
+      if (/^\d+$/.test(q)) {
+        const b = await api('/blocks/height/' + q);
+        showBlock(b, await signersOf(b.height));
+        return;
+      }
       if (/^[0-9a-fA-F]{64}$/.test(q)) {
         // 64 hex is either a transaction or a block hash — the shape can't say which. Try the
         // transaction first (far commoner), then fall back to the block.
         let t = null;
         try { t = await api('/transactions/' + q); }
-        catch (e) { showBlock(await api('/blocks/hash/' + q)); return; }
-        // `unknown` = a node with no receipt for this tx (blocks committed before receipts were
-        // stored). It means "cannot say", not "fine", so it must not be dressed up as either.
+        catch (e) { const b = await api('/blocks/hash/' + q); showBlock(b, await signersOf(b.height)); return; }
+        // `unknown` = a node with no receipt for this tx. It means "cannot say", not "fine".
         const failed = t.status === 'failed';
         out.innerHTML =
           `<div class="row"><span>Status</span><span class="${failed ? 'bad' : ''}">${esc(t.status || 'unknown')}</span></div>` +
@@ -634,18 +732,38 @@
           (t.nonce != null ? row('Nonce', t.nonce) : '');
         return;
       }
-      const a = await api('/accounts/' + q);
-      // History is a second call; a failing one must not take the balance down with it.
+      // An hlx… address goes straight to the account; anything else is treated as a name and
+      // resolved through /names first — that is the whole point of human-readable .hlx names.
+      let addr = q, resolvedName = null;
+      if (!/^hlx/i.test(q)) {
+        const nm = await api('/names/' + encodeURIComponent(q)).catch(() => null);
+        if (!nm) throw new Error('not found');
+        addr = nm.address; resolvedName = nm.name;
+      }
+      const a = await api('/accounts/' + addr);
+      // Reverse-resolve a name for a raw address, and fetch delegations — both best-effort, so a
+      // failure in either never takes the balance view down with it.
+      if (!resolvedName) { const nm = await api('/accounts/' + addr + '/name').catch(() => null); if (nm) resolvedName = nm.name; }
+      let dels = [];
+      try { dels = (await api('/accounts/' + addr + '/delegations')).delegations || []; } catch (e) { /* none */ }
       let hist = [];
-      try { hist = (await api('/accounts/' + q + '/transactions')).transactions || []; }
+      try { hist = (await api('/accounts/' + addr + '/transactions')).transactions || []; }
       catch (e) { /* leave it empty — the account still renders */ }
+      const delTable = dels.length
+        ? `<div class="sub-h">Delegations (${dels.length})</div>` +
+          dels.map((d) => `<div class="row"><span>${link(d.validator, short(d.validator, 8))}</span><span>${fmtHlx(d.value_hlx)} HLX</span></div>`).join('')
+        : '';
       out.innerHTML =
-        row('Address', a.address) +
+        rowRaw('Address', esc(a.address) + copyBtn(a.address)) +
+        (resolvedName ? row('Name', resolvedName + '.hlx') : '') +
         row('Balance', fmtHlx(a.balance_hlx) + ' HLX') +
         row('Staked', fmtHlx(a.staked_hlx) + ' HLX') +
         (a.unbonding_stake_hlx ? row('Unbonding', fmtHlx(a.unbonding_stake_hlx) + ' HLX until #' + a.unbonding_unlock_height) : '') +
         (a.unbonding_source ? row('Slashable for', a.unbonding_source) : '') +
+        (a.missed_blocks != null ? row('Missed blocks', a.missed_blocks) : '') +
+        (a.jailed_until != null ? row('Jailed until', '#' + a.jailed_until) : '') +
         row('Nonce', a.nonce) +
+        delTable +
         `<div class="sub-h">Transactions (${hist.length})</div>` + txTable(hist.slice(0, 15), a.address);
     } catch (e) {
       out.innerHTML = `<div class="err">${esc(e.message)}</div>` +
@@ -653,10 +771,10 @@
     }
   }
 
-  // Section anchors (#explorer, #tokenomics, …) are page navigation, not lookups — the browser
+  // Section anchors (#explorer, #validators, …) are page navigation, not lookups — the browser
   // scrolls to them natively, so `fromHash` must skip them. A real lookup query is an address,
   // a 64-hex hash, or a block number; none collide with a section id.
-  const SECTIONS = new Set(['top', 'network', 'explorer', 'start', 'node', 'tokenomics', 'tech', 'resources']);
+  const SECTIONS = new Set(['top', 'explorer', 'transactions', 'validators', 'governance']);
   function fromHash() {
     const raw = location.hash.slice(1);
     if (!raw || SECTIONS.has(raw)) return;
@@ -684,15 +802,12 @@
     btn.disabled = true;
     msg.textContent = 'sending…';
     try {
-      const r = await fetch('/faucet', {
+      const r = await fetch(API_BASE + '/faucet', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ address: addr }),
       });
       const d = await r.json();
-      // The server's own words, not a generic failure: "already holds the full amount" and
-      // "faucet is out of funds" are different problems for the person reading them, and only
-      // one of them is theirs to do anything about.
       msg.textContent = r.ok
         ? `sent ${d.amount_hlx} HLX — it lands in the next block`
         : (d.error || ('HTTP ' + r.status));
@@ -701,6 +816,34 @@
       msg.textContent = 'could not reach the node';
     }
     btn.disabled = false;
+  });
+
+  // Pager buttons. Newer = towards the tip (lower page), Older = back in history (higher page).
+  $('blocks-newer').onclick = () => loadBlocks(blocksPage - 1);
+  $('blocks-older').onclick = () => loadBlocks(blocksPage + 1);
+  $('tx-newer').onclick = () => loadTx(txPage - 1);
+  $('tx-older').onclick = () => loadTx(txPage + 1);
+  $('vals-newer').onclick = () => renderValsPage(valPage - 1);
+  $('vals-older').onclick = () => renderValsPage(valPage + 1);
+  $('gov-newer').onclick = () => renderGovPage(govPage - 1);
+  $('gov-older').onclick = () => renderGovPage(govPage + 1);
+
+  // Click-to-copy, delegated so it works on rows rendered after load. Keyboard-activatable too.
+  function doCopy(el) {
+    const text = el.dataset.copy;
+    const done = () => { el.textContent = '✓'; setTimeout(() => { el.textContent = '⧉'; }, 900); };
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(done).catch(done);
+    else done();
+  }
+  document.addEventListener('click', (e) => {
+    const c = e.target.closest('.copy');
+    if (c) doCopy(c);
+  });
+  document.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.classList && e.target.classList.contains('copy')) {
+      e.preventDefault();
+      doCopy(e.target);
+    }
   });
 
   window.addEventListener('hashchange', fromHash);
