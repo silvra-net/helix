@@ -714,14 +714,7 @@ impl HelixNode {
         let genesis_height = self.store.read().await.latest_height();
         let validator_set = {
             let state_guard = self.chain_state.read().await;
-            let validators: Vec<Validator> = state_guard
-                .engine_validator_set()
-                .into_iter()
-                .map(|(addr, stake)| {
-                    let has_personhood = state_guard.has_personhood(&addr);
-                    Validator::new(addr, stake, has_personhood)
-                })
-                .collect();
+            let validators = validators_from_state(&state_guard);
             drop(state_guard);
             let epoch = genesis_height / helix_consensus::EPOCH_LENGTH;
             if validators.is_empty() {
@@ -1005,6 +998,12 @@ async fn handle_p2p_event(
                             // tracking and EIP-1559 base fee in step, same as
                             // rpc_sync_loop does after its own sync_blocks_from_peer call.
                             engine.write().await.sync_to_externally_finalized_block(new_height, new_hash);
+                            // Mirror any validator rotation those synced blocks applied in chain
+                            // state into the live engine — the finalize path that normally does
+                            // this was skipped. Without it, a validator that crossed its own
+                            // activation while filling this gap keeps a stale set and never votes,
+                            // stalling the chain while reporting itself bonded-but-silent.
+                            reconcile_engine_validator_set(engine, chain_state, new_height).await;
                             if let Ok(tip) = store.read().await.get_block_by_height(new_height) {
                                 publish_base_fee(engine, mempool, base_fee_for_next_block(&tip)).await;
                             }
@@ -1178,6 +1177,60 @@ async fn publish_base_fee(
 ) {
     engine.write().await.set_base_fee_per_byte(base_fee_per_byte);
     mempool.write().await.set_base_fee_per_byte(base_fee_per_byte);
+}
+
+/// Build the live BFT validator inputs from chain state — the set every node must run to agree
+/// on the round-robin proposer schedule and the quorum denominator. Reads `engine_validator_set()`
+/// (the post-rotation `active_validators`, or `stakers()` during the genesis window before the
+/// first rotation) and pairs each address with its current personhood so the 1% / 0.5%
+/// voting-power cap is applied. Shared by the startup engine build and both catch-up paths, so a
+/// synced validator can never construct a different set from the same state than a live one does.
+fn validators_from_state(state: &ChainState) -> Vec<Validator> {
+    state
+        .engine_validator_set()
+        .into_iter()
+        .map(|(addr, stake)| {
+            let has_personhood = state.has_personhood(&addr);
+            Validator::new(addr, stake, has_personhood)
+        })
+        .collect()
+}
+
+/// Mirror a just-synced chain-state validator rotation into the live BFT engine.
+///
+/// The catch-up paths (`sync_blocks_from_peer`, via the P2P gap-fill and the periodic
+/// `rpc_sync_loop`) apply blocks — so `execute_block` rotates `active_validators` in chain state
+/// — but bypass the finalize path that normally calls `rotate_validator_set`. Without this a
+/// validator that crossed its *own* activation rotation while catching up keeps the stale set it
+/// built at startup: it never sees itself in the set, so it never proposes or votes, and a small
+/// chain that now counts it toward quorum stalls with the node reporting itself "bonded" (from
+/// chain state) yet silent (never co-signing). See [`BftEngine::set_validator_set`].
+///
+/// `height` is the freshly-synced tip; the epoch is derived from it exactly as the startup engine
+/// build does. Safe to call every catch-up: it only rebuilds the set when membership changed, and
+/// logs solely in that case.
+async fn reconcile_engine_validator_set(
+    engine: &Arc<RwLock<BftEngine>>,
+    chain_state: &Arc<RwLock<ChainState>>,
+    height: u64,
+) {
+    let validators = {
+        let cs = chain_state.read().await;
+        validators_from_state(&cs)
+    };
+    let epoch = height / helix_consensus::EPOCH_LENGTH;
+    let changed = engine.write().await.set_validator_set(validators, epoch);
+    if changed {
+        let eng = engine.read().await;
+        info!(
+            height,
+            epoch = eng.validator_set().epoch,
+            validators = eng.validator_set().len(),
+            "Live validator set reconciled from synced state — a validator that crossed its \
+             activation rotation while catching up now runs the same set as the rest of the \
+             network, so it can propose and vote instead of sitting silent"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2353,6 +2406,11 @@ async fn rpc_sync_loop(
                     .write()
                     .await
                     .sync_to_externally_finalized_block(new_height, new_hash);
+                // Same reconciliation as the P2P gap-fill path: this apply bypassed the finalize
+                // path, so mirror any validator rotation it made into the live engine — otherwise
+                // a validator that activates while this loop is catching it up runs a stale set
+                // and never participates. See `reconcile_engine_validator_set`.
+                reconcile_engine_validator_set(&engine, &chain_state, new_height).await;
                 // Refresh the EIP-1559 base fee from the freshly-synced tip too — this apply
                 // bypassed apply_finalized_block, so without this the engine would keep a stale
                 // base fee and stamp/validate the wrong value for its next block.
@@ -2586,6 +2644,86 @@ mod sync_blocks_from_peer_tests {
 
         assert_eq!(applied, 3);
         assert_eq!(store.latest_height(), 3);
+    }
+
+    /// End-to-end reproduction of the join-stall, and the fix for it. A second operator stakes to
+    /// become a validator and their node catches up over the **sync path** — the one that applies
+    /// blocks (rotating `active_validators` in chain state) but skips the finalize path's
+    /// `rotate_validator_set`. Their activation rotation lands mid-sync.
+    ///
+    /// Before the fix, the live engine kept the stale set it built at startup, so the joiner was
+    /// never in its own validator set: it never proposed or voted, and the 2-of-2 chain it had
+    /// just made quorum-critical stalled with the node reporting itself bonded-but-silent. After
+    /// the fix, reconciling the live engine from the freshly-synced chain state puts the joiner in
+    /// its own set, so it participates and the chain keeps finalizing.
+    #[tokio::test]
+    async fn a_validator_that_activates_while_syncing_ends_up_in_its_own_live_set() {
+        let genesis_kp = KeyPair::generate();
+        let genesis_addr = Address::from_public_key(&genesis_kp.public);
+        let joiner_kp = KeyPair::generate();
+        let joiner_addr = Address::from_public_key(&joiner_kp.public);
+
+        // The peer serves a fresh single-validator chain across two epoch boundaries — the
+        // genesis window defers everyone once, then a real rotation promotes the joiner. Every
+        // block is produced by the genesis validator, exactly as a real solo chain looks right up
+        // to the joiner's activation.
+        let heights: Vec<u64> = (1..=helix_consensus::EPOCH_LENGTH * 2).collect();
+        let blocks = chained_blocks(&genesis_kp, &heights);
+        let peer_url = serve_blocks(blocks).await;
+
+        // The joiner's node state: both validators are staked (the joiner's `Stake` tx is already
+        // part of the chain it is about to sync), `active_validators` still empty — the genesis
+        // window, so the rotation logic must promote them itself.
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = {
+            let mut cs = ChainState::new(0);
+            stake_validator(&mut cs, &genesis_kp);
+            stake_validator(&mut cs, &joiner_kp);
+            Arc::new(RwLock::new(cs))
+        };
+
+        // The engine the joiner built at startup, before it was ever active: the bootstrap
+        // fallback set (just the genesis validator it syncs behind), with itself as its identity.
+        let stale =
+            ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(stale, joiner_addr.clone(), 0)));
+        assert!(
+            engine.read().await.validator_set().get(&joiner_addr).is_none(),
+            "precondition: the joiner is not yet in its own live set (the bonded-but-silent trap)"
+        );
+
+        // Catch up across the activation rotation over the sync path.
+        let new_height = {
+            let mut s = store.write().await;
+            let mut cs = chain_state.write().await;
+            let applied = sync_blocks_from_peer(&peer_url, 0, &mut s, &mut cs).await.unwrap();
+            assert_eq!(applied, helix_consensus::EPOCH_LENGTH * 2);
+            s.latest_height()
+        };
+
+        // Chain state rotated the joiner in — this is the "bonded" the health heartbeat reports.
+        assert!(
+            chain_state.read().await.active_validators.contains(&joiner_addr),
+            "the joiner must be bonded (active) in chain state after crossing its activation epoch"
+        );
+
+        // The fix: reconcile mirrors that rotation into the live engine.
+        reconcile_engine_validator_set(&engine, &chain_state, new_height).await;
+
+        let eng = engine.read().await;
+        assert!(
+            eng.validator_set().get(&joiner_addr).is_some(),
+            "after reconciling, the joiner runs itself in its own live set and can propose/vote"
+        );
+        assert!(
+            eng.validator_set().get(&genesis_addr).is_some(),
+            "the genesis validator stays in the set — a real 2-of-2 quorum, not a silent stall"
+        );
+        assert_eq!(
+            eng.peers_needed_for_quorum(),
+            1,
+            "the joiner now knows it needs the other validator's vote — no longer silent"
+        );
     }
 
     #[tokio::test]

@@ -1055,6 +1055,41 @@ impl BftEngine {
         self.validator_set = ValidatorSet::new(validators, next_epoch);
     }
 
+    /// Install the validator set a synced node computed from chain state, at an explicit
+    /// `epoch`, *without* the per-boundary `+1` bump [`rotate_validator_set`] applies.
+    ///
+    /// The catch-up paths (`sync_blocks_from_peer`, reached from the P2P gap-fill and the
+    /// periodic `rpc_sync_loop`) apply finalized blocks — so `execute_block` rotates
+    /// `active_validators` in chain state — but never travel the finalize path that calls
+    /// `rotate_validator_set`. A validator that crosses its *own* activation rotation while
+    /// catching up would otherwise keep the stale set it built at startup: it never finds
+    /// itself in the set, so `assert_is_validator` fails and it neither proposes nor votes,
+    /// silently stalling a small chain that now counts it toward quorum. That is the live-sync
+    /// half of the join-stall bug — the startup rebuild only closed the restart case, leaving a
+    /// node that activates *while already running and catching up* still stuck.
+    ///
+    /// `epoch` is supplied by the caller (`height / EPOCH_LENGTH`, the same expression the
+    /// startup engine build uses) because the engine holds no block height of its own. The set
+    /// is rebuilt through `ValidatorSet::new`, so the 1% voting-power cap and the address-sorted
+    /// proposer order come out byte-for-byte identical to a node that rotated live — the whole
+    /// point, since a divergent proposer order silently halts multi-validator consensus.
+    ///
+    /// Returns whether the active membership actually changed, so the caller can log an
+    /// operator-facing line only when something moved. A no-op on an empty candidate list, for
+    /// the same reason as `rotate_validator_set`: dropping to zero validators would halt block
+    /// production, so the previous set is kept.
+    pub fn set_validator_set(&mut self, validators: Vec<Validator>, epoch: u64) -> bool {
+        if validators.is_empty() {
+            return false;
+        }
+        let before: HashSet<Address> =
+            self.validator_set.validators.iter().map(|v| v.address.clone()).collect();
+        let after: HashSet<Address> = validators.iter().map(|v| v.address.clone()).collect();
+        let changed = before != after;
+        self.validator_set = ValidatorSet::new(validators, epoch);
+        changed
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────────
 
     /// Update `missed_rounds` from a round that just timed out (via `advance_round`) without
@@ -2473,6 +2508,75 @@ mod tests {
         // Height 0 has no parent to attest — an empty (or even non-empty) last_commit must
         // not be rejected for "missing" a parent that doesn't exist.
         assert!(engine.verify_last_commit(&[], 0, &Hash::ZERO).is_ok());
+    }
+
+    /// `set_validator_set` installs the set a synced node derived from chain state at an explicit
+    /// epoch, *without* `rotate_validator_set`'s `+1` bump — the fix for a validator that
+    /// activates while catching up over the sync path (which never calls `rotate_validator_set`).
+    /// It must add the newcomer to the *live* set and report the membership change, so the joiner
+    /// stops being absent from its own set (the "bonded but silent" trap) and starts voting.
+    #[test]
+    fn set_validator_set_adds_the_activated_validator_at_the_given_epoch() {
+        let v = two_validators();
+        let peer_addr = Address::from_public_key(&v.peer_kp.public);
+        // Start from a stale, self-only set at epoch 1 — what a joiner built at startup, behind
+        // the genesis validator, before its own activation rotation ever landed.
+        let mut engine = BftEngine::new(
+            ValidatorSet::new(vec![Validator::new(v.self_addr.clone(), 1_000, true)], 1),
+            v.self_addr.clone(),
+            250,
+        );
+        assert!(
+            engine.validator_set().get(&peer_addr).is_none(),
+            "precondition: the peer is not in the stale startup set"
+        );
+
+        let changed = engine.set_validator_set(v.validator_set.validators.clone(), 2);
+
+        assert!(changed, "adding a validator is a membership change");
+        assert!(engine.validator_set().get(&v.self_addr).is_some());
+        assert!(
+            engine.validator_set().get(&peer_addr).is_some(),
+            "the activated peer must be in the live set now"
+        );
+        assert_eq!(
+            engine.validator_set().epoch,
+            2,
+            "epoch is set to the value passed, not bumped by one like a rotation"
+        );
+    }
+
+    /// A periodic catch-up that applied blocks but crossed no rotation must not be reported as a
+    /// change — the caller uses the return value to decide whether to log, and a per-poll line
+    /// while nothing moved is exactly the noise operators complained about.
+    #[test]
+    fn set_validator_set_reports_no_change_when_membership_is_identical() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 300);
+
+        let changed = engine.set_validator_set(v.validator_set.validators.clone(), 3);
+
+        assert!(!changed, "same set of addresses must report unchanged");
+        assert_eq!(engine.validator_set().len(), 2, "the set itself is still intact");
+    }
+
+    /// An empty candidate list must never replace a live set — switching to zero validators halts
+    /// block production. Matches `rotate_validator_set`'s own empty guard.
+    #[test]
+    fn set_validator_set_is_a_no_op_on_an_empty_candidate_list() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let before = engine.validator_set().len();
+
+        let changed = engine.set_validator_set(vec![], 9);
+
+        assert!(!changed, "an empty list is a no-op, not a change");
+        assert_eq!(
+            engine.validator_set().len(),
+            before,
+            "the previous set must survive an empty candidate list"
+        );
+        assert_eq!(engine.validator_set().epoch, 0, "a no-op must not touch the epoch either");
     }
 
     /// Rounds a silent peer is left silent for in the tests below. Far past the 20 rounds the
