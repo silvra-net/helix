@@ -7,6 +7,9 @@
 /validator-key.json
 /validator-wallet.json
 /faucet-key.json
+# Double-sign high-water mark — per-node runtime state, next to the key (see signing_guard)
+*.signing-state.json
+*.signing-state.json.tmp
 # Chain-Datenbank — Laufzeitdaten, kein Quellcode
 /helix-data.redb
 /helix-data.redb.*.bak
