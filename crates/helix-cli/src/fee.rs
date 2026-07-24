@@ -51,18 +51,39 @@ pub fn hlx_to_nano(amount_hlx: f64) -> Result<u64> {
 /// asked to accept the transaction.
 pub async fn fetch_base_fee_per_byte(node: &str) -> Result<u64> {
     let client = reqwest::Client::new();
-    let status: serde_json::Value = client
+    let resp = client
         .get(format!("{}/status", node))
         .send()
-        .await?
+        .await
+        .with_context(|| format!("could not reach {} to price the fee", node))?;
+
+    // A non-2xx here is the request being refused, not a protocol mismatch — so it must not be
+    // reported as "the node is too old". The common case is HTTP 429: this client is being
+    // rate-limited (the node caps requests per IP). Blaming the build sent an operator chasing a
+    // version problem that did not exist; say what actually happened and how to get past it.
+    let http = resp.status();
+    if !http.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let detail = body.trim();
+        bail!(
+            "the node refused the fee lookup with HTTP {}{} — the node is not too old, the request \
+             was rejected. HTTP 429 means you are being rate-limited: retry, slow down, or pass \
+             --fee explicitly to skip the lookup entirely.",
+            http.as_u16(),
+            if detail.is_empty() { String::new() } else { format!(" ({detail})") },
+        );
+    }
+
+    let status: serde_json::Value = resp
         .json()
-        .await?;
+        .await
+        .context("the node's /status was not valid JSON — cannot read the current fee")?;
     status
         .get("base_fee_per_byte")
         .and_then(|v| v.as_u64())
         .context(
-            "node did not report base_fee_per_byte — it is running a build older than the fee \
-             market; pass --fee explicitly",
+            "this node's /status has no base_fee_per_byte field — it is running a build older than \
+             the fee market; pass --fee explicitly",
         )
 }
 
