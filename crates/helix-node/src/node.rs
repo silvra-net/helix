@@ -647,39 +647,49 @@ impl HelixNode {
             start_rpc_server(rpc_state, rpc_bind).await;
         });
 
-        // Historical catch-up, now that the RPC is up. Runs to completion before consensus
-        // starts (see the wait in `block_production_loop`): a node that proposes while it is
-        // still missing history would build on a chain it hasn't seen, which on a
-        // single-validator network means immediately forking off its own.
+        // Historical catch-up, now that the RPC is up (spawned just above, so `GET /status`
+        // keeps answering — reporting `is_syncing` — throughout the wait below; that is the
+        // whole point of #107 and is preserved).
+        //
+        // Awaited to completion HERE, *before* the BFT engine is constructed, rather than being
+        // spawned to run alongside it. The engine is seeded entirely from the persisted chain
+        // tip a few lines down — height, tip hash, base fee, and the validator set. When this
+        // sync was a detached task, a genuinely fresh node built that engine from its height-0
+        // genesis while the sync was still fetching: it would then rotate `active_validators` in
+        // *chain state* as it applied blocks, but nothing mirrors a sync-path rotation into the
+        // live engine (only the finalize path calls `rotate_validator_set`). The result was a
+        // freshly-synced validator running a stale height-0 validator set — it disagreed with the
+        // rest of the network on the round-robin proposer schedule and silently stalled the chain
+        // the instant it was expected to co-sign. Structurally invisible on a single-validator
+        // network (a one-element set has only one order) and it only bites when the joining node
+        // crosses its own activation rotation *during sync* rather than while live — the exact
+        // post-reset onboarding case. See backlog #129. Awaiting here makes a fresh sync seed the
+        // engine from the true tip, exactly as an ordinary restart (whose DB is already current)
+        // already does. Consensus additionally waits on `syncing` in `block_production_loop`; a
+        // node that proposes while still missing history would fork off a chain it hasn't seen.
         if let Some(peer_url) = self.sync_peer.clone() {
-            let store = self.store.clone();
-            let chain_state = self.chain_state.clone();
-            let syncing = self.syncing.clone();
-            let target = self.sync_target_height.clone();
-            tokio::spawn(async move {
-                // Best-effort: the target is only for the progress display, so an old or
-                // unreachable peer just leaves it at 0 (reported as `null`) rather than
-                // holding up the sync itself.
-                if let Ok(client) = peer_http_client(Duration::from_secs(10)) {
-                    if let Ok(tip) = fetch_peer_height(&client, &peer_url).await {
-                        target.store(tip, std::sync::atomic::Ordering::Relaxed);
-                    }
+            // Best-effort: the target is only for the progress display, so an old or
+            // unreachable peer just leaves it at 0 (reported as `null`) rather than
+            // holding up the sync itself.
+            if let Ok(client) = peer_http_client(Duration::from_secs(10)) {
+                if let Ok(tip) = fetch_peer_height(&client, &peer_url).await {
+                    self.sync_target_height.store(tip, std::sync::atomic::Ordering::Relaxed);
                 }
-                let local_tip = store.read().await.latest_height();
-                info!(peer = %peer_url, local_tip, "Syncing blocks from peer");
-                let result = {
-                    let mut s = store.write().await;
-                    let mut cs = chain_state.write().await;
-                    sync_blocks_from_peer(&peer_url, local_tip, &mut s, &mut cs).await
-                };
-                match result {
-                    Ok(synced) => info!(applied = synced, "Block sync complete"),
-                    // Same tolerance as before this moved out of the constructor: an
-                    // unreachable peer must not stop the node, it just starts from what it has.
-                    Err(e) => warn!(error = %e, "Block sync failed (continuing anyway)"),
-                }
-                syncing.store(false, std::sync::atomic::Ordering::Relaxed);
-            });
+            }
+            let local_tip = self.store.read().await.latest_height();
+            info!(peer = %peer_url, local_tip, "Syncing blocks from peer");
+            let result = {
+                let mut s = self.store.write().await;
+                let mut cs = self.chain_state.write().await;
+                sync_blocks_from_peer(&peer_url, local_tip, &mut s, &mut cs).await
+            };
+            match result {
+                Ok(synced) => info!(applied = synced, "Block sync complete"),
+                // Same tolerance as before this moved out of the constructor: an
+                // unreachable peer must not stop the node, it just starts from what it has.
+                Err(e) => warn!(error = %e, "Block sync failed (continuing anyway)"),
+            }
+            self.syncing.store(false, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Spawn P2P service
@@ -696,12 +706,16 @@ impl HelixNode {
         //
         // Rebuilt from persisted chain state rather than hardcoded, so a restart
         // resumes with the same validator set and epoch the chain already
-        // rotated to — not epoch 0 with only this node as validator.
+        // rotated to — not epoch 0 with only this node as validator. Built from
+        // `engine_validator_set()` (the rotation's own truth, `active_validators`),
+        // not raw `stakers()`, so a node that synced up to the tip runs exactly the
+        // set every live node rotated to — including honouring the one-epoch activation
+        // delay for a staker that has not been rotated in yet. See backlog #129.
         let genesis_height = self.store.read().await.latest_height();
         let validator_set = {
             let state_guard = self.chain_state.read().await;
             let validators: Vec<Validator> = state_guard
-                .stakers()
+                .engine_validator_set()
                 .into_iter()
                 .map(|(addr, stake)| {
                     let has_personhood = state_guard.has_personhood(&addr);

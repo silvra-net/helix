@@ -862,6 +862,36 @@ impl ChainState {
         stakers
     }
 
+    /// The validator set a node's live BFT engine should run, matching exactly what the
+    /// consensus rotation last installed. A node that catches up through `sync_blocks_from_peer`
+    /// executes blocks (rotating `active_validators` in state) but never mirrors that into the
+    /// live engine — only the finalize path calls `rotate_validator_set` — so an engine built
+    /// from the wrong source diverges on the round-robin proposer schedule and silently stalls
+    /// the chain the moment more than one validator is active. See backlog #129 for the live
+    /// incident (two operators, both freshly synced, both stalled at the first epoch after a
+    /// reset).
+    ///
+    /// Prefer `active_validators` — the post-rotation truth, folded into `state_hash`, and the
+    /// exact set `rotate_active_validators` produced (so a staker still serving its one-epoch
+    /// activation delay is correctly *excluded*, unlike raw `stakers()` which would wrongly
+    /// include it). Fall back to `stakers()` only before the first rotation has populated the
+    /// field — a fresh chain's genesis window — where the sitting validators still run their
+    /// genesis-derived set and `active_validators` is legitimately empty. Address-sorted, byte
+    /// for byte the order `rotate_active_validators` returns, so the computed proposer schedule
+    /// is identical to a node that rotated live.
+    pub fn engine_validator_set(&self) -> Vec<(Address, u64)> {
+        if self.active_validators.is_empty() {
+            return self.stakers();
+        }
+        let mut set: Vec<(Address, u64)> = self
+            .active_validators
+            .iter()
+            .map(|addr| (addr.clone(), self.effective_stake(addr)))
+            .collect();
+        set.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+        set
+    }
+
     /// `stakers()`, but with new entries held out of the active set for one full epoch — see
     /// `pending_validators`' doc comment for why. `previously_active` is the validator set
     /// about to be replaced (i.e. still-current members are never delayed, only genuinely new
@@ -1321,6 +1351,50 @@ mod tests {
 
     fn stake(state: &mut ChainState, seed: u8, amount: u64) {
         state.update_account(&addr(seed), |acc| acc.staked = amount);
+    }
+
+    /// The joiner-side half of #129: the set a synced node installs into its live engine must be
+    /// the rotation's own truth (`active_validators`), address-sorted exactly as
+    /// `rotate_active_validators` returns it — never raw `stakers()`, which would wrongly hand a
+    /// still-pending staker quorum weight and desynchronise the round-robin proposer schedule
+    /// from every node that rotated live, silently stalling the chain.
+    #[test]
+    fn engine_validator_set_mirrors_active_validators_not_raw_stakers() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 3, 100);
+        stake(&mut state, 1, 100);
+        stake(&mut state, 2, 100); // qualifies but will be held out of the active set
+
+        // Before any rotation has populated `active_validators`, fall back to `stakers()` so a
+        // fresh chain's genesis validators still run their genesis-derived set.
+        assert_eq!(
+            state.engine_validator_set(),
+            state.stakers(),
+            "with no rotation yet, the engine set is the genesis staker set"
+        );
+
+        // Rotation makes {1,3} active; 2 is still serving its one-epoch activation delay.
+        state.active_validators = [addr(1), addr(3)].into_iter().collect();
+
+        let mut expected = vec![(addr(1), 100u64), (addr(3), 100u64)];
+        expected.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+        assert_eq!(
+            state.engine_validator_set(),
+            expected,
+            "engine set must be exactly the active validators, address-sorted, and must NOT \
+             include the still-pending staker that stakers() would"
+        );
+
+        // Prove the two sources genuinely differ here, so the choice actually mattered.
+        assert!(
+            state.stakers().iter().any(|(a, _)| a == &addr(2)),
+            "precondition: stakers() includes the pending staker"
+        );
+        assert!(
+            !state.engine_validator_set().iter().any(|(a, _)| a == &addr(2)),
+            "the pending staker must never reach the live engine set"
+        );
     }
 
     /// The core property this whole mechanism exists for: a brand-new staker must sit out
