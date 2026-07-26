@@ -874,11 +874,16 @@ impl ChainState {
     /// Prefer `active_validators` — the post-rotation truth, folded into `state_hash`, and the
     /// exact set `rotate_active_validators` produced (so a staker still serving its one-epoch
     /// activation delay is correctly *excluded*, unlike raw `stakers()` which would wrongly
-    /// include it). Fall back to `stakers()` only before the first rotation has populated the
-    /// field — a fresh chain's genesis window — where the sitting validators still run their
-    /// genesis-derived set and `active_validators` is legitimately empty. Address-sorted, byte
-    /// for byte the order `rotate_active_validators` returns, so the computed proposer schedule
-    /// is identical to a node that rotated live.
+    /// include it). Fall back to `stakers()` only when the field is empty, which on a chain
+    /// launched fresh no longer happens: `GenesisConfig::build_state` seeds the genesis
+    /// validators into `active_validators` at block 0 precisely so this fallback cannot hand a
+    /// joining node the undelayed staker set during the first activation epoch (the window in
+    /// which the first rotation has deferred everyone and the field would otherwise still be
+    /// empty). The only remaining empty case is a database written *before* `active_validators`
+    /// existed — a one-time upgrade migration — where every staker was already live and
+    /// participating, so `stakers()` still ≈ the set the network runs until the next rotation
+    /// repopulates the field. Address-sorted, byte for byte the order `rotate_active_validators`
+    /// returns, so the computed proposer schedule is identical to a node that rotated live.
     pub fn engine_validator_set(&self) -> Vec<(Address, u64)> {
         if self.active_validators.is_empty() {
             return self.stakers();

@@ -243,6 +243,31 @@ impl GenesisConfig {
         }
         state.genesis_extra_validators = self.extra_validators.clone();
 
+        // Seed the active BFT set with the genesis validators so `active_validators` is
+        // authoritative from block 0. Without this it stays empty until the *second* epoch
+        // rotation — the first rotation defers everyone, including a long-running validator,
+        // so `active_validators` is still empty throughout the entire first activation epoch —
+        // and `ChainState::engine_validator_set()` falls back to raw `stakers()` in that whole
+        // window. That fallback is the bug: the instant a newcomer stakes (while the field is
+        // still empty) `stakers()` includes it with no activation delay, so a joining or
+        // restarting node builds the *undelayed* set and diverges from the delayed set the live
+        // validators actually run — a silent proposer-schedule split that halts a small network.
+        // The genesis validators have produced since block 0 and must never be deferred, so they
+        // belong in the active set immediately; a later staker is correctly *excluded* here (it
+        // is not a genesis validator) and serves its one-epoch `pending_validators` delay as
+        // before. An upgraded pre-`active_validators` database legitimately still loads an empty
+        // set — that transient-migration case is the only place `engine_validator_set()`'s
+        // `stakers()` fallback now fires, and there `stakers()` already ≈ the live set.
+        //
+        // This is folded into `state_hash`, so it changes the genesis state hash: it is safe
+        // only for chains launched fresh (both `build_state` and the joining node's
+        // `rebuild_genesis_state` run this same code, so `GET /genesis` still agrees), and an
+        // existing chain must upgrade every node and reset to adopt it.
+        state.active_validators.insert(self.validator.clone());
+        for (address, _stake) in &self.extra_validators {
+            state.active_validators.insert(address.clone());
+        }
+
         state.total_issued = issued;
         state.personhood_authorities = self.personhood_authorities.clone();
 
@@ -330,6 +355,73 @@ mod tests {
             state.total_issued,
             peer_stake + VALIDATOR_GENESIS_LIQUID_HLX * NANO_PER_HLX,
             "issuance must count what was really staked, plus the validator's liquid reserve"
+        );
+    }
+
+    /// A chain launched fresh must run its genesis validators as the *active* BFT set from block
+    /// 0 — not leave `active_validators` empty until the second epoch rotation. If it were empty,
+    /// `engine_validator_set()` falls back to raw `stakers()`, and the moment any newcomer stakes
+    /// before that second rotation a syncing or restarting node builds the undelayed set and
+    /// diverges from the live one. Regression guard for the silent multi-validator join stall.
+    #[test]
+    fn genesis_seeds_the_active_validator_set_from_block_zero() {
+        let validator = some_address();
+        let state = GenesisConfig::devnet(validator.clone()).build_state();
+
+        assert!(
+            state.active_validators.contains(&validator),
+            "the genesis validator must be active immediately, never deferred like a newcomer"
+        );
+        let engine_set: Vec<Address> =
+            state.engine_validator_set().into_iter().map(|(a, _)| a).collect();
+        assert_eq!(
+            engine_set,
+            vec![validator],
+            "engine_validator_set must come from the seeded active set, not a stakers() fallback"
+        );
+    }
+
+    /// Extra genesis validators are active from block 0 too — they are pre-staked founders of the
+    /// chain, not newcomers that have to serve the one-epoch activation delay.
+    #[test]
+    fn genesis_seeds_extra_validators_into_the_active_set() {
+        let validator = some_address();
+        let extra = some_address();
+        let mut cfg = GenesisConfig::devnet(validator.clone());
+        cfg.extra_validators = vec![(extra.clone(), VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX)];
+        let state = cfg.build_state();
+
+        assert!(state.active_validators.contains(&validator));
+        assert!(state.active_validators.contains(&extra));
+    }
+
+    /// The exact divergence the seed prevents: a newcomer that stakes *before the first rotation*
+    /// is in `stakers()` immediately, but must NOT be in the engine set — the genesis validator
+    /// is, and the newcomer serves its one-epoch activation delay. On the pre-seed code this
+    /// assertion failed, because `active_validators` was empty and `engine_validator_set()`
+    /// returned raw `stakers()` (which includes the newcomer): a joining node then ran a
+    /// 2-validator set while the live chain still ran 1 — a silent proposer-schedule split.
+    #[test]
+    fn a_newcomer_staking_before_the_first_rotation_is_excluded_from_the_engine_set() {
+        let validator = some_address();
+        let newcomer = some_address();
+        let mut state = GenesisConfig::devnet(validator.clone()).build_state();
+        state.governance_params.min_validator_stake = 100;
+        state.update_account(&newcomer, |acc| acc.staked = 100_000);
+
+        assert!(
+            state.stakers().iter().any(|(a, _)| a == &newcomer),
+            "precondition: the newcomer qualifies by stake right away"
+        );
+        let engine_set: Vec<Address> =
+            state.engine_validator_set().into_iter().map(|(a, _)| a).collect();
+        assert!(
+            !engine_set.contains(&newcomer),
+            "a newcomer must serve its activation delay — never appear in the live set early"
+        );
+        assert!(
+            engine_set.contains(&validator),
+            "the genesis validator stays the live set until a real rotation promotes the newcomer"
         );
     }
 
