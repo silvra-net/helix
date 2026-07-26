@@ -735,9 +735,23 @@ impl HelixNode {
         // mark before it is gossiped, so a restart or a stray second instance can't equivocate
         // and get this validator slashed. Seeded with the persisted tip so it never re-signs an
         // already-committed height even on a first run with no state file. See `signing_guard`.
+        // The chain this signing state belongs to — the genesis block's hash. A reset to a new
+        // genesis (a different chain that happens to reuse this validator key) must not inherit the
+        // old chain's high-water mark: the old chain reached far higher heights, so every vote on
+        // the fresh chain would look like a regression and the validator would sit bonded-but-silent
+        // forever (diagnosed live 2026-07-26). Same genesis across a restart keeps its mark, so the
+        // double-sign protection is unchanged within a chain.
+        let chain_id = self
+            .store
+            .read()
+            .await
+            .get_block_by_height(0)
+            .map(|b| b.hash())
+            .unwrap_or(helix_crypto::Hash::ZERO);
         let signing_guard = Arc::new(std::sync::Mutex::new(SigningGuard::load(
             self.signing_state_path.clone(),
             genesis_height,
+            chain_id,
         )));
         // Seed the engine's chain-continuity check with the real tip hash — without
         // this, `validate_block`'s prev_hash check stays silently disabled until this

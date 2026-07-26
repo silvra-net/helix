@@ -55,6 +55,17 @@ struct SignedState {
     /// a harmless gossip re-send, not equivocation — but a *different* hash at the same position
     /// is exactly the double-sign we refuse.
     block_hash: Hash,
+    /// The chain this state belongs to — the genesis block's hash. A persisted mark from a
+    /// *different* genesis (a reset to a brand-new chain that reuses this key) is discarded on
+    /// load, because the old chain's heights are unrelated to the new one: keeping it left the
+    /// validator refusing every vote on the reset chain until it climbed past the old high-water
+    /// mark — the "bonded but silent" stall diagnosed live on 2026-07-26 (a key last signed at
+    /// height ~48089 on a chain that was then reset to genesis could not vote again until #48089).
+    /// Within one chain this is constant, so it never weakens the cross-restart double-sign
+    /// protection: a restart on the *same* chain still carries the mark forward. A pre-upgrade
+    /// state file without this field simply fails to parse and falls back to the chain-height
+    /// floor (see [`load`]) — safe, since the floor already forbids signing at or below the tip.
+    chain_id: Hash,
 }
 
 /// Outcome of checking a candidate vote against the high-water mark.
@@ -72,6 +83,9 @@ pub struct SigningGuard {
     /// and non-signing nodes — a real validator always loads a `Some` path via [`load`].
     path: Option<PathBuf>,
     last: SignedState,
+    /// The genesis hash of the chain this guard is running on. Stamped into every state it
+    /// persists and compared on load, so a mark from a different chain is never applied here.
+    chain_id: Hash,
 }
 
 impl SigningGuard {
@@ -85,7 +99,9 @@ impl SigningGuard {
             last: SignedState {
                 position: Position { height: 0, round: 0, step: 0 },
                 block_hash: Hash::ZERO,
+                chain_id: Hash::ZERO,
             },
+            chain_id: Hash::ZERO,
         }
     }
 
@@ -99,27 +115,45 @@ impl SigningGuard {
     /// unreadable file falls back to the floor with a loud error rather than refusing to start:
     /// the floor alone already prevents the overwhelmingly common restart case, and bricking a
     /// validator on a stat/parse hiccup would be its own outage.
-    pub fn load(path: PathBuf, chain_height: u64) -> Self {
+    /// `chain_id` is the genesis hash of the chain this node is running. A persisted mark whose
+    /// `chain_id` differs is from another chain (a reset that reused this key) and is discarded in
+    /// favour of the floor — otherwise the old chain's far-higher heights would make every vote on
+    /// the new chain look like a regression and the validator would sit bonded-but-silent forever.
+    pub fn load(path: PathBuf, chain_height: u64, chain_id: Hash) -> Self {
         let floor = SignedState {
             position: Position { height: chain_height, round: u32::MAX, step: u8::MAX },
             block_hash: Hash::ZERO,
+            chain_id,
         };
         let last = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<SignedState>(&bytes) {
+                // A mark from a *different* genesis is meaningless here — the old chain's votes can
+                // never be equivocation on this one. Reset to the floor so a genesis reset doesn't
+                // permanently gag this validator; double-sign protection continues on the new chain.
+                Ok(state) if state.chain_id != chain_id => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "signing-state belongs to a different chain (genesis hash changed) — \
+                         resetting the double-sign high-water mark to this chain's floor. This is \
+                         expected after a chain reset; protection continues on the new chain."
+                    );
+                    floor
+                }
                 Ok(state) if state.position > floor.position => state,
                 Ok(_) => floor, // stale file at/below the chain tip — the floor is safer
                 Err(e) => {
                     error!(
                         err = %e, path = %path.display(),
-                        "signing-state file is unreadable — falling back to the chain-height floor; \
-                         inspect it if this validator was ever unexpectedly slashed"
+                        "signing-state file is unreadable (or predates chain-id tagging) — falling \
+                         back to the chain-height floor; inspect it if this validator was ever \
+                         unexpectedly slashed"
                     );
                     floor
                 }
             },
             Err(_) => floor, // no file yet: first run under this feature
         };
-        SigningGuard { path: Some(path), last }
+        SigningGuard { path: Some(path), last, chain_id }
     }
 
     /// Decide whether `vote` is safe to broadcast, durably advancing the high-water mark first
@@ -150,7 +184,7 @@ impl SigningGuard {
         }
 
         // The position advances the high-water mark: record it durably *before* allowing it out.
-        let state = SignedState { position: pos, block_hash: vote.block_hash };
+        let state = SignedState { position: pos, block_hash: vote.block_hash, chain_id: self.chain_id };
         if let Err(e) = Self::persist(&path, &state) {
             error!(err = %e, "could not persist signing state — refusing the vote to stay safe");
             return Decision::Refuse;
@@ -202,7 +236,7 @@ mod tests {
 
     fn guard(height: u64) -> (SigningGuard, tempdir::Guard) {
         let dir = tempdir::Guard::new();
-        (SigningGuard::load(dir.path(), height), dir)
+        (SigningGuard::load(dir.path(), height, hash(0xAA)), dir)
     }
 
     #[test]
@@ -263,14 +297,38 @@ mod tests {
     fn the_high_water_mark_survives_a_reload() {
         let dir = tempdir::Guard::new();
         {
-            let mut g = SigningGuard::load(dir.path(), 100);
+            let mut g = SigningGuard::load(dir.path(), 100, hash(0xAA));
             assert_eq!(g.check(&vote(101, 2, VoteType::Precommit, hash(7))), Decision::Allow);
         }
-        // A "restart": a new guard over the same file must refuse a conflicting re-sign at 101/2.
-        let mut g = SigningGuard::load(dir.path(), 100);
+        // A "restart" on the SAME chain (same chain_id): a new guard over the same file must
+        // refuse a conflicting re-sign at 101/2.
+        let mut g = SigningGuard::load(dir.path(), 100, hash(0xAA));
         assert_eq!(g.check(&vote(101, 2, VoteType::Precommit, hash(9))), Decision::Refuse);
         // …and the identical value is still fine.
         assert_eq!(g.check(&vote(101, 2, VoteType::Precommit, hash(7))), Decision::Allow);
+    }
+
+    /// A genesis reset (a new chain that reuses the same validator key) must clear the high-water
+    /// mark. Keeping it left the validator refusing every vote on the reset chain until it climbed
+    /// past the old height — the "bonded but silent" stall diagnosed live on 2026-07-26, where a
+    /// key that had signed up to ~#48089 on the pre-reset chain could not vote on the fresh chain
+    /// at #1501. On the pre-fix code this final assertion was `Refuse`.
+    #[test]
+    fn a_reset_to_a_new_genesis_clears_the_high_water_mark() {
+        let dir = tempdir::Guard::new();
+        {
+            // Chain A: sign high up, exactly as the stalled validator had.
+            let mut g = SigningGuard::load(dir.path(), 100, hash(0xAA));
+            assert_eq!(g.check(&vote(48089, 0, VoteType::Precommit, hash(1))), Decision::Allow);
+        }
+        // Reset to chain B (different genesis hash), back at a low tip. The stale #48089 mark from
+        // chain A must NOT gag this validator here — the old chain's votes can't be equivocation
+        // on this one.
+        let mut g = SigningGuard::load(dir.path(), 1500, hash(0xBB));
+        assert_eq!(g.check(&vote(1501, 0, VoteType::Prevote, hash(2))), Decision::Allow);
+        // …and within chain B, double-sign protection is fully back: a conflicting re-sign at the
+        // same slot is still refused.
+        assert_eq!(g.check(&vote(1501, 0, VoteType::Prevote, hash(3))), Decision::Refuse);
     }
 
     /// Minimal self-cleaning temp path helper — avoids a dev-dependency just for these tests.
