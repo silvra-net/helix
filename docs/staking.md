@@ -16,13 +16,31 @@ mutually exclusive:
 
 ### Staking as a Node Operator (Validator)
 
-1. **Get a node running** (see [Running a Node](running-a-node.md#running-a-node)) — its `validator-key.json`
-   is the identity that will stake and produce blocks.
-2. **Stake at least the minimum** (100,000 HLX — ~0.3% of the total supply) using that same
-   key:
+> **Stake the address your node signs with — not some other wallet.** Your node has its own
+> validator identity in `validator-key.json` (auto-generated on first start if you didn't supply
+> one). Staking a *different* address — say a wallet you already had funded — makes that address
+> a validator the network then waits on, while **no node is signing for it**. In a small set that
+> single "phantom" validator halts the chain, and it can't be removed until the chain moves again
+> (which it can't, because it's waiting on the phantom). This is the single most common validator
+> mis-setup. Guard against it in step 1 by *verifying the two addresses are the same*.
+
+1. **Get a node running** (see [Running a Node](running-a-node.md#running-a-node)) and read off
+   the address it validates as — **this is the only address you may stake**:
+   ```bash
+   helix wallet address --key validator-key.json     # e.g. hlxbx7oYT7n1...  ← your node's identity
+   ```
+   If you want your validator to *be* an existing wallet of yours, don't stake that wallet
+   against a freshly-generated node key — instead make that wallet the node's key: point
+   `HELIX_VALIDATOR_KEY` at its key file, or restore it into place with
+   `helix wallet restore --mnemonic "…" --output validator-key.json`, then re-check the address
+   above. The node signs with whatever `validator-key.json` holds, nothing else.
+2. **Stake at least the minimum** (100,000 HLX — ~0.3% of the total supply) **from that exact
+   address**, using that same key file:
    ```bash
    helix tx stake 100000 --key validator-key.json
    ```
+   The `--key` here must be the same file whose address you read in step 1. If `helix tx stake`
+   uses any other key, you have just created a phantom validator — see the warning above.
 3. **Wait for the next epoch rotation** (every 100 blocks — at most a few minutes at the 2s
    block time). The validator set is rebuilt from every account meeting the minimum stake —
    counting both self-stake and anything delegated to it (see below) — once included, your

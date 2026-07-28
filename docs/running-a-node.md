@@ -298,12 +298,27 @@ server / firewall, so this assumes the WebSocket-tunnel setup:
    ```
 6. **Start and verify:** `helix start`, then confirm `peer_count` climbs above zero and your
    node is following the chain. `helix chain status` shows height advancing.
-7. **Only now, stake:** `helix tx stake <amount> --key validator-key.json`. Staking before the
-   node is connected is the one ordering mistake worth avoiding — the address becomes a
-   validator on schedule whether or not anything is listening, and a validator that never
-   answers is jailed for downtime (~5 minutes of missed blocks) and has to `tx unjail` to get
-   back. You join the active set one full epoch (~100 blocks / ~3.3 minutes) after the
-   rotation that first sees your stake; that wait is deliberate and is not counted against you.
+7. **Only now, stake — and stake *this node's* address, nothing else:**
+   ```bash
+   helix wallet address --key validator-key.json     # the address your node signs with
+   helix tx stake <amount> --key validator-key.json   # stake that same key
+   ```
+   The address you stake **must** be the one your node validates as (step 1's key). Staking a
+   *different* wallet you happen to have funded does not make this node a validator — it makes
+   that other address a validator the network waits on while nothing signs for it, a "phantom"
+   that halts a small set until the chain can move again (which it can't, because it's blocked on
+   the phantom). If `helix wallet address` and the address you funded/staked don't match, fix
+   that before staking, not after — a stalled chain can't accept the corrective transaction.
+
+   Two ordering mistakes to avoid, both for the same reason (the address becomes a validator on
+   schedule whether or not a matching node is listening):
+   - **Wrong key** — the phantom case above.
+   - **Right key, but staked before the node was connected** — a validator that never answers is
+     jailed for downtime (~5 minutes of missed blocks) and has to `tx unjail` to get back. That's
+     why staking is the *last* step, after step 6 shows the node meshed and following.
+
+   You join the active set one full epoch (~100 blocks / ~3.3 minutes) after the rotation that
+   first sees your stake; that wait is deliberate and is not counted against you.
 
 ### Docker Deployment
 
