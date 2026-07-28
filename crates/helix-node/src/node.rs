@@ -483,7 +483,19 @@ impl HelixNode {
             state
         } else {
             let sig = keypair.sign(b"helix-genesis-v1")?;
-            let genesis = genesis_block(address.clone(), keypair.public.clone(), sig);
+            // Wall-clock timestamp, not the historical hardcoded 0: it makes this genesis hash
+            // — and hence the chain_id the signing guard uses to tell chains apart — unique to
+            // this reset. Without it every reset that reused the validator key produced a
+            // byte-identical genesis (all other fields are deterministic, ML-DSA signing
+            // included), so a returning validator's stale double-sign high-water mark was never
+            // recognised as belonging to a dead chain and gagged it into silence. Joining nodes
+            // adopt this block verbatim (the sync_peer branch above), so all nodes on this chain
+            // still share one chain_id.
+            let genesis_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let genesis = genesis_block(address.clone(), keypair.public.clone(), sig, genesis_ts);
             store.put_block(genesis)?;
             info!("Genesis block created (height 0)");
 
@@ -1725,7 +1737,14 @@ async fn block_production_loop(
     syncing: Arc<std::sync::atomic::AtomicBool>,
     signing_guard: Arc<std::sync::Mutex<SigningGuard>>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_millis(BLOCK_TIME_MS));
+    // Pure production cadence — it enters no hash, no signature and not the proposer schedule
+    // (`proposer_for_round` is `(height+round) % len`, timestamp-free), so overriding it cannot
+    // fork a chain the way a consensus constant like `EPOCH_LENGTH` would. Overridable via
+    // `HELIX_BLOCK_TIME_MS` purely so the multi-node integration tests can march a joiner across
+    // its (fixed, 100-block) activation epochs in seconds instead of minutes; unset in production,
+    // where it stays `BLOCK_TIME_MS`.
+    let block_time_ms = config::resolve_u64("HELIX_BLOCK_TIME_MS", None).unwrap_or(BLOCK_TIME_MS);
+    let mut interval = tokio::time::interval(Duration::from_millis(block_time_ms));
 
     // One-time startup gate: in a multi-validator set, don't produce the very first
     // block until enough peers are connected AND the gossip mesh has had a few ticks
@@ -2576,6 +2595,7 @@ mod sync_blocks_from_peer_tests {
             Address::from_public_key(&kp.public),
             kp.public.clone(),
             Sig::from_bytes(vec![]),
+            0,
         );
         block.header.height = height;
         block.header.prev_hash = prev_hash;
@@ -2737,6 +2757,126 @@ mod sync_blocks_from_peer_tests {
             eng.peers_needed_for_quorum(),
             1,
             "the joiner now knows it needs the other validator's vote — no longer silent"
+        );
+    }
+
+    /// The **2→3** case of the join-over-sync stall — the one that actually halted the live chain
+    /// when a third operator tried to join a running two-validator network, and the case the
+    /// existing 1→2 test above does not reach. It is the harder shape in two ways a single joiner
+    /// never exercises: C first syncs across a rotation that already happened *for validators it is
+    /// not part of* (A and B activating at height 200), and only then crosses its **own** activation
+    /// (at 400) — both over the sync path, which applies blocks (rotating `active_validators` in
+    /// chain state) but never travels the finalize path that mirrors a rotation into the live engine.
+    ///
+    /// Sequencing is the whole point and is why this is a distinct test: A and B activate first, and
+    /// C stakes only *afterwards*, so its activation lands a full epoch later against an already-
+    /// larger set. A 3-validator set tolerates zero absences (2 of 3 capped-equal voters fall one
+    /// short of `2/3+1`, exactly like 2 of 2), so if C computed even a slightly different set or
+    /// proposer order than the incumbents at either boundary, the chain stalls. The assertion is
+    /// that C, purely from syncing, arrives at the identical address-sorted {A,B,C} set — so every
+    /// node agrees on the round-robin schedule — and that reconciling is what makes it so.
+    #[tokio::test]
+    async fn a_third_validator_joining_over_sync_matches_the_incumbents_set_and_schedule() {
+        let genesis_kp = KeyPair::generate(); // A
+        let kp_b = KeyPair::generate();
+        let kp_c = KeyPair::generate();
+        let addr_a = Address::from_public_key(&genesis_kp.public);
+        let addr_b = Address::from_public_key(&kp_b.public);
+        let addr_c = Address::from_public_key(&kp_c.public);
+        let joiner_addr = addr_c.clone();
+
+        // A signs every block, exactly as `/sync/blocks` looks to a catching-up node: the endpoint
+        // enforces validator-set membership, not per-height proposer identity, so a solo producer's
+        // blocks are valid to apply right across both the incumbents' and the joiner's activation.
+        let heights: Vec<u64> = (1..=helix_consensus::EPOCH_LENGTH * 4).collect();
+        let (phase1, phase2): (Vec<Block>, Vec<Block>) = chained_blocks(&genesis_kp, &heights)
+            .into_iter()
+            .partition(|b| b.height() <= helix_consensus::EPOCH_LENGTH * 2);
+        let peer1 = serve_blocks(phase1).await;
+        let peer2 = serve_blocks(phase2).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = {
+            let mut cs = ChainState::new(0);
+            stake_validator(&mut cs, &genesis_kp); // A
+            stake_validator(&mut cs, &kp_b); // B — C is deliberately NOT staked yet
+            Arc::new(RwLock::new(cs))
+        };
+        // C's engine at startup: the bootstrap fallback set (just the validator it syncs behind),
+        // with its own identity. C is a plain follower so far, in nobody's set.
+        let stale = ValidatorSet::new(vec![Validator::new(addr_a.clone(), 1_000_000, false)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(stale, joiner_addr.clone(), 0)));
+
+        // Phase 1: C follows the chain across A and B's activation at height 200 — a rotation it is
+        // not part of — over the sync path.
+        let h1 = {
+            let mut s = store.write().await;
+            let mut cs = chain_state.write().await;
+            sync_blocks_from_peer(&peer1, 0, &mut s, &mut cs).await.unwrap();
+            s.latest_height()
+        };
+        assert_eq!(h1, helix_consensus::EPOCH_LENGTH * 2);
+        reconcile_engine_validator_set(&engine, &chain_state, h1).await;
+        {
+            let cs = chain_state.read().await;
+            assert!(
+                cs.active_validators.contains(&addr_a) && cs.active_validators.contains(&addr_b),
+                "A and B must be active after their rotation at height {h1}"
+            );
+            assert!(!cs.active_validators.contains(&addr_c), "C has not staked yet — it must not be active");
+        }
+        assert!(
+            engine.read().await.validator_set().get(&joiner_addr).is_none(),
+            "C is only a follower through phase 1 — correctly not in the set"
+        );
+
+        // C now stakes: its `Stake` tx lands on the chain. Modelled as the stake taking effect in
+        // chain state, which is exactly what `execute_block` does when C's tx is included.
+        stake_validator(&mut *chain_state.write().await, &kp_c);
+
+        // Phase 2: C keeps syncing across ITS OWN activation rotation at height 400 — still the sync
+        // path, never the finalize path.
+        let h2 = {
+            let mut s = store.write().await;
+            let mut cs = chain_state.write().await;
+            sync_blocks_from_peer(&peer2, helix_consensus::EPOCH_LENGTH * 2, &mut s, &mut cs).await.unwrap();
+            s.latest_height()
+        };
+        assert_eq!(h2, helix_consensus::EPOCH_LENGTH * 4);
+        assert!(
+            chain_state.read().await.active_validators.contains(&addr_c),
+            "C must be bonded (active) in chain state after crossing its activation epoch at {h2}"
+        );
+
+        // Positive control: without reconciling, C's live engine keeps the stale phase-1 set and
+        // never learns it is a validator — the exact bonded-but-silent stall the operators hit.
+        assert!(
+            engine.read().await.validator_set().get(&joiner_addr).is_none(),
+            "before reconcile C is bonded in state but absent from its own live set — the stall"
+        );
+
+        // The fix: mirror the synced rotation into the live engine.
+        reconcile_engine_validator_set(&engine, &chain_state, h2).await;
+
+        let eng = engine.read().await;
+        for (label, a) in [("A", &addr_a), ("B", &addr_b), ("C", &addr_c)] {
+            assert!(
+                eng.validator_set().get(a).is_some(),
+                "after reconcile, validator {label} must be in C's live set — a real 3-of-3 quorum, not a silent stall"
+            );
+        }
+        // Every node builds the set through `ValidatorSet::new`, which sorts by address, so the
+        // round-robin proposer schedule is a pure function of the membership. Pin that C's schedule
+        // is the canonical address-sorted order — identical to what the incumbents run. A divergent
+        // order here IS the 2→3 stall (a node proposes out of turn / expects the wrong proposer).
+        let mut expected = vec![addr_a.clone(), addr_b.clone(), addr_c.clone()];
+        expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let actual: Vec<Address> = eng.validator_set().validators.iter().map(|v| v.address.clone()).collect();
+        assert_eq!(actual, expected, "C's proposer-schedule order diverges from the canonical set — the 2→3 stall");
+        assert_eq!(
+            eng.peers_needed_for_quorum(),
+            2,
+            "a 3-validator set needs the other two — genuine multi-validator BFT, zero fault tolerance"
         );
     }
 
@@ -3000,6 +3140,7 @@ mod handle_p2p_event_tests {
             Address::from_public_key(&kp.public),
             kp.public.clone(),
             Sig::from_bytes(vec![]),
+            0,
         );
         block.header.height = height;
         block.header.prev_hash = prev_hash;
@@ -3610,6 +3751,7 @@ mod genesis_verification_tests {
                 validator,
                 kp.public.clone(),
                 Signature::from_bytes(vec![0u8; 8]),
+                0,
             ),
             personhood_authorities: vec![],
             governance_params: GovernanceParams::default(),

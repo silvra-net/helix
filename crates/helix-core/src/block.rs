@@ -201,12 +201,28 @@ impl Block {
     }
 }
 
-/// Genesis block — the first block, height 0, no parent
-pub fn genesis_block(validator: Address, public_key: PublicKey, signature: Signature) -> Block {
+/// Genesis block — the first block, height 0, no parent.
+///
+/// `timestamp` is part of the header, so it flows into `hash()` — which is this chain's
+/// identity (block 1's `prev_hash`, and the `chain_id` the double-sign signing guard persists
+/// to tell one chain from another). Every *other* genesis field is deterministic for a given
+/// validator key (`height`/`prev_hash`/`merkle_root` fixed, and the signature is over a constant
+/// string with ML-DSA signing deterministically), so **two chains bootstrapped by the same key
+/// hash to the same genesis unless their timestamps differ.** A real bootstrap therefore passes a
+/// wall-clock timestamp, making each reset a genuinely distinct chain; tests that want a stable
+/// hash pass `0`. Before this was a parameter it was hardcoded `0`, which silently made every
+/// reset that reused the validator key produce the *same* chain_id — defeating the guard's
+/// reset detection and leaving a re-joining validator gagged by its old chain's high-water mark.
+pub fn genesis_block(
+    validator: Address,
+    public_key: PublicKey,
+    signature: Signature,
+    timestamp: u64,
+) -> Block {
     let header = BlockHeader {
         version: 1,
         height: 0,
-        timestamp: 0,
+        timestamp,
         prev_hash: Hash::ZERO,
         merkle_root: Hash::ZERO,
         validator,
@@ -278,7 +294,7 @@ mod tests {
 
     fn signed_test_block(kp: &helix_crypto::KeyPair) -> Block {
         let addr = Address::from_public_key(&kp.public);
-        let mut block = genesis_block(addr, kp.public.clone(), Sig::from_bytes(vec![]));
+        let mut block = genesis_block(addr, kp.public.clone(), Sig::from_bytes(vec![]), 0);
         let sig = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
         block.header.signature = sig;
         block
@@ -320,8 +336,32 @@ mod tests {
             Address::from_public_key(&pk),
             pk,
             Sig::from_bytes(vec![]),
+            0,
         );
         assert!(block.merkle_proof_for(0).is_none());
+    }
+
+    /// The genesis hash is this chain's identity (block 1's `prev_hash`, and the signing guard's
+    /// `chain_id` for telling one chain from another across a reset). Every genesis field except
+    /// the timestamp is fixed for a given key — and the genesis signature is over a constant with
+    /// deterministic ML-DSA signing — so the timestamp is the *only* thing that distinguishes two
+    /// chains bootstrapped by the same validator key. This pins that: same fields + same timestamp
+    /// collide (the historical hardcoded-0 bug), different timestamps do not. If this ever fails,
+    /// the signing guard's reset detection silently breaks and a re-joining validator gets gagged.
+    #[test]
+    fn genesis_hash_distinguishes_resets_only_via_timestamp() {
+        let kp = helix_crypto::KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let sig = kp.sign(b"helix-genesis-v1").unwrap();
+        let mk = |ts: u64| genesis_block(addr.clone(), kp.public.clone(), sig.clone(), ts).hash();
+
+        assert_eq!(mk(0), mk(0), "same key + same timestamp must be identical — chain_id is stable within a chain");
+        assert_ne!(
+            mk(1_753_000_000_000),
+            mk(1_753_000_000_001),
+            "same key, different reset timestamp must differ — this is what makes chain_id chain-unique"
+        );
+        assert_ne!(mk(0), mk(1_753_000_000_000), "the old hardcoded-0 genesis must not collide with a real-timestamp reset");
     }
 
     fn signed_commit_sig(kp: &helix_crypto::KeyPair, height: u64, round: u32, block_hash: Hash) -> CommitSig {

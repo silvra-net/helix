@@ -360,6 +360,27 @@ mod tests {
         assert!(verify(&kp.public, msg, &sig).is_ok());
     }
 
+    /// ML-DSA `try_sign` (the Signer trait, no RNG) is DETERMINISTIC: the same seed signing
+    /// the same message twice — even from two independently reconstructed keypairs, exactly
+    /// what a chain reset does with the persisted validator key — yields byte-identical
+    /// signatures. Consequence for the node: the genesis block (timestamp 0, ZERO parent/merkle,
+    /// signature over a fixed `b"helix-genesis-v1"`) hashes identically across every reset that
+    /// reuses the validator key, so `Block::hash()` — and therefore the signing guard's
+    /// `chain_id` — is NOT chain-unique. Pins the assumption the chain_id double-sign defense
+    /// depends on.
+    #[test]
+    fn mldsa_sign_is_deterministic_across_reconstruction() {
+        let seed = [7u8; 32];
+        let a = KeyPair::from_mldsa_seed(&seed).unwrap();
+        let b = KeyPair::from_mldsa_seed(&seed).unwrap();
+        let msg = b"helix-genesis-v1";
+        let sig_a1 = a.sign(msg).unwrap();
+        let sig_a2 = a.sign(msg).unwrap();
+        let sig_b = b.sign(msg).unwrap();
+        assert_eq!(sig_a1.as_bytes(), sig_a2.as_bytes(), "same key, same msg, two signs");
+        assert_eq!(sig_a1.as_bytes(), sig_b.as_bytes(), "reconstructed key signs identically");
+    }
+
     #[test]
     fn test_verify_wrong_message_fails() {
         let kp = KeyPair::generate();

@@ -83,6 +83,19 @@ const WS_A_WS: u16 = 29_647;
 const WS_B_RPC: u16 = 29_655;
 const WS_B_P2P: u16 = 29_656;
 
+/// Fifth port range, for the runtime-join test — a validator funded, staked and activated *at
+/// runtime* rather than pre-staked in genesis. Same shared-binary concurrency reason as above.
+const JOIN_A_RPC: u16 = 29_665;
+const JOIN_A_P2P: u16 = 29_666;
+const JOIN_B_RPC: u16 = 29_675;
+const JOIN_B_P2P: u16 = 29_676;
+
+/// Block cadence for the runtime-join test only (`HELIX_BLOCK_TIME_MS`). The two activation
+/// epochs a runtime joiner must cross are a fixed 200 blocks (`EPOCH_LENGTH` is a protocol
+/// constant, deliberately not tunable), so at the production 2 s/block that alone is ~7 minutes.
+/// Block time enters no hash and not the proposer schedule, so shrinking it changes only wall-clock.
+const JOIN_BLOCK_TIME_MS: &str = "300";
+
 /// Owns a spawned node's child process and its temp working directory. Killing the process
 /// on drop (even if the test panics or an assertion fails partway through) is the whole point
 /// — without it, a failing run leaks `helix` processes still bound to these ports, and every
@@ -317,6 +330,170 @@ async fn wait_for_height(rpc_port: u16, min_height: u64, timeout: Duration) -> s
             std::time::Instant::now() < deadline,
             "node on RPC port {rpc_port} did not reach height {min_height} within {timeout:?}"
         );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+async fn account(rpc_port: u16, address: &str) -> Option<serde_json::Value> {
+    reqwest::get(format!("http://127.0.0.1:{rpc_port}/accounts/{address}"))
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()
+}
+
+/// Write a keypair to a throwaway plaintext key file the `helix` CLI can sign transactions with
+/// (`--key`). The returned `TempDir` must stay alive for the file to exist.
+fn temp_keyfile(kp: &KeyPair) -> (tempdir::TempDir, std::path::PathBuf) {
+    let dir = tempdir::TempDir::new().expect("temp dir for key file");
+    let path = dir.path().join("signer-key.json");
+    KeyFile::from_keypair_plain(kp).save(&path).expect("save plaintext key file");
+    (dir, path)
+}
+
+/// Run the real `helix` CLI binary against `node_url` (via `HELIX_NODE`), returning the exit
+/// status. This is the same binary an operator runs — `helix tx send` / `helix tx stake` — so the
+/// test exercises transaction building, signing, nonce fetch and submission end to end, not a
+/// test-only shortcut.
+fn run_cli(node_url: &str, args: &[&str]) -> bool {
+    Command::new(env!("CARGO_BIN_EXE_helix"))
+        .env("HELIX_NODE", node_url)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run helix CLI")
+        .success()
+}
+
+/// The end-to-end runtime join, over the **real `helix` binary**: an operator funds a second
+/// account, that account stakes with a real `helix tx stake`, waits out its activation, and must
+/// then actually co-sign. No existing test covers this — the 3- and 4-validator tests all pre-stake
+/// every validator in genesis, so a joiner is a validator from block 0 and never crosses an
+/// activation rotation at all. This is the path every real operator takes, and the one that kept
+/// stalling.
+///
+/// The decisive assertion needs no signature inspection: node A starts as the *sole* validator, so
+/// once B is active the set is 2-of-2, whose quorum needs **both** votes — A alone mathematically
+/// cannot finalize another block. So if the height keeps climbing *after* B activates, B is
+/// provably co-signing. A stall (B bonded-but-silent) would freeze the height instead, exactly the
+/// live symptom.
+///
+/// Honest scope: with both nodes healthy, B crosses its activation *live* (connected, voting), so
+/// this exercises the runtime stake→activate→co-sign path of the real binary rather than the
+/// sync-path activation race of #130 — that race is covered deterministically by
+/// `a_third_validator_joining_over_sync_matches_the_incumbents_set_and_schedule` in the node crate,
+/// which can force the crossing to happen over `sync_blocks_from_peer` without a flaky process race.
+#[tokio::test]
+#[ignore = "spawns 2 real node processes, funds+stakes a validator via the real CLI, and waits out its ~200-block activation at an accelerated block time (~1-2 min wall-clock) — run explicitly with --ignored"]
+async fn a_validator_funded_and_staked_at_runtime_activates_and_co_signs() {
+    let kp_a = KeyPair::generate();
+    let kp_b = KeyPair::generate();
+    let addr_b = Address::from_public_key(&kp_b.public).to_string();
+
+    let ma = |port: u16| format!("/ip4/127.0.0.1/tcp/{port}");
+    let fast = ("HELIX_BLOCK_TIME_MS", JOIN_BLOCK_TIME_MS);
+
+    // A: fresh single-validator genesis (its 500k liquid reserve is what funds B), known key so the
+    // test can sign transfers from it. Seeds toward B so the two form a mesh once B is up.
+    let seeds_a = ma(JOIN_B_P2P);
+    let _node_a = spawn_node_with(
+        JOIN_A_RPC,
+        JOIN_A_P2P,
+        None,
+        &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_a)],
+        Some(&kp_a),
+    );
+    wait_until_reachable(JOIN_A_RPC, Duration::from_secs(15)).await;
+    wait_for_height(JOIN_A_RPC, 2, Duration::from_secs(30)).await;
+
+    // B: fresh node, no local chain, joins by syncing A's genesis + history — the real join path.
+    let seeds_b = ma(JOIN_A_P2P);
+    let _node_b = spawn_node_with(JOIN_B_RPC, JOIN_B_P2P, Some(JOIN_A_RPC), &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_b)], Some(&kp_b));
+    wait_until_reachable(JOIN_B_RPC, Duration::from_secs(15)).await;
+
+    // Fund B from A's liquid reserve — `helix tx send`, signed by A's key. 110k HLX: 100k to stake
+    // plus a margin for fees, mirroring how the live validators were funded.
+    let (_kd_a, key_a) = temp_keyfile(&kp_a);
+    let a_url = format!("http://127.0.0.1:{JOIN_A_RPC}");
+    assert!(
+        run_cli(&a_url, &["tx", "send", &addr_b, "110000", "--key", key_a.to_str().unwrap()]),
+        "helix tx send (fund B) exited non-zero"
+    );
+    let funded = wait_for_account(JOIN_A_RPC, &addr_b, |a| a["balance_hlx"].as_f64().unwrap_or(0.0) >= 110_000.0, Duration::from_secs(30)).await;
+    assert!(funded, "B was never credited the 110k funding transfer");
+
+    // B stakes 100k — `helix tx stake`, signed by B's key. This is the transaction that makes B a
+    // validator; it takes effect at the next epoch boundary and B activates one epoch after that.
+    let (_kd_b, key_b) = temp_keyfile(&kp_b);
+    assert!(
+        run_cli(&a_url, &["tx", "stake", "100000", "--key", key_b.to_str().unwrap()]),
+        "helix tx stake exited non-zero"
+    );
+    let staked = wait_for_account(JOIN_A_RPC, &addr_b, |a| a["staked_hlx"].as_f64().unwrap_or(0.0) >= 100_000.0, Duration::from_secs(30)).await;
+    assert!(staked, "B's stake never took effect on chain");
+
+    // B must cross both activation epochs and show up as active. `EPOCH_LENGTH` is 100, so this is
+    // up to ~200 blocks; generous timeout for the accelerated cadence on a loaded machine.
+    let active = wait_for_validator_active(JOIN_A_RPC, &addr_b, Duration::from_secs(180)).await;
+    assert!(active, "B staked but never entered the active validator set — the activation stalled");
+
+    // THE anti-stall assertion: A alone cannot finalize in a 2-of-2 set, so height advancing past
+    // B's activation proves B is co-signing, not sitting bonded-but-silent.
+    let height_at_activation = status(JOIN_A_RPC).await.unwrap()["height"].as_u64().unwrap();
+    wait_for_height(JOIN_A_RPC, height_at_activation + 10, Duration::from_secs(60)).await;
+
+    // And both nodes agree on the result — no fork or execution divergence across the join.
+    // Third port is A again: this is a 2-node test, so "all three agree" is just "A and B agree".
+    let target = status(JOIN_A_RPC).await.unwrap()["height"].as_u64().unwrap();
+    wait_for_matching_snapshot([JOIN_A_RPC, JOIN_B_RPC, JOIN_A_RPC], target, Duration::from_secs(60)).await;
+    assert_states_converge([JOIN_A_RPC, JOIN_B_RPC, JOIN_A_RPC], Duration::from_secs(20)).await;
+}
+
+/// Poll `/accounts/:address` on `rpc_port` until `pred` holds or `timeout` elapses.
+async fn wait_for_account<F: Fn(&serde_json::Value) -> bool>(
+    rpc_port: u16,
+    address: &str,
+    pred: F,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(a) = account(rpc_port, address).await {
+            if pred(&a) {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll `/validators` on `rpc_port` until `address` shows `active == true` or `timeout` elapses.
+/// The endpoint returns an object `{"validators": [...], ...}`, not a bare array — reaching in for
+/// the `validators` field is the difference between measuring activation and measuring nothing.
+async fn wait_for_validator_active(rpc_port: u16, address: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let active = validators(rpc_port)
+            .await
+            .as_ref()
+            .and_then(|v| v.get("validators"))
+            .and_then(|v| v.as_array())
+            .is_some_and(|list| {
+                list.iter().any(|v| {
+                    v["address"].as_str() == Some(address) && v["active"].as_bool() == Some(true)
+                })
+            });
+        if active {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
