@@ -160,6 +160,9 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
   const amt = Number(amount);
   const amtValid = amount.trim() !== "" && Number.isFinite(amt) && amt > 0;
   const balance = ov?.balance_hlx ?? 0;
+  // Staking moves liquid balance into stake; asking to stake more than you hold only earns a
+  // rejected transaction (and its fee). Catch it here, the same way Send guards a transfer.
+  const overStake = amtValid && amt > balance;
 
   const unbonding = ov?.unbonding_hlx ?? 0;
   const blocksLeft = ov ? Math.max(0, ov.unbonding_unlock_height - (net?.height ?? 0)) : 0;
@@ -311,10 +314,15 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
             </button>
           )}
           <button onClick={() => setAction({ kind: "unstake" })}>Unstake…</button>
-          <button className="primary" disabled={!amtValid} onClick={() => run(() => api.stake(node, amt))}>
+          <button className="primary" disabled={!amtValid || overStake} onClick={() => run(() => api.stake(node, amt))}>
             Stake
           </button>
         </div>
+        {overStake && (
+          <p className="muted small text-warn" style={{ marginTop: 6 }}>
+            More than you have — available to stake is {hlx(balance)} HLX (keep a little back for the fee).
+          </p>
+        )}
         <p className="muted small">
           Available to stake: {ov ? hlx(ov.balance_hlx) : "…"} HLX. Stake also earns you a
           governance vote. Unstaking begins a 7-day unbonding period; the stake stays slashable

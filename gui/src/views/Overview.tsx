@@ -45,9 +45,14 @@ export default function Overview({
 
   const copy = async () => {
     if (!data) return;
-    await navigator.clipboard.writeText(data.address);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1200);
+    try {
+      await navigator.clipboard.writeText(data.address);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Clipboard access can be refused (permissions / insecure context) — the address stays
+      // on screen to copy by hand rather than throwing an unhandled rejection.
+    }
   };
 
   return (

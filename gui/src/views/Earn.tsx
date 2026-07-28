@@ -63,10 +63,18 @@ export default function Earn({ node }: { node: string }) {
               <div className="list-row" key={d.validator}>
                 <div className="list-main">
                   <div className="mono small">{shortAddr(d.validator)}</div>
-                  <div className="muted small">{d.shares.toLocaleString()} shares</div>
+                  <div
+                    className="muted small"
+                    title="Pool shares are the internal accounting unit for your slice of this validator's reward pool. You don't act on them directly — their HLX value (shown at right) is what grows as the validator earns."
+                  >
+                    {d.shares.toLocaleString()} pool shares
+                  </div>
                 </div>
                 <div className="list-right">
-                  <span className="amount">{hlx(d.value_hlx)} HLX</span>
+                  <div className="amount-block">
+                    <span className="micro muted">current value</span>
+                    <span className="amount">{hlx(d.value_hlx)} HLX</span>
+                  </div>
                   <button className="mini" onClick={() => setAction({ kind: "undelegate", validator: d.validator })}>Undelegate</button>
                   <button className="mini" onClick={() => setAction({ kind: "redelegate", validator: d.validator })}>Move</button>
                 </div>

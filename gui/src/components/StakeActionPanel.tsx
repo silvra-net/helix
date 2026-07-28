@@ -110,6 +110,10 @@ export function StakeActionPanel({
         </label>
       )}
 
+      {action.kind === "undelegate" && (
+        <p className="muted small">Amount is the current HLX value to withdraw (your delegation plus whatever it has compounded). It enters a 7-day unbonding period before you can claim it — during that window it earns nothing and still shares the validator's slashing risk.</p>
+      )}
+
       {action.kind === "redelegate" && (
         <p className="muted small">The moved stake keeps earning at the new validator immediately, but stays slashable for the one you left for 7 days.</p>
       )}

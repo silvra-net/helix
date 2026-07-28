@@ -3,6 +3,19 @@ import { api } from "../api";
 import type { GuardianInfo, RecoveryStatus, SubmitResult } from "../types";
 import { shortAddr, shortHash } from "../format";
 
+// Mirrors the backend rule set in helix-identity `HelixName::new` (3–32 chars, lowercase
+// letters/digits/hyphens, no leading/trailing hyphen). Kept in lockstep so an invalid name is
+// caught here — with the same message the chain would give — instead of after a paid, rejected
+// transaction. Returns null when the name is valid.
+function hlxNameError(name: string): string | null {
+  if (name.length < 3) return "Too short — at least 3 characters.";
+  if (name.length > 32) return "Too long — at most 32 characters.";
+  const bad = [...name].find((c) => !/[a-z0-9-]/.test(c));
+  if (bad) return `Invalid character '${bad}' — only lowercase letters, digits and hyphens.`;
+  if (name.startsWith("-") || name.endsWith("-")) return "Cannot start or end with a hyphen.";
+  return null;
+}
+
 // Everything about who you are on-chain: your .hlx name, and social recovery (the guardians who
 // can rotate a lost account, and helping recover someone else's). Two previously separate tabs —
 // merged because both answer the same underlying question ("how does this address represent me,
@@ -85,6 +98,7 @@ export default function Identity({ node, address }: { node: string; address: str
   };
 
   const cleanedName = newName.trim().replace(/\.hlx$/, "");
+  const nameErr = cleanedName ? hlxNameError(cleanedName) : null;
   const pendingOnMe = mine && mine.pending_approvals != null;
 
   return (
@@ -132,13 +146,14 @@ export default function Identity({ node, address }: { node: string; address: str
               spellCheck={false}
               placeholder="alice"
               onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && cleanedName && registerName()}
+              onKeyDown={(e) => e.key === "Enter" && cleanedName && !nameErr && !nameBusy && registerName()}
             />
             <span className="suffix">.hlx</span>
           </div>
         </label>
-        <button className="primary" disabled={nameBusy || !cleanedName} onClick={registerName}>
-          {nameBusy ? "Signing…" : cleanedName ? `Register ${cleanedName}.hlx` : "Register"}
+        {nameErr && <p className="muted small text-warn" style={{ marginTop: -4 }}>{nameErr}</p>}
+        <button className="primary" disabled={nameBusy || !cleanedName || !!nameErr} onClick={registerName}>
+          {nameBusy ? "Signing…" : cleanedName && !nameErr ? `Register ${cleanedName}.hlx` : "Register"}
         </button>
       </div>
 
@@ -228,7 +243,8 @@ function GuardianCard({
   const [text, setText] = useState("");
 
   const list = text.split("\n").map((s) => s.trim()).filter(Boolean);
-  const valid = list.length >= 3 && list.length <= 10 && list.every((a) => a.startsWith("hlx"));
+  const hasDupes = new Set(list).size !== list.length;
+  const valid = list.length >= 3 && list.length <= 10 && list.every((a) => a.startsWith("hlx")) && !hasDupes;
 
   return (
     <div className="card">
@@ -267,6 +283,7 @@ function GuardianCard({
               onChange={(e) => setText(e.target.value)}
             />
           </label>
+          {hasDupes && <p className="muted small text-warn" style={{ marginTop: -4 }}>The same address is listed more than once — each guardian must be distinct.</p>}
           <div className="row-actions end">
             {guardians && <button className="ghost" onClick={() => setEditing(false)}>Cancel</button>}
             <button className="primary" disabled={!valid} onClick={() => onRun(() => api.registerGuardians(node, list))}>

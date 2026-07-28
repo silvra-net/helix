@@ -48,9 +48,14 @@ export default function Settings({ address }: { address: string }) {
   };
 
   const copy = async (what: string, value: string) => {
-    await navigator.clipboard.writeText(value);
-    setCopied(what);
-    setTimeout(() => setCopied(null), 1200);
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(what);
+      setTimeout(() => setCopied(null), 1200);
+    } catch {
+      // Clipboard access can be refused (permissions / insecure context) — the value stays on
+      // screen to copy by hand, which matters most for the recovery phrase. Don't crash on it.
+    }
   };
 
   return (
@@ -90,7 +95,7 @@ export default function Settings({ address }: { address: string }) {
                 value={passphrase}
                 placeholder="passphrase"
                 onChange={(e) => setPassphrase(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && reveal()}
+                onKeyDown={(e) => e.key === "Enter" && !busy && reveal()}
               />
               <button className="primary" disabled={busy} onClick={reveal}>
                 {busy ? "…" : "Reveal recovery phrase"}

@@ -35,7 +35,7 @@ export default function Unlock({ encrypted, onUnlocked }: { encrypted: boolean; 
               autoFocus
               value={passphrase}
               onChange={(e) => setPassphrase(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && unlock()}
+              onKeyDown={(e) => e.key === "Enter" && !busy && passphrase && unlock()}
             />
           </label>
         ) : (
