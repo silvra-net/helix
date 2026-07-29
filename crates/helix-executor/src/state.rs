@@ -373,6 +373,25 @@ pub struct ChainState {
     /// within a block or two and be caught anyway, one step later.
     #[serde(default)]
     pub active_validators: std::collections::HashSet<Address>,
+    /// Validators serving their one-epoch **probation** (backlog #132): promoted out of
+    /// `pending_validators` into the live signing set — so their precommits are gathered and land
+    /// in `last_commit` — but carrying zero voting power and no proposer turn (see
+    /// `helix_consensus::Validator::probationary`). This is what stops a "phantom" (an address
+    /// that staked but has no live node signing for it) from ever becoming quorum-critical and
+    /// freezing a small set: a probationer that never signs is simply not promoted. Hashed like
+    /// `pending_validators`, so joining nodes agree on the signing set that shapes the proposer
+    /// schedule.
+    #[serde(default)]
+    pub probationary_validators: std::collections::HashSet<Address>,
+    /// Probationary validators whose signature has appeared in a committed `last_commit` during
+    /// the current probation epoch — the on-chain, identical-on-every-node proof that a real node
+    /// is running this key. Populated by `record_probation_liveness` from the same verified signer
+    /// set `record_block_participation` uses, cleared at each rotation. `rotate_active_validators`
+    /// promotes exactly `probationary_validators ∩ probation_seen` to full membership. Hashed so a
+    /// divergence in who proved live surfaces immediately rather than silently changing a future
+    /// active set.
+    #[serde(default)]
+    pub probation_seen: std::collections::HashSet<Address>,
     /// Height of the block whose execution produced the state currently in memory.
     ///
     /// Exists so `GET /status` can report a `state_hash` together with the height it belongs to.
@@ -446,6 +465,8 @@ impl ChainState {
             genesis_allocations: Vec::new(),
             pending_validators: std::collections::HashSet::new(),
             active_validators: std::collections::HashSet::new(),
+            probationary_validators: std::collections::HashSet::new(),
+            probation_seen: std::collections::HashSet::new(),
             applied_height: 0,
             missed_blocks: HashMap::new(),
             jailed_until: HashMap::new(),
@@ -884,79 +905,120 @@ impl ChainState {
     /// participating, so `stakers()` still ≈ the set the network runs until the next rotation
     /// repopulates the field. Address-sorted, byte for byte the order `rotate_active_validators`
     /// returns, so the computed proposer schedule is identical to a node that rotated live.
-    pub fn engine_validator_set(&self) -> Vec<(Address, u64)> {
+    pub fn engine_validator_set(&self) -> Vec<(Address, u64, bool)> {
         if self.active_validators.is_empty() {
-            return self.stakers();
+            // Migration / genesis window before any rotation recorded an active set: every
+            // qualifying staker runs as a full member, exactly as before probation existed.
+            return self.stakers().into_iter().map(|(a, s)| (a, s, false)).collect();
         }
-        let mut set: Vec<(Address, u64)> = self
-            .active_validators
-            .iter()
-            .map(|addr| (addr.clone(), self.effective_stake(addr)))
-            .collect();
-        set.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
-        set
+        self.tagged_engine_set()
     }
 
-    /// `stakers()`, but with new entries held out of the active set for one full epoch — see
-    /// `pending_validators`' doc comment for why. `previously_active` is the validator set
-    /// about to be replaced (i.e. still-current members are never delayed, only genuinely new
-    /// ones); mutates `self.pending_validators` in place and returns exactly the addresses
-    /// that should make up the new active set this rotation.
-    ///
-    /// Pure aside from that one mutation, so it's fully unit-testable without a chain, an
-    /// engine, or block production — call it repeatedly with the previous call's own state to
-    /// simulate consecutive rotations.
-    pub fn stakers_after_delayed_activation(
-        &mut self,
-        previously_active: &std::collections::HashSet<Address>,
-    ) -> Vec<(Address, u64)> {
-        let current = self.stakers();
-        let qualifying: std::collections::HashSet<&Address> = current.iter().map(|(a, _)| a).collect();
-        // Anyone who no longer qualifies gets no credit for a wait they didn't finish —
-        // re-crossing the threshold later starts the delay over.
-        self.pending_validators.retain(|addr| qualifying.contains(addr));
+    /// The signing set from the rotation's own truth: `active_validators` as full members
+    /// (`probationary = false`) followed by `probationary_validators` (`true`, zero voting power —
+    /// see `helix_consensus::Validator::probationary`), each group address-sorted so every node
+    /// builds the identical proposer schedule. Returns empty when there is no full member: a set of
+    /// only probationers carries no quorum power and must never be installed, so the caller keeps
+    /// the set it already has (matching `rotate_validator_set`'s existing empty-list no-op).
+    fn tagged_engine_set(&self) -> Vec<(Address, u64, bool)> {
+        if self.active_validators.is_empty() {
+            return Vec::new();
+        }
+        let mut active: Vec<&Address> = self.active_validators.iter().collect();
+        active.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut prob: Vec<&Address> = self.probationary_validators.iter().collect();
+        prob.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        active
+            .into_iter()
+            .map(|a| (a.clone(), self.effective_stake(a), false))
+            .chain(prob.into_iter().map(|a| (a.clone(), self.effective_stake(a), true)))
+            .collect()
+    }
 
-        let mut activated = Vec::with_capacity(current.len());
-        let mut still_new = std::collections::HashSet::new();
-        for (addr, stake) in &current {
-            if previously_active.contains(addr) || self.pending_validators.contains(addr) {
-                activated.push((addr.clone(), *stake));
-            } else {
-                // First time crossing the threshold — sit out this rotation, eligible next time.
-                still_new.insert(addr.clone());
+    /// Advance to the next epoch's signing set, in three tiers (backlog #132): a newly-qualifying
+    /// staker waits one epoch in `pending_validators`, then one epoch in `probationary_validators`
+    /// (in the set to sign, but zero voting power / no proposer turn), and is promoted to full
+    /// `active_validators` only if its signature reached a committed `last_commit` during that
+    /// probation epoch (`probation_seen`). A staker with no live node behind it therefore never
+    /// becomes quorum-critical — it cycles pending → probation → pending without ever gaining
+    /// power — which is what stops a phantom from freezing a small set. Returns the full signing
+    /// set as `(address, effective_stake, probationary)` for the caller to build the consensus
+    /// `ValidatorSet` from.
+    ///
+    /// Called from `execute_block` at every epoch boundary rather than from the node, because it
+    /// mutates consensus state (`pending_validators`, `probationary_validators`, `probation_seen`
+    /// — all folded into `state_hash`; `active_validators` is not, see its doc comment). Rotating
+    /// only where blocks are *produced* would leave a node that caught up through
+    /// `sync_blocks_from_peer` — which executes blocks but never rotated — computing a different
+    /// set from the same blocks.
+    pub fn rotate_active_validators(&mut self) -> Vec<(Address, u64, bool)> {
+        let qualifying: std::collections::HashSet<Address> =
+            self.stakers().into_iter().map(|(a, _)| a).collect();
+
+        // Anyone who no longer meets the stake threshold leaves every tier — no credit for a wait
+        // they didn't finish, the same rule the two-tier logic applied to `pending_validators`.
+        self.active_validators.retain(|a| qualifying.contains(a));
+        self.probationary_validators.retain(|a| qualifying.contains(a));
+        self.pending_validators.retain(|a| qualifying.contains(a));
+        self.probation_seen.retain(|a| qualifying.contains(a));
+
+        // Promote probationers that proved themselves live this epoch — their signature reached a
+        // committed `last_commit` (see `record_probation_liveness`) — to full active membership.
+        // A probationer that never signed (a phantom with no live node) is simply not here.
+        let promoted: Vec<Address> = self
+            .probationary_validators
+            .iter()
+            .filter(|a| self.probation_seen.contains(*a))
+            .cloned()
+            .collect();
+        for a in &promoted {
+            self.active_validators.insert(a.clone());
+        }
+
+        // Pending stakers that have served their one-epoch delay enter probation: in the signing
+        // set so they can prove liveness, but with zero voting power and no proposer turn, so they
+        // cannot make the chain depend on them before they've shown a node is actually running.
+        let new_probationary: std::collections::HashSet<Address> = self
+            .pending_validators
+            .iter()
+            .filter(|a| !self.active_validators.contains(*a))
+            .cloned()
+            .collect();
+
+        // Everyone qualifying who is neither active nor entering probation is new — or a probationer
+        // that failed to prove liveness. Both (re)start the one-epoch pending delay, so a phantom
+        // cycles pending → probation → pending indefinitely without ever becoming quorum-critical,
+        // and rejoins for real the epoch after its node finally signs.
+        let new_pending: std::collections::HashSet<Address> = qualifying
+            .iter()
+            .filter(|a| !self.active_validators.contains(*a) && !new_probationary.contains(*a))
+            .cloned()
+            .collect();
+
+        self.probationary_validators = new_probationary;
+        self.pending_validators = new_pending;
+        self.probation_seen.clear(); // fresh window for the new probation cohort
+
+        // On the very first rotation of a migrated chain (empty `active_validators`) this returns
+        // empty — a no-op that leaves the sitting validators on the `stakers()` fallback set until
+        // a promotion populates `active_validators` — exactly the old empty-list behaviour.
+        self.tagged_engine_set()
+    }
+
+    /// Mark every probationary validator whose verified signature is in this block's `last_commit`
+    /// as having proved itself live this epoch. `signers` is the same validated set
+    /// `record_block_participation` scores against (see `execute_block`), so a proposer can neither
+    /// fabricate nor omit a probationer's liveness beyond what it can already do for any signature.
+    /// Accumulated across the probation epoch and consumed by `rotate_active_validators`.
+    pub fn record_probation_liveness(&mut self, signers: &std::collections::HashSet<Address>) {
+        if self.probationary_validators.is_empty() {
+            return;
+        }
+        for addr in signers {
+            if self.probationary_validators.contains(addr) {
+                self.probation_seen.insert(addr.clone());
             }
         }
-        self.pending_validators = still_new;
-        activated
-    }
-
-    /// Advance to the next epoch's active validator set: promote whoever has served the
-    /// `pending_validators` delay, drop whoever no longer qualifies, and record the result in
-    /// `active_validators`. Returns the new set with each address's effective stake, so the
-    /// caller can build the consensus `ValidatorSet` from it.
-    ///
-    /// Called from `execute_block` at every epoch boundary rather than from the node, because
-    /// it mutates consensus state (`pending_validators`/`active_validators`, both folded into
-    /// `state_hash`). Rotating only where blocks are *produced* would leave a node that caught
-    /// up through `sync_blocks_from_peer` — which executes blocks but never rotated — computing
-    /// a different state from the same blocks.
-    ///
-    /// `previously_active` is taken from `active_validators` itself: a validator already in the
-    /// set is never made to wait again, and one that was jailed out of it is not in the set to
-    /// begin with, so it correctly re-enters as new.
-    pub fn rotate_active_validators(&mut self) -> Vec<(Address, u64)> {
-        // On the very first rotation under this field — a fresh chain, or a database written
-        // before `active_validators` existed — the set is empty and everyone qualifying is
-        // treated as new. That is deliberately *not* special-cased: an empty candidate list
-        // makes `rotate_validator_set` a no-op, so the validators already producing blocks
-        // simply keep their seats for one more epoch and are promoted at the next rotation,
-        // while a newcomer that happened to stake beforehand still serves its delay. Trusting
-        // `stakers()` here instead would hand a brand-new validator quorum weight the instant a
-        // node upgraded — the precise failure `pending_validators` exists to prevent.
-        let previously_active = self.active_validators.clone();
-        let activated = self.stakers_after_delayed_activation(&previously_active);
-        self.active_validators = activated.iter().map(|(addr, _)| addr.clone()).collect();
-        activated
     }
 
     /// An address's total stake-weighted backing for validator-set eligibility and BFT
@@ -1077,6 +1139,8 @@ impl ChainState {
             genesis_allocations: BTreeMap<&'a str, u64>,
             pending_validators: std::collections::BTreeSet<&'a str>,
             // `active_validators` is deliberately NOT hashed — see the note below the struct.
+            probationary_validators: std::collections::BTreeSet<&'a str>,
+            probation_seen: std::collections::BTreeSet<&'a str>,
             missed_blocks: BTreeMap<&'a str, u32>,
             jailed_until: BTreeMap<&'a str, u64>,
         }
@@ -1142,6 +1206,8 @@ impl ChainState {
                 .map(|(a, b)| (a.as_str(), *b))
                 .collect(),
             pending_validators: self.pending_validators.iter().map(|a| a.as_str()).collect(),
+            probationary_validators: self.probationary_validators.iter().map(|a| a.as_str()).collect(),
+            probation_seen: self.probation_seen.iter().map(|a| a.as_str()).collect(),
             missed_blocks: self.missed_blocks.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
             jailed_until: self.jailed_until.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
         };
@@ -1371,19 +1437,21 @@ mod tests {
         stake(&mut state, 1, 100);
         stake(&mut state, 2, 100); // qualifies but will be held out of the active set
 
-        // Before any rotation has populated `active_validators`, fall back to `stakers()` so a
-        // fresh chain's genesis validators still run their genesis-derived set.
+        // Before any rotation has populated `active_validators`, fall back to `stakers()` (every
+        // qualifying staker a full member) so a fresh chain's genesis validators still run.
+        let stakers_as_full: Vec<(Address, u64, bool)> =
+            state.stakers().into_iter().map(|(a, s)| (a, s, false)).collect();
         assert_eq!(
             state.engine_validator_set(),
-            state.stakers(),
-            "with no rotation yet, the engine set is the genesis staker set"
+            stakers_as_full,
+            "with no rotation yet, the engine set is the genesis staker set, all full members"
         );
 
-        // Rotation makes {1,3} active; 2 is still serving its one-epoch activation delay.
+        // Rotation makes {1,3} active; 2 is still serving its activation delay.
         state.active_validators = [addr(1), addr(3)].into_iter().collect();
 
-        let mut expected = vec![(addr(1), 100u64), (addr(3), 100u64)];
-        expected.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+        let mut expected = vec![(addr(1), 100u64, false), (addr(3), 100u64, false)];
+        expected.sort_by(|(a, _, _), (b, _, _)| a.as_str().cmp(b.as_str()));
         assert_eq!(
             state.engine_validator_set(),
             expected,
@@ -1397,79 +1465,135 @@ mod tests {
             "precondition: stakers() includes the pending staker"
         );
         assert!(
-            !state.engine_validator_set().iter().any(|(a, _)| a == &addr(2)),
+            !state.engine_validator_set().iter().any(|(a, _, _)| a == &addr(2)),
             "the pending staker must never reach the live engine set"
         );
     }
 
-    /// The core property this whole mechanism exists for: a brand-new staker must sit out
-    /// the rotation in which they first qualify, and only activate on the *next* one — never
-    /// immediately, no matter how large their stake.
+    /// A probationary validator (backlog #132) is in the engine set so its precommits are gathered,
+    /// but tagged so consensus gives it zero power and no proposer turn.
     #[test]
-    fn a_new_staker_is_deferred_one_rotation_then_activated() {
+    fn engine_set_tags_probationary_validators() {
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100;
-        stake(&mut state, 1, 100); // already active
-        stake(&mut state, 2, 100); // just crossed the threshold
+        stake(&mut state, 1, 100);
+        stake(&mut state, 2, 100);
+        state.active_validators = [addr(1)].into_iter().collect();
+        state.probationary_validators = [addr(2)].into_iter().collect();
 
-        let previously_active: std::collections::HashSet<Address> = [addr(1)].into_iter().collect();
-
-        let first_rotation = state.stakers_after_delayed_activation(&previously_active);
-        assert_eq!(first_rotation, vec![(addr(1), 100)], "the new staker must not appear yet");
-        assert!(
-            state.pending_validators.contains(&addr(2)),
-            "the new staker must be recorded as pending"
+        let set = state.engine_validator_set();
+        assert_eq!(set.iter().find(|(a, _, _)| a == &addr(1)).unwrap().2, false, "active is full");
+        assert_eq!(
+            set.iter().find(|(a, _, _)| a == &addr(2)).unwrap().2,
+            true,
+            "the probationer must be tagged so it signs with no voting power",
         );
-
-        // Simulate the next rotation — the active set hasn't changed (addr(2) never got
-        // promoted), so `previously_active` is unchanged too.
-        let second_rotation = state.stakers_after_delayed_activation(&previously_active);
-        let mut addrs: Vec<Address> = second_rotation.into_iter().map(|(a, _)| a).collect();
-        addrs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        assert_eq!(addrs, vec![addr(1), addr(2)], "the staker must activate on the second rotation");
-        assert!(state.pending_validators.is_empty(), "a promoted staker must leave the pending set");
     }
 
-    /// A staker that drops back below the threshold before ever being promoted gets no
-    /// credit for the wait already spent — re-crossing later must start the delay over, not
-    /// pick up where it left off (otherwise a stake/unstake/restake cycle timed around
-    /// rotations could shortcut the whole mechanism).
+    /// Convenience for the rotation tests: which addresses are active / probationary after a call.
+    fn active_addrs(state: &ChainState) -> Vec<Address> {
+        let mut v: Vec<Address> = state.active_validators.iter().cloned().collect();
+        v.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        v
+    }
+    fn prob_addrs(state: &ChainState) -> Vec<Address> {
+        let mut v: Vec<Address> = state.probationary_validators.iter().cloned().collect();
+        v.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        v
+    }
+
+    /// The core property (backlog #132): a brand-new staker crosses the set in three steps —
+    /// pending, then probation (in the set to sign but powerless), then full active only once it
+    /// has proved a live node. Never quorum-critical before that, no matter its stake.
+    #[test]
+    fn a_new_staker_walks_pending_then_probation_then_active() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 100);
+        stake(&mut state, 2, 100);
+        state.active_validators = [addr(1)].into_iter().collect(); // 1 already active
+
+        // Rotation 1: the newcomer sits in pending, out of the signing set entirely.
+        state.rotate_active_validators();
+        assert_eq!(active_addrs(&state), vec![addr(1)]);
+        assert!(state.pending_validators.contains(&addr(2)), "newcomer waits one epoch in pending");
+        assert!(prob_addrs(&state).is_empty());
+
+        // Rotation 2: it enters probation — now in the signing set, but still not active.
+        state.rotate_active_validators();
+        assert_eq!(active_addrs(&state), vec![addr(1)], "a probationer is not yet quorum-critical");
+        assert_eq!(prob_addrs(&state), vec![addr(2)]);
+        assert!(state.pending_validators.is_empty());
+
+        // During the probation epoch its signature lands in a committed last_commit.
+        state.record_probation_liveness(&[addr(2)].into_iter().collect());
+
+        // Rotation 3: proven live, it is promoted to full active membership.
+        state.rotate_active_validators();
+        assert_eq!(active_addrs(&state), vec![addr(1), addr(2)], "proven-live probationer activates");
+        assert!(prob_addrs(&state).is_empty());
+    }
+
+    /// The whole point of probation: a validator that staked but never signs during its probation
+    /// epoch (a "phantom" with no live node) is dropped, not promoted — it cycles back to pending
+    /// instead of ever becoming quorum-critical, so it can never freeze the chain.
+    #[test]
+    fn a_probationer_that_never_signs_is_dropped_not_promoted() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 100);
+        stake(&mut state, 2, 100);
+        state.active_validators = [addr(1)].into_iter().collect();
+        state.probationary_validators = [addr(2)].into_iter().collect();
+        // probation_seen stays empty — the phantom never signed.
+
+        state.rotate_active_validators();
+        assert_eq!(active_addrs(&state), vec![addr(1)], "the phantom must never gain voting power");
+        assert!(
+            state.pending_validators.contains(&addr(2)),
+            "an unproven probationer restarts the delay rather than activating",
+        );
+        assert!(prob_addrs(&state).is_empty());
+    }
+
+    /// A staker that drops below the threshold before promotion forfeits its accrued wait —
+    /// re-crossing later starts over, so a stake/unstake/restake cycle can't shortcut the delay.
     #[test]
     fn dropping_below_the_threshold_before_promotion_forfeits_the_wait() {
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 100);
         stake(&mut state, 2, 100);
-        let empty: std::collections::HashSet<Address> = std::collections::HashSet::new();
+        state.active_validators = [addr(1)].into_iter().collect();
 
-        state.stakers_after_delayed_activation(&empty);
+        state.rotate_active_validators();
         assert!(state.pending_validators.contains(&addr(2)));
 
-        // Unstakes back below the threshold before the next rotation ever promotes it.
+        // Unstakes below the threshold before the next rotation ever promotes it.
         stake(&mut state, 2, 0);
-        let after_drop = state.stakers_after_delayed_activation(&empty);
-        assert!(after_drop.is_empty());
-        assert!(state.pending_validators.is_empty(), "no longer qualifying — forgotten, not retained");
+        state.rotate_active_validators();
+        assert!(!state.pending_validators.contains(&addr(2)), "no longer qualifying — forgotten");
+        assert!(prob_addrs(&state).is_empty());
 
-        // Re-crosses the threshold — must defer again, not activate immediately just
-        // because it was pending once before.
+        // Re-crosses the threshold — must restart at pending, not resume where it left off.
         stake(&mut state, 2, 100);
-        let after_restake = state.stakers_after_delayed_activation(&empty);
-        assert!(after_restake.is_empty(), "re-crossing the threshold must restart the delay");
-        assert!(state.pending_validators.contains(&addr(2)));
+        state.rotate_active_validators();
+        assert!(state.pending_validators.contains(&addr(2)), "re-crossing restarts the delay");
     }
 
-    /// A validator already in the active set is never delayed, regardless of pending-set
-    /// state — being currently active always takes priority.
+    /// A validator already in the active set is never demoted or delayed by a rotation, even as
+    /// its stake changes — being currently active takes priority.
     #[test]
-    fn an_already_active_validator_is_never_delayed() {
+    fn an_already_active_validator_stays_active() {
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100;
-        stake(&mut state, 1, 250); // stake changed since last rotation, still qualifies
-        let previously_active: std::collections::HashSet<Address> = [addr(1)].into_iter().collect();
+        stake(&mut state, 1, 250);
+        state.active_validators = [addr(1)].into_iter().collect();
 
-        let activated = state.stakers_after_delayed_activation(&previously_active);
-        assert_eq!(activated, vec![(addr(1), 250)]);
+        state.rotate_active_validators();
+        assert_eq!(active_addrs(&state), vec![addr(1)]);
         assert!(state.pending_validators.is_empty());
+        assert!(prob_addrs(&state).is_empty());
     }
 
     /// The point of persisted downtime-jailing: a validator missing from `last_commit` for

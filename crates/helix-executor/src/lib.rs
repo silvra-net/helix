@@ -76,6 +76,11 @@ pub fn execute_block(
         .map(|sig| sig.validator.clone())
         .collect();
     let newly_jailed = state.record_block_participation(&current_validators, &signers, height);
+    // Same verified signer set feeds probation: any probationary validator (backlog #132) whose
+    // signature is in this committed `last_commit` has proved a live node is running its key, and
+    // becomes eligible for promotion at the next rotation. A probationer carries no voting power,
+    // so a phantom that never signs is simply never promoted rather than freezing the chain.
+    state.record_probation_liveness(&signers);
 
     for tx in &block.transactions {
         let receipt = execute_transaction(state, tx, fee_recipient, height, base_fee_per_byte);
@@ -4077,7 +4082,8 @@ mod tests {
     #[test]
     fn the_epoch_rotation_happens_during_block_execution() {
         let proposer = Address::from_public_key(&KeyPair::generate().public);
-        let newcomer = Address::from_public_key(&KeyPair::generate().public);
+        let newcomer_kp = KeyPair::generate();
+        let newcomer = Address::from_public_key(&newcomer_kp.public);
         let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
         state.governance_params.min_validator_stake = 100;
         // An already-running set, so this exercises a newcomer joining rather than the
@@ -4087,58 +4093,87 @@ mod tests {
         state.update_account(&newcomer, |acc| acc.staked = 1_000);
 
         let epoch = helix_consensus::EPOCH_LENGTH;
+
+        // Rotation 1: the newcomer waits in pending, out of the signing set entirely.
         let receipt = execute_block(&mut state, &empty_block(&proposer, epoch), None);
         assert!(receipt.rotated_validators.is_some(), "an epoch boundary must report a rotation");
         assert!(
             state.pending_validators.contains(&newcomer) && !state.active_validators.contains(&newcomer),
-            "first rotation defers the newcomer"
+            "first rotation defers the newcomer to pending"
         );
         assert!(state.active_validators.contains(&proposer), "the sitting validator is never deferred");
 
+        // Rotation 2: it enters probation — now signing (so it can prove a live node), but still
+        // powerless and not active (backlog #132).
         execute_block(&mut state, &empty_block(&proposer, epoch * 2), None);
         assert!(
-            state.active_validators.contains(&newcomer),
-            "second rotation activates it"
+            state.probationary_validators.contains(&newcomer) && !state.active_validators.contains(&newcomer),
+            "second rotation puts the newcomer on probation, not yet quorum-critical"
         );
 
-        let mid_epoch = execute_block(&mut state, &empty_block(&proposer, epoch * 2 + 1), None);
+        // It signs a block during its probation epoch — the on-chain proof of a live node.
+        execute_block(&mut state, &block_with_commit(&proposer, epoch * 2 + 1, &[&newcomer_kp]), None);
+        assert!(state.probation_seen.contains(&newcomer), "its signature is recorded as proof of liveness");
+
+        // Rotation 3: proven live, promoted to full active membership.
+        execute_block(&mut state, &empty_block(&proposer, epoch * 3), None);
+        assert!(
+            state.active_validators.contains(&newcomer),
+            "third rotation activates the newcomer that proved itself live"
+        );
+
+        let mid_epoch = execute_block(&mut state, &empty_block(&proposer, epoch * 3 + 1), None);
         assert!(mid_epoch.rotated_validators.is_none(), "ordinary blocks must not rotate");
     }
 
-    /// Upgrading a node must not hand out quorum weight. On the first rotation after the
-    /// upgrade `active_validators` is empty, and the tempting shortcut — "seed it from
-    /// `stakers()`, they must all be active already" — would promote a validator that staked
-    /// beforehand and never ran a node, instantly and with no delay: exactly the freeze
-    /// `pending_validators` was built to prevent. Everyone waits instead; the sitting
-    /// validators lose nothing, because an empty candidate list leaves their seats untouched
-    /// (`rotate_validator_set` is a no-op) and they are promoted one epoch later.
+    /// The heart of backlog #132: probation activates only a validator that has proved a live node
+    /// signs for it. A validator that stakes but never signs (a "phantom") is held powerless
+    /// through probation and dropped — it never becomes quorum-critical, so it can never freeze the
+    /// chain. This also covers the post-upgrade migration case (`active_validators` starts empty):
+    /// nobody is handed instant quorum weight.
     #[test]
-    fn the_first_rotation_after_an_upgrade_grants_nobody_instant_quorum_weight() {
-        let sitting = Address::from_public_key(&KeyPair::generate().public);
-        let never_ran_a_node = Address::from_public_key(&KeyPair::generate().public);
+    fn probation_activates_only_a_validator_that_proves_it_is_live() {
+        let sitting_kp = KeyPair::generate();
+        let sitting = Address::from_public_key(&sitting_kp.public);
+        let phantom = Address::from_public_key(&KeyPair::generate().public);
         let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
         state.governance_params.min_validator_stake = 100;
         state.update_account(&sitting, |acc| acc.staked = 100_000);
-        state.update_account(&never_ran_a_node, |acc| acc.staked = 100_000);
+        state.update_account(&phantom, |acc| acc.staked = 100_000);
         assert!(state.active_validators.is_empty(), "a state loaded from a pre-upgrade database");
 
         let epoch = helix_consensus::EPOCH_LENGTH;
-        let receipt = execute_block(&mut state, &empty_block(&sitting, epoch), None);
 
+        // Rotation 1: no active member yet — nobody is handed instant weight, both wait in pending
+        // and the live set is left untouched (empty candidate list, a no-op for the engine).
+        let receipt = execute_block(&mut state, &empty_block(&sitting, epoch), None);
         assert_eq!(
             receipt.rotated_validators.as_deref(),
             Some(&[][..]),
-            "no candidate list — the live set stays exactly as it is for one more epoch"
+            "no full member yet — the live set stays exactly as it is"
+        );
+        assert!(!state.active_validators.contains(&phantom));
+
+        // Rotation 2: both enter probation together.
+        execute_block(&mut state, &empty_block(&sitting, epoch * 2), None);
+        assert!(state.probationary_validators.contains(&sitting));
+        assert!(state.probationary_validators.contains(&phantom));
+
+        // Only `sitting` signs during the probation epoch; `phantom` has no node behind it.
+        execute_block(&mut state, &block_with_commit(&sitting, epoch * 2 + 1, &[&sitting_kp]), None);
+
+        // Rotation 3: the prover is promoted; the phantom is not, and cycles back to pending
+        // rather than ever gaining voting power.
+        execute_block(&mut state, &empty_block(&sitting, epoch * 3), None);
+        assert!(state.active_validators.contains(&sitting), "the validator that signed is promoted");
+        assert!(
+            !state.active_validators.contains(&phantom),
+            "the phantom that never signed must never be handed quorum weight",
         );
         assert!(
-            !state.active_validators.contains(&never_ran_a_node),
-            "an address that never validated must not be handed quorum weight by an upgrade"
+            state.pending_validators.contains(&phantom),
+            "it restarts the delay instead of becoming quorum-critical",
         );
-
-        // One epoch later both have served the delay and are promoted normally.
-        execute_block(&mut state, &empty_block(&sitting, epoch * 2), None);
-        assert!(state.active_validators.contains(&sitting));
-        assert!(state.active_validators.contains(&never_ran_a_node));
     }
 
     #[test]

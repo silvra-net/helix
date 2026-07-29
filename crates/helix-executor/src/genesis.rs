@@ -373,7 +373,7 @@ mod tests {
             "the genesis validator must be active immediately, never deferred like a newcomer"
         );
         let engine_set: Vec<Address> =
-            state.engine_validator_set().into_iter().map(|(a, _)| a).collect();
+            state.engine_validator_set().into_iter().map(|(a, _, _)| a).collect();
         assert_eq!(
             engine_set,
             vec![validator],
@@ -414,7 +414,7 @@ mod tests {
             "precondition: the newcomer qualifies by stake right away"
         );
         let engine_set: Vec<Address> =
-            state.engine_validator_set().into_iter().map(|(a, _)| a).collect();
+            state.engine_validator_set().into_iter().map(|(a, _, _)| a).collect();
         assert!(
             !engine_set.contains(&newcomer),
             "a newcomer must serve its activation delay — never appear in the live set early"

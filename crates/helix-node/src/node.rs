@@ -1215,9 +1215,15 @@ fn validators_from_state(state: &ChainState) -> Vec<Validator> {
     state
         .engine_validator_set()
         .into_iter()
-        .map(|(addr, stake)| {
+        .map(|(addr, stake, probationary)| {
             let has_personhood = state.has_personhood(&addr);
-            Validator::new(addr, stake, has_personhood)
+            if probationary {
+                // In the set to sign (so its liveness is provable via `last_commit`) but with no
+                // voting power and no proposer turn — see `Validator::probationary` / backlog #132.
+                Validator::new_probationary(addr, stake, has_personhood)
+            } else {
+                Validator::new(addr, stake, has_personhood)
+            }
         })
         .collect()
 }
@@ -1419,9 +1425,13 @@ async fn apply_finalized_block(
         let deferred: Vec<Address> = state_guard.pending_validators.iter().cloned().collect();
         let validators: Vec<Validator> = activated
             .into_iter()
-            .map(|(addr, stake)| {
+            .map(|(addr, stake, probationary)| {
                 let has_personhood = state_guard.has_personhood(&addr);
-                Validator::new(addr, stake, has_personhood)
+                if probationary {
+                    Validator::new_probationary(addr, stake, has_personhood)
+                } else {
+                    Validator::new(addr, stake, has_personhood)
+                }
             })
             .collect();
         drop(state_guard);
@@ -2685,11 +2695,15 @@ mod sync_blocks_from_peer_tests {
     /// blocks (rotating `active_validators` in chain state) but skips the finalize path's
     /// `rotate_validator_set`. Their activation rotation lands mid-sync.
     ///
-    /// Before the fix, the live engine kept the stale set it built at startup, so the joiner was
-    /// never in its own validator set: it never proposed or voted, and the 2-of-2 chain it had
-    /// just made quorum-critical stalled with the node reporting itself bonded-but-silent. After
-    /// the fix, reconciling the live engine from the freshly-synced chain state puts the joiner in
-    /// its own set, so it participates and the chain keeps finalizing.
+    /// Before the fix (#129), the live engine kept the stale set it built at startup, so the joiner
+    /// was never in its own validator set: it never proposed or voted, and the node reported itself
+    /// bonded-but-silent. After the fix, reconciling the live engine from the freshly-synced chain
+    /// state puts the joiner in its own set, so it participates.
+    ///
+    /// Layered on top (#132): because the joiner only *synced* and its own signature never reached
+    /// a committed `last_commit`, it enters the reconciled set as a zero-power **probationer** — in
+    /// the set to sign, but not yet carrying quorum weight — so the chain keeps finalizing on the
+    /// incumbent alone and an unproven (possibly phantom) joiner can never freeze it.
     #[tokio::test]
     async fn a_validator_that_activates_while_syncing_ends_up_in_its_own_live_set() {
         let genesis_kp = KeyPair::generate();
@@ -2706,13 +2720,15 @@ mod sync_blocks_from_peer_tests {
         let peer_url = serve_blocks(blocks).await;
 
         // The joiner's node state: both validators are staked (the joiner's `Stake` tx is already
-        // part of the chain it is about to sync), `active_validators` still empty — the genesis
-        // window, so the rotation logic must promote them itself.
+        // part of the chain it is about to sync). The genesis validator has been active since
+        // block 0 (`Genesis::apply` seeds `active_validators`), so it holds its seat across the
+        // rotations while the joiner walks the tiers.
         let store = Arc::new(RwLock::new(fresh_store()));
         let chain_state = {
             let mut cs = ChainState::new(0);
             stake_validator(&mut cs, &genesis_kp);
             stake_validator(&mut cs, &joiner_kp);
+            cs.active_validators.insert(genesis_addr.clone());
             Arc::new(RwLock::new(cs))
         };
 
@@ -2735,28 +2751,45 @@ mod sync_blocks_from_peer_tests {
             s.latest_height()
         };
 
-        // Chain state rotated the joiner in — this is the "bonded" the health heartbeat reports.
-        assert!(
-            chain_state.read().await.active_validators.contains(&joiner_addr),
-            "the joiner must be bonded (active) in chain state after crossing its activation epoch"
-        );
+        // Chain state rotated the joiner into PROBATION — the synced blocks carry no `last_commit`
+        // signed by the joiner (a solo producer's chain), so it never proved liveness and is held
+        // at zero power rather than handed full membership. That is #132's protection: a node that
+        // only synced, and might be a phantom, cannot become quorum-critical until it signs.
+        {
+            let cs = chain_state.read().await;
+            assert!(
+                cs.probationary_validators.contains(&joiner_addr),
+                "the joiner is in probation after crossing its activation epoch — in the set, no power yet"
+            );
+            assert!(
+                !cs.active_validators.contains(&joiner_addr),
+                "…and specifically NOT active: it has not proved a live node behind it"
+            );
+            assert!(
+                cs.active_validators.contains(&genesis_addr),
+                "the genesis validator was active from block 0 and stays active"
+            );
+        }
 
-        // The fix: reconcile mirrors that rotation into the live engine.
+        // The fix (#129/#130): reconcile mirrors that rotation into the live engine.
         reconcile_engine_validator_set(&engine, &chain_state, new_height).await;
 
         let eng = engine.read().await;
+        let joiner = eng.validator_set().get(&joiner_addr).cloned();
         assert!(
-            eng.validator_set().get(&joiner_addr).is_some(),
-            "after reconciling, the joiner runs itself in its own live set and can propose/vote"
-        );
-        assert!(
-            eng.validator_set().get(&genesis_addr).is_some(),
-            "the genesis validator stays in the set — a real 2-of-2 quorum, not a silent stall"
+            joiner.is_some(),
+            "after reconciling, the joiner is in its own live set so it can sign — no longer silent"
         );
         assert_eq!(
-            eng.peers_needed_for_quorum(),
-            1,
-            "the joiner now knows it needs the other validator's vote — no longer silent"
+            joiner.unwrap().voting_power,
+            0,
+            "but as a zero-power probationer: it participates without the chain depending on it"
+        );
+        let genesis = eng.validator_set().get(&genesis_addr).cloned();
+        assert!(genesis.is_some(), "the genesis validator stays in the set");
+        assert!(
+            genesis.unwrap().voting_power > 0,
+            "and carries all the voting power — the chain still finalizes on it alone, no stall"
         );
     }
 
@@ -2770,11 +2803,15 @@ mod sync_blocks_from_peer_tests {
     ///
     /// Sequencing is the whole point and is why this is a distinct test: A and B activate first, and
     /// C stakes only *afterwards*, so its activation lands a full epoch later against an already-
-    /// larger set. A 3-validator set tolerates zero absences (2 of 3 capped-equal voters fall one
-    /// short of `2/3+1`, exactly like 2 of 2), so if C computed even a slightly different set or
-    /// proposer order than the incumbents at either boundary, the chain stalls. The assertion is
-    /// that C, purely from syncing, arrives at the identical address-sorted {A,B,C} set — so every
-    /// node agrees on the round-robin schedule — and that reconciling is what makes it so.
+    /// larger set. If C computed even a slightly different membership or proposer order than the
+    /// incumbents at either boundary, the chain stalls. The assertion is that C, purely from
+    /// syncing, arrives at the identical set every other node builds — the full incumbents {A,B} in
+    /// canonical address order plus C — so every node agrees on the round-robin schedule, and that
+    /// reconciling is what makes it so.
+    ///
+    /// And (#132) because C only synced and never signed a committed `last_commit`, it lands as a
+    /// zero-power **probationer**: present so it can start signing, but carrying no quorum weight, so
+    /// the incumbents keep finalizing and an unproven C cannot freeze the set it just joined.
     #[tokio::test]
     async fn a_third_validator_joining_over_sync_matches_the_incumbents_set_and_schedule() {
         let genesis_kp = KeyPair::generate(); // A
@@ -2800,6 +2837,10 @@ mod sync_blocks_from_peer_tests {
             let mut cs = ChainState::new(0);
             stake_validator(&mut cs, &genesis_kp); // A
             stake_validator(&mut cs, &kp_b); // B — C is deliberately NOT staked yet
+            // A and B are the sitting validators, active since block 0 (`Genesis::apply` seeds
+            // `active_validators`) — the realistic state a third operator joins into.
+            cs.active_validators.insert(addr_a.clone());
+            cs.active_validators.insert(addr_b.clone());
             Arc::new(RwLock::new(cs))
         };
         // C's engine at startup: the bootstrap fallback set (just the validator it syncs behind),
@@ -2843,16 +2884,24 @@ mod sync_blocks_from_peer_tests {
             s.latest_height()
         };
         assert_eq!(h2, helix_consensus::EPOCH_LENGTH * 4);
-        assert!(
-            chain_state.read().await.active_validators.contains(&addr_c),
-            "C must be bonded (active) in chain state after crossing its activation epoch at {h2}"
-        );
+        {
+            let cs = chain_state.read().await;
+            assert!(
+                cs.probationary_validators.contains(&addr_c),
+                "C is in probation after crossing its activation epoch at {h2} — the synced blocks carry \
+                 no `last_commit` signed by C, so it has not yet proved a live node and stays zero-power"
+            );
+            assert!(
+                !cs.active_validators.contains(&addr_c),
+                "…and NOT active: probation is exactly what stops an unproven C from freezing the 3-set (#132)"
+            );
+        }
 
         // Positive control: without reconciling, C's live engine keeps the stale phase-1 set and
-        // never learns it is a validator — the exact bonded-but-silent stall the operators hit.
+        // never learns it is even in the set — the exact bonded-but-silent stall the operators hit.
         assert!(
             engine.read().await.validator_set().get(&joiner_addr).is_none(),
-            "before reconcile C is bonded in state but absent from its own live set — the stall"
+            "before reconcile C is in state but absent from its own live set — the stall"
         );
 
         // The fix: mirror the synced rotation into the live engine.
@@ -2862,21 +2911,42 @@ mod sync_blocks_from_peer_tests {
         for (label, a) in [("A", &addr_a), ("B", &addr_b), ("C", &addr_c)] {
             assert!(
                 eng.validator_set().get(a).is_some(),
-                "after reconcile, validator {label} must be in C's live set — a real 3-of-3 quorum, not a silent stall"
+                "after reconcile, member {label} must be in C's live set — same membership on every node"
             );
         }
-        // Every node builds the set through `ValidatorSet::new`, which sorts by address, so the
-        // round-robin proposer schedule is a pure function of the membership. Pin that C's schedule
-        // is the canonical address-sorted order — identical to what the incumbents run. A divergent
-        // order here IS the 2→3 stall (a node proposes out of turn / expects the wrong proposer).
-        let mut expected = vec![addr_a.clone(), addr_b.clone(), addr_c.clone()];
-        expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        let actual: Vec<Address> = eng.validator_set().validators.iter().map(|v| v.address.clone()).collect();
-        assert_eq!(actual, expected, "C's proposer-schedule order diverges from the canonical set — the 2→3 stall");
+        // A and B carry the voting power; C is a zero-power probationer until it signs — so the
+        // live chain finalizes on the incumbents and C's arrival cannot stall it (#132).
+        assert!(
+            eng.validator_set().get(&addr_a).unwrap().voting_power > 0
+                && eng.validator_set().get(&addr_b).unwrap().voting_power > 0,
+            "the incumbents keep their voting power"
+        );
+        assert_eq!(
+            eng.validator_set().get(&addr_c).unwrap().voting_power,
+            0,
+            "C participates in the set but carries no quorum weight until it proves liveness"
+        );
+        // The proposer schedule is what a divergent set silently breaks (a node proposes out of
+        // turn / expects the wrong proposer = the 2→3 stall). It runs over the FULL members only
+        // (`full_members()`; probationers take no proposer turn), address-sorted, and every path
+        // that builds the set — live finalize, sync/reconcile, genesis — funnels through
+        // `tagged_engine_set` which emits `[active-address-sorted, probationary-address-sorted]`,
+        // a pure function of committed state. Pin that C computes exactly that: the two full
+        // incumbents in canonical address order, then C as a trailing zero-power probationer. A
+        // divergence here is a fork.
+        let vs = eng.validator_set();
+        let full_actual: Vec<Address> =
+            vs.validators.iter().filter(|v| !v.probationary).map(|v| v.address.clone()).collect();
+        let mut full_expected = vec![addr_a.clone(), addr_b.clone()];
+        full_expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(full_actual, full_expected, "C's full-member proposer schedule diverges — the 2→3 stall");
+        let prob_actual: Vec<Address> =
+            vs.validators.iter().filter(|v| v.probationary).map(|v| v.address.clone()).collect();
+        assert_eq!(prob_actual, vec![addr_c.clone()], "C must be the sole probationary member, held after the full set");
         assert_eq!(
             eng.peers_needed_for_quorum(),
             2,
-            "a 3-validator set needs the other two — genuine multi-validator BFT, zero fault tolerance"
+            "C carries no power, so from its seat it needs both full incumbents' votes to reach quorum"
         );
     }
 
@@ -3146,6 +3216,40 @@ mod handle_p2p_event_tests {
         block.header.prev_hash = prev_hash;
         let sig = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
         block.header.signature = sig;
+        block
+    }
+
+    /// A block proposed by `kp` that carries a `last_commit` — the parent height's precommits —
+    /// signed by `signers`. That certificate is what `execute_block` verifies into the `signers`
+    /// set it hands `record_probation_liveness`, so this is how a test makes a probationer's
+    /// signature "seen" (mirrors `helix_executor`'s `block_with_commit`).
+    fn signed_block_with_commit(
+        kp: &KeyPair,
+        height: u64,
+        prev_hash: Hash,
+        signers: &[&KeyPair],
+    ) -> Block {
+        let mut block = signed_block(kp, height, prev_hash);
+        block.header.last_commit = signers
+            .iter()
+            .map(|s| {
+                let bytes = helix_core::precommit_signing_bytes(
+                    height.saturating_sub(1),
+                    0,
+                    &block.header.prev_hash,
+                    helix_core::CryptoVersion::MlDsa,
+                );
+                helix_core::CommitSig {
+                    validator: Address::from_public_key(&s.public),
+                    public_key: s.public.clone(),
+                    crypto_version: helix_core::CryptoVersion::MlDsa,
+                    round: 0,
+                    signature: s.sign(&bytes).unwrap(),
+                }
+            })
+            .collect();
+        // The header signature must cover the last_commit we just set.
+        block.header.signature = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
         block
     }
 
@@ -3616,19 +3720,25 @@ mod handle_p2p_event_tests {
         assert_eq!(store.read().await.latest_height(), 3, "the racing duplicate must not re-touch storage either");
     }
 
-    /// Wiring-level regression test for the new-entrant delay in epoch rotation — the pure
-    /// promotion logic itself (`ChainState::stakers_after_delayed_activation`) has exhaustive
-    /// unit coverage in `helix_executor::state`; this proves `apply_finalized_block`'s rotation
-    /// block actually threads `engine.validator_set()` through as `previously_active` and holds
-    /// a brand-new staker out of the active set for one full epoch. Closes the gap found live
-    /// on 2026-07-20: a `Stake` tx alone made a second validator quorum-critical the moment the
-    /// epoch rotated, with no online-check and no warning, freezing the chain for hours because
-    /// their node wasn't actually connected yet.
+    /// Wiring-level regression test that `apply_finalized_block`'s epoch-rotation block threads
+    /// `execute_block`'s three-tier decision (backlog #132) into the live `BftEngine` — the pure
+    /// promotion logic itself has exhaustive unit coverage in `helix_executor::state`. It walks a
+    /// brand-new staker through the full lifecycle at the node level:
+    ///
+    ///   pending (1 epoch, absent from the set) → probation (in the set, **zero voting power**,
+    ///   no proposer turn) → [its node signs a committed `last_commit`] → full active membership.
+    ///
+    /// Closes the gap found live on 2026-07-20 (a `Stake` tx alone made a second validator
+    /// quorum-critical the moment the epoch rotated, freezing the chain because its node wasn't
+    /// actually connected) *and* the phantom case of 2026-07-28 (#132): a staker whose node never
+    /// signs never gains power — the earlier one-epoch delay let it in unconditionally, probation
+    /// gates it on a proof of liveness.
     #[tokio::test]
-    async fn epoch_rotation_defers_a_brand_new_staker_by_one_epoch() {
+    async fn epoch_rotation_walks_a_new_staker_through_probation_to_full_power() {
         let genesis_kp = KeyPair::generate();
         let genesis_addr = Address::from_public_key(&genesis_kp.public);
-        let new_staker_addr = Address::from_public_key(&KeyPair::generate().public);
+        let new_staker_kp = KeyPair::generate();
+        let new_staker_addr = Address::from_public_key(&new_staker_kp.public);
 
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let store = Arc::new(RwLock::new(fresh_store()));
@@ -3640,39 +3750,126 @@ mod handle_p2p_event_tests {
             // Staked directly rather than via a `Stake` tx — the rotation only cares about
             // `stakers()`, and this keeps the test focused on the rotation wiring itself.
             cs.update_account(&new_staker_addr, |acc| acc.staked = 1_000_000);
+            // Genesis seeds `active_validators` at block 0 (see `Genesis::apply`), so the
+            // incumbent holds its seat across rotations while newcomers walk the tiers. Modelling
+            // that here is what makes this a fresh-genesis chain rather than the one-time
+            // pre-`active_validators` upgrade window (in which everyone runs full via the
+            // `stakers()` fallback and probation offers no gate — covered separately in executor).
+            cs.active_validators.insert(genesis_addr.clone());
         }
         let validator_set = ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, genesis_addr.clone(), 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0u64));
 
-        // First epoch boundary: both accounts already qualify, but new_staker_addr was never
-        // part of the active set before — it must not appear in the rotated set yet.
-        let block_at_epoch = signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH, Hash::ZERO);
-        apply_finalized_block(
-            block_at_epoch, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
-        )
-        .await;
+        let apply = |block: Block, store: &Arc<RwLock<HelixDb>>, engine: &Arc<RwLock<BftEngine>>| {
+            let (store, engine, mempool, chain_state, p2p_tx, last_applied_height) = (
+                store.clone(), engine.clone(), mempool.clone(), chain_state.clone(),
+                p2p_tx.clone(), last_applied_height.clone(),
+            );
+            async move {
+                apply_finalized_block(
+                    block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+                )
+                .await;
+            }
+        };
 
+        // First epoch boundary: both accounts qualify, but the new staker was never active before,
+        // so it enters the one-epoch pending delay — absent from the live set entirely.
+        apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH, Hash::ZERO), &store, &engine).await;
         assert!(
             engine.read().await.validator_set().get(&genesis_addr).is_some(),
             "the already-active validator must remain active"
         );
         assert!(
             engine.read().await.validator_set().get(&new_staker_addr).is_none(),
-            "a brand-new staker must not become quorum-critical on the very rotation it first qualifies"
+            "a brand-new staker must not enter the set on the very rotation it first qualifies"
         );
 
-        // Second epoch boundary, one full epoch later: the new staker must now be promoted.
-        let block_at_second_epoch = signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * 2, Hash::ZERO);
-        apply_finalized_block(
-            block_at_second_epoch, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+        // Second epoch boundary: the new staker enters PROBATION — now in the signing set so its
+        // liveness is provable, but with zero voting power and no proposer turn, so it cannot make
+        // the chain depend on it before it has shown a node is actually running.
+        apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * 2, Hash::ZERO), &store, &engine).await;
+        {
+            let eng = engine.read().await;
+            let v = eng.validator_set().get(&new_staker_addr).cloned();
+            assert!(v.is_some(), "the staker must enter the set at the second rotation (probation)");
+            assert_eq!(v.unwrap().voting_power, 0, "…but as a zero-power probationer, not a full voter");
+        }
+        assert!(
+            chain_state.read().await.probationary_validators.contains(&new_staker_addr),
+            "chain state records it as probationary, not active"
+        );
+
+        // During the probation epoch its node signs a block's `last_commit` — the proof of a live
+        // node the promotion gate requires.
+        apply(
+            signed_block_with_commit(
+                &genesis_kp, helix_consensus::EPOCH_LENGTH * 2 + 1, Hash::ZERO, &[&new_staker_kp],
+            ),
+            &store, &engine,
         )
         .await;
 
+        // Third epoch boundary: having proved itself live, the probationer is promoted to full
+        // active membership with real voting power.
+        apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * 3, Hash::ZERO), &store, &engine).await;
+        {
+            let eng = engine.read().await;
+            let v = eng.validator_set().get(&new_staker_addr).cloned();
+            assert!(v.is_some(), "the prover stays in the set");
+            assert!(v.unwrap().voting_power > 0, "and now carries real voting power — full member");
+        }
         assert!(
-            engine.read().await.validator_set().get(&new_staker_addr).is_some(),
-            "the staker must be promoted at the next epoch rotation"
+            chain_state.read().await.active_validators.contains(&new_staker_addr),
+            "chain state now records it as active — the full lifecycle completed",
+        );
+    }
+
+    /// Companion to the promotion path above: a staker whose node never signs during probation
+    /// must *not* be promoted — it cycles back to pending rather than ever gaining quorum weight.
+    /// This is the phantom that froze the live 3-validator set on 2026-07-28 (#132); the earlier
+    /// one-epoch delay would have handed it full power at the second rotation regardless.
+    #[tokio::test]
+    async fn epoch_rotation_never_promotes_a_staker_that_stays_silent() {
+        let genesis_kp = KeyPair::generate();
+        let genesis_addr = Address::from_public_key(&genesis_kp.public);
+        let phantom_addr = Address::from_public_key(&KeyPair::generate().public);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            cs.governance_params.min_validator_stake = 1;
+            cs.update_account(&genesis_addr, |acc| acc.staked = 1_000_000);
+            cs.update_account(&phantom_addr, |acc| acc.staked = 1_000_000);
+            cs.active_validators.insert(genesis_addr.clone());
+        }
+        let validator_set = ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, genesis_addr.clone(), 0)));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        let last_applied_height = Arc::new(Mutex::new(0u64));
+
+        // Three epoch boundaries, and the phantom never signs a single `last_commit`.
+        for epoch in 1..=3u64 {
+            apply_finalized_block(
+                signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * epoch, Hash::ZERO),
+                false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+            )
+            .await;
+        }
+
+        // It may sit in the set as a zero-power probationer, but it must never gain voting power…
+        if let Some(v) = engine.read().await.validator_set().get(&phantom_addr).cloned() {
+            assert_eq!(v.voting_power, 0, "a silent staker must never be handed voting power");
+        }
+        // …and it must never be recorded active — the exact guarantee that keeps a phantom from
+        // freezing a small set.
+        assert!(
+            !chain_state.read().await.active_validators.contains(&phantom_addr),
+            "a staker whose node never signed must never become active (#132)"
         );
     }
 

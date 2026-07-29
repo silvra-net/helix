@@ -65,6 +65,15 @@ const PENDING_VALIDATORS: TableDefinition<&str, &[u8]> = TableDefinition::new("p
 /// insert-only persistence would keep a departed validator in the quorum-accounting set after
 /// a restart, and it would go on being charged with missed blocks it was never asked to sign.
 const ACTIVE_VALIDATORS: TableDefinition<&str, &[u8]> = TableDefinition::new("active_validators");
+/// address string → empty value (key-as-set) — see `ChainState::probationary_validators`'s doc
+/// comment. Rewritten wholesale at every rotation (probationers are promoted, dropped, or replaced
+/// by the next pending cohort), so it needs the same stale-key pruning as `ACTIVE_VALIDATORS`.
+const PROBATIONARY_VALIDATORS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("probationary_validators");
+/// address string → empty value (key-as-set) — see `ChainState::probation_seen`'s doc comment.
+/// Grows within a probation epoch and is cleared wholesale at each rotation, so it needs the same
+/// stale-key pruning as `PROBATIONARY_VALIDATORS`.
+const PROBATION_SEEN: TableDefinition<&str, &[u8]> = TableDefinition::new("probation_seen");
 /// address string → 4-byte little-endian u32 consecutive-miss count — see
 /// `ChainState::missed_blocks`'s doc comment. Removed (not just left stale) the instant a
 /// validator's signature is seen again, so needs the same stale-key pruning as
@@ -178,6 +187,8 @@ impl HelixDb {
         tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(ACTIVE_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(PROBATIONARY_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -208,6 +219,8 @@ impl HelixDb {
             let mut redelegations = tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut pending_validators = tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut active_validators = tx.open_table(ACTIVE_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut probationary_validators = tx.open_table(PROBATIONARY_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut probation_seen = tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut missed_blocks = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut jailed_until = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut contract_storage = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -414,6 +427,52 @@ impl HelixDb {
                 active_validators.insert(addr.as_str(), &[][..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // Probationary set + liveness-proof set: both rewritten wholesale each rotation, so
+            // they need the same stale-key pruning as ACTIVE_VALIDATORS (see their doc comments).
+            {
+                let current: std::collections::HashSet<&str> =
+                    state.probationary_validators.iter().map(|a| a.as_str()).collect();
+                let stale: Vec<String> = probationary_validators
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!current.contains(key.as_str())).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    probationary_validators
+                        .remove(key.as_str())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
+            for addr in &state.probationary_validators {
+                probationary_validators.insert(addr.as_str(), &[][..])
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+            {
+                let current: std::collections::HashSet<&str> =
+                    state.probation_seen.iter().map(|a| a.as_str()).collect();
+                let stale: Vec<String> = probation_seen
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!current.contains(key.as_str())).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    probation_seen
+                        .remove(key.as_str())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
+            for addr in &state.probation_seen {
+                probation_seen.insert(addr.as_str(), &[][..])
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
             // Same stale-key pruning as PENDING_VALIDATORS — see MISSED_BLOCKS' doc comment.
             {
                 let current: std::collections::HashSet<&str> =
@@ -482,6 +541,8 @@ impl HelixDb {
         let contract_storage_table = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
         let pending_validators_table = tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         let active_validators_table = tx.open_table(ACTIVE_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let probationary_validators_table = tx.open_table(PROBATIONARY_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let probation_seen_table = tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
         let missed_blocks_table = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         let jailed_until_table = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_extra_validators_table = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -654,6 +715,26 @@ impl HelixDb {
             active_validators.insert(address);
         }
 
+        let mut probationary_validators = std::collections::HashSet::new();
+        let probationary_validators_iter =
+            probationary_validators_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        for entry in probationary_validators_iter {
+            let (k, _v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let address = Address::from_str(k.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            probationary_validators.insert(address);
+        }
+
+        let mut probation_seen = std::collections::HashSet::new();
+        let probation_seen_iter =
+            probation_seen_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        for entry in probation_seen_iter {
+            let (k, _v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let address = Address::from_str(k.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            probation_seen.insert(address);
+        }
+
         let mut missed_blocks = std::collections::HashMap::new();
         let missed_blocks_iter =
             missed_blocks_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
@@ -740,6 +821,8 @@ impl HelixDb {
             genesis_allocations,
             pending_validators,
             active_validators,
+            probationary_validators,
+            probation_seen,
             missed_blocks,
             jailed_until,
         })

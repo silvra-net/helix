@@ -48,12 +48,14 @@ pub struct BlockReceipt {
     /// `BftEngine::validator_set` immediately, the same way it already does for
     /// `SubmitDoubleSignEvidence`, rather than waiting for the next epoch rotation.
     pub newly_jailed: Vec<helix_crypto::Address>,
-    /// `Some` only on an epoch boundary, carrying the freshly rotated active validator set
-    /// (address + effective stake) that `execute_block` just committed to
-    /// `ChainState::active_validators`. The node builds the consensus `ValidatorSet` from
-    /// this instead of rotating on its own, so that block execution stays the single place
-    /// that decides who validates — see `ChainState::rotate_active_validators`.
-    pub rotated_validators: Option<Vec<(helix_crypto::Address, u64)>>,
+    /// `Some` only on an epoch boundary, carrying the freshly rotated signing set as
+    /// `(address, effective_stake, probationary)` that `execute_block` just committed to
+    /// `ChainState::active_validators` / `probationary_validators`. The node builds the consensus
+    /// `ValidatorSet` from this instead of rotating on its own, so that block execution stays the
+    /// single place that decides who validates. `probationary = true` entries sign but carry no
+    /// voting power and take no proposer turn (backlog #132) — see
+    /// `ChainState::rotate_active_validators` and `helix_consensus::Validator::probationary`.
+    pub rotated_validators: Option<Vec<(helix_crypto::Address, u64, bool)>>,
 }
 
 impl BlockReceipt {
