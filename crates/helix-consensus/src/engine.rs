@@ -800,6 +800,18 @@ impl BftEngine {
         self.last_committed_round
     }
 
+    /// The precommit votes that finalized the most recently committed block — its commit
+    /// certificate. After `finalize` this is the quorum that carried the block; it is also what
+    /// `build_signed_block` folds into the *next* block's `last_commit`. Exposed so the node can
+    /// gossip it alongside a committed block (#114): a peer that receives the block over the
+    /// committed-blocks fast path never collected these votes itself, so without them its own next
+    /// `last_commit` would be empty — leaving the block's participation unrecorded for downtime
+    /// accounting and its finality unprovable to a light client. Empty at genesis / before the
+    /// first finalize.
+    pub fn commit_certificate(&self) -> Vec<Vote> {
+        self.last_commit.clone()
+    }
+
     /// The block currently proposed for the active round, if any — e.g. so a
     /// caller can inspect what this node is waiting on votes for.
     pub fn pending_proposal(&self) -> Option<&Block> {
@@ -1237,7 +1249,12 @@ impl BftEngine {
     /// number), so `last_committed_round` is cleared to `None` rather than guessed
     /// — callers already treat "unknown" as round 0 (see `last_committed_round()`'s
     /// doc comment).
-    pub fn sync_to_externally_finalized_block(&mut self, height: u64, block_hash: Hash) {
+    pub fn sync_to_externally_finalized_block(
+        &mut self,
+        height: u64,
+        block_hash: Hash,
+        certificate: Vec<Vote>,
+    ) {
         if height <= self.current_height {
             return;
         }
@@ -1256,13 +1273,6 @@ impl BftEngine {
         // Only votes for `block_hash` itself are kept, so the certificate still attests exactly
         // the block it is attached to — a vote for any other hash would produce a `last_commit`
         // that every receiving node's `verify_last_commit` would (correctly) reject.
-        //
-        // Deliberately local: no wire format changes, so this needs no coordinated upgrade
-        // (cf. #109). It cannot cause divergence either — jailing is scored from the certificate
-        // in a received block, which every node sees identically; this only affects how complete
-        // the certificates *this* node produces are. The remaining gap (a node that never saw the
-        // votes at all, e.g. one following purely over RPC) needs the commit certificate to
-        // travel with the gossiped block, which is a protocol change.
         let salvaged = self
             .round
             .as_ref()
@@ -1270,14 +1280,58 @@ impl BftEngine {
             .map(|round| round.precommits.votes_for(&block_hash))
             .unwrap_or_default();
 
+        // The other half of the gap (#114): a node that never saw the votes at all — a pure
+        // committed-blocks/RPC follower, or a validator that fell behind and caught up over the
+        // fast path — has nothing to salvage. It now receives the finalizer's own certificate
+        // alongside the block and adopts it, so its next proposed block carries a real
+        // `last_commit` rather than an empty one. `certificate` arrives over the wire from an
+        // untrusted peer, so it is verified here exactly as `verify_last_commit` checks a
+        // certificate embedded in a received block — every signature genuine for this
+        // `(height, block_hash)`, no validator counted twice — and anything failing is dropped.
+        // Membership against the current validator set is deliberately not checked (same accepted
+        // approximation as `verify_last_commit`: the parent height's set can differ slightly around
+        // a rotation, and a stale-but-genuine signature must not be discarded). Salvage wins when
+        // present: it is this node's own first-hand view, and preferring it keeps the participating
+        // path byte-for-byte unchanged.
+        let commit = if salvaged.is_empty() {
+            self.verified_commit_certificate(certificate, height, &block_hash)
+        } else {
+            salvaged
+        };
+
         self.current_height = height;
         self.last_committed = Some(block_hash);
         self.last_committed_round = None;
         self.round = None;
         self.round_ticks = 0;
         self.buffered_votes.clear();
-        self.last_commit = salvaged;
+        self.last_commit = commit;
         self.clear_locks();
+    }
+
+    /// Filter a commit certificate received over the wire down to the precommit votes that are
+    /// genuinely usable as a `last_commit` for `(height, block_hash)`: a precommit (not a prevote)
+    /// for exactly this block, with a signature that verifies, and no validator appearing twice.
+    /// Mirrors `verify_last_commit`'s checks — this is the same trust decision, just applied to a
+    /// gossiped certificate before it becomes this node's own rather than to one already embedded
+    /// in a validated block.
+    fn verified_commit_certificate(
+        &self,
+        certificate: Vec<Vote>,
+        height: u64,
+        block_hash: &Hash,
+    ) -> Vec<Vote> {
+        let mut seen: HashSet<Address> = HashSet::new();
+        certificate
+            .into_iter()
+            .filter(|vote| {
+                vote.vote_type == VoteType::Precommit
+                    && vote.height == height
+                    && &vote.block_hash == block_hash
+                    && vote.verify_signature().is_ok()
+                    && seen.insert(vote.validator.clone())
+            })
+            .collect()
     }
 
     /// Release the per-height Tendermint lock and reset the round counter. Called whenever the
@@ -1831,7 +1885,7 @@ mod tests {
         assert!(engine.has_active_round(), "the round must still be open for this to mean anything");
 
         // The finished block overtakes us via the committed-block fast path.
-        engine.sync_to_externally_finalized_block(2, block_hash);
+        engine.sync_to_externally_finalized_block(2, block_hash, vec![]);
 
         assert_eq!(engine.current_height(), 2);
         let signers: Vec<&Address> = engine.last_commit.iter().map(|v| &v.validator).collect();
@@ -1846,6 +1900,77 @@ mod tests {
         assert!(
             engine.last_commit.iter().all(|vote| vote.block_hash == block_hash),
             "only votes for the block actually committed may be carried forward"
+        );
+    }
+
+    /// #114, the other half: a node that never saw the votes at all — a pure committed-blocks/RPC
+    /// follower, or one that fell behind and caught up over the fast path — has nothing to salvage.
+    /// It now adopts the certificate gossiped with the block, so its own next `last_commit` records
+    /// who took part instead of being empty. The certificate is untrusted, so a vote for the wrong
+    /// block and a prevote-not-precommit are both filtered out; only genuine precommits for exactly
+    /// this block survive.
+    #[test]
+    fn a_fast_path_receiver_adopts_the_gossiped_commit_certificate() {
+        let v = four_validators();
+        // This node holds no round for height 2 — it never participated, it only received the
+        // finished block. Without the certificate its `last_commit` would be empty.
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        assert!(!engine.has_active_round(), "precondition: no round to salvage from");
+
+        let block_hash = Hash::digest(b"committed-block-2");
+        let a_addr = Address::from_public_key(&v.a_kp.public);
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        let certificate = vec![
+            peer_vote(&v.a_kp, VoteType::Precommit, 2, 0, block_hash),
+            peer_vote(&v.b_kp, VoteType::Precommit, 2, 0, block_hash),
+            // Junk that must be dropped: a precommit for a different block…
+            peer_vote(&v.a_kp, VoteType::Precommit, 2, 0, Hash::digest(b"other-block")),
+            // …and a prevote (not a precommit) for the right block.
+            peer_vote(&v.b_kp, VoteType::Prevote, 2, 0, block_hash),
+        ];
+
+        engine.sync_to_externally_finalized_block(2, block_hash, certificate);
+
+        assert_eq!(engine.current_height(), 2);
+        let signers: Vec<&Address> = engine.last_commit.iter().map(|vote| &vote.validator).collect();
+        assert!(signers.contains(&&a_addr) && signers.contains(&&b_addr), "both genuine precommits are adopted");
+        assert_eq!(engine.last_commit.len(), 2, "the wrong-block precommit and the prevote are filtered out");
+        assert!(
+            engine.last_commit.iter().all(|vote| vote.block_hash == block_hash
+                && vote.vote_type == VoteType::Precommit),
+            "only precommits for exactly the committed block may be carried forward"
+        );
+    }
+
+    /// Positive control that the participating path is untouched: when this node *does* hold its own
+    /// precommits for the committed block, those win and the gossiped certificate is ignored — the
+    /// salvage branch behaves byte-for-byte as it did before #114. Here the node's own precommit is
+    /// for the real block, while the certificate carries an extra signer; the extra one must NOT
+    /// appear, proving the certificate was not consulted.
+    #[test]
+    fn a_gossiped_certificate_is_ignored_when_this_node_has_its_own_precommits() {
+        let v = four_validators();
+        let mut proposer_engine =
+            BftEngine::new(v.validator_set.clone(), Address::from_public_key(&v.b_kp.public), 1);
+        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), vec![]);
+        let block = proposer_engine.pending_proposal().unwrap().clone();
+        let block_hash = block.hash();
+
+        let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
+        engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
+        engine.add_vote(&v.self_kp, peer_vote(&v.a_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
+        engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Precommit, 2, 0, block_hash)).unwrap();
+        assert!(engine.has_active_round(), "precondition: this node has its own round to salvage");
+
+        // The certificate carries a third signer (a) this node never precommitted itself.
+        let a_addr = Address::from_public_key(&v.a_kp.public);
+        let certificate = vec![peer_vote(&v.a_kp, VoteType::Precommit, 2, 0, block_hash)];
+        engine.sync_to_externally_finalized_block(2, block_hash, certificate);
+
+        assert!(
+            !engine.last_commit.iter().any(|vote| vote.validator == a_addr),
+            "salvage wins: a signer present only in the gossiped certificate must not appear"
         );
     }
 
@@ -1870,7 +1995,7 @@ mod tests {
 
         // A different block wins at this height (e.g. a later round we never saw).
         let other_hash = Hash::digest(b"some-other-block");
-        engine.sync_to_externally_finalized_block(2, other_hash);
+        engine.sync_to_externally_finalized_block(2, other_hash, vec![]);
 
         assert!(
             engine.last_commit.is_empty(),
@@ -2002,7 +2127,7 @@ mod tests {
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 1);
 
         // Height 2 arrived already committed — no receive_proposal/add_vote call.
-        engine.sync_to_externally_finalized_block(2, Hash::digest(b"block-2"));
+        engine.sync_to_externally_finalized_block(2, Hash::digest(b"block-2"), vec![]);
         assert_eq!(engine.current_height(), 2);
         assert!(!engine.has_active_round(), "any stale round for height 2 must be cleared");
 

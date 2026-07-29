@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use helix_consensus::{BftEngine, ConsensusError, DoubleSignEvidence, Proposal, Validator, ValidatorSet};
+use helix_consensus::{BftEngine, ConsensusError, DoubleSignEvidence, Proposal, Validator, ValidatorSet, Vote};
 use helix_core::{genesis_block, Block, Transaction, TxType};
 use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair, PublicKey, Signature};
 use helix_executor::{
@@ -910,7 +910,7 @@ async fn handle_p2p_event(
                     // is a per-node config, not part of the block — make every node compute
                     // a different balance for the same block. `None` lets execute_block fall
                     // back to `block.header.validator`, which is identical on every node.
-                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
+                    apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::UnknownValidator(_)) => {
@@ -935,7 +935,7 @@ async fn handle_p2p_event(
                     info!(height = block.height(), "Block finalized via peer votes");
                     // Same reasoning as the NewProposal arm above: this block's proposer
                     // isn't necessarily us, so `None` — not our local reward_address.
-                    apply_finalized_block(block, true, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
+                    apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::NoActiveRound) => {
@@ -946,7 +946,7 @@ async fn handle_p2p_event(
                 Err(e) => warn!("Rejected peer vote: {}", e),
             }
         }
-        P2PEvent::NewCommittedBlock(block) => {
+        P2PEvent::NewCommittedBlock(block, commit_certificate) => {
             let our_height = store.read().await.latest_height();
             let block_height = block.height();
 
@@ -991,7 +991,11 @@ async fn handle_p2p_event(
                             // apply_finalized_block entirely — keep the engine's height
                             // tracking and EIP-1559 base fee in step, same as
                             // rpc_sync_loop does after its own sync_blocks_from_peer call.
-                            engine.write().await.sync_to_externally_finalized_block(new_height, new_hash);
+                            // Gap-filled over the RPC /sync/blocks path, which carries no
+                            // certificate — pass none. A pure catch-up follower doesn't propose, so
+                            // an empty last_commit here is harmless; the gossip fast path below is
+                            // where the certificate matters (#114).
+                            engine.write().await.sync_to_externally_finalized_block(new_height, new_hash, vec![]);
                             // Mirror any validator rotation those synced blocks applied in chain
                             // state into the live engine — the finalize path that normally does
                             // this was skipped. Without it, a validator that crossed its own
@@ -1049,7 +1053,7 @@ async fn handle_p2p_event(
                     // `None`, same reasoning as the NewProposal/NewVote arms above: this
                     // block came from a peer, not our own block_production_loop, so our
                     // local reward_address override must not apply to it.
-                    apply_finalized_block(block, false, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
+                    apply_finalized_block(block, false, commit_certificate, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
                 }
                 Err(e) => {
                     warn!(height = block_height, err = %e, "Committed block from peer failed signature check — dropping");
@@ -1237,6 +1241,7 @@ async fn reconcile_engine_validator_set(
 async fn apply_finalized_block(
     block: Block,
     should_broadcast: bool,
+    commit_certificate: Vec<Vote>,
     store: &Arc<RwLock<HelixDb>>,
     mempool: &Arc<RwLock<Mempool>>,
     chain_state: &Arc<RwLock<ChainState>>,
@@ -1293,7 +1298,10 @@ async fn apply_finalized_block(
     // sync_to_externally_finalized_block's doc comment for why skipping this
     // silently desyncs the engine from the actual chain tip.
     if !should_broadcast {
-        engine.write().await.sync_to_externally_finalized_block(height, block.hash());
+        // The certificate gossiped with the block (#114): the engine adopts it as its own
+        // `last_commit` because a fast-path receiver never collected these precommits itself. The
+        // live-finalize path leaves it empty here — it already holds the real votes via finalize().
+        engine.write().await.sync_to_externally_finalized_block(height, block.hash(), commit_certificate);
     }
 
     // Execute transactions. The per-tx receipts are kept and persisted below: they are the only
@@ -1460,9 +1468,17 @@ async fn apply_finalized_block(
     // and can broadcast a semantically correct Proposal. Nodes that received the block
     // via NewCommittedBlock skip re-broadcasting to avoid flooding with wrong round tags.
     if should_broadcast {
-        let round = engine.read().await.last_committed_round().unwrap_or(0);
+        // Read both under one lock. `commit_certificate()` is this node's `last_commit`, which
+        // `finalize` just set to the precommits that carried exactly this block (a following block
+        // cannot finalize before this one is persisted below, so no later certificate can race in
+        // here) — send it with the block so a fast-path receiver can adopt it as its own
+        // `last_commit` instead of an empty one (#114).
+        let (round, certificate) = {
+            let eng = engine.read().await;
+            (eng.last_committed_round().unwrap_or(0), eng.commit_certificate())
+        };
         let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal::fresh(round, block.clone())));
-        let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone()));
+        let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone(), certificate));
     }
 
     // Persist block + chain state to the same redb file, under one write lock.
@@ -1937,7 +1953,7 @@ async fn block_production_loop(
         };
         match produced {
             Ok(block) => {
-                apply_finalized_block(block, true, &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone(), &last_applied_height)
+                apply_finalized_block(block, true, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone(), &last_applied_height)
                     .await;
             }
             Err(ConsensusError::AwaitingVotes { .. }) => {
@@ -2434,7 +2450,9 @@ async fn rpc_sync_loop(
                 engine
                     .write()
                     .await
-                    .sync_to_externally_finalized_block(new_height, new_hash);
+                    // RPC-sync path — no certificate travels with /sync/blocks (#114); harmless
+                    // for a catch-up follower, which doesn't propose.
+                    .sync_to_externally_finalized_block(new_height, new_hash, vec![]);
                 // Same reconciliation as the P2P gap-fill path: this apply bypassed the finalize
                 // path, so mirror any validator rotation it made into the live engine — otherwise
                 // a validator that activates while this loop is catching it up runs a stale set
@@ -3262,7 +3280,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
 
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(block),
+            P2PEvent::NewCommittedBlock(block, vec![]),
             &mempool,
             &peer_count,
             &store,
@@ -3306,7 +3324,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
 
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(block),
+            P2PEvent::NewCommittedBlock(block, vec![]),
             &mempool,
             &peer_count,
             &store,
@@ -3349,7 +3367,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
 
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(block),
+            P2PEvent::NewCommittedBlock(block, vec![]),
             &mempool,
             &peer_count,
             &store,
@@ -3493,7 +3511,7 @@ mod handle_p2p_event_tests {
 
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
-        apply_finalized_block(block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
 
         assert!(
             engine.read().await.validator_set.get(&bad_validator_addr).is_none(),
@@ -3560,7 +3578,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
 
-        apply_finalized_block(block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
 
         let receipt = store
             .read()
@@ -3591,13 +3609,13 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
 
-        apply_finalized_block(block.clone(), false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        apply_finalized_block(block.clone(), false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
         let issued_after_first = chain_state.read().await.total_issued;
         assert!(issued_after_first > 0, "the first application must mint the scheduled block reward");
 
         // A second application of the *same* block/height — as a racing duplicate ingestion
         // path would produce — must change nothing further.
-        apply_finalized_block(block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
         let issued_after_second = chain_state.read().await.total_issued;
         assert_eq!(issued_after_second, issued_after_first, "the block reward must not be minted twice for the same height");
         assert_eq!(store.read().await.latest_height(), 1, "the duplicate must not re-touch storage either");
@@ -3657,7 +3675,7 @@ mod handle_p2p_event_tests {
         // content is irrelevant; it's never applied directly, only used to detect the gap.
         let far_ahead = signed_block(&kp, 5, Hash::ZERO);
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(far_ahead),
+            P2PEvent::NewCommittedBlock(far_ahead, vec![]),
             &mempool,
             &peer_count,
             &store,
@@ -3688,6 +3706,7 @@ mod handle_p2p_event_tests {
         apply_finalized_block(
             racing_duplicate,
             false,
+            vec![],
             &store,
             &mempool,
             &chain_state,
@@ -3755,7 +3774,7 @@ mod handle_p2p_event_tests {
             );
             async move {
                 apply_finalized_block(
-                    block, false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+                    block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
                 )
                 .await;
             }
@@ -3842,7 +3861,7 @@ mod handle_p2p_event_tests {
         for epoch in 1..=3u64 {
             apply_finalized_block(
                 signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * epoch, Hash::ZERO),
-                false, &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+                false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
             )
             .await;
         }

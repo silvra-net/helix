@@ -30,9 +30,12 @@ pub enum P2PEvent {
     NewProposal(Proposal),
     NewTransaction(Transaction),
     NewVote(Vote),
-    /// A peer broadcast a committed block (already past BFT quorum).
-    /// The receiving node can apply it directly after verifying the proposer signature.
-    NewCommittedBlock(Block),
+    /// A peer broadcast a committed block (already past BFT quorum), together with the commit
+    /// certificate — the precommit votes that finalized it. The receiving node applies the block
+    /// after verifying the proposer signature, and adopts the certificate as its own `last_commit`
+    /// when it never collected those votes itself (the committed-blocks fast path), so the block's
+    /// participation and finality are not lost (#114).
+    NewCommittedBlock(Block, Vec<Vote>),
     PeerConnected(String),
     PeerDisconnected(String),
 }
@@ -43,8 +46,9 @@ pub enum P2PCommand {
     BroadcastProposal(Proposal),
     BroadcastTransaction(Transaction),
     BroadcastVote(Vote),
-    /// Broadcast a committed block to help lagging peers catch up.
-    BroadcastBlock(Block),
+    /// Broadcast a committed block, with its commit certificate (the finalizing precommit votes),
+    /// to help lagging peers catch up and carry finality with the block (#114).
+    BroadcastBlock(Block, Vec<Vote>),
     ConnectPeer(Multiaddr),
 }
 
@@ -421,8 +425,12 @@ impl P2PService {
                                 }
                             }
                         }
-                        P2PCommand::BroadcastBlock(block) => {
-                            if let Ok(data) = bincode::serialize(&block) {
+                        P2PCommand::BroadcastBlock(block, commit) => {
+                            // The certificate travels as the second element of a (block, commit)
+                            // tuple on the committed-blocks topic — a wire-format change from the
+                            // bare `Block` this used to carry, so it needs a coordinated upgrade
+                            // (#114/#109); the receive side below parses the same shape.
+                            if let Ok(data) = bincode::serialize(&(&block, &commit)) {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
                                     .publish(committed_topic.clone(), data)
                                 {
@@ -581,10 +589,10 @@ async fn handle_app_message(topic: &str, data: &[u8], event_tx: &mpsc::Sender<P2
             }
         }
     } else if topic == TOPIC_COMMITTED_BLOCKS {
-        match bincode::deserialize::<Block>(data) {
-            Ok(block) => {
-                debug!(height = block.height(), "Committed block from peer");
-                let _ = event_tx.send(P2PEvent::NewCommittedBlock(block)).await;
+        match bincode::deserialize::<(Block, Vec<Vote>)>(data) {
+            Ok((block, commit)) => {
+                debug!(height = block.height(), commit_sigs = commit.len(), "Committed block from peer");
+                let _ = event_tx.send(P2PEvent::NewCommittedBlock(block, commit)).await;
                 false
             }
             Err(e) => {
