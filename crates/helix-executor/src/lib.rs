@@ -3845,6 +3845,7 @@ mod tests {
                 validator: validator.clone(),
                 public_key: KeyPair::generate().public,
                 crypto_version: CryptoVersion::MlDsa,
+                node_version: String::new(),
                 base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
                 last_commit: vec![],
                 signature: Signature::from_bytes(vec![]),

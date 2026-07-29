@@ -95,6 +95,15 @@ pub struct BlockHeader {
     pub public_key: PublicKey,
     /// Which crypto scheme the validator used — supports migration
     pub crypto_version: CryptoVersion,
+    /// The proposer's node **software** version (`CARGO_PKG_VERSION`, e.g. `"0.8.13"`) — distinct
+    /// from `version` above, which is the protocol format number. Written and signed by the
+    /// proposer so the explorer can show, per validator, which build actually produced a block
+    /// (backlog #128). A single version mismatch has cost the chain before; this makes the running
+    /// version verifiable on-chain rather than something an operator has to be asked about. Signed
+    /// like every other header field — a proposer can no more forge its neighbour's version than
+    /// its neighbour's signature.
+    #[serde(default)]
+    pub node_version: String,
     /// EIP-1559-style base fee for this block, in nano-HLX **per transaction byte**. Every
     /// transaction in the block must pay at least `base_fee_per_byte × its_serialized_size`,
     /// and exactly that portion of its fee is burned (the remainder is the validator's tip).
@@ -128,6 +137,10 @@ impl BlockHeader {
         let last_commit_bytes = bincode::serialize(&self.last_commit)
             .expect("CommitSig vec serialization is infallible");
         let last_commit_hash = Hash::digest(&last_commit_bytes);
+        // `node_version` is the second variable-length field. Rather than weaken the single-parse
+        // argument above by concatenating it raw, it is folded into its own fixed-size digest —
+        // exactly like `last_commit` and `merkle_root` — so the field layout stays unambiguous.
+        let node_version_hash = Hash::digest(self.node_version.as_bytes());
         Hash::digest_many(&[
             b"helix-block-header-v1:",
             &self.version.to_le_bytes(),
@@ -137,6 +150,7 @@ impl BlockHeader {
             self.merkle_root.as_bytes(),
             self.validator.as_str().as_bytes(),
             &[self.crypto_version as u8],
+            node_version_hash.as_bytes(),
             &self.base_fee_per_byte.to_le_bytes(),
             last_commit_hash.as_bytes(),
         ])
@@ -228,6 +242,7 @@ pub fn genesis_block(
         validator,
         public_key,
         crypto_version: CryptoVersion::MlDsa,
+        node_version: env!("CARGO_PKG_VERSION").to_string(),
         base_fee_per_byte: crate::fee::INITIAL_BASE_FEE_PER_BYTE,
         last_commit: vec![],
         signature,
@@ -279,6 +294,7 @@ mod tests {
                 validator: Address::from_public_key(&PublicKey::from_bytes(vec![9])),
                 public_key: PublicKey::from_bytes(vec![9]),
                 crypto_version: CryptoVersion::MlDsa,
+                node_version: String::new(),
                 base_fee_per_byte: crate::fee::INITIAL_BASE_FEE_PER_BYTE,
                 last_commit: vec![],
                 signature: Sig::from_bytes(vec![]),
@@ -426,5 +442,37 @@ mod tests {
         block.header.last_commit.push(commit_sig);
 
         assert_ne!(before, block.header.signing_hash());
+    }
+
+    /// `node_version` (#128) is a signed header field: it must move the signing hash, or a proposer
+    /// could stamp any version it liked and still present a validly signed block — exactly the
+    /// "which build is this validator really running" question the field exists to answer honestly.
+    #[test]
+    fn signing_hash_changes_when_node_version_changes() {
+        use helix_crypto::KeyPair;
+        let proposer = KeyPair::generate();
+        let mut block = signed_test_block(&proposer);
+        block.header.node_version = "0.8.12".to_string();
+        let before = block.header.signing_hash();
+
+        block.header.node_version = "0.8.13".to_string();
+        assert_ne!(before, block.header.signing_hash());
+    }
+
+    /// And the signature is over that hash, so tampering with a signed block's `node_version`
+    /// invalidates it — a relaying peer cannot rewrite the proposer's declared version.
+    #[test]
+    fn tampering_with_node_version_breaks_the_signature() {
+        use helix_crypto::KeyPair;
+        let proposer = KeyPair::generate();
+        let block = signed_test_block(&proposer);
+        assert!(block.header.verify_signature().is_ok(), "the freshly signed block must verify");
+
+        let mut tampered = block.clone();
+        tampered.header.node_version = "9.9.9".to_string();
+        assert!(
+            tampered.header.verify_signature().is_err(),
+            "rewriting the signed version must fail verification"
+        );
     }
 }

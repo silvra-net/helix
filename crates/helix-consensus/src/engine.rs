@@ -1185,6 +1185,10 @@ impl BftEngine {
             validator: self.address.clone(),
             public_key: keypair.public.clone(),
             crypto_version: keypair.scheme,
+            // The proposer stamps its own build here, then signs the header over it (#128). The
+            // workspace shares one version, so this crate's `CARGO_PKG_VERSION` is the running
+            // node's version.
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
             base_fee_per_byte: self.current_base_fee_per_byte,
             last_commit,
             signature: Signature::from_bytes(vec![]),

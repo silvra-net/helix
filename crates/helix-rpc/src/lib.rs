@@ -40,6 +40,10 @@ pub struct BlockResponse {
     pub merkle_root: String,
     /// EIP-1559 base fee for this block, in nano-HLX per transaction byte.
     pub base_fee_per_byte: u64,
+    /// The proposer's node software version (`BlockHeader::node_version`, #128). Lets the explorer
+    /// show which build produced each block. Empty for genesis / pre-#128 blocks.
+    #[serde(default)]
+    pub node_version: String,
     pub transactions: Vec<TxResponse>,
 }
 
@@ -82,6 +86,7 @@ impl BlockResponse {
             prev_hash: block.header.prev_hash.to_hex(),
             merkle_root: block.header.merkle_root.to_hex(),
             base_fee_per_byte: block.header.base_fee_per_byte,
+            node_version: block.header.node_version.clone(),
             transactions,
         }
     }
@@ -112,6 +117,9 @@ pub struct HeaderResponse {
     /// an endpoint whose whole purpose is to be small (they are what makes a full block ~37 KB).
     /// A verifier wanting to check them fetches the block from `/sync/blocks`.
     pub last_commit: Vec<String>,
+    /// The proposer's node software version (`BlockHeader::node_version`, #128).
+    #[serde(default)]
+    pub node_version: String,
 }
 
 impl From<&Block> for HeaderResponse {
@@ -124,6 +132,7 @@ impl From<&Block> for HeaderResponse {
             prev_hash: block.header.prev_hash.to_hex(),
             merkle_root: block.header.merkle_root.to_hex(),
             base_fee_per_byte: block.header.base_fee_per_byte,
+            node_version: block.header.node_version.clone(),
             last_commit: block
                 .header
                 .last_commit
