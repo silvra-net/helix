@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { api } from "../api";
+import { getThemePref, setThemePref, type ThemePref } from "../theme";
 
 // Settings: the deliberate backup path. A wallet created before you wrote the 24 words down would
 // otherwise have no recovery — here you can re-reveal the phrase (re-authenticating with the
@@ -14,6 +15,12 @@ export default function Settings({ address }: { address: string }) {
   const [copied, setCopied] = useState<string | null>(null);
   const [logDir, setLogDir] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [theme, setTheme] = useState<ThemePref>(getThemePref());
+
+  const chooseTheme = (pref: ThemePref) => {
+    setThemePref(pref);
+    setTheme(pref);
+  };
 
   useEffect(() => {
     api.logDirPath().then(setLogDir).catch(() => setLogDir(null));
@@ -103,6 +110,24 @@ export default function Settings({ address }: { address: string }) {
             </div>
           </>
         )}
+      </div>
+
+      <div className="card">
+        <div className="section-title">Appearance</div>
+        <p className="muted small" style={{ marginTop: -4 }}>
+          Follow the system setting, or lock the wallet to light or dark.
+        </p>
+        <div className="theme-choice">
+          {(["system", "light", "dark"] as ThemePref[]).map((p) => (
+            <button
+              key={p}
+              className={theme === p ? "theme-opt active" : "theme-opt"}
+              onClick={() => chooseTheme(p)}
+            >
+              {p === "system" ? "System" : p === "light" ? "Light" : "Dark"}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="card">

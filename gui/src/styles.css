@@ -1,40 +1,56 @@
+/* Helix shared design system — cool graphite neutrals + a single iris accent, identical hexes to
+   the explorer (crates/helix-rpc/src/explorer.html). Default :root is dark; the media query and the
+   manual data-theme override below carry light. */
 :root {
-  --bg: #0b1220;
-  --surface: #111a2e;
-  --surface-2: #16223c;
-  --border: #24314f;
-  --text: #e7ecf5;
-  --muted: #93a1bd;
-  --accent: #22d3ee;
-  --violet: #a78bfa;
-  --ok: #34d399;
-  --ok-bg: #10352b;
-  --bad: #f87171;
-  --bad-bg: #3a1620;
-  --warn: #fbbf24;
-  --warn-bg: #35270c;
+  --bg: #0c0f15;
+  --surface: #141a23;
+  --surface-2: #1b212d;
+  --border: #272f3d;
+  --text: #e7eaf1;
+  --muted: #8992a4;
+  --accent: #8092f4;
+  --accent-ink: #0c0f15;
+  --ok: #34cea0;
+  --ok-bg: #0f2620;
+  --bad: #f2718a;
+  --bad-bg: #2c1620;
+  --warn: #e0a44a;
+  --warn-bg: #281f11;
   --radius: 10px;
-  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
 }
 
+/* Light palette, applied when the OS prefers light AND no manual theme is set. */
 @media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f4f6fb;
+  :root:not([data-theme]) {
+    --bg: #f5f6f9;
     --surface: #ffffff;
-    --surface-2: #f0f3fa;
-    --border: #dde3ee;
-    --text: #101728;
-    --muted: #5a6a86;
-    --accent: #0891b2;
-    --violet: #7c3aed;
-    --ok: #059669;
-    --ok-bg: #dcfce7;
-    --bad: #dc2626;
-    --bad-bg: #fee2e2;
-    --warn: #b45309;
-    --warn-bg: #fef3c7;
+    --surface-2: #eceef4;
+    --border: #e1e4ec;
+    --text: #14171f;
+    --muted: #5a6172;
+    --accent: #3f57df;
+    --accent-ink: #ffffff;
+    --ok: #0c9c6b;
+    --ok-bg: #e2f4ec;
+    --bad: #d23a56;
+    --bad-bg: #fbe6ea;
+    --warn: #a86c07;
+    --warn-bg: #f7eeda;
   }
+}
+
+/* Manual theme toggle (Settings) — data-theme on <html> wins over the OS preference both ways. */
+:root[data-theme="dark"] {
+  --bg: #0c0f15; --surface: #141a23; --surface-2: #1b212d; --border: #272f3d; --text: #e7eaf1;
+  --muted: #8992a4; --accent: #8092f4; --accent-ink: #0c0f15;
+  --ok: #34cea0; --ok-bg: #0f2620; --bad: #f2718a; --bad-bg: #2c1620; --warn: #e0a44a; --warn-bg: #281f11;
+}
+:root[data-theme="light"] {
+  --bg: #f5f6f9; --surface: #ffffff; --surface-2: #eceef4; --border: #e1e4ec; --text: #14171f;
+  --muted: #5a6172; --accent: #3f57df; --accent-ink: #ffffff;
+  --ok: #0c9c6b; --ok-bg: #e2f4ec; --bad: #d23a56; --bad-bg: #fbe6ea; --warn: #a86c07; --warn-bg: #f7eeda;
 }
 
 * { box-sizing: border-box; }
@@ -67,7 +83,7 @@ nav { display: flex; flex-direction: column; gap: 2px; }
   padding: 9px 10px; border-radius: 8px; cursor: pointer; font-size: 14px;
 }
 .nav-item:hover { background: var(--surface-2); color: var(--text); }
-.nav-item.active { background: rgba(34, 211, 238, 0.12); color: var(--accent); }
+.nav-item.active { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
 /* Section label between nav groups — quiet enough to read as structure, not as an entry. */
 .nav-group {
   font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
@@ -124,7 +140,15 @@ button {
 }
 button:hover:not(:disabled) { border-color: var(--accent); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
-button.primary { background: var(--accent); color: #04222a; border-color: transparent; font-weight: 600; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+
+.theme-choice { display: inline-flex; gap: 4px; padding: 4px; background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 10px; }
+.theme-opt { background: transparent; border: none; color: var(--muted); font-weight: 600;
+  font-size: 13px; padding: 6px 14px; border-radius: 7px; cursor: pointer; }
+.theme-opt:hover { color: var(--text); }
+.theme-opt.active { background: var(--surface); color: var(--accent);
+  box-shadow: 0 1px 2px rgba(0,0,0,.12); }
 button.ghost { background: transparent; }
 
 .list { padding: 0; overflow: hidden; }
@@ -245,5 +269,5 @@ button.mini { padding: 4px 9px; font-size: 12px; }
   border-bottom: 1px solid var(--border); cursor: pointer; font: inherit; color: inherit;
 }
 .picker-row:hover:not(:disabled) { background: var(--surface-2); }
-.picker-row.active { background: rgba(34, 211, 238, 0.12); }
+.picker-row.active { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .picker-row:disabled { opacity: 0.45; cursor: not-allowed; }

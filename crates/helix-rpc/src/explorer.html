@@ -16,47 +16,52 @@
 <meta name="description" content="Live block explorer for Helix (HLX), a post-quantum Layer-1 blockchain in Rust. Blocks, transactions, accounts and validators, straight from the node.">
 <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEfUlEQVR42u2XzY8UVRTFf/fVq/6qZoSeZiDoGIcZkI2RxGAEokEQ/FjIf4AbNyQuDHGr0cQdiVFMjCYkbPwP3LgANCGgiEGXCuPASFxAunvG0B8z1VXvuqiarh6mu2FwQUysZb26571377nnnpKbX7+hPMLH8IifRw7A3vcLEUAABX3Aaq0jZgQAAQGNllAXI8YitpBuqCNiJI2JEOOlMQyNscNuoC6CKCI3PoNXrBC3aoQLs4iXB/EGbCigMRqF5CrTeKUqcadBWJ8FzyLGDsyGHXQLjSOMX6T60glKk/tBDOpiWjfOU//xs+Sr/g1FUBeDsWze9x7B1IEEpDraty5Su/QJrttJYu4BbgfWz3Wp7v+A0uQ+UAfqEDGUpw+jLuTOdx9i/CBZS9Dgum22HPqYYPuhBFi6VnryRaricef8++D5a7KwGoAYNOqQG9+ZHh6DmD5COcrTR4jbdTRaTtdIANoiwdSh5GCRtMEUNKY0uY/c+E7CxnXEFjPggzKgLsYrVdNUrbA5I5iIYeOzxx6wybJu8EpVtPZbb7chABQxlrh1Ow10GZCU/eoiFq6eHpCBApueexsRrwc2iVXAELduPwAHVBFbIKzP0pw7S3n7K2t6++7v37DwyxlMLuirp+C6bfyxx9nw9Ju9yyRAPFo3zrPcmF3Nm6EkVEVsnvoPn6LREsHUQYwt4LptmrPfsnD1NLa8FRHpbwJMvkzjypcAlKcPI7aIRsu0bn5P/afPMV5+YBvK4GEkCBC17lB5/h027j5G48oXLPx6BhtsHSJGAupwUQd/bBKvWMEtLRL+/SfGDtOOoUqoIBbxS2gcJm+iMEkhBoiGxBhMrkzUuk109y8wXl+pdL1SrH0tleZZ3QgZpqf94vng5bI9/qPTUJI2W7mBuj5RYvQwikNwERgvmR0jSmCGbqQx2u0k0wwQW0C77RSQDBEdhwub2GCC/MQz+OVtuLCVKOoQ4Hbo4cYycfAjgqcOgDo27n4Lu2EbCz9/1ZPt7FYZP8ZfeJfy9BGMv7oNcfHATjADR3G8THXvCcozryUZEIPxS4ztOkplz3Fc1MnImca4qENlz3HGdh3F+MVEVW2e8syrVPeewMXLq2MGAkjNRK6yg2Dq5TR12hMo1FHe8Tr+Y5NJnSWruT/2BOUdb6TTU/sGWEwwdZB8ZQaNltaAMGu8gIvwgom1wyg9TIzFljYnJFtZdxE2mEi0XqTvkL5hFGxJTA4yugRiPOJ2LbtBr2apv9OYuFMH42XrxkveaXwP47V3kbhdQ4x3nxKkcz2sX6N961LqalIx0YR4zblzhIvzWXupIl6ecHGe5ty5tHXJSiEe7VuXCOvX1niBwSRUBeNTu3iS9vyFzKioozl3lvrlU5ieOc1ijC1Qv3yK5txZtKcZ0J6/QO3iSTD+OobRiimN7zWlfyBebrQpjUNym6bxgoc2pelIFgu+JWzMZrbcL41QtSTd4pcIF2+gjeuJLfdTW64PNYwSBZQ+Tzj60Z6fEAr/9sekjxOs8/91HTH//5z+AzC3Nft/pcWSAAAAAElFTkSuQmCC">
 <style>
+  /* Helix shared design system — cool graphite neutrals + a single iris accent.
+     Token names kept from the original explorer so the rest of this stylesheet is unchanged;
+     only the values move to the shared palette (identical hexes in the wallet). */
   :root {
-    --ground: #faf9f7;
+    --ground: #f5f6f9;
     --panel: #ffffff;
-    --panel-2: #f4f2ee;
-    --line: #e2ded7;
-    --ink: #1b1d21;
-    --dim: #6f7480;
-    --accent: #9a5b06;
-    --accent-soft: #fdf3e2;
-    --warn-bg: #fdf1ec;
-    --warn-line: #e8c4b4;
-    --warn-ink: #8a3d1c;
-    --ok: #1a7f37;
-    --ok-bg: #e7f6ec;
+    --panel-2: #eceef4;
+    --line: #e1e4ec;
+    --ink: #14171f;
+    --dim: #5a6172;
+    --accent: #3f57df;
+    --accent-soft: #eceffc;
+    --accent-ink: #ffffff;
+    --warn-bg: #f7eeda;
+    --warn-line: #e8d3a6;
+    --warn-ink: #a86c07;
+    --ok: #0c9c6b;
+    --ok-bg: #e2f4ec;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --ground: #0f1218;
-      --panel: #161a22;
-      --panel-2: #10131a;
-      --line: #262c38;
-      --ink: #e9e6e0;
-      --dim: #8a909e;
-      --accent: #e0a44a;
-      --accent-soft: #221a0e;
-      --warn-bg: #2a1710;
-      --warn-line: #58301d;
-      --warn-ink: #f0a883;
-      --ok: #4ac26b;
-      --ok-bg: #12241a;
+      --ground: #0c0f15;
+      --panel: #141a23;
+      --panel-2: #1b212d;
+      --line: #272f3d;
+      --ink: #e7eaf1;
+      --dim: #8992a4;
+      --accent: #8092f4;
+      --accent-soft: #191f34;
+      --accent-ink: #0c0f15;
+      --warn-bg: #281f11;
+      --warn-line: #58431d;
+      --warn-ink: #e0a44a;
+      --ok: #34cea0;
+      --ok-bg: #0f2620;
     }
   }
   :root[data-theme="dark"] {
-    --ground: #0f1218; --panel: #161a22; --panel-2: #10131a; --line: #262c38; --ink: #e9e6e0;
-    --dim: #8a909e; --accent: #e0a44a; --accent-soft: #221a0e;
-    --warn-bg: #2a1710; --warn-line: #58301d; --warn-ink: #f0a883; --ok: #4ac26b; --ok-bg: #12241a;
+    --ground: #0c0f15; --panel: #141a23; --panel-2: #1b212d; --line: #272f3d; --ink: #e7eaf1;
+    --dim: #8992a4; --accent: #8092f4; --accent-soft: #191f34; --accent-ink: #0c0f15;
+    --warn-bg: #281f11; --warn-line: #58431d; --warn-ink: #e0a44a; --ok: #34cea0; --ok-bg: #0f2620;
   }
   :root[data-theme="light"] {
-    --ground: #faf9f7; --panel: #ffffff; --panel-2: #f4f2ee; --line: #e2ded7; --ink: #1b1d21;
-    --dim: #6f7480; --accent: #9a5b06; --accent-soft: #fdf3e2;
-    --warn-bg: #fdf1ec; --warn-line: #e8c4b4; --warn-ink: #8a3d1c; --ok: #1a7f37; --ok-bg: #e7f6ec;
+    --ground: #f5f6f9; --panel: #ffffff; --panel-2: #eceef4; --line: #e1e4ec; --ink: #14171f;
+    --dim: #5a6172; --accent: #3f57df; --accent-soft: #eceffc; --accent-ink: #ffffff;
+    --warn-bg: #f7eeda; --warn-line: #e8d3a6; --warn-ink: #a86c07; --ok: #0c9c6b; --ok-bg: #e2f4ec;
   }
 
   * { box-sizing: border-box; }
@@ -207,6 +212,9 @@
   /* ---------- validators + tx feed ---------- */
   .sig-yes { color: var(--ok); font-weight: 600; font-size: 12.5px; }
   .sig-no { color: var(--dim); font-size: 12.5px; }
+  .vtag { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: var(--ink); }
+  .vtag.stale { color: var(--warn-ink); font-weight: 600; }
+  .dim-cell { color: var(--dim); }
   .badge { font-size: 11px; font-weight: 650; padding: 2px 9px; border-radius: 999px;
     border: 1px solid transparent; white-space: nowrap; }
   .badge.bond { color: var(--ok); background: var(--ok-bg); }
@@ -216,6 +224,34 @@
   .copy { cursor: pointer; color: var(--dim); font-size: 11px; margin-left: 6px; user-select: none; }
   .copy:hover { color: var(--accent); }
   .none { color: var(--dim); }
+
+  /* ---------- brand kit ---------- */
+  #brand { margin-top: 40px; }
+  .brand-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); gap: 16px; margin-top: 14px; }
+  .bk-card { padding: 18px; }
+  .bk-h { font-size: 11px; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+  .bk-card p.muted { margin: 0 0 14px; font-size: 13px; }
+  .bk-logo { display: flex; gap: 16px; align-items: flex-start; }
+  .bk-logo-art { flex: none; width: 84px; height: 84px; border-radius: 14px; background: var(--panel-2);
+    border: 1px solid var(--line); display: grid; place-items: center; }
+  .bk-logo-body { min-width: 0; }
+  .bk-btn { display: inline-block; background: var(--accent); color: var(--accent-ink); font-weight: 600;
+    font-size: 13px; padding: 8px 14px; border-radius: 8px; }
+  .bk-btn:hover { filter: brightness(1.06); text-decoration: none; }
+  .bk-link { display: inline-block; margin-left: 10px; font-size: 12.5px; font-family: ui-monospace, Menlo, monospace; }
+  .bk-swatches { display: flex; flex-direction: column; gap: 9px; }
+  .bk-sw { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+  .bk-sw .chip { width: 22px; height: 22px; border-radius: 6px; flex: none; box-shadow: inset 0 0 0 1px rgba(0,0,0,.08); }
+  .bk-sw .chip-b { box-shadow: inset 0 0 0 1px var(--line); }
+  .bk-sw b { font-weight: 600; }
+  .bk-sw .hexes { margin-left: auto; font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--dim); white-space: nowrap; }
+  .bk-type-row { display: flex; align-items: center; gap: 14px; padding: 9px 0; border-top: 1px solid var(--line); }
+  .bk-type-row:first-of-type { border-top: none; }
+  .bk-type-sample { flex: none; width: 46px; height: 46px; border-radius: 9px; background: var(--panel-2);
+    border: 1px solid var(--line); display: grid; place-items: center; font-size: 19px; font-weight: 640; }
+  .bk-type-sample.mono { font-family: ui-monospace, Menlo, monospace; font-size: 15px; }
+  .bk-type-name { font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+  .bk-stack { font-size: 11px; color: var(--dim); word-break: break-word; }
 
   footer { margin-top: 44px; padding-top: 16px; border-top: 1px solid var(--line);
     color: var(--dim); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
@@ -338,8 +374,8 @@
       2/3 of the voting power, so a silent validator in a small set can halt the chain.</p>
     <div class="panel scroll">
       <table>
-        <thead><tr><th>Validator</th><th>Self-stake</th><th>Effective</th><th>Participation</th><th>Missed</th><th>Status</th></tr></thead>
-        <tbody id="vals"><tr><td colspan="6" class="hash">loading…</td></tr></tbody>
+        <thead><tr><th>Validator</th><th>Version</th><th>Self-stake</th><th>Effective</th><th>Participation</th><th>Missed</th><th>Status</th></tr></thead>
+        <tbody id="vals"><tr><td colspan="7" class="hash">loading…</td></tr></tbody>
       </table>
     </div>
     <div class="pager">
@@ -365,6 +401,62 @@
       <button class="pg" id="gov-newer" disabled>‹ Newer</button>
       <span class="pg-info" id="gov-info"></span>
       <button class="pg" id="gov-older">Older ›</button>
+    </div>
+  </section>
+
+  <!-- ===================== BRAND KIT ===================== -->
+  <section id="brand">
+    <div class="lead">Brand kit</div>
+    <h2>Use the Helix marks</h2>
+    <p class="muted">Served straight from this node — pull it and ship it. The logo lives at a stable
+      URL on every Helix node; the colors and type below are the exact tokens this explorer and the
+      wallet render with.</p>
+    <div class="brand-grid">
+
+      <div class="panel bk-card bk-logo">
+        <div class="bk-logo-art"><img src="/logo.png" alt="Helix logo" width="60" height="60"></div>
+        <div class="bk-logo-body">
+          <div class="bk-h">Logo</div>
+          <p class="muted">Transparent PNG. Pull it from <code>/logo.png</code> on any node — no
+            sign-in, no external host.</p>
+          <a class="bk-btn" href="/logo.png" download="helix-logo.png">Download PNG</a>
+          <a class="bk-link" href="/logo.png" target="_blank" rel="noopener">/logo.png ↗</a>
+        </div>
+      </div>
+
+      <div class="panel bk-card bk-colors">
+        <div class="bk-h">Color</div>
+        <p class="muted">One iris accent, cool graphite neutrals. Each swatch lists its light /
+          dark hex.</p>
+        <div class="bk-swatches">
+          <div class="bk-sw"><span class="chip" style="background:#3f57df"></span><b>Accent</b><span class="hexes">#3f57df / #8092f4</span></div>
+          <div class="bk-sw"><span class="chip" style="background:#0c9c6b"></span><b>Signing</b><span class="hexes">#0c9c6b / #34cea0</span></div>
+          <div class="bk-sw"><span class="chip" style="background:#a86c07"></span><b>Warning</b><span class="hexes">#a86c07 / #e0a44a</span></div>
+          <div class="bk-sw"><span class="chip" style="background:#14171f"></span><b>Ink</b><span class="hexes">#14171f / #e7eaf1</span></div>
+          <div class="bk-sw"><span class="chip" style="background:#5a6172"></span><b>Dim</b><span class="hexes">#5a6172 / #8992a4</span></div>
+          <div class="bk-sw"><span class="chip chip-b" style="background:#f5f6f9"></span><b>Ground</b><span class="hexes">#f5f6f9 / #0c0f15</span></div>
+        </div>
+      </div>
+
+      <div class="panel bk-card bk-type">
+        <div class="bk-h">Type</div>
+        <p class="muted">System faces only — nothing to download, nothing that phones home.</p>
+        <div class="bk-type-row">
+          <div class="bk-type-sample">Aa</div>
+          <div>
+            <div class="bk-type-name">Interface</div>
+            <code class="bk-stack">system-ui, -apple-system, "Segoe UI", Roboto, sans-serif</code>
+          </div>
+        </div>
+        <div class="bk-type-row">
+          <div class="bk-type-sample mono">0x9f</div>
+          <div>
+            <div class="bk-type-name">Data — heights, amounts, hashes</div>
+            <code class="bk-stack">ui-monospace, "SF Mono", Menlo, Consolas, monospace</code>
+          </div>
+        </div>
+      </div>
+
     </div>
   </section>
 
@@ -397,6 +489,13 @@
   // keeps its own page; page 0 follows the tip live, deeper pages are historical and static.
   let tip = 0, blocksPage = 0, txPage = 0, valPage = 0, govPage = 0;
   let valsCache = [], signersCache = new Set(), govCache = [];
+  // Proposer address -> the node software version it stamped into a recent block header (#128).
+  // Built from the same recent-headers scan as signersCache; a validator that hasn't proposed
+  // inside the window shows "—" until it next produces a block.
+  let versionsByProposer = new Map();
+  // The version of the node serving this page (from /status), used as the reference a validator's
+  // version is compared against to flag a mismatch.
+  let nodeVersion = '';
 
   const fmtHlx = (n) => (n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 9 });
   const short = (s, n = 10) => (s && s.length > n * 2 ? s.slice(0, n) + '…' + s.slice(-6) : s || '');
@@ -546,7 +645,7 @@
     valPage = page;
     const slice = valsCache.slice(page * VAL_PAGE, page * VAL_PAGE + VAL_PAGE);
     if (!slice.length) {
-      $('vals').innerHTML = '<tr><td colspan="6" class="hash">no validators</td></tr>';
+      $('vals').innerHTML = '<tr><td colspan="7" class="hash">no validators</td></tr>';
       setPager('vals', false, false, '—');
       return;
     }
@@ -557,8 +656,15 @@
       else if (v.active === false) { st = 'Inactive'; sc = 'off'; }
       else { st = 'Bonded'; sc = 'bond'; }
       const signed = signersCache.has(v.address);
+      // A validator running a different build than the node serving this page is the mismatch #128
+      // exists to surface — flag it rather than let it hide in a version string nobody reads.
+      const ver = versionsByProposer.get(v.address);
+      const verCell = ver
+        ? `<span class="vtag${nodeVersion && ver !== nodeVersion ? ' stale' : ''}" title="${nodeVersion && ver !== nodeVersion ? 'differs from this node (v' + esc(nodeVersion) + ')' : 'node software version'}">v${esc(ver)}</span>`
+        : '<span class="dim-cell">—</span>';
       return `<tr>
         <td class="hash">${link(v.address, short(v.address, 10))}</td>
+        <td>${verCell}</td>
         <td class="num">${fmtHlx(v.self_staked_hlx || 0)}</td>
         <td class="num">${fmtHlx(v.effective_stake_hlx || 0)}</td>
         <td>${signed ? '<span class="sig-yes">● signing</span>' : '<span class="sig-no">— silent</span>'}</td>
@@ -608,6 +714,7 @@
     try {
       const s = await api('/status');
       tip = s.height;
+      nodeVersion = s.version;
       $('ver').textContent = 'v' + s.version;
       // Only offer the faucet where one exists. A node serving this page from someone else's
       // machine usually has none, and an offer that 404s is worse than no offer.
@@ -629,6 +736,15 @@
       renderHealth(headers, s);
       signersCache = new Set();
       headers.forEach((hd) => (hd.last_commit || []).forEach((a) => signersCache.add(a)));
+      // Rebuilt each tick so an upgrade shows through. Freshest first (the loop walks tip
+      // downward), so the first version seen per proposer is its latest. Only non-empty versions
+      // count — genesis and pre-#128 blocks carry none.
+      versionsByProposer = new Map();
+      headers.forEach((hd) => {
+        if (hd.validator && hd.node_version && !versionsByProposer.has(hd.validator)) {
+          versionsByProposer.set(hd.validator, hd.node_version);
+        }
+      });
 
       // Live-follow the tip only on page 0; a reader who paged back into history stays there.
       if (blocksPage === 0) await loadBlocks(0);
@@ -774,7 +890,7 @@
   // Section anchors (#explorer, #validators, …) are page navigation, not lookups — the browser
   // scrolls to them natively, so `fromHash` must skip them. A real lookup query is an address,
   // a 64-hex hash, or a block number; none collide with a section id.
-  const SECTIONS = new Set(['top', 'explorer', 'transactions', 'validators', 'governance']);
+  const SECTIONS = new Set(['top', 'explorer', 'transactions', 'validators', 'governance', 'brand']);
   function fromHash() {
     const raw = location.hash.slice(1);
     if (!raw || SECTIONS.has(raw)) return;

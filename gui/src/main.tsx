@@ -2,7 +2,12 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { attachConsole, error as logError } from "@tauri-apps/plugin-log";
 import App from "./App";
+import { applyStoredTheme } from "./theme";
 import "./styles.css";
+
+// Apply the saved light/dark choice before first paint, so a manual theme doesn't flash the OS
+// default for a frame on launch.
+applyStoredTheme();
 
 // Mirror the webview console into the same persistent log file node_process.rs/commands.rs
 // write to (see lib.rs's tauri-plugin-log setup) — a frontend crash otherwise leaves nothing
