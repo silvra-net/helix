@@ -2280,21 +2280,22 @@ async fn resolve_seed_peer_multiaddr(peer_url: &str) -> Result<String> {
 /// Compares our build against the sync peer's reported one, returning a warning when they
 /// differ. Pure so it can be tested without a live peer.
 ///
-/// Nothing in the P2P layer refuses a version mismatch — `Peer::protocol_version` exists as a
-/// field and is never checked — so two nodes running different consensus rules will peer
-/// happily and then disagree in silence. That is not hypothetical: the downtime-accounting fix
+/// The P2P layer warns on a version mismatch but never refuses one, so two nodes running
+/// different consensus rules will peer happily and then disagree in silence. That is not
+/// hypothetical: the downtime-accounting fix
 /// in 0.8.1 changes which validators are scored for missed blocks, so an un-upgraded node jails
 /// a validator that an upgraded one considers fine and stops voting with it — while both keep
 /// producing perfectly valid-looking blocks. 0.8.5 raises the stakes again: a node still running
 /// the old local liveness exclusion will finalize blocks alone that an upgraded peer refuses to,
 /// which is how the chain split at height 66918.
 ///
-/// This only catches the mismatch at join time, which is where it usually starts (an operator
-/// brings up a node against an already-upgraded network). It cannot see a peer that upgrades
-/// while we keep running; catching that needs a real handshake (libp2p `identify`, or version
-/// in peer exchange) and is tracked separately. Warning rather than refusing is deliberate:
-/// most version differences are harmless, and a node that refuses to start because a peer is
-/// one patch ahead would be worse than one that says so loudly.
+/// This catches the mismatch at join time, which is where it usually starts (an operator brings
+/// up a node against an already-upgraded network). The complementary case — a peer that upgrades
+/// while we keep running — is now caught by the running P2P layer: every peer-exchange broadcast
+/// carries the sender's version, and `service::foreign_version_warning` logs a mismatch once
+/// (#109). Warning rather than refusing is deliberate in both places: most version differences are
+/// harmless, and a node that refuses to start because a peer is one patch ahead would be worse
+/// than one that says so loudly.
 fn peer_version_warning(status: &serde_json::Value, ours: &str) -> Option<String> {
     let theirs = status.get("version")?.as_str()?;
     if theirs == ours {

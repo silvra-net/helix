@@ -255,6 +255,9 @@ impl P2PService {
         // tells this node about any *other* peer to fall back on. See `TOPIC_PEER_EXCHANGE`'s
         // doc comment and `PeerExchangeMsg` below for the full picture.
         let mut known_addrs: HashSet<String> = HashSet::new();
+        // Peer versions we've already warned about, so a persistent mismatch on the 30s
+        // peer-exchange tick is logged once rather than every tick (#109).
+        let mut warned_versions: HashSet<String> = HashSet::new();
         if let Some(addr) = &config.public_addr {
             known_addrs.insert(addr.clone());
         }
@@ -290,6 +293,7 @@ impl P2PService {
                                     &mut known_addrs,
                                     config.public_addr.as_deref(),
                                     &mut swarm,
+                                    &mut warned_versions,
                                 )
                             } else {
                                 handle_app_message(topic, &message.data, &event_tx).await
@@ -470,9 +474,20 @@ pub(crate) fn multiaddr_ip(addr: &Multiaddr) -> Option<String> {
 /// this one doesn't already close.
 const MAX_KNOWN_PEER_ADDRS: usize = 200;
 
+/// This node's software version, stamped into every peer-exchange broadcast (#109). The
+/// workspace shares one version, so this crate's `CARGO_PKG_VERSION` is the running node's
+/// version — the same reasoning the signed `node_version` block header relies on (#128).
+const OUR_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PeerExchangeMsg {
     peers: Vec<String>,
+    /// The sender's software version. `peer_version_warning` in the node layer only catches a
+    /// mismatch at *join* time; this rides the periodic peer-exchange gossip so a peer that
+    /// upgrades (or downgrades) while we keep running is noticed too (#109). Adding this field
+    /// changes the topic's bincode payload — a coordinated upgrade, bundled with the release that
+    /// already resets the chain.
+    version: String,
 }
 
 /// Merges `incoming` into `known`, skipping our own address and anything already known, and
@@ -499,6 +514,25 @@ fn select_new_addrs(
     new_addrs
 }
 
+/// The warning text for a peer running a different version than ours, or `None` when it matches
+/// or we have already warned about this exact version. The `warned` set dedups so a mismatch that
+/// keeps arriving on the 30-second peer-exchange tick is logged once, not forever. Pure, so the
+/// dedup and same-version cases are testable without a `Swarm`.
+///
+/// It cannot say *which* peer — the gossiped message carries no sender identity — only that
+/// *some* peer on the network runs a different build, which is the fact an operator needs.
+fn foreign_version_warning(their: &str, ours: &str, warned: &mut HashSet<String>) -> Option<String> {
+    if their == ours || !warned.insert(their.to_string()) {
+        return None;
+    }
+    Some(format!(
+        "A peer on the network runs Helix {their}, this node runs {ours}. Peers aren't required to \
+         match, but a consensus-rule difference between builds shows up as silent disagreement — \
+         mismatched jailing, votes that never count, a chain that stalls without an error. Make \
+         sure every validator runs the same version."
+    ))
+}
+
 /// Returns `true` if the message was malformed (i.e. the sender should be charged a
 /// misbehavior strike).
 fn handle_peer_exchange_message(
@@ -506,6 +540,7 @@ fn handle_peer_exchange_message(
     known_addrs: &mut HashSet<String>,
     self_addr: Option<&str>,
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
+    warned_versions: &mut HashSet<String>,
 ) -> bool {
     let msg = match bincode::deserialize::<PeerExchangeMsg>(data) {
         Ok(m) => m,
@@ -514,6 +549,12 @@ fn handle_peer_exchange_message(
             return true;
         }
     };
+
+    // Catch a peer that upgraded (or downgraded) while we keep running — the gap join-time
+    // `peer_version_warning` cannot see (#109).
+    if let Some(warning) = foreign_version_warning(&msg.version, OUR_VERSION, warned_versions) {
+        warn!("{warning}");
+    }
 
     for addr in select_new_addrs(known_addrs, &msg.peers, self_addr) {
         match addr.parse::<Multiaddr>() {
@@ -529,18 +570,18 @@ fn handle_peer_exchange_message(
     false
 }
 
-/// Publishes our full current `known_addrs` set on the peer-exchange topic. No-op when we
-/// don't know any addresses yet (nothing useful to announce).
+/// Publishes our full current `known_addrs` set on the peer-exchange topic, stamped with our
+/// version. Sent even when we know no addresses yet: the message still carries our version, which
+/// is worth propagating on its own so peers can notice a running-version mismatch (#109) — the
+/// previous no-op-on-empty optimization would have withheld it exactly from a freshly started node.
 fn broadcast_known_addrs(
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
     topic: &gossipsub::IdentTopic,
     known_addrs: &HashSet<String>,
 ) {
-    if known_addrs.is_empty() {
-        return;
-    }
     let msg = PeerExchangeMsg {
         peers: known_addrs.iter().cloned().collect(),
+        version: OUR_VERSION.to_string(),
     };
     if let Ok(data) = bincode::serialize(&msg) {
         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
@@ -631,8 +672,39 @@ mod multiaddr_ip_tests {
 
 #[cfg(test)]
 mod peer_exchange_tests {
-    use super::{select_new_addrs, MAX_KNOWN_PEER_ADDRS};
+    use super::{foreign_version_warning, select_new_addrs, MAX_KNOWN_PEER_ADDRS};
     use std::collections::HashSet;
+
+    #[test]
+    fn a_matching_version_never_warns() {
+        let mut warned = HashSet::new();
+        assert!(foreign_version_warning("0.8.13", "0.8.13", &mut warned).is_none());
+        assert!(warned.is_empty(), "a match must not even be recorded");
+    }
+
+    #[test]
+    fn a_differing_version_warns_once_then_stays_quiet() {
+        let mut warned = HashSet::new();
+        let first = foreign_version_warning("0.9.0", "0.8.13", &mut warned);
+        assert!(first.is_some(), "the first sight of a foreign version must warn");
+        assert!(first.unwrap().contains("0.9.0"), "the warning names the peer's version");
+        // The same mismatch keeps arriving every 30s on the peer-exchange tick — it must not
+        // re-warn each time (#109).
+        assert!(
+            foreign_version_warning("0.9.0", "0.8.13", &mut warned).is_none(),
+            "a version already warned about must stay quiet"
+        );
+    }
+
+    #[test]
+    fn each_distinct_foreign_version_warns_separately() {
+        let mut warned = HashSet::new();
+        assert!(foreign_version_warning("0.9.0", "0.8.13", &mut warned).is_some());
+        assert!(
+            foreign_version_warning("0.7.0", "0.8.13", &mut warned).is_some(),
+            "a different foreign version is a new fact worth its own warning"
+        );
+    }
 
     #[test]
     fn returns_only_genuinely_new_addresses() {
