@@ -23,17 +23,17 @@
 //! A second test below (`three_validators_rotate_proposer_and_finalize_blocks_together`,
 //! CTO backlog item 56) goes further and exercises real multi-validator BFT — proposer
 //! rotation and live voting across independent processes under real network latency, not
-//! just gossip/sync agreement with a single active validator. Organically growing from one
-//! validator to three would mean each follower accumulating `MIN_VALIDATOR_STAKE` (100k HLX)
-//! via block rewards (1 HLX/block) or transfers — economically real, but far too slow for an
-//! automated test (literally weeks). Instead it uses `HELIX_GENESIS_EXTRA_VALIDATORS` (see
-//! `GenesisConfig::extra_validators`'s doc comment) to pre-stake two more validators — with
-//! known keypairs, so the spawned follower processes can be given matching `validator-key.json`
-//! files — directly at genesis, so all three are active BFT participants from block 0.
+//! just gossip/sync agreement with a single active validator. It grows the set the only way a
+//! Helix network can — funding two more validators from the genesis validator's liquid reserve
+//! and staking them at runtime — then waits out their activation epochs. That path is slow at
+//! the production 2 s/block (a fixed 200-block activation is ~7 minutes), so the test runs at an
+//! accelerated `HELIX_BLOCK_TIME_MS` (which enters no hash and not the proposer schedule, so it
+//! changes only wall-clock). There is deliberately no genesis pre-staking shortcut: a real
+//! network never gains validators that way, and the test exercises the path that ships.
 //!
 //! That second test is marked `#[ignore]`: it spawns three real validator processes and waits
-//! out a one-time gossip-mesh settle plus a window of finalized blocks (~30s wall-clock),
-//! which is slower than the rest of the suite is meant to be on every CI push. Run it
+//! out two activation epochs plus a window of finalized blocks (~2 min wall-clock even
+//! accelerated), which is slower than the rest of the suite is meant to be on every CI push. Run it
 //! explicitly with `cargo test -p helix-node --test multi_node -- --ignored` (e.g. before a
 //! release, or after touching consensus/BFT code — it's the regression guard for the
 //! multi-validator round-synchronization and vote-buffering that make cold start converge).
@@ -117,10 +117,10 @@ fn spawn_node(rpc_port: u16, p2p_port: u16, sync_peer_rpc_port: Option<u16>) -> 
 }
 
 /// `extra_env` — additional env vars beyond the standard bind/listen/sync-peer ones (e.g.
-/// `HELIX_GENESIS_EXTRA_VALIDATORS` on the genesis node). `keypair` — if set, pre-writes
+/// `HELIX_BLOCK_TIME_MS` to accelerate activation epochs). `keypair` — if set, pre-writes
 /// `validator-key.json` into the node's work dir so it starts with this exact validator
-/// identity instead of generating a random one, so a follower's address can be pre-staked in
-/// another node's genesis ahead of time and the follower still ends up controlling it.
+/// identity instead of generating a random one, so the test can address funding transfers to a
+/// follower and that follower still ends up controlling the stake it later stakes.
 /// Panics with a diagnosis if `port` is taken, instead of letting the test start a node that
 /// cannot bind and then time out on a symptom far from the cause.
 fn assert_port_free(port: u16, label: &str) {
@@ -367,12 +367,11 @@ fn run_cli(node_url: &str, args: &[&str]) -> bool {
         .success()
 }
 
-/// The end-to-end runtime join, over the **real `helix` binary**: an operator funds a second
+/// The focused, minimal runtime join, over the **real `helix` binary**: an operator funds a second
 /// account, that account stakes with a real `helix tx stake`, waits out its activation, and must
-/// then actually co-sign. No existing test covers this — the 3- and 4-validator tests all pre-stake
-/// every validator in genesis, so a joiner is a validator from block 0 and never crosses an
-/// activation rotation at all. This is the path every real operator takes, and the one that kept
-/// stalling.
+/// then actually co-sign. The 3- and 4-validator tests grow their sets the same way, but this one
+/// isolates a single 1→2 crossing so the co-sign proof needs no signature inspection at all (see
+/// below). This is the path every real operator takes, and the one that kept stalling.
 ///
 /// The decisive assertion needs no signature inspection: node A starts as the *sole* validator, so
 /// once B is active the set is 2-of-2, whose quorum needs **both** votes — A alone mathematically
@@ -498,6 +497,39 @@ async fn wait_for_validator_active(rpc_port: u16, address: &str, timeout: Durati
     }
 }
 
+/// Fund `joiner` from the genesis validator's liquid reserve and stake it — the two transactions
+/// that turn a plain account into a validator over the real production path (there is deliberately
+/// no genesis shortcut for pre-staking extra validators; a network grows from one validator by
+/// funding and staking more at runtime). Does NOT wait for activation: callers that stake several
+/// joiners want them to cross their activation epochs *together*, so staking is separated from the
+/// wait. `funder_key` signs the transfer (from the genesis validator's 500k reserve); `joiner_key`
+/// signs the stake. Both submit through `funder_rpc`, and each step waits for its on-chain effect
+/// before returning, so A's nonce has advanced before the next funding transfer is signed (back to
+/// back transfers sharing a committed nonce would collide).
+async fn fund_and_stake(
+    funder_rpc: u16,
+    funder_key: &std::path::Path,
+    joiner_kp: &KeyPair,
+    joiner_key: &std::path::Path,
+) {
+    let addr = Address::from_public_key(&joiner_kp.public).to_string();
+    let url = format!("http://127.0.0.1:{funder_rpc}");
+    // 110k HLX: 100k to stake plus a fee margin, mirroring how the live validators were funded.
+    assert!(
+        run_cli(&url, &["tx", "send", &addr, "110000", "--key", funder_key.to_str().unwrap()]),
+        "helix tx send (fund {addr}) exited non-zero"
+    );
+    let funded = wait_for_account(funder_rpc, &addr, |a| a["balance_hlx"].as_f64().unwrap_or(0.0) >= 110_000.0, Duration::from_secs(30)).await;
+    assert!(funded, "{addr} was never credited its 110k funding transfer");
+
+    assert!(
+        run_cli(&url, &["tx", "stake", "100000", "--key", joiner_key.to_str().unwrap()]),
+        "helix tx stake ({addr}) exited non-zero"
+    );
+    let staked = wait_for_account(funder_rpc, &addr, |a| a["staked_hlx"].as_f64().unwrap_or(0.0) >= 100_000.0, Duration::from_secs(30)).await;
+    assert!(staked, "{addr}'s stake never took effect on chain");
+}
+
 #[tokio::test]
 async fn three_nodes_converge_on_identical_height_hash_and_state() {
     // Node A: fresh devnet genesis, produces blocks alone — exactly today's production setup.
@@ -547,21 +579,22 @@ async fn three_nodes_converge_on_identical_height_hash_and_state() {
     );
 }
 
-/// CTO backlog item 56 — see the module doc comment for the design (genesis pre-staking
-/// instead of an organic, too-slow-to-automate staking dance). Boots a real 3-validator BFT
-/// set from block 0 and asserts two things a single-active-validator setup structurally
-/// cannot exercise: (1) more than one of the three distinct validator addresses actually
-/// proposes a block — real round-robin rotation, not just one validator winning every round
-/// — and (2) all three nodes still converge on identical height, hash, and state despite that
-/// rotation happening across independent processes over real network latency, the same
-/// bug class (backlog item 47) that a non-deterministic proposer order or an engine height
-/// desync would reproduce under exactly these conditions.
+/// CTO backlog item 56. Boots a real 3-validator BFT set — grown from one genesis validator by
+/// funding and staking two more at runtime, the only way a Helix network gains validators (there
+/// is no genesis pre-staking shortcut) — and asserts two things a single-active-validator setup
+/// structurally cannot exercise: (1) more than one of the three distinct validator addresses
+/// actually proposes a block — real round-robin rotation, not just one validator winning every
+/// round — and (2) all three nodes still converge on identical height, hash, and state despite
+/// that rotation happening across independent processes over real network latency, the same bug
+/// class (backlog item 47) that a non-deterministic proposer order or an engine height desync
+/// would reproduce under exactly these conditions.
 #[tokio::test]
-#[ignore = "spawns 3 real validator processes and waits out a mesh-settle + a window of blocks (~30s wall-clock) — run explicitly with --ignored, not on every CI push"]
+#[ignore = "spawns 3 real validator processes and grows the set by funding+staking two at runtime, waiting out their activation epochs at an accelerated block time (~2 min wall-clock) — run explicitly with --ignored, not on every CI push"]
 async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
-    // B and C's validator identities are generated up front so their addresses can be
-    // pre-staked in A's genesis, and their own processes can later be started with a
-    // matching `validator-key.json` so they actually control the stake genesis gave them.
+    // B and C's validator identities are generated up front so their processes can start with a
+    // matching `validator-key.json` (so they control the stake staked to their addresses) and so
+    // the test can address the funding transfers.
+    let kp_a = KeyPair::generate();
     let kp_b = KeyPair::generate();
     let kp_c = KeyPair::generate();
     let addr_b = Address::from_public_key(&kp_b.public);
@@ -577,38 +610,51 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
     let seeds_b = format!("{},{}", ma(VAL_A_P2P), ma(VAL_C_P2P));
     let seeds_c = format!("{},{}", ma(VAL_A_P2P), ma(VAL_B_P2P));
 
-    // Exactly MIN_VALIDATOR_STAKE (100k HLX) each — enough to qualify, nothing more.
-    let extra_validators = format!("{addr_b}:100000,{addr_c}:100000");
-    let _node_a = spawn_node_with(
-        VAL_A_RPC,
-        VAL_A_P2P,
-        None,
-        &[("HELIX_GENESIS_EXTRA_VALIDATORS", &extra_validators), ("HELIX_P2P_SEED_PEERS", &seeds_a)],
-        None,
-    );
+    // Accelerated block time so the two 100-block activation epochs the joiners cross pass in ~1
+    // minute rather than ~7 (see JOIN_BLOCK_TIME_MS); it enters no hash and not the proposer
+    // schedule. A is spawned with a known key so the test can sign the funding transfers from its
+    // 500k liquid reserve.
+    let fast = ("HELIX_BLOCK_TIME_MS", JOIN_BLOCK_TIME_MS);
+    let _node_a = spawn_node_with(VAL_A_RPC, VAL_A_P2P, None, &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_a)], Some(&kp_a));
     wait_until_reachable(VAL_A_RPC, Duration::from_secs(15)).await;
+    wait_for_height(VAL_A_RPC, 2, Duration::from_secs(30)).await;
 
-    // B and C join via HELIX_SYNC_PEER (adopts A's genesis block byte-for-byte *and*, via GET
-    // /genesis's extra_validators field, rebuilds the same pre-staked state, so all three
-    // independently arrive at an identical 3-validator ValidatorSet from height 0) and the
-    // same full-mesh seed peers. With `ValidatorSet::new`'s 1%-of-total-stake cap making every
-    // validator's voting power identical, quorum genuinely needs all three voting — a real
-    // multi-validator BFT round, proposal + two-phase commit, not a single-proposer shortcut.
-    let _node_b = spawn_node_with(VAL_B_RPC, VAL_B_P2P, Some(VAL_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_b)], Some(&kp_b));
-    let _node_c = spawn_node_with(VAL_C_RPC, VAL_C_P2P, Some(VAL_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_c)], Some(&kp_c));
+    // B and C join by syncing A's genesis + history (the real join path) with the same full-mesh
+    // seed peers, then stake at runtime. With `ValidatorSet::new`'s 1%-of-total-stake cap making
+    // every validator's voting power identical once active, quorum genuinely needs all three
+    // voting — a real multi-validator BFT round, proposal + two-phase commit, not a single-proposer
+    // shortcut.
+    let _node_b = spawn_node_with(VAL_B_RPC, VAL_B_P2P, Some(VAL_A_RPC), &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_b)], Some(&kp_b));
+    let _node_c = spawn_node_with(VAL_C_RPC, VAL_C_P2P, Some(VAL_A_RPC), &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_c)], Some(&kp_c));
     wait_until_reachable(VAL_B_RPC, Duration::from_secs(15)).await;
     wait_until_reachable(VAL_C_RPC, Duration::from_secs(15)).await;
 
-    // Block production waits out a one-time mesh-settle (so the first round's votes aren't lost
-    // to a half-formed gossip mesh — see block_production_loop) and then finalizes a steady
-    // ~1-2s/block with proposer rotation across all three. The timeout is deliberately far
-    // larger than the ~30s this needs, to stay green on a slow/loaded CI machine without
-    // masking a genuine stall.
-    let target_height = 10;
+    // Fund and stake both joiners (from A's reserve) before waiting on either activation, so they
+    // cross their activation epochs together and the set grows 1→3 rather than one at a time.
+    let (_kd_a, key_a) = temp_keyfile(&kp_a);
+    let (_kd_b, key_b) = temp_keyfile(&kp_b);
+    let (_kd_c, key_c) = temp_keyfile(&kp_c);
+    fund_and_stake(VAL_A_RPC, &key_a, &kp_b, &key_b).await;
+    fund_and_stake(VAL_A_RPC, &key_a, &kp_c, &key_c).await;
+    assert!(
+        wait_for_validator_active(VAL_A_RPC, &addr_b.to_string(), Duration::from_secs(180)).await,
+        "B staked but never entered the active validator set — activation stalled"
+    );
+    assert!(
+        wait_for_validator_active(VAL_A_RPC, &addr_c.to_string(), Duration::from_secs(180)).await,
+        "C staked but never entered the active validator set — activation stalled"
+    );
+
+    // With all three active and co-signing, finalization continues with proposer rotation across
+    // all three. The window starts from here so every sampled height is a genuine 3-validator
+    // round. The timeout is deliberately far larger than needed, to stay green on a slow/loaded CI
+    // machine without masking a genuine stall.
+    let start = status(VAL_A_RPC).await.unwrap()["height"].as_u64().unwrap();
+    let target_height = start + 10;
     wait_for_height(VAL_A_RPC, target_height, Duration::from_secs(180)).await;
 
     let mut distinct_proposers = HashSet::new();
-    for height in 1..=target_height {
+    for height in (start + 1)..=target_height {
         let header = block_header(VAL_A_RPC, height)
             .await
             .unwrap_or_else(|| panic!("node A has no header for height {height} despite reporting that height"));
@@ -616,9 +662,9 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
     }
     assert!(
         distinct_proposers.len() > 1,
-        "only one validator ({:?}) ever proposed across the first {target_height} blocks — \
+        "only one validator ({:?}) ever proposed across the {} blocks after all three activated — \
          proposer rotation isn't actually happening despite 3 active validators",
-        distinct_proposers
+        distinct_proposers, target_height - start
     );
 
     // Same convergence check as the single-validator test above — rotation happening across
@@ -639,8 +685,9 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
 /// proposer), so a dead proposer left every other validator waiting on a proposal that never
 /// came, with nothing advancing them to the next round's live proposer.
 #[tokio::test]
-#[ignore = "spawns 4 real validator processes, kills one, and waits out several round timeouts (~60-90s wall-clock) — run explicitly with --ignored, not on every CI push"]
+#[ignore = "spawns 4 real validator processes (grown by funding+staking three at runtime), kills one, and waits out several round timeouts at an accelerated block time (~2-3 min wall-clock) — run explicitly with --ignored, not on every CI push"]
 async fn four_validators_survive_one_going_offline() {
+    let kp_a = KeyPair::generate();
     let kp_b = KeyPair::generate();
     let kp_c = KeyPair::generate();
     let kp_d = KeyPair::generate();
@@ -654,24 +701,37 @@ async fn four_validators_survive_one_going_offline() {
     let seeds_c = format!("{},{},{}", ma(FT_A_P2P), ma(FT_B_P2P), ma(FT_D_P2P));
     let seeds_d = format!("{},{},{}", ma(FT_A_P2P), ma(FT_B_P2P), ma(FT_C_P2P));
 
-    let extra = format!("{addr_b}:100000,{addr_c}:100000,{addr_d}:100000");
-    let _node_a = spawn_node_with(
-        FT_A_RPC,
-        FT_A_P2P,
-        None,
-        &[("HELIX_GENESIS_EXTRA_VALIDATORS", &extra), ("HELIX_P2P_SEED_PEERS", &seeds_a)],
-        None,
-    );
+    // Accelerated block time (see JOIN_BLOCK_TIME_MS) so the joiners' activation epochs pass in
+    // ~1 minute; A carries a known key so the test can fund the other three from its 500k reserve.
+    let fast = ("HELIX_BLOCK_TIME_MS", JOIN_BLOCK_TIME_MS);
+    let _node_a = spawn_node_with(FT_A_RPC, FT_A_P2P, None, &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_a)], Some(&kp_a));
     wait_until_reachable(FT_A_RPC, Duration::from_secs(15)).await;
-    let _node_b = spawn_node_with(FT_B_RPC, FT_B_P2P, Some(FT_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_b)], Some(&kp_b));
-    let _node_c = spawn_node_with(FT_C_RPC, FT_C_P2P, Some(FT_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_c)], Some(&kp_c));
-    let node_d = spawn_node_with(FT_D_RPC, FT_D_P2P, Some(FT_A_RPC), &[("HELIX_P2P_SEED_PEERS", &seeds_d)], Some(&kp_d));
+    wait_for_height(FT_A_RPC, 2, Duration::from_secs(30)).await;
+    let _node_b = spawn_node_with(FT_B_RPC, FT_B_P2P, Some(FT_A_RPC), &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_b)], Some(&kp_b));
+    let _node_c = spawn_node_with(FT_C_RPC, FT_C_P2P, Some(FT_A_RPC), &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_c)], Some(&kp_c));
+    let node_d = spawn_node_with(FT_D_RPC, FT_D_P2P, Some(FT_A_RPC), &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_d)], Some(&kp_d));
     wait_until_reachable(FT_B_RPC, Duration::from_secs(15)).await;
     wait_until_reachable(FT_C_RPC, Duration::from_secs(15)).await;
     wait_until_reachable(FT_D_RPC, Duration::from_secs(15)).await;
 
+    // Grow the set from 1 to 4 by funding and staking B, C, D at runtime. Staked together so they
+    // cross their activation epochs in one boundary and the full 4-validator set forms at once.
+    let (_kd_a, key_a) = temp_keyfile(&kp_a);
+    let (_kd_b, key_b) = temp_keyfile(&kp_b);
+    let (_kd_c, key_c) = temp_keyfile(&kp_c);
+    let (_kd_d, key_d) = temp_keyfile(&kp_d);
+    fund_and_stake(FT_A_RPC, &key_a, &kp_b, &key_b).await;
+    fund_and_stake(FT_A_RPC, &key_a, &kp_c, &key_c).await;
+    fund_and_stake(FT_A_RPC, &key_a, &kp_d, &key_d).await;
+    for (addr, label) in [(&addr_b, "B"), (&addr_c, "C"), (&addr_d, "D")] {
+        assert!(
+            wait_for_validator_active(FT_A_RPC, &addr.to_string(), Duration::from_secs(240)).await,
+            "{label} staked but never entered the active validator set — activation stalled"
+        );
+    }
+
     // All four finalize an initial run of blocks together.
-    let before = wait_for_height(FT_A_RPC, 8, Duration::from_secs(180)).await;
+    let before = wait_for_height(FT_A_RPC, status(FT_A_RPC).await.unwrap()["height"].as_u64().unwrap() + 4, Duration::from_secs(120)).await;
     let height_at_kill = before["height"].as_u64().unwrap();
 
     // Take D offline (Drop kills its process). The remaining three are still a quorum, so

@@ -121,8 +121,8 @@ pub struct GenesisConfig {
     pub validator: Address,
     /// Liquid genesis balances (address, nano-HLX). Seeded from the `GENESIS_PREFUND` default
     /// for a chain launching fresh; a node joining an existing chain replaces it with that
-    /// chain's real allocations from the peer's `GET /genesis`, exactly like `validator_stake`
-    /// and `extra_validators`. See `ChainState::genesis_allocations`.
+    /// chain's real allocations from the peer's `GET /genesis`, exactly like `validator_stake`.
+    /// See `ChainState::genesis_allocations`.
     pub allocations: Vec<(Address, u64)>,
     /// The network's personhood-issuing authorities, if configured — see
     /// `ChainState::personhood_authorities`'s doc comment. Empty means `ProvePersonhood` stays
@@ -130,20 +130,6 @@ pub struct GenesisConfig {
     /// default here (auto-generating a keypair would produce an authority nobody actually
     /// holds the private key for, which would just brick the feature a different way).
     pub personhood_authorities: Vec<PublicKey>,
-    /// Additional validators to pre-stake directly at genesis, beyond `validator` (address,
-    /// nano-HLX stake). Empty by default — every chain still starts with exactly one
-    /// bootstrap validator unless an operator explicitly opts into more. Exists because
-    /// organically growing from one validator to several requires each new validator to
-    /// accumulate `MIN_VALIDATOR_STAKE` (100k HLX) via block rewards (1 HLX/block) or
-    /// transfers from an already-funded account — economically real, but far too slow to
-    /// ever set up a genuinely multi-validator network (let alone test one) in anything
-    /// short of months. Setting this lets an operator launch with real multi-validator BFT
-    /// (proposer rotation, live voting) active from block 0 instead. Populated from
-    /// `HELIX_GENESIS_EXTRA_VALIDATORS`/`helix.toml`'s `genesis_extra_validators` — see
-    /// `helix-node::node::HelixNode::new` — and, for a node joining an existing chain via
-    /// `sync_peer`, from that peer's `GET /genesis` response (`ChainState::genesis_extra_validators`
-    /// carries it forward so it can be replayed identically by every later-joining node).
-    pub extra_validators: Vec<(Address, u64)>,
     /// Bootstrap stake (nano-HLX) for `validator`. Defaults to `VALIDATOR_GENESIS_STAKE_HLX`
     /// for a chain launching fresh; a node joining an existing chain overwrites it with that
     /// chain's real value from the peer's `GET /genesis`, rather than trusting its own binary's
@@ -167,13 +153,11 @@ pub struct GenesisConfig {
 pub fn rebuild_genesis_state(
     validator: Address,
     personhood_authorities: Vec<PublicKey>,
-    extra_validators: Vec<(Address, u64)>,
     validator_stake: u64,
     allocations: Vec<(Address, u64)>,
     governance_params: crate::governance::GovernanceParams,
 ) -> ChainState {
     let mut cfg = GenesisConfig::devnet_with_personhood_authority(validator, personhood_authorities);
-    cfg.extra_validators = extra_validators;
     cfg.validator_stake = validator_stake;
     cfg.allocations = allocations;
     let mut state = cfg.build_state();
@@ -205,7 +189,6 @@ impl GenesisConfig {
             allocations,
             validator,
             personhood_authorities,
-            extra_validators: Vec::new(),
             validator_stake: VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX,
         }
     }
@@ -236,14 +219,7 @@ impl GenesisConfig {
         state.genesis_validator_stake = validator_stake;
         issued += validator_stake;
 
-        // Extra genesis validators, if configured — see `extra_validators`'s doc comment.
-        for (address, stake) in &self.extra_validators {
-            state.set_validator_stake(address, *stake);
-            issued += stake;
-        }
-        state.genesis_extra_validators = self.extra_validators.clone();
-
-        // Seed the active BFT set with the genesis validators so `active_validators` is
+        // Seed the active BFT set with the genesis validator so `active_validators` is
         // authoritative from block 0. Without this it stays empty until the *second* epoch
         // rotation — the first rotation defers everyone, including a long-running validator,
         // so `active_validators` is still empty throughout the entire first activation epoch —
@@ -252,8 +228,8 @@ impl GenesisConfig {
         // still empty) `stakers()` includes it with no activation delay, so a joining or
         // restarting node builds the *undelayed* set and diverges from the delayed set the live
         // validators actually run — a silent proposer-schedule split that halts a small network.
-        // The genesis validators have produced since block 0 and must never be deferred, so they
-        // belong in the active set immediately; a later staker is correctly *excluded* here (it
+        // The genesis validator has produced since block 0 and must never be deferred, so it
+        // belongs in the active set immediately; a later staker is correctly *excluded* here (it
         // is not a genesis validator) and serves its one-epoch `pending_validators` delay as
         // before. An upgraded pre-`active_validators` database legitimately still loads an empty
         // set — that transient-migration case is the only place `engine_validator_set()`'s
@@ -264,9 +240,6 @@ impl GenesisConfig {
         // `rebuild_genesis_state` run this same code, so `GET /genesis` still agrees), and an
         // existing chain must upgrade every node and reset to adopt it.
         state.active_validators.insert(self.validator.clone());
-        for (address, _stake) in &self.extra_validators {
-            state.active_validators.insert(address.clone());
-        }
 
         state.total_issued = issued;
         state.personhood_authorities = self.personhood_authorities.clone();
@@ -379,20 +352,6 @@ mod tests {
             vec![validator],
             "engine_validator_set must come from the seeded active set, not a stakers() fallback"
         );
-    }
-
-    /// Extra genesis validators are active from block 0 too — they are pre-staked founders of the
-    /// chain, not newcomers that have to serve the one-epoch activation delay.
-    #[test]
-    fn genesis_seeds_extra_validators_into_the_active_set() {
-        let validator = some_address();
-        let extra = some_address();
-        let mut cfg = GenesisConfig::devnet(validator.clone());
-        cfg.extra_validators = vec![(extra.clone(), VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX)];
-        let state = cfg.build_state();
-
-        assert!(state.active_validators.contains(&validator));
-        assert!(state.active_validators.contains(&extra));
     }
 
     /// The exact divergence the seed prevents: a newcomer that stakes *before the first rotation*

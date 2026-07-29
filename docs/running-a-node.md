@@ -40,7 +40,6 @@ sync_peer = "http://seed-host:8545"
 validator_crypto_scheme = "ml-dsa"
 mempool_tx_ttl_secs = 1800
 p2p_public_addr = "helix.example.com"
-genesis_extra_validators = "hlx1abc...:100000,hlx1def...:100000"
 ```
 
 An absent file is not an error (all fields default to unset); a present but
@@ -66,7 +65,6 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_FAUCET_KEY_PASSPHRASE` | (none) | Passphrase for `HELIX_FAUCET_KEY` if that file was encrypted. |
 | `HELIX_DB_CACHE_MB` | `128` | Page cache the embedded database may hold, in MiB. Sized so a node fits comfortably on a 1 GB machine: a full sync of the live chain peaks around 280 MB of RSS in total and stays there. Raise it (e.g. `512`) on a server with memory to spare and RPC read traffic to serve; there is no reason to lower it. |
 | `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable address, announced to peers via peer exchange (see "Network Resilience" below). Either a bare host (a domain or public IP, no scheme/port — the configured raw-TCP P2P port is appended automatically), or, for a node behind a proxy/tunnel, a full multiaddr starting with `/` (e.g. `/dns4/host/tcp/443/tls/ws`). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
-| `HELIX_GENESIS_EXTRA_VALIDATORS` | (none) | Comma-separated `address:stake_hlx` pairs — additional validators to pre-stake directly at genesis, beyond the one bootstrap validator every chain has always had. Only takes effect for a fresh chain (same caveat as `HELIX_PERSONHOOD_AUTHORITIES`). See "Bootstrapping a Multi-Validator Network" below. Overrides `genesis_extra_validators` in `helix.toml`. |
 | `HELIX_P2P_SEED_PEERS` | (none) | Comma-separated libp2p multiaddrs (e.g. `/ip4/1.2.3.4/tcp/8546,/dns4/peer.example/tcp/8546`) to dial directly, in addition to the one derived from `sync_peer`. Use this to wire a validator set into a full mesh — every validator should peer with every other, not hub-and-spoke through one node. Overrides `p2p_seed_peers` in `helix.toml`. |
 | `HELIX_P2P_DISABLE_MDNS` | (off) | Set truthy (`1`/`true`) to turn off mDNS LAN auto-discovery, leaving only seed peers + peer exchange. Needed only when two independent Helix networks share a LAN (mDNS would otherwise cross-wire them). Overrides `p2p_disable_mdns` in `helix.toml`. |
 
@@ -219,25 +217,25 @@ validators than funding each one to 100,000 — a smaller stake still carries fu
 long as it clears the 1% cap (`> total_stake/50`). See the governance flow in
 [Using the CLI](cli.md#governance).
 
-`HELIX_GENESIS_EXTRA_VALIDATORS` (or `genesis_extra_validators` in `helix.toml`) skips that
-wait: it pre-stakes additional validators — by address, at whatever stake you choose — directly
-into the genesis state, so they're active BFT participants (real proposer rotation, real
-voting) from block 0, with no staking transactions or epoch rotation needed:
+Every validator joins the same way — there is no genesis shortcut that pre-stakes extra
+validators. A network starts with exactly one bootstrap validator; every other validator is
+added at runtime by funding its address and having it stake, whether the network launched
+yesterday or years ago. Concretely, to add Bob and Carol to your network:
 
-```toml
-# helix.toml, on the node that will self-sign the fresh genesis
-new_chain = true     # this is a brand-new standalone network, not the public one
-genesis_extra_validators = "hlx1bob...:100000,hlx1carol...:100000"
-```
-
-Only the node building the *fresh* genesis needs this set — it takes effect once, at first
-startup on an empty `helix-data.redb`, exactly like `HELIX_PERSONHOOD_AUTHORITIES`. Every node
-that later joins via `sync_peer` automatically adopts the same pre-staked validators as part of
-genesis adoption (`GET /genesis` carries the list along), so the whole fleet agrees on the same
-validator set without needing this variable set anywhere else. Bob and Carol still need their
-own node processes running with the matching `validator-key.json` (the key whose address you
-staked) to actually participate — genesis only grants the stake, it doesn't run their nodes for
-them.
+1. Each generates a validator key and starts a node that syncs your chain (`sync_peer` set to a
+   node already on it), meshed with the others (see below). The node need not stake to sync — it
+   can catch up and stay current first.
+2. Fund each validator's address with at least `MIN_VALIDATOR_STAKE` plus a fee margin — by
+   transfer from an already-funded account (`helix tx send`), or by letting block rewards
+   accumulate.
+3. **On the node whose key holds that stake**, send `helix tx stake 100000`. Verify the staking
+   address matches the node's own key first (`helix wallet address --key validator-key.json`) —
+   staking from one wallet while the node signs as a *different* self-generated key produces a
+   "phantom" validator that is in the set but never signs, which freezes a small set.
+4. The new staker is picked up at the next epoch boundary and becomes a full voting validator one
+   epoch after that (it spends that epoch on probation, in the signing set but with zero voting
+   power, and is promoted only once it has actually co-signed — so a node that staked but isn't
+   really running never gains power).
 
 **Wire the validators into a full mesh.** BFT relays prevotes and precommits between *all*
 validators, so every validator should have a direct P2P connection to every other — not
@@ -271,12 +269,11 @@ server / firewall, so this assumes the WebSocket-tunnel setup:
 
 1. **Generate a validator key** on the machine that will run the node, and never let the
    24-word phrase leave it: `helix wallet new -o validator-key.json`. Note the address.
-2. **Fund that address** with at least `MIN_VALIDATOR_STAKE` (100,000 HLX) — either pre-staked
-   into genesis via `genesis_extra_validators` (for a brand-new network's launch), or by
-   transfer / accumulated block rewards (to join an existing one). Fund it now, but **do not
-   send the `Stake` transaction yet** — that is the last step, once the node is provably
-   connected. Budget somewhat above the minimum: a slash takes 5% of your stake, and landing
-   below `MIN_VALIDATOR_STAKE` drops you out of the set entirely.
+2. **Fund that address** with at least `MIN_VALIDATOR_STAKE` (100,000 HLX) by transfer or
+   accumulated block rewards. Fund it now, but **do not send the `Stake` transaction yet** — that
+   is the last step, once the node is provably connected. Budget somewhat above the minimum: a
+   slash takes 5% of your stake, and landing below `MIN_VALIDATOR_STAKE` drops you out of the set
+   entirely.
 3. **Expose a P2P path in.** Behind a proxy/tunnel, forward an HTTPS hostname (e.g.
    `p2p.yourdomain.net`) to your local WebSocket port and set:
    ```bash

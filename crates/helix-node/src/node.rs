@@ -379,38 +379,7 @@ impl HelixNode {
             info!("No personhood authorities configured — ProvePersonhood transactions will be rejected");
         }
 
-        // Extra genesis validators — only takes effect for a fresh chain, same caveat as
-        // personhood_authorities above. See `GenesisConfig::extra_validators`'s doc comment.
-        let extra_validators: Vec<(Address, u64)> =
-            config::resolve("HELIX_GENESIS_EXTRA_VALIDATORS", &cfg.genesis_extra_validators)
-                .map(|raw| {
-                    raw.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .filter_map(|entry| {
-                            let (addr_str, stake_str) = entry.split_once(':')?;
-                            let address = match Address::from_str(addr_str) {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    warn!(err = %e, addr = addr_str, "HELIX_GENESIS_EXTRA_VALIDATORS / helix.toml contains an invalid address — skipping it");
-                                    return None;
-                                }
-                            };
-                            let stake_hlx: u64 = match stake_str.parse() {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    warn!(err = %e, stake = stake_str, "HELIX_GENESIS_EXTRA_VALIDATORS / helix.toml has a non-numeric stake — skipping it");
-                                    return None;
-                                }
-                            };
-                            Some((address, stake_hlx * NANO_PER_HLX))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-        let mut genesis_cfg = GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authorities);
-        genesis_cfg.extra_validators = extra_validators;
+        let genesis_cfg = GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authorities);
 
         // `sync_peer = "http://seed:8545"` in helix.toml, or HELIX_SYNC_PEER — resolved here
         // (rather than after genesis, as before) because a node with no local chain yet needs
@@ -467,7 +436,6 @@ impl HelixNode {
             let state = helix_executor::genesis::rebuild_genesis_state(
                 genesis.header.validator.clone(),
                 peer_genesis.personhood_authorities.clone(),
-                peer_genesis.extra_validators.clone(),
                 peer_genesis.validator_stake,
                 peer_genesis.allocations.clone(),
                 peer_genesis.governance_params.clone(),
@@ -1833,6 +1801,7 @@ async fn block_production_loop(
                 mesh_ready = true;
             } else {
                 engine.write().await.reset_peer_wait();
+                waited_ticks = 0;
                 if settle_ticks_left > 0 {
                     settle_ticks_left -= 1;
                     continue; // peers here — let the mesh settle before first use
@@ -1875,14 +1844,31 @@ async fn block_production_loop(
             // never even runs — would otherwise hold this node here forever. Past
             // `PEER_WAIT_TIMEOUT_TICKS`, stop waiting and tick anyway; see
             // `note_peer_wait_tick`'s doc comment.
-            if peer_count.load(std::sync::atomic::Ordering::Relaxed)
-                < engine.read().await.peers_needed_for_quorum()
-            {
+            let needed = engine.read().await.peers_needed_for_quorum();
+            if peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed {
                 if !engine.write().await.note_peer_wait_tick() {
+                    // Same silence #121 fixes in the mesh phase, one step later: a round is
+                    // already open but validators dropped below quorum, so we hold it and say
+                    // nothing until the wait expires and `record_round_liveness` starts naming
+                    // names. Those are the minutes an operator decides whether to restart (which
+                    // resets the counter and lengthens the very outage they meant to end). Once a
+                    // minute is enough to be visible without flooding.
+                    waited_ticks += 1;
+                    if waited_ticks % 30 == 1 {
+                        let have = peer_count.load(std::sync::atomic::Ordering::Relaxed);
+                        info!(
+                            peers = have,
+                            needed,
+                            "Holding the open round — validators dropped below quorum. The chain \
+                             stays here until they reconnect; restarting this node does not speed \
+                             it up."
+                        );
+                    }
                     continue;
                 }
             } else {
                 engine.write().await.reset_peer_wait();
+                waited_ticks = 0;
             }
 
             let timed_out = { engine.write().await.note_round_tick(&keypair) };
@@ -1912,10 +1898,25 @@ async fn block_production_loop(
                 // Under-connected — don't burn rounds getting ahead of validators still
                 // joining at round 0 (the same guard the active-round branch applies).
                 // Bounded the same way: see `note_peer_wait_tick`'s doc comment.
+                // And, per #121, don't do it silently: this is the no-active-round twin of the
+                // hold above — a non-proposer waiting for a proposal that cannot come while
+                // quorum is unreachable. Once a minute, say so.
+                waited_ticks += 1;
+                if waited_ticks % 30 == 1 {
+                    let have = peer_count.load(std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        peers = have,
+                        needed,
+                        "Waiting for a proposal — validators are below quorum, so the round \
+                         cannot start. The chain stays here until they reconnect; restarting \
+                         this node does not speed it up."
+                    );
+                }
                 continue;
             } else {
                 if !under_connected {
                     engine.write().await.reset_peer_wait();
+                    waited_ticks = 0;
                 }
                 let timed_out = { engine.write().await.note_round_tick(&keypair) };
                 // Same reason as the active-round branch: a nil prevote cast here has to go
@@ -2046,7 +2047,6 @@ struct PeerGenesis {
     block: Block,
     personhood_authorities: Vec<PublicKey>,
     governance_params: GovernanceParams,
-    extra_validators: Vec<(Address, u64)>,
     validator_stake: u64,
     allocations: Vec<(Address, u64)>,
     /// The hash the peer's genesis state has. `None` from a peer too old to report it — see
@@ -2162,19 +2162,6 @@ async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
             .context("peer's /genesis \"governance_params\" did not deserialize")?,
         None => GovernanceParams::default(),
     };
-    let extra_validators = resp
-        .get("extra_validators")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|entry| {
-                    let address = Address::from_str(entry.get("address")?.as_str()?).ok()?;
-                    let stake = entry.get("stake_nano")?.as_u64()?;
-                    Some((address, stake))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     // A peer too old to report this leaves us no better source than our own default — the same
     // position every node was in before this field existed. Falling back keeps such a peer
     // syncable instead of refusing to join it; it is only correct as long as that chain did
@@ -2204,7 +2191,6 @@ async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
         block,
         personhood_authorities,
         governance_params,
-        extra_validators,
         validator_stake,
         allocations,
         state_hash,
@@ -3952,7 +3938,6 @@ mod genesis_verification_tests {
             ),
             personhood_authorities: vec![],
             governance_params: GovernanceParams::default(),
-            extra_validators: vec![],
             validator_stake,
             allocations: vec![],
             state_hash,
@@ -3963,7 +3948,6 @@ mod genesis_verification_tests {
         helix_executor::genesis::rebuild_genesis_state(
             pg.block.header.validator.clone(),
             pg.personhood_authorities.clone(),
-            pg.extra_validators.clone(),
             pg.validator_stake,
             pg.allocations.clone(),
             pg.governance_params.clone(),

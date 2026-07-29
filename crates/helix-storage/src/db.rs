@@ -42,11 +42,6 @@ const REDELEGATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("redele
 /// `DELEGATOR_SHARES`. Without this table, `ChainState.contract_storage` would silently
 /// reset to empty on every node restart, wiping every deployed contract's state.
 const CONTRACT_STORAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("contract_storage");
-/// address string → stake in nano-HLX (8-byte little-endian) — see
-/// `ChainState::genesis_extra_validators`'s doc comment for why this needs its own table
-/// rather than being re-derivable from `ACCOUNTS` (genesis composition can drift from
-/// current stakes long after startup).
-const GENESIS_EXTRA_VALIDATORS: TableDefinition<&str, &[u8]> = TableDefinition::new("genesis_extra_validators");
 /// address string → bincode(u64 nano-HLX). Liquid balances allocated at genesis — see
 /// `ChainState::genesis_allocations`'s doc comment for why this is recorded rather than left to
 /// the `GENESIS_PREFUND` compile-time default.
@@ -183,7 +178,6 @@ impl HelixDb {
         tx.open_table(DELEGATOR_SHARES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(REDELEGATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
-        tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PENDING_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(ACTIVE_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -224,7 +218,6 @@ impl HelixDb {
             let mut missed_blocks = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut jailed_until = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut contract_storage = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
-            let mut genesis_extra_validators = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut genesis_allocations = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
@@ -370,10 +363,6 @@ impl HelixDb {
                 let encoded = bincode::serialize(storage)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 contract_storage.insert(addr.as_str(), encoded.as_slice())
-                    .map_err(|e| StorageError::Db(e.to_string()))?;
-            }
-            for (addr, stake) in &state.genesis_extra_validators {
-                genesis_extra_validators.insert(addr.as_str(), &stake.to_le_bytes()[..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
             for (addr, balance) in &state.genesis_allocations {
@@ -545,7 +534,6 @@ impl HelixDb {
         let probation_seen_table = tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
         let missed_blocks_table = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         let jailed_until_table = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
-        let genesis_extra_validators_table = tx.open_table(GENESIS_EXTRA_VALIDATORS).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_allocations_table = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
@@ -668,18 +656,6 @@ impl HelixDb {
             let storage = bincode::deserialize(v.value())
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             contract_storage.insert(k.value().to_string(), storage);
-        }
-
-        let mut genesis_extra_validators = Vec::new();
-        let mut genesis_extra_validators_iter = genesis_extra_validators_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
-        while let Some(entry) = genesis_extra_validators_iter.next() {
-            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
-            let stake_bytes: [u8; 8] = v.value().try_into().map_err(|_| {
-                StorageError::Serialization("genesis extra validator stake must be 8 bytes".to_string())
-            })?;
-            let address = Address::from_str(k.value())
-                .map_err(|e| StorageError::Serialization(e.to_string()))?;
-            genesis_extra_validators.push((address, u64::from_le_bytes(stake_bytes)));
         }
 
         let mut genesis_allocations = Vec::new();
@@ -816,7 +792,6 @@ impl HelixDb {
             delegator_shares,
             redelegations,
             contract_storage,
-            genesis_extra_validators,
             genesis_validator_stake,
             genesis_allocations,
             pending_validators,

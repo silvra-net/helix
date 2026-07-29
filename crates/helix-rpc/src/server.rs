@@ -382,11 +382,11 @@ async fn get_blocks_range(
 ///
 /// The genesis block identifies *who* got the bootstrap stake; everything else here is a
 /// per-deployment choice that cannot be re-derived from the block: `personhood_authorities`,
-/// the governance params, the bootstrap `validator_stake_nano`, any `extra_validators`, and any
-/// liquid `allocations`. Each is served from chain state rather than from this node's own
-/// compile-time defaults, which describe how a *new* chain would launch on today's build — not
-/// how this one launched. Together they let a joining node rebuild the exact same initial
-/// `ChainState` this chain started from, whatever build it happens to be running.
+/// the governance params, the bootstrap `validator_stake_nano`, and any liquid `allocations`.
+/// Each is served from chain state rather than from this node's own compile-time defaults, which
+/// describe how a *new* chain would launch on today's build — not how this one launched. Together
+/// they let a joining node rebuild the exact same initial `ChainState` this chain started from,
+/// whatever build it happens to be running.
 async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
     let store = state.store.read().await;
     let block = match store.get_block_by_height(0) {
@@ -397,14 +397,6 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
     let cs = state.chain_state.read().await;
     let personhood_authorities: Vec<String> =
         cs.personhood_authorities.iter().map(|pk| pk.to_hex()).collect();
-    // Additional validators pre-staked at genesis beyond this block's own `validator` — see
-    // `ChainState::genesis_extra_validators`'s doc comment for why this can't just be
-    // re-derived from current stakers().
-    let extra_validators: Vec<serde_json::Value> = cs
-        .genesis_extra_validators
-        .iter()
-        .map(|(addr, stake)| json!({ "address": addr.as_str(), "stake_nano": stake }))
-        .collect();
     let allocations: Vec<serde_json::Value> = cs
         .genesis_allocations
         .iter()
@@ -416,7 +408,6 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
     let genesis_state_hash = helix_executor::genesis::rebuild_genesis_state(
         block.header.validator.clone(),
         cs.personhood_authorities.clone(),
-        cs.genesis_extra_validators.clone(),
         cs.genesis_validator_stake,
         cs.genesis_allocations.clone(),
         cs.governance_params.clone(),
@@ -437,11 +428,9 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
             "block": block,
             "personhood_authorities": personhood_authorities,
             "governance_params": governance_params,
-            "extra_validators": extra_validators,
-            // What the genesis validator was actually staked at height 0. Served for the same
-            // reason as `extra_validators`, and it must come from chain state rather than
-            // `VALIDATOR_GENESIS_STAKE_HLX`: the constant is a default for *new* chains and may
-            // since have been retuned, whereas this chain's genesis is fixed forever.
+            // What the genesis validator was actually staked at height 0. It must come from chain
+            // state rather than `VALIDATOR_GENESIS_STAKE_HLX`: the constant is a default for *new*
+            // chains and may since have been retuned, whereas this chain's genesis is fixed forever.
             "validator_stake_nano": cs.genesis_validator_stake,
             // Liquid genesis balances (faucet, treasury, …). Served for the same reason as the
             // two above: `GENESIS_PREFUND` is a compile-time default for new chains, not a
@@ -2007,7 +1996,6 @@ mod tests {
 
         let expected = helix_executor::genesis::rebuild_genesis_state(
             validator,
-            vec![],
             vec![],
             100_000 * helix_executor::genesis::NANO_PER_HLX,
             vec![],

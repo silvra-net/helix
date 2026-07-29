@@ -284,19 +284,11 @@ pub struct ChainState {
     /// written anything, not an error.
     #[serde(default)]
     pub contract_storage: HashMap<String, HashMap<Vec<u8>, Vec<u8>>>,
-    /// Additional validators pre-staked directly at genesis (address, nano-HLX stake),
-    /// beyond the one bootstrap validator every chain has always had — see
-    /// `GenesisConfig::extra_validators`'s doc comment for why this exists. The actual
-    /// stake itself lives in `accounts` like any other; this is purely a record of what
-    /// genesis originally configured, so a node joining long after startup via `GET
-    /// /genesis` can rebuild byte-for-byte identical genesis state instead of only ever
-    /// seeing today's `accounts`, which may have drifted from genesis by then (stakes
-    /// changed, validators slashed, etc).
-    #[serde(default)]
-    pub genesis_extra_validators: Vec<(Address, u64)>,
-    /// The bootstrap stake (nano-HLX) the *primary* genesis validator was given at height 0 —
-    /// the same kind of record as `genesis_extra_validators`, for the one validator that
-    /// predates it.
+    /// The bootstrap stake (nano-HLX) the genesis validator was given at height 0 — a record of
+    /// what genesis originally configured, so a node joining long after startup via `GET /genesis`
+    /// can rebuild byte-for-byte identical genesis state instead of only ever seeing today's
+    /// `accounts`, which may have drifted from genesis by then (stakes changed, validators
+    /// slashed, etc).
     ///
     /// It has to be recorded rather than re-derived for exactly the reason stated above: today's
     /// `accounts` may have drifted from genesis by any amount. But it also has to be recorded
@@ -312,7 +304,7 @@ pub struct ChainState {
     /// Liquid balances handed out at genesis beyond any staked amounts (address, nano-HLX) —
     /// e.g. a faucet or an operator treasury. The third and last piece of genesis that cannot be
     /// re-derived from the genesis block, recorded here for the same reason as
-    /// `genesis_extra_validators` and `genesis_validator_stake`: `GENESIS_PREFUND` is a
+    /// `genesis_validator_stake`: `GENESIS_PREFUND` is a
     /// compile-time default describing how a *new* chain would launch on this build, and a node
     /// joining an existing chain must not rebuild that chain's genesis from it.
     ///
@@ -460,7 +452,6 @@ impl ChainState {
             delegator_shares: HashMap::new(),
             redelegations: HashMap::new(),
             contract_storage: HashMap::new(),
-            genesis_extra_validators: Vec::new(),
             genesis_validator_stake: 0,
             genesis_allocations: Vec::new(),
             pending_validators: std::collections::HashSet::new(),
@@ -1134,7 +1125,6 @@ impl ChainState {
             // Byte-string keys have no Ord impl conflict to worry about (unlike
             // PublicKey above) — Vec<u8> already implements Ord lexicographically.
             contract_storage: BTreeMap<&'a str, BTreeMap<&'a Vec<u8>, &'a Vec<u8>>>,
-            genesis_extra_validators: BTreeMap<&'a str, u64>,
             genesis_validator_stake: u64,
             genesis_allocations: BTreeMap<&'a str, u64>,
             pending_validators: std::collections::BTreeSet<&'a str>,
@@ -1193,11 +1183,6 @@ impl ChainState {
                 .contract_storage
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.iter().collect()))
-                .collect(),
-            genesis_extra_validators: self
-                .genesis_extra_validators
-                .iter()
-                .map(|(a, s)| (a.as_str(), *s))
                 .collect(),
             genesis_validator_stake: self.genesis_validator_stake,
             genesis_allocations: self
