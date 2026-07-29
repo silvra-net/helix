@@ -159,7 +159,17 @@ impl HelixDb {
         let db = Database::builder()
             .set_cache_size(configured_cache_bytes())
             .create(path)
-            .map_err(|e| StorageError::Db(e.to_string()))?;
+            // A second process opening the same data directory is the single most likely reason
+            // this fails in production (a stray node left running, or a restart racing its
+            // predecessor). redb reports it as `DatabaseAlreadyOpen` with the opaque message
+            // "Database already open. Cannot acquire lock." — translate that one case into an
+            // operator-facing error that names the directory and what to do (#126).
+            .map_err(|e| match e {
+                redb::DatabaseError::DatabaseAlreadyOpen => {
+                    StorageError::AlreadyLocked(path.to_path_buf())
+                }
+                other => StorageError::Db(other.to_string()),
+            })?;
         // Ensure tables exist
         let tx = db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1174,6 +1184,34 @@ mod tests {
         (HelixDb::open(&path).unwrap(), path)
     }
 
+    /// A second node opening a directory the first still holds must get the specific
+    /// `AlreadyLocked` error (naming the path), not a generic `Db` string carrying redb's opaque
+    /// "Database already open" — that is what lets the node layer tell an operator a second node
+    /// is already running here rather than leaving them to decode a library message (#126).
+    ///
+    /// Positive control built in: while the first handle is alive the open MUST fail this exact
+    /// way; the assertion after the drop proves the lock — not some unrelated error — is what
+    /// blocked it, since the same path opens cleanly once released.
+    #[test]
+    fn a_second_open_of_a_locked_directory_reports_it_as_already_locked() {
+        let (db, path) = fresh_db();
+
+        match HelixDb::open(&path) {
+            Err(StorageError::AlreadyLocked(p)) => assert_eq!(p, path, "the error must name the locked directory"),
+            Err(other) => panic!("expected AlreadyLocked while the first handle is open, got a different error: {other:?}"),
+            Ok(_) => panic!("expected AlreadyLocked while the first handle is open, but the second open succeeded"),
+        }
+
+        // Release the lock and confirm the directory was fine all along — the AlreadyLocked above
+        // was the live handle, not a corrupt file or a missing path.
+        drop(db);
+        assert!(
+            HelixDb::open(&path).is_ok(),
+            "the same directory must open cleanly once the first handle is dropped"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn address_transactions_finds_sent_and_received_newest_first() {
         let (mut db, path) = fresh_db();
@@ -1464,7 +1502,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
     /// `active_validators` decides who is charged with missed blocks, so losing it on restart
     /// would stop downtime accounting until the next rotation — and keeping a stale entry
     /// would charge a validator that has already left the set. Both directions checked in one

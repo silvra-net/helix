@@ -72,6 +72,15 @@ mutually exclusive:
 height/round) burns 5% of your stake *and* 5% of your delegators' pooled stake, and jails you
 from BFT rounds immediately — not just at the next epoch. Run one node per key. Ever.
 
+What the node protects for you, and what it does not: a persisted signing high-water mark stops a
+*restart* from re-signing a height it already signed (an honest reboot is safe), and the data
+directory is file-locked so a second node started against the **same** directory refuses to start
+with a clear "already in use" error rather than double-signing. Neither of those helps if you run
+a second node **elsewhere with a copy of the key** — separate machine, separate data directory.
+That setup has its own high-water mark that knows nothing of the first, so the two can sign
+conflicting blocks and slash you. There is no remote-signer coordination yet; "one node per key"
+is a discipline you keep, not something the software can currently enforce across machines.
+
 **Downtime risk (no slash, but real friction):** a validator whose precommit is missing from
 `last_commit` for ~150 consecutive blocks (~5 minutes) is downtime-jailed — excluded from
 `stakers()`, earning nothing, until it explicitly rejoins:

@@ -16,6 +16,20 @@ pub enum StorageError {
     Db(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    /// The data directory is held by another running node's file lock (redb's
+    /// `DatabaseAlreadyOpen`). Distinguished from a generic `Db` error so the node layer can
+    /// print an operator-facing "another node is already running here" instead of redb's bare
+    /// "Database already open. Cannot acquire lock." — see backlog #126.
+    #[error(
+        "the data directory {0} is already in use by another running helix node.\n\
+         redb holds a single-process file lock on it, so only one node may run against a data \
+         directory at a time. Either stop the other node, or point this one at a different \
+         directory.\n\
+         Note: this lock guards a *shared* directory only. It does NOT protect against running a \
+         second node elsewhere with a COPY of the validator key — that setup can double-sign and \
+         get the validator slashed; do not run two validators from the same key."
+    )]
+    AlreadyLocked(std::path::PathBuf),
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
