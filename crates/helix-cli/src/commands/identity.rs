@@ -50,7 +50,7 @@ async fn attest(address: String, key_path: PathBuf, fee: Option<u64>, node: &str
     let to = Address::from_str(&address)
         .map_err(|e| anyhow::anyhow!("Invalid target address: {}", e))?;
 
-    let nonce = fetch_nonce(node, &kf.address).await.unwrap_or(0);
+    let nonce = super::fetch_nonce(node, &kf.address).await?;
 
     let mut tx = Transaction {
         version: 1,
@@ -106,12 +106,4 @@ async fn status(address: String, node: &str) -> Result<()> {
     println!("Personhood status for {}:", address);
     println!("  {}", serde_json::to_string_pretty(&res["status"])?);
     Ok(())
-}
-
-async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {
-    let res: serde_json::Value = reqwest::get(format!("{}/accounts/{}", node, address))
-        .await?
-        .json()
-        .await?;
-    Ok(res["nonce"].as_u64().unwrap_or(0))
 }

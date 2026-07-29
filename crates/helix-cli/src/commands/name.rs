@@ -48,7 +48,7 @@ async fn register(name: String, key_path: PathBuf, fee: Option<u64>, node: &str)
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
 
-    let nonce = fetch_nonce(node, &kf.address).await.unwrap_or(0);
+    let nonce = super::fetch_nonce(node, &kf.address).await?;
 
     let mut tx = Transaction {
         version: 1,
@@ -106,12 +106,4 @@ async fn resolve(name: String, node: &str) -> Result<()> {
         res["address"].as_str().unwrap_or("?")
     );
     Ok(())
-}
-
-async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {
-    let res: serde_json::Value = reqwest::get(format!("{}/accounts/{}", node, address))
-        .await?
-        .json()
-        .await?;
-    Ok(res["nonce"].as_u64().unwrap_or(0))
 }

@@ -91,7 +91,7 @@ async fn deploy(
 
     let nonce = match nonce_override {
         Some(n) => n,
-        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+        None => super::fetch_nonce(node, &kf.address).await?,
     };
 
     let mut tx = Transaction {
@@ -146,7 +146,7 @@ async fn call(
     let amount_nano = hlx_to_nano(amount_hlx)?;
     let nonce = match nonce_override {
         Some(n) => n,
-        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+        None => super::fetch_nonce(node, &kf.address).await?,
     };
 
     let mut tx = Transaction {
@@ -206,12 +206,4 @@ async fn submit(tx: &Transaction, node: &str) -> Result<serde_json::Value> {
         bail!("Transaction rejected: {}", err);
     }
     Ok(res)
-}
-
-async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {
-    let res: serde_json::Value = reqwest::get(format!("{}/accounts/{}", node, address))
-        .await?
-        .json()
-        .await?;
-    Ok(res["nonce"].as_u64().unwrap_or(0))
 }

@@ -80,7 +80,7 @@ async fn register_guardians(
         Address::from_str(g).map_err(|e| anyhow::anyhow!("Invalid guardian address '{}': {}", g, e))?;
     }
 
-    let nonce = fetch_nonce(node, &kf.address).await.unwrap_or(0);
+    let nonce = super::fetch_nonce(node, &kf.address).await?;
 
     let mut tx = Transaction {
         version: 1,
@@ -143,7 +143,7 @@ async fn approve(
     let new_key_bytes = hex::decode(&new_public_key_hex)
         .map_err(|e| anyhow::anyhow!("Invalid new public key hex: {}", e))?;
 
-    let nonce = fetch_nonce(node, &kf.address).await.unwrap_or(0);
+    let nonce = super::fetch_nonce(node, &kf.address).await?;
 
     let mut tx = Transaction {
         version: 1,
@@ -220,12 +220,4 @@ async fn status(address: String, node: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {
-    let res: serde_json::Value = reqwest::get(format!("{}/accounts/{}", node, address))
-        .await?
-        .json()
-        .await?;
-    Ok(res["nonce"].as_u64().unwrap_or(0))
 }

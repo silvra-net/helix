@@ -201,7 +201,7 @@ async fn send(
     // Fetch current nonce from node if not provided
     let nonce = match nonce_override {
         Some(n) => n,
-        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+        None => super::fetch_nonce(node, &kf.address).await?,
     };
 
     // Build and sign transaction
@@ -251,7 +251,7 @@ async fn simple_amount_tx(
     let amount_nano = hlx_to_nano(amount_hlx)?;
     let nonce = match nonce_override {
         Some(n) => n,
-        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+        None => super::fetch_nonce(node, &kf.address).await?,
     };
     let mut tx = Transaction {
         version: 1,
@@ -290,7 +290,7 @@ async fn zero_amount_tx(
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let nonce = match nonce_override {
         Some(n) => n,
-        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+        None => super::fetch_nonce(node, &kf.address).await?,
     };
     let mut tx = Transaction {
         version: 1,
@@ -335,7 +335,7 @@ async fn targeted_amount_tx(
     let amount_nano = hlx_to_nano(amount_hlx)?;
     let nonce = match nonce_override {
         Some(n) => n,
-        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+        None => super::fetch_nonce(node, &kf.address).await?,
     };
     let mut tx = Transaction {
         version: 1,
@@ -386,7 +386,7 @@ async fn redelegate(
     let amount_nano = hlx_to_nano(amount_hlx)?;
     let nonce = match nonce_override {
         Some(n) => n,
-        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+        None => super::fetch_nonce(node, &kf.address).await?,
     };
     let mut tx = Transaction {
         version: 1,
@@ -435,7 +435,7 @@ async fn set_commission(
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let nonce = match nonce_override {
         Some(n) => n,
-        None => fetch_nonce(node, &kf.address).await.unwrap_or(0),
+        None => super::fetch_nonce(node, &kf.address).await?,
     };
     let mut tx = Transaction {
         version: 1,
@@ -494,14 +494,6 @@ async fn submit_tx(tx: &Transaction, node: &str) -> Result<()> {
 /// fixed once and stay fixed.
 pub(crate) fn rpassword_read(prompt: &str) -> Result<String> {
     Ok(rpassword::prompt_password(prompt)?.trim().to_string())
-}
-
-async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {
-    let res: serde_json::Value = reqwest::get(format!("{}/accounts/{}", node, address))
-        .await?
-        .json()
-        .await?;
-    Ok(res["nonce"].as_u64().unwrap_or(0))
 }
 
 async fn tx_status(hash: String, node: &str) -> Result<()> {
