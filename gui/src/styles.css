@@ -137,6 +137,9 @@ button.ghost { background: transparent; }
    compounding delegation) reads as "current value" rather than a static balance. */
 .amount-block { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.2; }
 .micro { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+/* A QR always sits on white with dark modules (see Receive.tsx) — this just frames and centres
+   it so the white block doesn't clash with a dark card background. */
+.qr-frame { display: flex; justify-content: center; width: max-content; margin: 8px auto 14px; padding: 14px; background: #fff; border-radius: 12px; }
 /* Incoming is tinted, outgoing stays in the normal text colour rather than red: spending your
    own coins is not an error, and colouring every payment like a warning trains people to
    ignore the colour that should mean something. The +/- sign carries the direction. */
