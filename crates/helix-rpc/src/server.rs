@@ -67,6 +67,11 @@ pub struct AppState {
     /// `crate::faucet`. `None` on every node that did not, which is the default and must stay
     /// the default: this binary ships to strangers.
     pub faucet: Option<Arc<crate::faucet::Faucet>>,
+    /// The commit certificate for this node's current tip — see [`crate::TipCertificate`]. Held in
+    /// a cell the node updates on every committed block (the tip's certificate lives only in the
+    /// live engine, never on disk), and served at `GET /sync/tip-certificate` so an RPC-only
+    /// follower can obtain the one certificate `/sync/blocks` cannot carry (#133).
+    pub tip_certificate: Arc<RwLock<crate::TipCertificate>>,
 }
 
 /// Explicit request-body cap for `POST /transactions`, well above any plausible signed
@@ -118,6 +123,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/mempool", get(get_mempool_info))
         .route("/genesis", get(get_genesis))
         .route("/sync/blocks", get(get_sync_blocks))
+        .route("/sync/tip-certificate", get(get_tip_certificate))
         .route(
             "/transactions",
             post(submit_transaction).layer(DefaultBodyLimit::max(TX_SUBMIT_BODY_LIMIT_BYTES)),
@@ -465,6 +471,23 @@ async fn get_sync_blocks(
         }
     }
     (StatusCode::OK, Json(json!(blocks)))
+}
+
+/// The commit certificate for this node's current tip — see [`crate::TipCertificate`].
+///
+/// `GET /sync/tip-certificate` returns the precommit signatures that finalized the tip. Every
+/// *older* block's certificate is already reconstructible from the following block's `last_commit`
+/// (served in full over `/sync/blocks`), but the tip's exists nowhere on disk — block tip+1 does
+/// not exist yet — so an RPC-only follower has no other source for it. It fetches this right after
+/// catching up, verifies the signatures against the tip it just synced to, and adopts them, so its
+/// engine holds a real certificate for the tip instead of an empty one (#133).
+///
+/// The cell is empty (`height: 0`, no signatures) until this node has committed its first block; a
+/// consumer treats a height that does not match its just-synced tip as "no certificate available"
+/// and proceeds with an empty one, exactly as before this endpoint existed.
+async fn get_tip_certificate(State(state): State<AppState>) -> impl IntoResponse {
+    let cert = state.tip_certificate.read().await;
+    (StatusCode::OK, Json(json!(*cert)))
 }
 
 /// Header-only view of a block — for light clients that sync the chain of
@@ -1296,6 +1319,7 @@ mod tests {
             p2p_public_addr: None,
             p2p_command_tx,
             faucet: None,
+            tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
         };
         (state, path)
     }
@@ -1820,7 +1844,49 @@ mod tests {
             p2p_public_addr: None,
             p2p_command_tx,
             faucet: None,
+            tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
         }
+    }
+
+    /// `/sync/tip-certificate` serves exactly what the node published into the cell — empty until
+    /// the node commits its first block, then the tip's precommit certificate verbatim (#133). This
+    /// is the one certificate `/sync/blocks` cannot carry, so an RPC-only follower depends on it to
+    /// obtain a verifiable certificate for the block it stops on.
+    #[tokio::test]
+    async fn the_tip_certificate_endpoint_serves_whatever_the_node_published() {
+        let state = fresh_test_state();
+
+        // Empty before the node has committed anything: height 0, no signatures — a consumer reads
+        // this as "no certificate for a tip I recognise" and proceeds with an empty one.
+        let resp = get_tip_certificate(State(state.clone())).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["height"], 0);
+        assert_eq!(parsed["signatures"].as_array().unwrap().len(), 0);
+
+        // After the node publishes its tip certificate, the endpoint serves it byte-for-byte.
+        let kp = KeyPair::generate();
+        let sig = helix_core::CommitSig {
+            validator: Address::from_public_key(&kp.public),
+            public_key: kp.public.clone(),
+            crypto_version: CryptoVersion::MlDsa,
+            round: 3,
+            signature: kp.sign(b"precommit").unwrap(),
+        };
+        *state.tip_certificate.write().await = crate::TipCertificate {
+            height: 42,
+            block_hash: "deadbeef".to_string(),
+            signatures: vec![sig],
+        };
+
+        let resp = get_tip_certificate(State(state)).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["height"], 42);
+        assert_eq!(parsed["block_hash"], "deadbeef");
+        let sigs = parsed["signatures"].as_array().unwrap();
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0]["round"], 3);
     }
 
     /// `/genesis` must report the stake *this chain* launched with, taken from chain state —

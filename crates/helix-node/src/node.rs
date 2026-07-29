@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use helix_consensus::{BftEngine, ConsensusError, DoubleSignEvidence, Proposal, Validator, ValidatorSet, Vote};
-use helix_core::{genesis_block, Block, Transaction, TxType};
-use helix_crypto::{Address, CryptoScheme, KeyFile, KeyPair, PublicKey, Signature};
+use helix_consensus::{
+    BftEngine, ConsensusError, DoubleSignEvidence, Proposal, Validator, ValidatorSet, Vote, VoteType,
+};
+use helix_core::{genesis_block, Block, CommitSig, Transaction, TxType};
+use helix_crypto::{Address, CryptoScheme, Hash, KeyFile, KeyPair, PublicKey, Signature};
 use helix_executor::{
     execute_block,
     genesis::{GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX, VALIDATOR_GENESIS_STAKE_HLX},
@@ -19,6 +21,7 @@ use helix_p2p::{
     service::{P2PCommand, P2PEvent, P2PService},
 };
 use helix_rpc::server::{start_rpc_server, AppState};
+use helix_rpc::TipCertificate;
 use helix_storage::{db::HelixDb, BlockStore};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -602,6 +605,12 @@ impl HelixNode {
         // Shared peer count for RPC status
         let peer_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+        // Live commit certificate for the current tip — served at `/sync/tip-certificate` (#133).
+        // Updated by every path that commits a block (all funnel through `apply_finalized_block`),
+        // plus the RPC catch-up loop once it seeds one. Starts empty: this node has no tip
+        // certificate to offer until it has committed (or adopted) its first block.
+        let tip_certificate = Arc::new(RwLock::new(TipCertificate::default()));
+
         let rpc_state = AppState {
             store: self.store.clone(),
             mempool: self.mempool.clone(),
@@ -616,6 +625,7 @@ impl HelixNode {
             // `None` unless this operator set HELIX_FAUCET_KEY. The node's own address goes in
             // so the faucet can refuse to be the validator key — see `helix_rpc::faucet`.
             faucet: helix_rpc::faucet::Faucet::from_env(&self.address.to_string()),
+            tip_certificate: tip_certificate.clone(),
         };
 
         // Spawn RPC server — first, before any catch-up, so `GET /status` answers from the
@@ -776,6 +786,7 @@ impl HelixNode {
         let sync_peer_for_p2p = self.sync_peer.clone();
         let last_applied_height_for_p2p = last_applied_height.clone();
         let signing_guard_for_p2p = signing_guard.clone();
+        let tip_certificate_for_p2p = tip_certificate.clone();
         let mut p2p_event_rx = self.p2p_event_rx;
         tokio::spawn(async move {
             while let Some(event) = p2p_event_rx.recv().await {
@@ -791,6 +802,7 @@ impl HelixNode {
                     &sync_peer_for_p2p,
                     &last_applied_height_for_p2p,
                     &signing_guard_for_p2p,
+                    &tip_certificate_for_p2p,
                 )
                 .await;
             }
@@ -807,6 +819,7 @@ impl HelixNode {
             engine.clone(),
             self.mempool.clone(),
             last_applied_height.clone(),
+            tip_certificate.clone(),
         ));
 
         // Validator health heartbeat — logs "am I actually validating?" on its own timer, so an
@@ -833,6 +846,7 @@ impl HelixNode {
             peer_count.clone(),
             self.syncing.clone(),
             signing_guard,
+            tip_certificate,
         ));
 
         tokio::select! {
@@ -862,6 +876,7 @@ async fn handle_p2p_event(
     sync_peer: &Option<String>,
     last_applied_height: &Arc<Mutex<u64>>,
     signing_guard: &Arc<std::sync::Mutex<SigningGuard>>,
+    tip_certificate: &Arc<RwLock<TipCertificate>>,
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
@@ -910,7 +925,7 @@ async fn handle_p2p_event(
                     // is a per-node config, not part of the block — make every node compute
                     // a different balance for the same block. `None` lets execute_block fall
                     // back to `block.header.validator`, which is identical on every node.
-                    apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
+                    apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::UnknownValidator(_)) => {
@@ -935,7 +950,7 @@ async fn handle_p2p_event(
                     info!(height = block.height(), "Block finalized via peer votes");
                     // Same reasoning as the NewProposal arm above: this block's proposer
                     // isn't necessarily us, so `None` — not our local reward_address.
-                    apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
+                    apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
                 }
                 Ok(None) => {}
                 Err(ConsensusError::NoActiveRound) => {
@@ -992,10 +1007,13 @@ async fn handle_p2p_event(
                             // tracking and EIP-1559 base fee in step, same as
                             // rpc_sync_loop does after its own sync_blocks_from_peer call.
                             // Gap-filled over the RPC /sync/blocks path, which carries no
-                            // certificate — pass none. A pure catch-up follower doesn't propose, so
-                            // an empty last_commit here is harmless; the gossip fast path below is
-                            // where the certificate matters (#114).
-                            engine.write().await.sync_to_externally_finalized_block(new_height, new_hash, vec![]);
+                            // certificate in-band. Fetch the peer's tip certificate for exactly the
+                            // block we stopped on and adopt it, so — if this node later proposes —
+                            // its next block stamps a real last_commit rather than an empty one
+                            // (#133, closing #114 for the RPC path). Empty on any failure, i.e. the
+                            // unchanged pre-#133 behaviour; the engine re-verifies it regardless.
+                            let cert = fetch_tip_certificate(peer_url, new_height, new_hash).await;
+                            engine.write().await.sync_to_externally_finalized_block(new_height, new_hash, cert);
                             // Mirror any validator rotation those synced blocks applied in chain
                             // state into the live engine — the finalize path that normally does
                             // this was skipped. Without it, a validator that crossed its own
@@ -1005,6 +1023,9 @@ async fn handle_p2p_event(
                             if let Ok(tip) = store.read().await.get_block_by_height(new_height) {
                                 publish_base_fee(engine, mempool, base_fee_for_next_block(&tip)).await;
                             }
+                            // Surface the certificate we just adopted (if any) so a follower syncing
+                            // from *this* node can obtain the tip's too (#133).
+                            publish_tip_certificate(engine, tip_certificate, new_height, new_hash).await;
                             info!("Gap filled: applied {} blocks", n);
                         }
                         Ok(_) => {}
@@ -1053,7 +1074,7 @@ async fn handle_p2p_event(
                     // `None`, same reasoning as the NewProposal/NewVote arms above: this
                     // block came from a peer, not our own block_production_loop, so our
                     // local reward_address override must not apply to it.
-                    apply_finalized_block(block, false, commit_certificate, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height).await;
+                    apply_finalized_block(block, false, commit_certificate, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
                 }
                 Err(e) => {
                     warn!(height = block_height, err = %e, "Committed block from peer failed signature check — dropping");
@@ -1237,6 +1258,85 @@ async fn reconcile_engine_validator_set(
     }
 }
 
+/// Rebuild precommit `Vote`s from a `CommitSig` certificate (the shape a block carries in its
+/// `last_commit`, and the shape `/sync/tip-certificate` serves). A `CommitSig` is a precommit with
+/// the `(height, block_hash)` it attests factored out — those are shared across the whole
+/// certificate — so restoring them yields votes the engine verifies byte-for-byte the same way it
+/// verifies a certificate carried in a gossiped block: `precommit_signing_bytes` backs both (see
+/// `Vote::signing_bytes`). The engine re-verifies every signature in `verified_commit_certificate`,
+/// so forged or mismatched entries from a lying peer are dropped there regardless of this rebuild.
+fn commit_sigs_to_votes(sigs: Vec<CommitSig>, height: u64, block_hash: Hash) -> Vec<Vote> {
+    sigs.into_iter()
+        .map(|s| Vote {
+            vote_type: VoteType::Precommit,
+            height,
+            round: s.round,
+            block_hash,
+            validator: s.validator,
+            public_key: s.public_key,
+            crypto_version: s.crypto_version,
+            signature: s.signature,
+        })
+        .collect()
+}
+
+/// Snapshot the engine's current commit certificate — its `last_commit`, the precommits that
+/// finalized the tip — into the cell the RPC serves at `/sync/tip-certificate` (#133). The tip's
+/// certificate lives only in the live engine until block tip+1 is produced (that block's header is
+/// where it would otherwise persist), so this is the one certificate an RPC-only follower cannot
+/// reconstruct from stored blocks. Publishing an empty certificate — a pure follower that salvaged
+/// nothing — is fine: it honestly says "I hold no certificate for this tip", which a consumer
+/// treats exactly as it treats the endpoint returning a non-matching height (falls back to empty).
+async fn publish_tip_certificate(
+    engine: &Arc<RwLock<BftEngine>>,
+    cell: &Arc<RwLock<TipCertificate>>,
+    height: u64,
+    block_hash: Hash,
+) {
+    let signatures: Vec<CommitSig> = engine
+        .read()
+        .await
+        .commit_certificate()
+        .iter()
+        .map(|v| CommitSig {
+            validator: v.validator.clone(),
+            public_key: v.public_key.clone(),
+            crypto_version: v.crypto_version,
+            round: v.round,
+            signature: v.signature.clone(),
+        })
+        .collect();
+    *cell.write().await = TipCertificate { height, block_hash: block_hash.to_hex(), signatures };
+}
+
+/// Fetch a sync peer's tip certificate for exactly `(expected_height, expected_hash)` (#133), for
+/// the RPC catch-up paths that just applied blocks up to that tip. Returns the certificate as
+/// precommit votes ready for [`BftEngine::sync_to_externally_finalized_block`], or an empty vec on
+/// any failure: an unreachable peer, a malformed response, or a certificate that attests a
+/// *different* tip (the peer advanced past `expected_height` between our `/sync/blocks` fetch and
+/// this call). An empty result is exactly the pre-#133 behaviour, so nothing regresses — the
+/// engine's `last_commit` stays empty for this tip, as it always did over RPC, and the next
+/// catch-up pass picks the certificate up once the peer's tip stops moving. The engine re-verifies
+/// every returned signature, so a lying peer buys nothing here.
+async fn fetch_tip_certificate(peer_url: &str, expected_height: u64, expected_hash: Hash) -> Vec<Vote> {
+    let client = match peer_http_client(Duration::from_secs(10)) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let url = format!("{}/sync/tip-certificate", peer_url.trim_end_matches('/'));
+    let cert: TipCertificate = match fetch_json(&client, &url).await {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("Could not fetch tip certificate from {peer_url}: {e}");
+            return Vec::new();
+        }
+    };
+    if cert.height != expected_height || cert.block_hash != expected_hash.to_hex() {
+        return Vec::new();
+    }
+    commit_sigs_to_votes(cert.signatures, expected_height, expected_hash)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_finalized_block(
     block: Block,
@@ -1249,9 +1349,11 @@ async fn apply_finalized_block(
     p2p_tx: &mpsc::Sender<P2PCommand>,
     reward_address: Option<Arc<Address>>,
     last_applied_height: &Arc<Mutex<u64>>,
+    tip_certificate: &Arc<RwLock<TipCertificate>>,
 ) {
     let tx_hashes: Vec<_> = block.transactions.iter().map(|t| t.hash()).collect();
     let height = block.height();
+    let block_hash = block.hash();
     let tx_count = block.tx_count();
     // EIP-1559: the base fee the *next* block must carry, derived from this one's fullness.
     // Captured here while `block` is still owned (it's moved into `put_block` below); applied to
@@ -1506,6 +1608,14 @@ async fn apply_finalized_block(
     // here, so the engine's expected base fee stays in lockstep with the persisted tip.
     publish_base_fee(engine, mempool, next_base_fee).await;
 
+    // Surface this tip's commit certificate for RPC-only followers (#133). Both ingestion paths
+    // funnel through here with the engine's `last_commit` already settled — set by `finalize` on
+    // the produce path, adopted from the gossiped certificate on the fast path (see the
+    // `sync_to_externally_finalized_block` call above) — so `commit_certificate()` now holds the
+    // precommits that carried exactly this block. This is the one certificate `/sync/blocks` cannot
+    // serve, since the block that would embed it (tip+1) does not exist yet.
+    publish_tip_certificate(engine, tip_certificate, height, block_hash).await;
+
     { mempool.write().await.remove_committed(&tx_hashes); }
 
     if tx_count > 0 {
@@ -1730,6 +1840,7 @@ async fn block_production_loop(
     peer_count: Arc<std::sync::atomic::AtomicUsize>,
     syncing: Arc<std::sync::atomic::AtomicBool>,
     signing_guard: Arc<std::sync::Mutex<SigningGuard>>,
+    tip_certificate: Arc<RwLock<TipCertificate>>,
 ) {
     // Pure production cadence — it enters no hash, no signature and not the proposer schedule
     // (`proposer_for_round` is `(height+round) % len`, timestamp-free), so overriding it cannot
@@ -1953,7 +2064,7 @@ async fn block_production_loop(
         };
         match produced {
             Ok(block) => {
-                apply_finalized_block(block, true, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone(), &last_applied_height)
+                apply_finalized_block(block, true, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone(), &last_applied_height, &tip_certificate)
                     .await;
             }
             Err(ConsensusError::AwaitingVotes { .. }) => {
@@ -2375,6 +2486,7 @@ fn catchup_defers_to_consensus(our_height: u64, peer_height: u64, round_in_fligh
     round_in_flight && peer_height.saturating_sub(our_height) <= RPC_CATCHUP_ROUND_GRACE_BLOCKS
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rpc_sync_loop(
     sync_peer: Option<String>,
     store: Arc<RwLock<HelixDb>>,
@@ -2382,6 +2494,7 @@ async fn rpc_sync_loop(
     engine: Arc<RwLock<BftEngine>>,
     mempool: Arc<RwLock<Mempool>>,
     last_applied_height: Arc<Mutex<u64>>,
+    tip_certificate: Arc<RwLock<TipCertificate>>,
 ) {
     let Some(peer_url) = sync_peer else {
         return; // standalone chain (HELIX_NEW_CHAIN) — nothing to catch up from
@@ -2448,12 +2561,17 @@ async fn rpc_sync_loop(
                 *last = new_height;
                 // Keep the BFT engine's own height tracking in step — this apply bypassed
                 // receive_proposal/add_vote, exactly like the NewCommittedBlock fast path.
+                //
+                // /sync/blocks carries no certificate in-band, so fetch the peer's tip certificate
+                // for exactly the block we stopped on and adopt it (#133). This is what lets a node
+                // that activates and then catches up purely over RPC stamp a real last_commit on
+                // its first proposal instead of dropping the tip's participation record. Empty on
+                // any failure — the unchanged pre-#133 behaviour — and the engine re-verifies it.
+                let cert = fetch_tip_certificate(&peer_url, new_height, new_hash).await;
                 engine
                     .write()
                     .await
-                    // RPC-sync path — no certificate travels with /sync/blocks (#114); harmless
-                    // for a catch-up follower, which doesn't propose.
-                    .sync_to_externally_finalized_block(new_height, new_hash, vec![]);
+                    .sync_to_externally_finalized_block(new_height, new_hash, cert);
                 // Same reconciliation as the P2P gap-fill path: this apply bypassed the finalize
                 // path, so mirror any validator rotation it made into the live engine — otherwise
                 // a validator that activates while this loop is catching it up runs a stale set
@@ -2465,6 +2583,9 @@ async fn rpc_sync_loop(
                 if let Ok(tip) = store.read().await.get_block_by_height(new_height) {
                     publish_base_fee(&engine, &mempool, base_fee_for_next_block(&tip)).await;
                 }
+                // Surface the adopted certificate (if any) so a follower syncing from this node can
+                // obtain the tip's certificate too (#133).
+                publish_tip_certificate(&engine, &tip_certificate, new_height, new_hash).await;
                 info!(
                     applied,
                     height = new_height,
@@ -3258,6 +3379,90 @@ mod handle_p2p_event_tests {
         block
     }
 
+    /// Precommit `CommitSig`s for `(height, block_hash)` at round 0, signed by each of `signers` —
+    /// the shape a serving node's live tip certificate takes on the wire (`/sync/tip-certificate`).
+    fn tip_commit_sigs(height: u64, block_hash: Hash, signers: &[&KeyPair]) -> Vec<CommitSig> {
+        signers
+            .iter()
+            .map(|s| {
+                let bytes = helix_core::precommit_signing_bytes(
+                    height,
+                    0,
+                    &block_hash,
+                    helix_core::CryptoVersion::MlDsa,
+                );
+                CommitSig {
+                    validator: Address::from_public_key(&s.public),
+                    public_key: s.public.clone(),
+                    crypto_version: helix_core::CryptoVersion::MlDsa,
+                    round: 0,
+                    signature: s.sign(&bytes).unwrap(),
+                }
+            })
+            .collect()
+    }
+
+    /// #133, positive control with a built-in red run. The one certificate `/sync/blocks` cannot
+    /// carry is the tip's — the block that would embed it (tip+1) does not exist yet — so an
+    /// RPC-only follower fetches it from `/sync/tip-certificate`. This proves that certificate
+    /// survives the JSON hop *and* the `CommitSig`→`Vote` reconstruction the follower does, so the
+    /// engine adopts it and holds a real `last_commit`: that is what lets the follower's *next*
+    /// proposal record who finalized the tip instead of stamping an empty certificate (#113's hole,
+    /// reopened over the RPC path until now). The red run — the same signatures reconstructed
+    /// against a different tip hash — must be rejected, proving the engine verifies the
+    /// round-tripped certificate rather than trusting whatever a peer serves.
+    #[test]
+    fn an_rpc_synced_engine_adopts_a_round_tripped_tip_certificate() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let tip_height = 5u64;
+        let tip_hash = Hash::digest(b"tip-block-5");
+
+        // The serving node's live tip certificate as `publish_tip_certificate` would snapshot it,
+        // serialized to JSON and back exactly as it crosses `/sync/tip-certificate`.
+        let served = TipCertificate {
+            height: tip_height,
+            block_hash: tip_hash.to_hex(),
+            signatures: tip_commit_sigs(tip_height, tip_hash, &[&a, &b]),
+        };
+        let wire = serde_json::to_string(&served).unwrap();
+        let received: TipCertificate = serde_json::from_str(&wire).unwrap();
+        assert_eq!(received.height, tip_height);
+        assert_eq!(received.block_hash, tip_hash.to_hex());
+
+        let set = ValidatorSet::new(
+            vec![
+                Validator::new(Address::from_public_key(&a.public), 1_000_000, true),
+                Validator::new(Address::from_public_key(&b.public), 1_000_000, true),
+            ],
+            0,
+        );
+
+        // The follower converts the CommitSigs back to precommit votes for the tip it just synced
+        // to and hands them to the engine, exactly as the RPC catch-up paths now do.
+        let votes = commit_sigs_to_votes(received.signatures.clone(), tip_height, tip_hash);
+        let mut follower = BftEngine::new(set.clone(), Address::from_public_key(&a.public), 0);
+        follower.sync_to_externally_finalized_block(tip_height, tip_hash, votes);
+        assert_eq!(
+            follower.commit_certificate().len(),
+            2,
+            "both genuine tip precommits survive the JSON + CommitSig↔Vote round-trip and are adopted"
+        );
+
+        // Red run: the same signatures reconstructed against the WRONG tip hash must be dropped —
+        // their signatures were made over the real tip, so they fail verification against another
+        // block. A certificate that does not attest the synced tip can never seed a bogus
+        // last_commit.
+        let other = Hash::digest(b"not-the-tip");
+        let wrong = commit_sigs_to_votes(received.signatures, tip_height, other);
+        let mut follower2 = BftEngine::new(set, Address::from_public_key(&a.public), 0);
+        follower2.sync_to_externally_finalized_block(tip_height, other, wrong);
+        assert!(
+            follower2.commit_certificate().is_empty(),
+            "signatures that do not attest the synced tip are verified out, never adopted"
+        );
+    }
+
     /// The free-throwaway-keypair attack this fix closes: a validly self-signed
     /// block from an address that holds no stake and isn't in the validator set
     /// must be dropped by the `NewCommittedBlock` P2P event handler, not applied.
@@ -3292,6 +3497,7 @@ mod handle_p2p_event_tests {
             &None,
             &Arc::new(Mutex::new(0)),
             &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            &Arc::new(RwLock::new(TipCertificate::default())),
         )
         .await;
 
@@ -3336,6 +3542,7 @@ mod handle_p2p_event_tests {
             &None,
             &Arc::new(Mutex::new(0)),
             &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            &Arc::new(RwLock::new(TipCertificate::default())),
         )
         .await;
 
@@ -3379,6 +3586,7 @@ mod handle_p2p_event_tests {
             &None,
             &Arc::new(Mutex::new(0)),
             &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            &Arc::new(RwLock::new(TipCertificate::default())),
         )
         .await;
 
@@ -3512,7 +3720,7 @@ mod handle_p2p_event_tests {
 
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
-        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
 
         assert!(
             engine.read().await.validator_set.get(&bad_validator_addr).is_none(),
@@ -3579,7 +3787,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
 
-        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
 
         let receipt = store
             .read()
@@ -3610,13 +3818,13 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
 
-        apply_finalized_block(block.clone(), false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        apply_finalized_block(block.clone(), false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
         let issued_after_first = chain_state.read().await.total_issued;
         assert!(issued_after_first > 0, "the first application must mint the scheduled block reward");
 
         // A second application of the *same* block/height — as a racing duplicate ingestion
         // path would produce — must change nothing further.
-        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height).await;
+        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
         let issued_after_second = chain_state.read().await.total_issued;
         assert_eq!(issued_after_second, issued_after_first, "the block reward must not be minted twice for the same height");
         assert_eq!(store.read().await.latest_height(), 1, "the duplicate must not re-touch storage either");
@@ -3687,6 +3895,7 @@ mod handle_p2p_event_tests {
             &Some(peer_url),
             &last_applied_height,
             &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            &Arc::new(RwLock::new(TipCertificate::default())),
         )
         .await;
 
@@ -3715,6 +3924,7 @@ mod handle_p2p_event_tests {
             &p2p_tx,
             None,
             &last_applied_height,
+            &Arc::new(RwLock::new(TipCertificate::default())),
         )
         .await;
 
@@ -3776,6 +3986,7 @@ mod handle_p2p_event_tests {
             async move {
                 apply_finalized_block(
                     block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+                    &Arc::new(RwLock::new(TipCertificate::default())),
                 )
                 .await;
             }
@@ -3863,6 +4074,7 @@ mod handle_p2p_event_tests {
             apply_finalized_block(
                 signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * epoch, Hash::ZERO),
                 false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+                &Arc::new(RwLock::new(TipCertificate::default())),
             )
             .await;
         }
@@ -3918,6 +4130,7 @@ mod handle_p2p_event_tests {
             peer_count.clone(),
             syncing.clone(),
             Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            Arc::new(RwLock::new(TipCertificate::default())),
         ));
 
         // Well past several block intervals: nothing may be produced while syncing.

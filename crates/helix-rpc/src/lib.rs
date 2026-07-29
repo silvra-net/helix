@@ -6,9 +6,34 @@ pub mod types;
 pub use server::start_rpc_server;
 pub use types::{RpcError, RpcRequest, RpcResponse};
 
-use helix_core::Block;
+use helix_core::{Block, CommitSig};
 use helix_crypto::Hash;
 use serde::{Deserialize, Serialize};
+
+/// The commit certificate for the current chain tip — the precommit signatures that finalized it,
+/// which will become the *next* block's [`helix_core::BlockHeader::last_commit`] once that block is
+/// produced.
+///
+/// Unlike every other block's certificate, the tip's lives nowhere on disk yet: block N+1 (whose
+/// header would carry block N's certificate) does not exist while N is the tip. It survives only in
+/// the live BFT engine's `last_commit`. This type surfaces it over RPC (`GET /sync/tip-certificate`)
+/// so a node catching up purely over RPC — which already reconstructs every *older* block's
+/// certificate from the following block's header — can obtain the tip's too, and thus hold a
+/// verifiable certificate for every block including the one it stops on. That in turn lets it stamp
+/// a real (not empty) `last_commit` on the first block it proposes after such a sync, instead of
+/// silently dropping the tip's participation record (#133, closing #114 for the RPC path).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TipCertificate {
+    /// Height of the block these signatures attest — the serving node's current tip.
+    pub height: u64,
+    /// Hex hash of that block, so a consumer can confirm the certificate attests exactly the tip
+    /// it just synced to before adopting it.
+    pub block_hash: String,
+    /// Full [`CommitSig`]s (not just addresses, unlike [`HeaderResponse::last_commit`]): the
+    /// consumer is a syncing node that must *verify* every signature before adopting it, exactly as
+    /// it verifies a block's embedded `last_commit`.
+    pub signatures: Vec<CommitSig>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxResponse {
