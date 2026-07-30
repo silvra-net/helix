@@ -80,7 +80,7 @@ pub fn execute_block(
     // signature is in this committed `last_commit` has proved a live node is running its key, and
     // becomes eligible for promotion at the next rotation. A probationer carries no voting power,
     // so a phantom that never signs is simply never promoted rather than freezing the chain.
-    state.record_probation_liveness(&signers);
+    state.record_probation_liveness(&signers, &validator);
 
     for tx in &block.transactions {
         let receipt = execute_transaction(state, tx, fee_recipient, height, base_fee_per_byte);
@@ -4135,9 +4135,9 @@ mod tests {
     ///
     /// It deliberately runs both a validator that signs during probation and one that never does
     /// (a "phantom"), and asserts they are treated *identically* — because they are. #132's
-    /// liveness gate is disabled (backlog #141), so what this pins is the delay, not a phantom
-    /// defence. Named for what it checks, so a future reader doesn't take the old name as a
-    /// guarantee the code stopped making.
+    /// liveness gate is disabled (see `rotate_active_validators` for the three attempts and what
+    /// each measured), so what this pins is the delay, not a phantom defence. Named for what it
+    /// checks, so a future reader doesn't take the old name as a guarantee the code stopped making.
     #[test]
     fn probation_delays_every_new_validator_by_one_epoch_and_then_promotes_it() {
         let sitting_kp = KeyPair::generate();
@@ -4169,10 +4169,9 @@ mod tests {
         // Only `sitting` signs during the probation epoch; `phantom` has no node behind it.
         execute_block(&mut state, &block_with_commit(&sitting, epoch * 2 + 1, &[&sitting_kp]), None);
 
-        // Rotation 3: both are promoted. Serving the epoch is the whole requirement now — the
-        // liveness gate that used to distinguish these two is disabled, because it could never be
-        // satisfied by anyone (see `rotate_active_validators`). Whether a node is actually running
-        // behind an address is, for the moment, not something the chain establishes.
+        // Rotation 3: both are promoted. Serving the epoch is the whole requirement while the
+        // liveness gate is off, so the two are indistinguishable to the chain — the honest
+        // statement of what ships until #141 produces a proof that works.
         execute_block(&mut state, &empty_block(&sitting, epoch * 3), None);
         assert!(
             state.active_validators.contains(&sitting),
@@ -4180,9 +4179,7 @@ mod tests {
         );
         assert!(
             state.active_validators.contains(&phantom),
-            "and so is one that never signed — the accepted gap #141 must close. Requiring proof \
-             here is what made every joiner cycle probation → pending forever, because a zero-power \
-             probationer is never asked for the vote the proof depends on."
+            "and so is one that never signed — the accepted gap #141 must close"
         );
     }
 

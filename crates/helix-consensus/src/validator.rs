@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Vote, VoteType};
 
+
 /// A single validator in the Helix PoS set
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Validator {
@@ -179,6 +180,11 @@ impl ValidatorSet {
     /// Probationary validators are skipped — a phantom that staked the wrong key would otherwise
     /// take proposer turns it can never fulfil, timing out a round every rotation. They rejoin the
     /// schedule only once promoted to a full member (see `Validator::probationary`).
+    ///
+    /// Giving them fixed proof slots instead was tried and reverted — see backlog #141 and #143.
+    /// It worked as a liveness proof and stalled the chain: a probationer that is a few blocks
+    /// behind proposes on a `prev_hash` nobody else has, every peer rejects the block, and the
+    /// round does not recover.
     pub fn proposer_for_round(&self, height: u64, round: u32) -> Option<&Validator> {
         let full: Vec<&Validator> = self.full_members().collect();
         if full.is_empty() {
@@ -400,6 +406,15 @@ mod tests {
         );
     }
 
+    /// A probationer never takes a proposer turn, at any height or round.
+    ///
+    /// Giving them fixed proof slots — so a running node could put a block bearing its own address
+    /// on-chain and satisfy #132's liveness gate — was implemented and reverted the same day. It
+    /// proved liveness exactly as intended and stalled the chain doing it: a probationer that is a
+    /// few blocks behind (the normal state of a node catching up) proposes on a `prev_hash` no peer
+    /// has, every peer rejects the block as invalid, and the height does not recover. Measured
+    /// twice on a three-node devnet, both times stuck at the block before the second slot. See
+    /// backlog #141 for what a workable proof needs and #143 for the recovery gap it exposed.
     #[test]
     fn the_proposer_schedule_skips_probationary_validators() {
         let a = rand_address();
@@ -412,7 +427,7 @@ mod tests {
             0,
         );
         // Every height/round must land on the one full member, never the probationer.
-        for h in 0..10u64 {
+        for h in 0..crate::EPOCH_LENGTH {
             for r in 0..4u32 {
                 assert_eq!(set.proposer_for_round(h, r).unwrap().address, a);
                 assert!(!set.is_proposer(&b, h, r), "a probationer is never the proposer");

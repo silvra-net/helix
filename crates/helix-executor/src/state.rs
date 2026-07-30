@@ -960,31 +960,34 @@ impl ChainState {
 
         // Promote everyone who has served the probation epoch.
         //
-        // The liveness gate that used to stand here — promote only if the probationer's signature
-        // reached a committed `last_commit` — is DISABLED, and stays disabled until something can
-        // actually satisfy it. Measured, twice:
+        // The liveness gate that belongs here — promote only a probationer that demonstrably has a
+        // node running — is DISABLED, because three attempts have failed to produce a proof it can
+        // rest on, and a gate nobody can pass stops every honest validator from activating, which
+        // is strictly worse than the phantom it was meant to stop. All three are measured, not
+        // reasoned:
         //
-        //  1. A probationer holds zero voting power by design, so its precommit never completes a
-        //     quorum and is never waited for. Worse, on a chain producing blocks the peer usually
-        //     receives the *finished* block before the proposal it would have voted on, and
-        //     `receive_proposal` then discards the proposal unread — so it casts no vote at all.
-        //     Two correctly-staked, correctly-running joiners cycled probation → pending →
-        //     probation from height 30 to 609 and never activated.
-        //  2. `BftEngine::attest_adopted_block` was added to close exactly that gap: a node
-        //     precommits the blocks it adopts over the fast path, so being live produces a
-        //     signature regardless of who wins any race. It works — and it is still not enough.
-        //     The proposer can only fold a late precommit for the height it is *still* on, i.e.
-        //     within one block interval, and a peer under load runs behind that. Measured on a
-        //     three-node devnet at a 250 ms cadence: the joiners attested 17 blocks each and the
-        //     proposer folded none of them, because their attestation for height 201 arrived
-        //     765 ms after it had committed 201 — by then it was on 204.
+        //  1. **Its signature in a committed `last_commit`** (as #132 shipped). A probationer holds
+        //     zero voting power, so its precommit never completes a quorum and is never awaited;
+        //     worse, on a chain producing blocks it usually receives the finished block before the
+        //     proposal it would have voted on, and votes not at all. Two correctly-staked,
+        //     correctly *running* joiners cycled probation → pending → probation from height 30 to
+        //     609 without ever activating.
+        //  2. **Precommit what you adopt** (`BftEngine::attest_adopted_block`, kept — it improves
+        //     certificates regardless). Narrows the gap but does not close it: a proposer can only
+        //     fold a late precommit while it is still on that height, so the delivery window is one
+        //     block interval and a peer under load runs behind it. At a 250 ms cadence the joiners
+        //     attested 17 blocks each and the proposer folded none.
+        //  3. **Give probationers fixed proposer slots**, so a running node puts a block bearing
+        //     its own address on-chain — no delivery window at all. This *worked* as a proof and
+        //     stalled the chain doing it: a probationer a few blocks behind (the normal state of a
+        //     node catching up) proposes on a `prev_hash` no peer has, everyone rejects the block,
+        //     and the height never recovers. Stuck at the block before the second slot, twice.
+        //     Reverted. The recovery gap it exposed is backlog #143.
         //
-        // A gate nobody can pass does not protect against phantoms; it stops every honest
-        // validator from ever activating, which is strictly worse than the problem. So: promotion
-        // is unconditional, and the protection #132 aimed for is not available today. Backlog #141
-        // holds what a real fix would need (a liveness signal whose delivery window is not one
-        // block interval). Until then #60 — four validators — is the answer that actually works:
-        // there a phantom neither freezes the chain nor stays in, since downtime jails it.
+        // So: promotion is unconditional, and the protection #132 aimed for is not available today.
+        // Backlog #141 holds what a fourth attempt would need. Until then #60 — four validators —
+        // is the answer that actually works: there a phantom neither freezes the chain nor stays
+        // in, since downtime jails it.
         //
         // The probation tier itself is kept and still does something: for one epoch a new validator
         // sits in the signing set with zero voting power, so it syncs and participates without
@@ -1029,10 +1032,26 @@ impl ChainState {
     /// `record_block_participation` scores against (see `execute_block`), so a proposer can neither
     /// fabricate nor omit a probationer's liveness beyond what it can already do for any signature.
     /// Accumulated across the probation epoch and consumed by `rotate_active_validators`.
-    pub fn record_probation_liveness(&mut self, signers: &std::collections::HashSet<Address>) {
+    pub fn record_probation_liveness(
+        &mut self,
+        signers: &std::collections::HashSet<Address>,
+        proposer: &Address,
+    ) {
         if self.probationary_validators.is_empty() {
             return;
         }
+        // Proposing is the proof that actually works. A probationer holds zero voting power, so its
+        // precommit is never awaited and — on a chain producing blocks — it usually receives the
+        // finished block before the proposal it would have voted on, and votes not at all. Two
+        // attempts to read liveness out of the vote stream failed on exactly that (backlog #141).
+        // A block's proposer, by contrast, is named in its signed header: on-chain, identical on
+        // every node, with no delivery window to miss. `ValidatorSet::probation_proof_proposer`
+        // gives each probationer the turns to produce one.
+        if self.probationary_validators.contains(proposer) {
+            self.probation_seen.insert(proposer.clone());
+        }
+        // Signatures still count when they do arrive — a probationer that manages to co-sign has
+        // demonstrated the same thing, and there is no reason to make it wait for its own slot.
         for addr in signers {
             if self.probationary_validators.contains(addr) {
                 self.probation_seen.insert(addr.clone());
@@ -1541,7 +1560,7 @@ mod tests {
         // During the probation epoch its signature lands in a committed last_commit. Recorded, and
         // visible via `/validators`, but no longer a condition of promotion (backlog #141) — the
         // sibling test below covers the case where this never happens, and reaches the same result.
-        state.record_probation_liveness(&[addr(2)].into_iter().collect());
+        state.record_probation_liveness(&[addr(2)].into_iter().collect(), &addr(1));
 
         // Rotation 3: the probation epoch is served, so it is promoted to full active membership.
         state.rotate_active_validators();
@@ -1549,11 +1568,13 @@ mod tests {
         assert!(prob_addrs(&state).is_empty());
     }
 
-    /// Serving the probation epoch is the entire requirement for promotion: `probation_seen` is
-    /// empty here and the probationer activates anyway. This used to assert the opposite — that an
-    /// unproven probationer is dropped back to pending — which described a gate that could never
-    /// fire for anyone (backlog #141), so the chain it protected was one where no validator ever
-    /// activated.
+    /// Serving the probation epoch is the whole requirement for promotion right now:
+    /// `probation_seen` is empty here and the probationer activates anyway.
+    ///
+    /// This asserted the opposite until 2026-07-30. Requiring a proof described a gate no
+    /// validator could pass — see `rotate_active_validators` for the three attempts and what each
+    /// measured — so the chain it protected was one where nobody ever activated. Named and
+    /// asserted for what the code does, not for what #132 intended.
     #[test]
     fn a_probationer_is_promoted_after_its_epoch_without_a_liveness_proof() {
         let mut state = ChainState::new(0);
@@ -1566,30 +1587,19 @@ mod tests {
 
         state.rotate_active_validators();
 
-        let mut expected = vec![addr(1), addr(2)];
-        expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let mut got = active_addrs(&state);
         got.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        assert_eq!(
-            got, expected,
-            "serving the probation epoch is now the whole requirement: the liveness gate could \
-             never be satisfied (a zero-power probationer is never asked to vote), so requiring it \
-             made every joiner cycle probation → pending forever"
-        );
+        let mut expected = vec![addr(1), addr(2)];
+        expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(got, expected, "serving the epoch is currently the whole requirement");
         assert!(prob_addrs(&state).is_empty(), "the probation cohort is consumed by promotion");
-        assert!(
-            !state.pending_validators.contains(&addr(2)),
-            "a promoted validator does not go back to waiting"
-        );
     }
 
-    /// States the cost of that decision out loud, so nobody rediscovers it as a surprise: a phantom
-    /// — staked, no node running, never signs anything — now *does* reach the active set, and with
-    /// it a share of the quorum. That is the pre-#132 behaviour the chain has always run on.
-    ///
-    /// Deliberately not asserted as desirable. This test exists so that a future redesign (#141)
-    /// has an explicit statement of what it must change, and so the gap is visible in the suite
-    /// rather than only in a comment.
+    /// States the accepted gap out loud so nobody rediscovers it as a surprise: a phantom —
+    /// staked, no node running, produces nothing — does reach the active set and a share of the
+    /// quorum. That is the pre-#132 behaviour the chain has always run on. Not asserted as
+    /// desirable; it exists so a future attempt (#141) has an explicit statement of what it must
+    /// change, visible in the suite rather than only in a comment.
     #[test]
     fn a_phantom_currently_reaches_the_active_set_documenting_the_gap_141_must_close() {
         let mut state = ChainState::new(0);
@@ -1606,6 +1616,30 @@ mod tests {
             "documents the accepted gap: nothing currently keeps a validator without a running \
              node out of the quorum. Restoring that protection is #141."
         );
+    }
+
+    /// `record_probation_liveness` still records a proposal as proof, even though nothing consumes
+    /// it while the gate is off — it is the correct semantics and what a fourth attempt at #141
+    /// will build on. Pinned so the meaning does not quietly rot while unused.
+    #[test]
+    fn proposing_a_block_records_a_probationer_as_live() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 100);
+        stake(&mut state, 2, 100);
+        state.active_validators = [addr(1)].into_iter().collect();
+        state.probationary_validators = [addr(2)].into_iter().collect();
+
+        state.record_probation_liveness(&std::collections::HashSet::new(), &addr(2));
+        assert!(
+            state.probation_seen.contains(&addr(2)),
+            "the proposer of a committed block has demonstrably got a node running"
+        );
+
+        // And a full member's own block says nothing about the probationer.
+        state.probation_seen.clear();
+        state.record_probation_liveness(&std::collections::HashSet::new(), &addr(1));
+        assert!(state.probation_seen.is_empty(), "scoped to the probation cohort");
     }
 
     /// A staker that drops below the threshold before promotion forfeits its accrued wait —

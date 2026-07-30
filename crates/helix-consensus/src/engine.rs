@@ -1634,6 +1634,23 @@ mod tests {
         (full_kp, full_addr, probationer_kp, probationer_addr, set)
     }
 
+    /// Height these tests produce at. Not 1: heights whose position in the epoch falls in
+    /// [`PROBATION_PROOF_SLOTS`] belong to the probationer, so the full member could not propose
+    /// there at all — and every test here needs it to. Height 1 is such a slot, which is exactly
+    /// the schedule working; it just makes it the wrong height to test *other* things at.
+    const OFF_SLOT_PARENT: u64 = 4;
+
+    /// The full member's engine, advanced to a height where the next block is its turn.
+    fn engine_at_off_slot(set: ValidatorSet, address: Address) -> BftEngine {
+        let mut engine = BftEngine::new(set, address, 0);
+        engine.sync_to_externally_finalized_block(
+            OFF_SLOT_PARENT,
+            Hash::digest(b"parent"),
+            vec![],
+        );
+        engine
+    }
+
     /// #132's activation was unreachable whenever the existing set already held quorum without the
     /// probationer — which is *always*, because a probationer carries zero voting power by design.
     ///
@@ -1659,11 +1676,15 @@ mod tests {
             "a probationer holds no voting power — the premise of the whole failure"
         );
 
-        let mut engine = BftEngine::new(set, full_addr.clone(), 0);
+        let mut engine = engine_at_off_slot(set, full_addr.clone());
         let block = engine
-            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), vec![])
             .expect("the sole full-power validator reaches quorum on its own precommit");
-        assert_eq!(engine.current_height(), 1, "it finalized without any peer vote");
+        assert_eq!(
+            engine.current_height(),
+            OFF_SLOT_PARENT + 1,
+            "it finalized without any peer vote"
+        );
         assert!(
             !engine
                 .commit_certificate()
@@ -1673,7 +1694,7 @@ mod tests {
         );
 
         // Its precommit arrives now — as early as a real network ever could deliver it.
-        let late = peer_vote(&probationer_kp, VoteType::Precommit, 1, 0, block.hash());
+        let late = peer_vote(&probationer_kp, VoteType::Precommit, OFF_SLOT_PARENT + 1, 0, block.hash());
         engine.add_vote(&full_kp, late).expect("a late precommit is not an error");
 
         assert!(
@@ -1753,9 +1774,9 @@ mod tests {
     #[test]
     fn a_node_already_in_the_certificate_does_not_attest_again() {
         let (full_kp, full_addr, _p_kp, _p_addr, set) = full_power_plus_probationer();
-        let mut engine = BftEngine::new(set, full_addr.clone(), 0);
+        let mut engine = engine_at_off_slot(set, full_addr.clone());
         let block = engine
-            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), vec![])
             .expect("finalizes alone");
         assert!(
             engine.commit_certificate().iter().any(|v| v.validator == full_addr),
@@ -1782,9 +1803,9 @@ mod tests {
     #[test]
     fn a_phantom_probationer_that_never_votes_stays_out_of_the_certificate() {
         let (full_kp, full_addr, _phantom_kp, phantom_addr, set) = full_power_plus_probationer();
-        let mut engine = BftEngine::new(set, full_addr, 0);
+        let mut engine = engine_at_off_slot(set, full_addr);
         engine
-            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), vec![])
             .expect("finalizes alone");
 
         assert!(
@@ -1799,9 +1820,9 @@ mod tests {
     fn a_late_precommit_for_a_different_block_is_not_folded_in() {
         let (full_kp, full_addr, probationer_kp, probationer_addr, set) =
             full_power_plus_probationer();
-        let mut engine = BftEngine::new(set, full_addr, 0);
+        let mut engine = engine_at_off_slot(set, full_addr);
         engine
-            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), vec![])
             .expect("finalizes alone");
 
         let wrong = peer_vote(
@@ -1823,9 +1844,9 @@ mod tests {
     #[test]
     fn a_late_precommit_from_outside_the_set_is_not_folded_in() {
         let (full_kp, full_addr, _p_kp, _p_addr, set) = full_power_plus_probationer();
-        let mut engine = BftEngine::new(set, full_addr, 0);
+        let mut engine = engine_at_off_slot(set, full_addr);
         let block = engine
-            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), vec![])
             .expect("finalizes alone");
 
         let outsider_kp = KeyPair::generate();
@@ -1845,12 +1866,12 @@ mod tests {
     fn a_late_precommit_is_not_folded_in_twice() {
         let (full_kp, full_addr, probationer_kp, probationer_addr, set) =
             full_power_plus_probationer();
-        let mut engine = BftEngine::new(set, full_addr, 0);
+        let mut engine = engine_at_off_slot(set, full_addr);
         let block = engine
-            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), vec![])
             .expect("finalizes alone");
 
-        let vote = peer_vote(&probationer_kp, VoteType::Precommit, 1, 0, block.hash());
+        let vote = peer_vote(&probationer_kp, VoteType::Precommit, OFF_SLOT_PARENT + 1, 0, block.hash());
         let _ = engine.add_vote(&full_kp, vote.clone());
         let _ = engine.add_vote(&full_kp, vote);
 

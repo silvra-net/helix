@@ -5301,15 +5301,10 @@ mod handle_p2p_event_tests {
     }
 
     /// Companion to the promotion path above, run end-to-end through the node: a staker whose node
-    /// never signs anything crosses the same three epoch boundaries as the prover — and reaches the
-    /// same place. It is held at zero voting power for its pending and probation epochs, and is a
-    /// full member after that.
-    ///
-    /// This test used to assert the opposite (that the phantom which froze the live 3-validator set
-    /// on 2026-07-28 stays out forever), and it passed, because the fixture handed the *prover* its
-    /// `last_commit` by hand. On a real network nobody ever casts that vote — see backlog #141 —
-    /// so the gate held everyone out, not just phantoms. What survives is the delay: two epochs
-    /// before a new staker is quorum-critical, which is what this now pins.
+    /// never produces anything crosses the same three epoch boundaries as the prover — and reaches
+    /// the same place, because the liveness gate is off (see `ChainState::rotate_active_validators`
+    /// for the three attempts and what each measured). What this pins is the delay: two epochs at
+    /// zero voting power before a new staker is quorum-critical.
     #[tokio::test]
     async fn epoch_rotation_holds_a_new_staker_powerless_for_two_epochs_then_promotes_it() {
         let genesis_kp = KeyPair::generate();
@@ -5362,8 +5357,8 @@ mod handle_p2p_event_tests {
             "and is not active yet"
         );
 
-        // Third boundary: promoted, having signed nothing at all. Not the behaviour #132 aimed
-        // for — the honest statement of what ships until #141 restores a workable liveness proof.
+        // Third boundary: promoted, having produced nothing at all. Not the behaviour #132 aimed
+        // for — the honest statement of what ships until #141 produces a workable liveness proof.
         apply_one(boundary(3), &last_applied_height).await;
         assert!(
             chain_state.read().await.active_validators.contains(&phantom_addr),
