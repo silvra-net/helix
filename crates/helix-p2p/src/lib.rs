@@ -1,8 +1,12 @@
+pub mod blocksync;
 pub mod config;
 mod conn_limits;
 pub mod reputation;
 pub mod service;
 
+pub use blocksync::{
+    BlockProvider, BlockSyncRequest, BlockSyncResponse, BLOCKSYNC_PROTOCOL, MAX_BLOCKSYNC_BATCH,
+};
 pub use config::P2PConfig;
 pub use reputation::PeerReputation;
 pub use service::{P2PCommand, P2PEvent, P2PService, MAX_CATCHUP_SERVE_BLOCKS};

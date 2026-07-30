@@ -72,11 +72,20 @@ libp2p = { version = "0.54", features = [
     "tcp", "noise", "yamux",
     "gossipsub", "mdns",
     "tokio", "dns", "macros",
+    # Directed request/response for block sync (#138). Gossipsub can only broadcast, so before
+    # this a node that fell behind could not *ask* anyone for the blocks it was missing — its only
+    # catch-up route was an operator-configured RPC `sync_peer`, and a node without one (the origin
+    # node) could never recover from a single missed block. See `blocksync` in helix-p2p.
+    "request-response",
     # Lets a node be reachable through an HTTPS reverse proxy / Cloudflare tunnel on
     # port 443, where raw TCP is not routable. See `P2PConfig::ws_listen_addr`.
     "websocket",
 ] }
 void = "1"
+# Required to implement libp2p's `request_response::Codec`, which is declared `#[async_trait]`
+# (#138). Already in the tree as a transitive dependency of libp2p-request-response, so this only
+# makes an existing dependency direct.
+async-trait = "0.1"
 
 # Wallet encryption
 aes-gcm = "0.10"

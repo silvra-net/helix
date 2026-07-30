@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use libp2p::{
     futures::StreamExt,
-    gossipsub, mdns,
+    gossipsub, mdns, request_response,
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
-    Multiaddr, SwarmBuilder,
+    Multiaddr, PeerId, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -18,6 +18,10 @@ use tracing::{debug, info, warn};
 use helix_consensus::{Proposal, Vote};
 use helix_core::{Block, Transaction};
 
+use crate::blocksync::{
+    clamp_batch, BlockProvider, BlockSyncCodec, BlockSyncRequest, BlockSyncResponse,
+    BLOCKSYNC_PROTOCOL, MAX_BLOCKSYNC_BATCH,
+};
 use crate::config::P2PConfig;
 use crate::conn_limits::IpConnLimiter;
 use crate::reputation::PeerReputation;
@@ -56,6 +60,10 @@ pub enum P2PEvent {
         /// The committed height that peer announced. It needs `peer_tip + 1` onwards.
         peer_tip: u64,
     },
+    /// A peer answered our block-sync request with a contiguous batch of committed blocks and a
+    /// commit certificate for the last one (#138). Entirely untrusted: the node layer verifies the
+    /// chain, every proposer signature, and the batch tip's quorum *before* anything is written.
+    BlocksSynced(BlockSyncResponse),
 }
 
 /// Commands sent TO the P2P network FROM the node
@@ -85,6 +93,10 @@ struct HelixBehaviour {
     /// no notion of IP, so a Sybil attacker presenting a fresh `PeerId` per socket
     /// isn't bounded by it; this closes that gap.
     ip_limits: IpConnLimiter,
+    /// Directed block sync (#138). The only behaviour here that can *ask* a specific peer for
+    /// something instead of shouting into a topic — which is what a node needs to catch up without
+    /// an operator-configured RPC endpoint. See the `blocksync` module.
+    blocksync: request_response::Behaviour<BlockSyncCodec>,
 }
 
 pub struct P2PService {
@@ -100,17 +112,21 @@ pub struct P2PService {
     /// or zero tip forever and be refused as "too far behind" by `should_serve_catchup`. Reading
     /// the store's real height cannot drift.
     tip_height: Arc<AtomicU64>,
+    /// Answers inbound block-sync requests (#138). Supplied by the node, which owns the store —
+    /// see [`BlockProvider`] for why the dependency points this way.
+    block_provider: Arc<dyn BlockProvider>,
 }
 
 impl P2PService {
     pub fn new(
         config: P2PConfig,
         tip_height: Arc<AtomicU64>,
+        block_provider: Arc<dyn BlockProvider>,
     ) -> (Self, mpsc::Sender<P2PCommand>, mpsc::Receiver<P2PEvent>) {
         let (event_tx, event_rx) = mpsc::channel(256);
         let (command_tx, command_rx) = mpsc::channel(256);
         (
-            P2PService { config, event_tx, command_rx, tip_height },
+            P2PService { config, event_tx, command_rx, tip_height, block_provider },
             command_tx,
             event_rx,
         )
@@ -122,6 +138,7 @@ impl P2PService {
         let mut command_rx = self.command_rx;
         let config = self.config;
         let tip_height = self.tip_height;
+        let block_provider = self.block_provider;
 
         let max_msg_size = config.max_message_size;
 
@@ -197,7 +214,17 @@ impl P2PService {
                 );
                 let ip_limits = IpConnLimiter::new(config.max_connections_per_ip);
 
-                HelixBehaviour { gossipsub, mdns, connection_limits, ip_limits }
+                // `ProtocolSupport::Full` — every node both asks and answers. A node that only
+                // asked would be a free-rider on a network whose whole point (#138) is that any
+                // peer can bootstrap any other without a central RPC endpoint.
+                let blocksync = request_response::Behaviour::with_codec(
+                    BlockSyncCodec,
+                    [(BLOCKSYNC_PROTOCOL, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(30)),
+                );
+
+                HelixBehaviour { gossipsub, mdns, connection_limits, ip_limits, blocksync }
             })
             .expect("behaviour setup never fails")
             .with_swarm_config(|cfg| {
@@ -289,6 +316,14 @@ impl P2PService {
         // Peer versions we've already warned about, so a persistent mismatch on the 30s
         // peer-exchange tick is logged once rather than every tick (#109).
         let mut warned_versions: HashSet<String> = HashSet::new();
+        // Tip each peer last announced, so the block-sync driver below knows who to ask (#138).
+        // Bounded by the connection limit and pruned on disconnect, so it cannot grow unbounded.
+        let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
+        // One outstanding request at a time. Without this, every driver tick while a slow batch is
+        // in transit would fire another request for the same range — turning our own catch-up into
+        // a flood. Cleared on a response and on any failure, so a peer that never answers costs one
+        // request and one timeout, not a wedged sync.
+        let mut blocksync_in_flight = false;
         if let Some(addr) = &config.public_addr {
             known_addrs.insert(addr.clone());
         }
@@ -302,6 +337,12 @@ impl P2PService {
         // how newly learned addresses (from a peer exchange we received) eventually reach
         // peers we were already connected to before we learned them.
         let mut peer_exchange_interval = tokio::time::interval(Duration::from_secs(30));
+
+        // Block-sync driver (#138). Far more often than the 30-second announcement tick, because a
+        // node that is genuinely behind should not wait half a minute between batches: one batch is
+        // capped at an epoch, so a long catch-up is many requests and the interval is the floor on
+        // how fast it can proceed. Cheap when idle — with nobody ahead of us it is one map scan.
+        let mut blocksync_interval = tokio::time::interval(Duration::from_secs(2));
 
         loop {
             tokio::select! {
@@ -327,6 +368,9 @@ impl P2PService {
                                     &mut warned_versions,
                                     tip_height.load(Ordering::Relaxed),
                                 );
+                                if let Some(tip) = outcome.announced_tip {
+                                    peer_tips.insert(propagation_source, tip);
+                                }
                                 if let Some(peer_tip) = outcome.serve_from_tip {
                                     let _ = event_tx
                                         .send(P2PEvent::PeerBehind { peer_tip })
@@ -341,6 +385,62 @@ impl P2PService {
                                 warn!(peer = %peer_str, "peer exceeded misbehavior threshold — disconnecting");
                                 let _ = swarm.disconnect_peer_id(propagation_source);
                             }
+                        }
+
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
+                            request_response::Event::Message { peer, message, .. }
+                        )) => {
+                            match message {
+                                request_response::Message::Request { request, channel, .. } => {
+                                    // Answered right here, inside the swarm loop, via the injected
+                                    // provider — no request-id bookkeeping and no round trip out to
+                                    // the node and back to the correct response slot. Serving is
+                                    // read-only and cannot be turned into anything else: the
+                                    // requester picks a height range, nothing more.
+                                    let count = clamp_batch(request.count);
+                                    let response = block_provider
+                                        .blocks(request.from_height, count)
+                                        .await;
+                                    debug!(
+                                        peer = %peer,
+                                        from = request.from_height,
+                                        asked = request.count,
+                                        served = response.blocks.len(),
+                                        "Answering a block-sync request"
+                                    );
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .blocksync
+                                        .send_response(channel, response);
+                                }
+                                request_response::Message::Response { response, .. } => {
+                                    blocksync_in_flight = false;
+                                    if response.blocks.is_empty() {
+                                        debug!(peer = %peer, "Block-sync peer had nothing to serve");
+                                    } else {
+                                        info!(
+                                            peer = %peer,
+                                            blocks = response.blocks.len(),
+                                            "Received a block-sync batch"
+                                        );
+                                        let _ = event_tx.send(P2PEvent::BlocksSynced(response)).await;
+                                    }
+                                }
+                            }
+                        }
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
+                            request_response::Event::OutboundFailure { peer, error, .. }
+                        )) => {
+                            // Clearing the in-flight flag is what keeps a dead or unwilling peer
+                            // from wedging catch-up forever: the next tick simply tries again,
+                            // possibly against a different peer.
+                            blocksync_in_flight = false;
+                            debug!(peer = %peer, err = %error, "Block-sync request failed");
+                        }
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
+                            request_response::Event::InboundFailure { peer, error, .. }
+                        )) => {
+                            debug!(peer = %peer, err = %error, "Failed to answer a block-sync request");
                         }
 
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Mdns(
@@ -410,6 +510,7 @@ impl P2PService {
                             // *reconnect* lines, which were the only trace at the default log
                             // level. A lost peer is exactly as newsworthy as a gained one.
                             info!(peer = %peer_id, "Peer disconnected");
+                            peer_tips.remove(&peer_id);
                             swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                             reputation.on_disconnect(&peer_id.to_string());
                             let _ = event_tx
@@ -417,6 +518,29 @@ impl P2PService {
                                 .await;
                         }
                         _ => {}
+                    }
+                }
+
+                _ = blocksync_interval.tick() => {
+                    if !blocksync_in_flight {
+                        let our_tip = tip_height.load(Ordering::Relaxed);
+                        if let Some((peer, peer_tip)) = best_blocksync_peer(&peer_tips, our_tip) {
+                            let count = blocksync_request_count(our_tip, peer_tip);
+                            if count > 0 {
+                                debug!(
+                                    peer = %peer,
+                                    from = our_tip + 1,
+                                    count,
+                                    peer_tip,
+                                    "Requesting missing blocks from a peer that is ahead"
+                                );
+                                swarm.behaviour_mut().blocksync.send_request(
+                                    &peer,
+                                    BlockSyncRequest { from_height: our_tip + 1, count },
+                                );
+                                blocksync_in_flight = true;
+                            }
+                        }
                     }
                 }
 
@@ -629,6 +753,9 @@ fn foreign_version_warning(their: &str, ours: &str, warned: &mut HashSet<String>
 struct PeerExchangeOutcome {
     /// The message was malformed — the sender should be charged a misbehavior strike.
     malformed: bool,
+    /// The tip the sender claims, whenever the message parsed at all. Recorded per peer so the
+    /// block-sync driver knows who is worth asking for blocks (#138).
+    announced_tip: Option<u64>,
     /// The sender's announced tip, when it is behind us by a servable margin (#137). The caller
     /// turns this into a [`P2PEvent::PeerBehind`]; `None` means nothing to serve.
     serve_from_tip: Option<u64>,
@@ -648,7 +775,11 @@ fn handle_peer_exchange_message(
         Ok(m) => m,
         Err(e) => {
             warn!("Malformed peer-exchange message: {}", e);
-            return PeerExchangeOutcome { malformed: true, serve_from_tip: None };
+            return PeerExchangeOutcome {
+                malformed: true,
+                announced_tip: None,
+                serve_from_tip: None,
+            };
         }
     };
 
@@ -670,12 +801,10 @@ fn handle_peer_exchange_message(
         }
     }
 
-    // The other direction of the same comparison: a peer ahead of us means *we* are missing
-    // blocks. We cannot pull them (there is no request protocol — that is the remaining half of
-    // #137), but saying so out loud is the difference between an operator seeing "my node is
-    // behind and the network moved on" and seeing nothing at all, which is what a stalled node
-    // looked like from the outside for 14.5 hours. `debug!`, not `warn!`: while a node is doing a
-    // normal bulk sync this is true and unremarkable on every tick.
+    // The other direction of the same comparison: a peer ahead of us means *we* are missing blocks.
+    // The caller records the height and the block-sync driver (#138) asks this peer for them.
+    // `debug!`, not `warn!`: while a node is doing a normal bulk sync this is true and unremarkable
+    // on every tick.
     if msg.tip_height > our_tip {
         debug!(
             our_tip,
@@ -686,8 +815,51 @@ fn handle_peer_exchange_message(
 
     PeerExchangeOutcome {
         malformed: false,
+        announced_tip: Some(msg.tip_height),
         serve_from_tip: should_serve_catchup(msg.tip_height, our_tip).then_some(msg.tip_height),
     }
+}
+
+/// The peer worth asking for blocks: whichever known peer claims the highest tip, provided it is
+/// actually above ours. `None` when nobody is ahead — which is the normal, healthy state.
+///
+/// Claims are unauthenticated, so "highest" is not "most trustworthy" — it only decides *who to ask
+/// first*. A peer that lies about its height, or answers with junk, costs one round trip: the batch
+/// fails verification in the node layer, nothing is written, and the next tick tries again. That is
+/// why this can be a naive maximum rather than a reputation calculation.
+fn best_blocksync_peer(peer_tips: &HashMap<PeerId, u64>, our_tip: u64) -> Option<(PeerId, u64)> {
+    peer_tips
+        .iter()
+        .filter(|(_, &tip)| tip > our_tip)
+        .max_by_key(|(_, &tip)| tip)
+        .map(|(peer, &tip)| (*peer, tip))
+}
+
+/// How many blocks to ask for, given where we are and what the peer claims. Zero when we are not
+/// behind, which the caller reads as "do not send a request at all".
+///
+/// Bounded by two things, and the second is the subtle one. Beyond the flat batch cap, a request
+/// must not reach past the **validator-set rotation** that follows our tip. The executor rotates
+/// `active_validators` while executing a block whose height is a multiple of `EPOCH_LENGTH`, after
+/// that block's own participation is scored — so every block in `(k·L, (k+1)·L]` is signed by the
+/// one set installed at `k·L`, and that is the set a receiver can derive from the state it already
+/// trusts.
+///
+/// This matters because the receiver checks the batch tip's certificate against its **pre-batch**
+/// set, which is the only set an attacker cannot influence. (Deriving the set by applying the batch
+/// first would be self-certifying: whoever supplies the blocks would supply the set that validates
+/// them.) A batch straddling a rotation would therefore be checked against a set that never signed
+/// its tip, and honest blocks would be rejected. Stopping at the boundary keeps every batch inside
+/// one set, at the cost of a shorter request every `EPOCH_LENGTH` blocks.
+fn blocksync_request_count(our_tip: u64, peer_tip: u64) -> u32 {
+    if peer_tip <= our_tip {
+        return 0;
+    }
+    let from = our_tip + 1;
+    let epoch_len = helix_consensus::EPOCH_LENGTH;
+    let last_of_signing_group = ((from - 1) / epoch_len + 1) * epoch_len;
+    let last = peer_tip.min(last_of_signing_group);
+    (last - our_tip).min(u64::from(MAX_BLOCKSYNC_BATCH)) as u32
 }
 
 /// Publishes our full current `known_addrs` set on the peer-exchange topic, stamped with our
@@ -849,6 +1021,96 @@ mod peer_exchange_tests {
     #[test]
     fn two_nodes_at_genesis_do_not_serve_each_other() {
         assert!(!should_serve_catchup(0, 0));
+    }
+
+    // ── Block-sync driver (#138) ──────────────────────────────────────────────
+
+    fn peer(n: u8) -> libp2p::PeerId {
+        // Deterministic distinct ids; the bytes themselves are irrelevant to the selection logic.
+        libp2p::identity::Keypair::ed25519_from_bytes([n; 32]).unwrap().public().to_peer_id()
+    }
+
+    /// Nobody ahead of us is the healthy steady state, and it must produce no request at all —
+    /// otherwise every node in a synced network would poll its peers forever.
+    #[test]
+    fn no_peer_ahead_means_no_request() {
+        let mut tips = std::collections::HashMap::new();
+        tips.insert(peer(1), 100);
+        tips.insert(peer(2), 99);
+        assert!(super::best_blocksync_peer(&tips, 100).is_none());
+    }
+
+    #[test]
+    fn the_peer_with_the_highest_tip_is_chosen() {
+        let mut tips = std::collections::HashMap::new();
+        tips.insert(peer(1), 105);
+        tips.insert(peer(2), 130);
+        tips.insert(peer(3), 90); // behind us — must not be picked
+        let (chosen, tip) = super::best_blocksync_peer(&tips, 100).unwrap();
+        assert_eq!(chosen, peer(2));
+        assert_eq!(tip, 130);
+    }
+
+    #[test]
+    fn with_no_known_peers_there_is_nobody_to_ask() {
+        assert!(super::best_blocksync_peer(&std::collections::HashMap::new(), 0).is_none());
+    }
+
+    /// The exact production shape: one block behind, so ask for exactly one block.
+    #[test]
+    fn a_one_block_gap_requests_one_block() {
+        assert_eq!(super::blocksync_request_count(26261, 26262), 1);
+    }
+
+    /// A long catch-up is capped per request, not truncated to nothing and not asked for in one
+    /// enormous batch that would blow the response size limit. From tip 0 the first signing group is
+    /// `1..=EPOCH_LENGTH`, which is exactly one full batch.
+    #[test]
+    fn a_long_gap_is_capped_to_one_batch() {
+        assert_eq!(
+            super::blocksync_request_count(0, 26_262),
+            super::MAX_BLOCKSYNC_BATCH
+        );
+    }
+
+    /// A request must stop at the validator-set rotation that follows our tip, even when the flat
+    /// batch cap would allow more and the peer has far more to give. Getting this wrong is silent:
+    /// the batch arrives, is checked against a set that never signed its tip, and honest blocks are
+    /// rejected — a node that can never catch up while every individual check looks correct.
+    #[test]
+    fn a_request_stops_at_the_next_validator_set_rotation() {
+        let epoch = helix_consensus::EPOCH_LENGTH;
+        // Tip mid-epoch: blocks (200, 300] share one signing set, so from 262 we may ask for 300−262+1.
+        let our_tip = 2 * epoch + 62; // 262
+        let count = super::blocksync_request_count(our_tip, our_tip + 5_000);
+        assert_eq!(u64::from(count), (3 * epoch) - our_tip, "must stop at the boundary at 3·L");
+        assert_eq!(our_tip + u64::from(count), 3 * epoch, "last requested block is the boundary itself");
+        assert!(u64::from(count) < epoch, "and is therefore shorter than a full batch");
+    }
+
+    /// Sitting exactly on a boundary, the next group is a full epoch and may be requested whole —
+    /// the boundary rule must not permanently shorten every request.
+    #[test]
+    fn sitting_on_a_boundary_allows_a_full_batch() {
+        let epoch = helix_consensus::EPOCH_LENGTH;
+        let count = super::blocksync_request_count(3 * epoch, 10 * epoch);
+        assert_eq!(u64::from(count), epoch);
+        assert_eq!(3 * epoch + u64::from(count), 4 * epoch);
+    }
+
+    /// The production shape once more, now against the boundary rule: one block behind, mid-epoch,
+    /// asks for exactly that one block and does not get widened to the boundary.
+    #[test]
+    fn a_one_block_gap_is_not_widened_by_the_boundary_rule() {
+        assert_eq!(super::blocksync_request_count(26_261, 26_262), 1);
+    }
+
+    /// Not behind means nothing to ask for. Guards the underflow too: subtracting a larger tip from
+    /// a smaller one must not wrap around into a gigantic request.
+    #[test]
+    fn being_level_or_ahead_requests_nothing() {
+        assert_eq!(super::blocksync_request_count(100, 100), 0);
+        assert_eq!(super::blocksync_request_count(100, 90), 0);
     }
 
     #[test]
