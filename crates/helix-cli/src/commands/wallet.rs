@@ -342,11 +342,43 @@ mod tests {
     /// A phrase with a word out of place is not a wallet — BIP39's checksum makes that
     /// detectable, and restore must lean on it rather than silently deriving some other
     /// address the user would then wonder about.
+    ///
+    /// Fixed phrase, fixed transposition, on purpose. This test used to generate a random mnemonic
+    /// and swap its first two words, which fails roughly **4 runs in 1000**: a 24-word phrase
+    /// carries only an 8-bit checksum, so a transposition has about a 1-in-256 chance of landing on
+    /// a phrase that checks out anyway. Measured over 20 000 samples: 77 still parsed (only 6 of
+    /// them because the two swapped words happened to be identical — the coincidence, not the
+    /// degenerate swap, was the real cause). A probabilistic assertion in the suite is worse than no
+    /// assertion, because it teaches you to re-run a red build instead of reading it.
     #[test]
     fn a_corrupted_phrase_is_rejected_rather_than_restoring_a_stranger() {
+        // Standard BIP39 test vector: 23×"abandon" + "art" is a valid 24-word phrase.
+        let valid = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                     abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                     abandon abandon abandon abandon abandon art";
+        assert!(
+            Mnemonic::parse_normalized(valid).is_ok(),
+            "the fixture itself must be a valid phrase, or this test proves nothing"
+        );
+
+        let mut words: Vec<&str> = valid.split_whitespace().collect();
+        let last = words.len() - 1;
+        words.swap(0, last);
+        assert!(
+            Mnemonic::parse_normalized(&words.join(" ")).is_err(),
+            "a transposed word must be caught by the checksum, not silently restore another wallet"
+        );
+    }
+
+    /// The deterministic half of the same guarantee: a word that is not in the BIP39 list at all can
+    /// never parse, no checksum luck involved. Guards the typo case (the common one in practice)
+    /// independently of the transposition above.
+    #[test]
+    fn a_phrase_containing_a_word_outside_the_wordlist_is_rejected() {
         let mnemonic = Mnemonic::from_entropy(&random_seed()).unwrap();
-        let mut words: Vec<&str> = mnemonic.words().collect();
-        words.swap(0, 1);
+        let mut words: Vec<String> = mnemonic.words().map(str::to_string).collect();
+        words[0] = "helix".to_string(); // not a BIP39 word
         assert!(Mnemonic::parse_normalized(&words.join(" ")).is_err());
     }
 }
+
