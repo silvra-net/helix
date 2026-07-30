@@ -18,7 +18,7 @@ use helix_executor::{
 use helix_mempool::Mempool;
 use helix_p2p::{
     config::P2PConfig,
-    service::{P2PCommand, P2PEvent, P2PService},
+    service::{P2PCommand, P2PEvent, P2PService, MAX_CATCHUP_SERVE_BLOCKS},
 };
 use helix_rpc::server::{start_rpc_server, AppState};
 use helix_rpc::TipCertificate;
@@ -315,6 +315,11 @@ pub struct HelixNode {
     syncing: Arc<std::sync::atomic::AtomicBool>,
     /// Tip the startup sync is working towards, 0 when unknown. Purely informational.
     sync_target_height: Arc<std::sync::atomic::AtomicU64>,
+    /// The committed tip height this node announces on the peer-exchange gossip, so peers can see
+    /// they are behind us and be served the blocks they are missing (#137). Shared with
+    /// [`P2PService`], which reads it on every announcement; written here at startup, after the
+    /// initial sync, and by `publish_tip_certificate` at every commit.
+    announced_tip_height: Arc<std::sync::atomic::AtomicU64>,
     /// Where this node's double-sign high-water mark lives — next to `validator-key.json`. Loaded
     /// into a [`SigningGuard`] in `run()`. See `signing_guard` for why the protection sits on the
     /// broadcast path rather than in the consensus engine.
@@ -565,7 +570,15 @@ impl HelixNode {
         // Captured before `p2p_config` is moved into the service — surfaced via `/status` so
         // syncing peers dial this announced address directly (see `resolve_seed_peer_multiaddr`).
         let p2p_public_addr = p2p_config.public_addr.clone();
-        let (p2p_service, p2p_command_tx, p2p_event_rx) = P2PService::new(p2p_config);
+        // Seeded from the store's real tip, not 0 (#137). A restart must announce the height it
+        // actually holds from its very first peer-exchange broadcast — a node that announced 0
+        // until its first commit would be written off as "hopelessly behind" and refused a serve
+        // by `should_serve_catchup`, which is exactly the node that needs one: a stalled validator
+        // never reaches a commit to correct the number.
+        let announced_tip_height =
+            Arc::new(std::sync::atomic::AtomicU64::new(store.latest_height()));
+        let (p2p_service, p2p_command_tx, p2p_event_rx) =
+            P2PService::new(p2p_config, announced_tip_height.clone());
 
         let rpc_bind = resolve_rpc_bind(&cfg)?;
 
@@ -597,6 +610,7 @@ impl HelixNode {
             // "synced" before checking would be the same lie the old hardcoded `false` told.
             syncing: Arc::new(std::sync::atomic::AtomicBool::new(has_sync_peer)),
             sync_target_height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            announced_tip_height,
             signing_state_path,
         })
     }
@@ -684,6 +698,31 @@ impl HelixNode {
             }
             self.syncing.store(false, std::sync::atomic::Ordering::Relaxed);
         }
+
+        // Keep the tip height announced to peers (#137) in step with the store.
+        //
+        // On a timer reading the store, deliberately, rather than pushed from each of the paths
+        // that commit a block. Those are three (the `apply_finalized_block` funnel, the P2P
+        // gap-fill, the RPC catch-up loop) plus the bulk startup sync, and a copy of this
+        // assignment in each is a copy that can be forgotten when a fourth path appears — the
+        // duplicated-invariant trap, where the omission looks like nothing at all until a node
+        // silently announces a stale height and is refused the blocks it needs. Reading the store
+        // cannot drift from the store no matter who wrote to it.
+        //
+        // Well below the 30-second announcement interval, so the value a peer receives is never
+        // meaningfully behind; one cheap height read per tick.
+        tokio::spawn({
+            let store = self.store.clone();
+            let announced_tip_height = self.announced_tip_height.clone();
+            async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    let tip = store.read().await.latest_height();
+                    announced_tip_height.store(tip, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
 
         // Spawn P2P service
         let p2p_service = self.p2p_service.take().unwrap();
@@ -1073,6 +1112,34 @@ async fn handle_p2p_event(
                         );
                         return;
                     }
+                    // BFT quorum gate (audit A1). The three checks above prove the block is
+                    // well-formed, authored by an in-set validator, and builds on our tip — none of
+                    // them proves 2/3 of the set actually finalized it. `TOPIC_COMMITTED_BLOCKS` is
+                    // public, so without this a single Byzantine validator could self-sign a block
+                    // it alone stands behind, gossip it here, and fork every receiver off the real
+                    // chain — the exact guarantee BFT is supposed to hold at f < N/3. Require the
+                    // accompanying certificate to carry precommits summing to quorum for *this*
+                    // block before adopting it. The certificate is untrusted wire data; every
+                    // signature in it is re-verified against the current set (`precommits_reach_quorum`).
+                    let has_quorum = {
+                        let eng = engine.read().await;
+                        let set = eng.validator_set();
+                        // Bootstrap window: before the network's first `Stake` tx there is no staked
+                        // power to form a quorum from — the only producer is the genesis/self-fallback
+                        // validator, and the `is_known_validator` check above is the only gate that
+                        // can apply. Once real stake exists this reduces to the strict quorum check.
+                        // Same window `sync_blocks_from_peer` handles via `stakers().is_empty()`.
+                        set.total_voting_power() == 0
+                            || set.precommits_reach_quorum(&commit_certificate, block_height, &block.hash())
+                    };
+                    if !has_quorum {
+                        warn!(
+                            height = block_height,
+                            validator = %block.header.validator,
+                            "Committed block from peer carries no quorum certificate — dropping (not proven final)"
+                        );
+                        return;
+                    }
                     info!(height = block_height, "Applying committed block from peer");
                     // `None`, same reasoning as the NewProposal/NewVote arms above: this
                     // block came from a peer, not our own block_production_loop, so our
@@ -1090,6 +1157,103 @@ async fn handle_p2p_event(
         P2PEvent::PeerDisconnected(_) => {
             peer_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
+        P2PEvent::PeerBehind { peer_tip } => {
+            serve_catchup_blocks(peer_tip, store, tip_certificate, p2p_tx).await;
+        }
+    }
+}
+
+/// Re-broadcast the committed blocks a peer that announced `peer_tip` is missing, each with the
+/// commit certificate that finalized it, so it can adopt them through the ordinary
+/// committed-blocks fast path (#137).
+///
+/// Why this exists at all: `BroadcastBlock` fires exactly once, at the moment of commit. A peer
+/// whose link is down in that instant never hears of the block again — there is no request
+/// protocol to ask for it, and the `NewCommittedBlock` gap-fill branch needs both a gap of two or
+/// more *and* an operator-configured `sync_peer`. A validator one block behind therefore had no
+/// route back at all, and being part of the quorum it took the whole chain down with it: it could
+/// not advance without the block, and the block could not be superseded without its vote. That is
+/// the 14.5-hour production stall of 2026-07-29, and the reason it survived a restart and full
+/// reconnection of every peer.
+///
+/// Safe against a lying `peer_tip` by construction. The height only ever selects which of *our own
+/// already-committed* blocks we upload; the receiver re-verifies each one from scratch (proposer
+/// signature, known validator, `prev_hash`, and the certificate's quorum), so nothing here can put
+/// a block into anyone's chain that the fast path would not have accepted anyway. The volume is
+/// bounded twice — by `should_serve_catchup` before the event is emitted, and by
+/// [`MAX_CATCHUP_SERVE_BLOCKS`] again here.
+async fn serve_catchup_blocks(
+    peer_tip: u64,
+    store: &Arc<RwLock<HelixDb>>,
+    tip_certificate: &Arc<RwLock<TipCertificate>>,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
+) {
+    let our_tip = store.read().await.latest_height();
+    if peer_tip >= our_tip {
+        return; // caught up (or ahead) since the announcement — nothing to serve
+    }
+    let last = our_tip.min(peer_tip + MAX_CATCHUP_SERVE_BLOCKS);
+
+    for height in (peer_tip + 1)..=last {
+        let block = match store.read().await.get_block_by_height(height) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(height, err = %e, "Cannot serve catch-up block — not in our store");
+                return;
+            }
+        };
+        let certificate = catchup_certificate(&block, our_tip, store, tip_certificate).await;
+        // Stop at the first block we cannot certify rather than skipping it. The receiver applies
+        // the fast path strictly in sequence (anything above `our_height + 1` is a gap it cannot
+        // fill without a `sync_peer`), so a hole makes every block after it useless — and sending
+        // an uncertified block would just have it dropped by the receiver's quorum gate, which is
+        // exactly the check that keeps this path from becoming a fork vector.
+        if certificate.is_empty() {
+            debug!(
+                height,
+                "No commit certificate available for this block — ending catch-up serve here"
+            );
+            return;
+        }
+        if p2p_tx.send(P2PCommand::BroadcastBlock(block, certificate)).await.is_err() {
+            return; // P2P service gone; the node is shutting down
+        }
+        info!(height, peer_tip, "Serving a peer the committed block it is missing");
+    }
+}
+
+/// The commit certificate for one of our stored blocks, as precommit votes, or empty when we hold
+/// none for it.
+///
+/// Two sources, because a chain stores the certificate for block `h` in block `h + 1`'s header:
+/// every block below our tip is certified by its successor's `last_commit`, while the tip itself
+/// has no successor yet and is certified only by the live cell that #133/#134 maintain. The tip is
+/// the interesting case — it is the block a peer one behind actually needs.
+async fn catchup_certificate(
+    block: &Block,
+    our_tip: u64,
+    store: &Arc<RwLock<HelixDb>>,
+    tip_certificate: &Arc<RwLock<TipCertificate>>,
+) -> Vec<Vote> {
+    let height = block.height();
+    let block_hash = block.hash();
+
+    if height < our_tip {
+        return match store.read().await.get_block_by_height(height + 1) {
+            Ok(successor) => {
+                commit_sigs_to_votes(successor.header.last_commit.clone(), height, block_hash)
+            }
+            Err(_) => Vec::new(),
+        };
+    }
+
+    // The tip: only the live cell can certify it. Match on both height and hash — a certificate
+    // for a different block is worse than none, and the receiver would reject it anyway.
+    let cert = tip_certificate.read().await;
+    if cert.height == height && cert.block_hash == block_hash.to_hex() {
+        commit_sigs_to_votes(cert.signatures.clone(), height, block_hash)
+    } else {
+        Vec::new()
     }
 }
 
@@ -3601,6 +3765,10 @@ mod handle_p2p_event_tests {
         let validator_kp = KeyPair::generate();
         let validator_addr = Address::from_public_key(&validator_kp.public);
         let block = signed_block(&validator_kp, 1, Hash::ZERO);
+        // Quorum gate (audit A1): the block is adopted only with a certificate proving quorum.
+        // A single-validator set reaches quorum on that validator's own precommit.
+        let block_hash = block.hash();
+        let cert = commit_sigs_to_votes(tip_commit_sigs(1, block_hash, &[&validator_kp]), 1, block_hash);
 
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let peer_count = Arc::new(AtomicUsize::new(0));
@@ -3614,7 +3782,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
 
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(block, vec![]),
+            P2PEvent::NewCommittedBlock(block, cert),
             &mempool,
             &peer_count,
             &store,
@@ -3632,6 +3800,248 @@ mod handle_p2p_event_tests {
         let state = chain_state.read().await;
         assert!(state.get(&validator_addr).unwrap().balance > 0, "block reward must land on the actual block validator");
         assert!(state.get(&Address::from_public_key(&own_kp.public)).is_none(), "our own address never participated and must not receive anything");
+    }
+
+    /// Audit A1: a committed block from a real in-set validator, correctly signed, building on our
+    /// tip is STILL dropped if its accompanying certificate does not prove quorum. This is the fork
+    /// defense — `TOPIC_COMMITTED_BLOCKS` is public, so a single Byzantine validator must not be
+    /// able to gossip a block it alone stands behind and have receivers adopt it. Two-validator set,
+    /// certificate carrying only one of the two precommits (below the 2/3 threshold): must not apply.
+    #[tokio::test]
+    async fn new_committed_block_without_quorum_certificate_is_dropped() {
+        let proposer_kp = KeyPair::generate();
+        let proposer_addr = Address::from_public_key(&proposer_kp.public);
+        let other_kp = KeyPair::generate();
+        let other_addr = Address::from_public_key(&other_kp.public);
+
+        // Block built by an in-set validator on the fresh store's tip (Hash::ZERO) — passes the
+        // signature, membership, and prev_hash checks, so only the quorum gate can stop it.
+        let block = signed_block(&proposer_kp, 1, Hash::ZERO);
+        let block_hash = block.hash();
+        // Certificate with only the proposer's own precommit: 1 of 2, below quorum.
+        let lone_cert = commit_sigs_to_votes(tip_commit_sigs(1, block_hash, &[&proposer_kp]), 1, block_hash);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let peer_count = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+
+        // Two equal-stake validators, so a lone precommit is genuinely below the 2/3 threshold.
+        let validator_set = ValidatorSet::new(
+            vec![
+                Validator::new(proposer_addr.clone(), 1_000_000, true),
+                Validator::new(other_addr, 1_000_000, true),
+            ],
+            0,
+        );
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, proposer_addr.clone(), 0)));
+        let own_kp = KeyPair::generate();
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
+
+        handle_p2p_event(
+            P2PEvent::NewCommittedBlock(block, lone_cert),
+            &mempool,
+            &peer_count,
+            &store,
+            &chain_state,
+            &engine,
+            &own_kp,
+            &p2p_tx,
+            &None,
+            &Arc::new(Mutex::new(0)),
+            &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            &Arc::new(RwLock::new(TipCertificate::default())),
+        )
+        .await;
+
+        // Dropped: no quorum, so never applied (height unchanged) and nothing broadcast.
+        assert_eq!(store.read().await.latest_height(), 0, "a block without a quorum certificate must not be adopted");
+        assert!(chain_state.read().await.get(&proposer_addr).is_none(), "no reward minted for an unproven block");
+        assert!(p2p_rx.try_recv().is_err());
+    }
+
+    /// Blocks that properly chain from `Hash::ZERO` (a fresh store's tip) through each other.
+    fn chained_blocks(kp: &KeyPair, heights: &[u64]) -> Vec<Block> {
+        let mut prev_hash = Hash::ZERO;
+        heights
+            .iter()
+            .map(|&h| {
+                let block = signed_block(kp, h, prev_hash);
+                prev_hash = block.hash();
+                block
+            })
+            .collect()
+    }
+
+    /// Puts `blocks` into a fresh store and returns it alongside a tip-certificate cell holding a
+    /// quorum certificate for the last one — the state a node is in after committing them.
+    async fn store_with_chain(
+        kp: &KeyPair,
+        blocks: &[Block],
+    ) -> (Arc<RwLock<HelixDb>>, Arc<RwLock<TipCertificate>>) {
+        let store = Arc::new(RwLock::new(fresh_store()));
+        for b in blocks {
+            store.write().await.put_block(b.clone()).unwrap();
+        }
+        let tip = blocks.last().unwrap();
+        let cell = Arc::new(RwLock::new(TipCertificate {
+            height: tip.height(),
+            block_hash: tip.hash().to_hex(),
+            signatures: tip_commit_sigs(tip.height(), tip.hash(), &[kp]),
+        }));
+        (store, cell)
+    }
+
+    /// Drives a `PeerBehind` event through `handle_p2p_event` and collects whatever it broadcast.
+    async fn blocks_served_to_peer_at(
+        peer_tip: u64,
+        store: &Arc<RwLock<HelixDb>>,
+        tip_certificate: &Arc<RwLock<TipCertificate>>,
+    ) -> Vec<(u64, usize)> {
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(64);
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let engine = Arc::new(RwLock::new(BftEngine::new(
+            ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0),
+            addr,
+            0,
+        )));
+
+        handle_p2p_event(
+            P2PEvent::PeerBehind { peer_tip },
+            &Arc::new(RwLock::new(Mempool::new())),
+            &Arc::new(AtomicUsize::new(0)),
+            store,
+            &Arc::new(RwLock::new(ChainState::new(0))),
+            &engine,
+            &kp,
+            &p2p_tx,
+            &None,
+            &Arc::new(Mutex::new(0)),
+            &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            tip_certificate,
+        )
+        .await;
+
+        let mut served = Vec::new();
+        while let Ok(cmd) = p2p_rx.try_recv() {
+            if let P2PCommand::BroadcastBlock(b, cert) = cmd {
+                served.push((b.height(), cert.len()));
+            }
+        }
+        served
+    }
+
+    /// The production incident of 2026-07-29, as a test (#137). A peer sits exactly one block
+    /// behind us; that block is our tip, so its certificate exists *only* in the live cell (no
+    /// successor block carries it yet). Before this path existed the peer had no way to obtain it —
+    /// the one-shot commit broadcast was long gone, gap-fill needs a gap of two and a `sync_peer` —
+    /// and since it was part of the quorum, the chain stopped with it for 14.5 hours.
+    #[tokio::test]
+    async fn a_peer_one_block_behind_is_served_our_tip_with_its_certificate() {
+        let kp = KeyPair::generate();
+        let blocks = chained_blocks(&kp, &[1]);
+        let (store, cell) = store_with_chain(&kp, &blocks).await;
+
+        let served = blocks_served_to_peer_at(0, &store, &cell).await;
+
+        assert_eq!(
+            served,
+            vec![(1, 1)],
+            "the tip must be served, carrying the certificate from the live cell"
+        );
+    }
+
+    /// Negative control for the certificate sourcing, so the test above cannot pass vacuously: with
+    /// the cell empty we hold no certificate for our tip, and serving an uncertified block would
+    /// only get it dropped by the receiver's quorum gate. Nothing must go out.
+    #[tokio::test]
+    async fn a_tip_we_hold_no_certificate_for_is_not_served() {
+        let kp = KeyPair::generate();
+        let blocks = chained_blocks(&kp, &[1]);
+        let (store, _) = store_with_chain(&kp, &blocks).await;
+        let empty_cell = Arc::new(RwLock::new(TipCertificate::default()));
+
+        let served = blocks_served_to_peer_at(0, &store, &empty_cell).await;
+
+        assert!(served.is_empty(), "without a certificate there is nothing worth sending");
+    }
+
+    /// A certificate for a *different* block than our tip must not be attached to it. The cell is
+    /// updated at every commit, so a mismatch means it is stale — treat it as absent rather than
+    /// pairing a block with someone else's proof.
+    #[tokio::test]
+    async fn a_stale_tip_certificate_is_not_attached_to_the_tip() {
+        let kp = KeyPair::generate();
+        let blocks = chained_blocks(&kp, &[1]);
+        let (store, _) = store_with_chain(&kp, &blocks).await;
+        let wrong_hash = Hash::digest(b"some other block");
+        let stale = Arc::new(RwLock::new(TipCertificate {
+            height: 1,
+            block_hash: wrong_hash.to_hex(),
+            signatures: tip_commit_sigs(1, wrong_hash, &[&kp]),
+        }));
+
+        let served = blocks_served_to_peer_at(0, &store, &stale).await;
+
+        assert!(served.is_empty(), "a certificate for another block must not be served as ours");
+    }
+
+    /// Blocks below the tip are certified by their successor's `last_commit`, not by the live cell —
+    /// so a peer several blocks behind gets each of them with the right proof. Proves both
+    /// certificate sources work in one sweep, and that they are served oldest-first (the receiver's
+    /// fast path only accepts `our_height + 1`, so order is not cosmetic).
+    #[tokio::test]
+    async fn blocks_below_the_tip_are_served_with_the_certificate_from_their_successor() {
+        let kp = KeyPair::generate();
+        let mut blocks = chained_blocks(&kp, &[1, 2, 3]);
+        // Stamp each block with the certificate for its predecessor, exactly as a real proposer
+        // does — this is what makes a stored block below the tip certifiable at all.
+        for i in 1..blocks.len() {
+            let prev_height = blocks[i - 1].height();
+            let prev_hash = blocks[i - 1].hash();
+            blocks[i].header.last_commit = tip_commit_sigs(prev_height, prev_hash, &[&kp]);
+        }
+        let (store, cell) = store_with_chain(&kp, &blocks).await;
+
+        let served = blocks_served_to_peer_at(0, &store, &cell).await;
+
+        assert_eq!(
+            served,
+            vec![(1, 1), (2, 1), (3, 1)],
+            "every missing block, oldest first, each with a non-empty certificate"
+        );
+    }
+
+    /// The serve stops at the first block it cannot certify instead of skipping it. The receiver
+    /// applies the fast path strictly in sequence, so a hole makes everything after it unusable —
+    /// and here block 2 carries no `last_commit`, leaving block 1 uncertifiable.
+    #[tokio::test]
+    async fn the_serve_stops_at_the_first_block_it_cannot_certify() {
+        let kp = KeyPair::generate();
+        let blocks = chained_blocks(&kp, &[1, 2]);
+        let (store, cell) = store_with_chain(&kp, &blocks).await;
+
+        let served = blocks_served_to_peer_at(0, &store, &cell).await;
+
+        assert!(
+            served.is_empty(),
+            "block 1 has no certificate (block 2 carries no last_commit), so the serve must stop \
+             there rather than skipping ahead to the certifiable tip"
+        );
+    }
+
+    /// A peer that is ahead of us, or level with us, has nothing to receive. Guards the direction of
+    /// the comparison at the handler level, where a slip would have every healthy node broadcasting
+    /// its tip at every other node forever.
+    #[tokio::test]
+    async fn a_peer_that_is_not_behind_is_served_nothing() {
+        let kp = KeyPair::generate();
+        let blocks = chained_blocks(&kp, &[1]);
+        let (store, cell) = store_with_chain(&kp, &blocks).await;
+
+        assert!(blocks_served_to_peer_at(1, &store, &cell).await.is_empty(), "level: nothing to send");
+        assert!(blocks_served_to_peer_at(9, &store, &cell).await.is_empty(), "ahead: nothing to send");
     }
 
     /// A block from a real, staked validator with a signature that checks out is

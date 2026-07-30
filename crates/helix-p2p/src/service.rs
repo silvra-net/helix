@@ -1,6 +1,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use libp2p::{
@@ -38,6 +40,22 @@ pub enum P2PEvent {
     NewCommittedBlock(Block, Vec<Vote>),
     PeerConnected(String),
     PeerDisconnected(String),
+    /// A peer announced, on the periodic peer-exchange gossip, a committed tip *below* ours and
+    /// close enough behind to be worth serving over gossip. The node layer answers by
+    /// re-broadcasting the committed blocks that peer is missing, each with its commit
+    /// certificate, on the committed-blocks topic.
+    ///
+    /// This is the recovery path whose absence stalled production for 14.5 hours on 2026-07-29
+    /// (#137): a `NewCommittedBlock` broadcast fires exactly once, at commit time, and a peer
+    /// whose link happens to be down in that instant never hears about the block again. There is
+    /// no way to ask for it — so the only catch-up route was an operator-configured RPC
+    /// `sync_peer`, which the origin node does not have. A validator that is part of the quorum
+    /// and one block behind then deadlocks the chain outright: it cannot advance without the
+    /// block, and the block cannot be superseded without its vote.
+    PeerBehind {
+        /// The committed height that peer announced. It needs `peer_tip + 1` onwards.
+        peer_tip: u64,
+    },
 }
 
 /// Commands sent TO the P2P network FROM the node
@@ -73,14 +91,26 @@ pub struct P2PService {
     config: P2PConfig,
     event_tx: mpsc::Sender<P2PEvent>,
     command_rx: mpsc::Receiver<P2PCommand>,
+    /// This node's committed tip height, announced on every peer-exchange broadcast so peers can
+    /// tell they are behind us (and we can tell we are behind them) without any new protocol.
+    ///
+    /// Deliberately a shared counter rather than a value the node pushes over `command_rx` and we
+    /// cache: a cached height is only as fresh as the last commit, and a node that is *stalled* —
+    /// precisely the node that needs serving — never commits again, so it would announce a stale
+    /// or zero tip forever and be refused as "too far behind" by `should_serve_catchup`. Reading
+    /// the store's real height cannot drift.
+    tip_height: Arc<AtomicU64>,
 }
 
 impl P2PService {
-    pub fn new(config: P2PConfig) -> (Self, mpsc::Sender<P2PCommand>, mpsc::Receiver<P2PEvent>) {
+    pub fn new(
+        config: P2PConfig,
+        tip_height: Arc<AtomicU64>,
+    ) -> (Self, mpsc::Sender<P2PCommand>, mpsc::Receiver<P2PEvent>) {
         let (event_tx, event_rx) = mpsc::channel(256);
         let (command_tx, command_rx) = mpsc::channel(256);
         (
-            P2PService { config, event_tx, command_rx },
+            P2PService { config, event_tx, command_rx, tip_height },
             command_tx,
             event_rx,
         )
@@ -91,6 +121,7 @@ impl P2PService {
         let event_tx = self.event_tx;
         let mut command_rx = self.command_rx;
         let config = self.config;
+        let tip_height = self.tip_height;
 
         let max_msg_size = config.max_message_size;
 
@@ -288,13 +319,20 @@ impl P2PService {
                             let topic = message.topic.as_str();
 
                             let malformed = if topic == TOPIC_PEER_EXCHANGE {
-                                handle_peer_exchange_message(
+                                let outcome = handle_peer_exchange_message(
                                     &message.data,
                                     &mut known_addrs,
                                     config.public_addr.as_deref(),
                                     &mut swarm,
                                     &mut warned_versions,
-                                )
+                                    tip_height.load(Ordering::Relaxed),
+                                );
+                                if let Some(peer_tip) = outcome.serve_from_tip {
+                                    let _ = event_tx
+                                        .send(P2PEvent::PeerBehind { peer_tip })
+                                        .await;
+                                }
+                                outcome.malformed
                             } else {
                                 handle_app_message(topic, &message.data, &event_tx).await
                             };
@@ -354,12 +392,24 @@ impl P2PService {
                             // Announce what we know right away too — don't make a freshly
                             // connected peer wait up to 30s for the periodic tick just to
                             // learn about other peers it could dial.
-                            broadcast_known_addrs(&mut swarm, &peer_exchange_topic, &known_addrs);
+                            broadcast_known_addrs(
+                                &mut swarm,
+                                &peer_exchange_topic,
+                                &known_addrs,
+                                tip_height.load(Ordering::Relaxed),
+                            );
 
                             let _ = event_tx.send(P2PEvent::PeerConnected(peer_str)).await;
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            debug!(peer = %peer_id, "Peer disconnected");
+                            // `info!`, matching "Peer connected" above — the asymmetry this
+                            // replaces (connect at `info!`, disconnect at `debug!`) is not
+                            // cosmetic. On 2026-07-29 a dropped link to one validator cost 14.5
+                            // hours of production downtime, and the disconnect that started it was
+                            // invisible: the outage had to be reconstructed backwards from the
+                            // *reconnect* lines, which were the only trace at the default log
+                            // level. A lost peer is exactly as newsworthy as a gained one.
+                            info!(peer = %peer_id, "Peer disconnected");
                             swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                             reputation.on_disconnect(&peer_id.to_string());
                             let _ = event_tx
@@ -371,7 +421,12 @@ impl P2PService {
                 }
 
                 _ = peer_exchange_interval.tick() => {
-                    broadcast_known_addrs(&mut swarm, &peer_exchange_topic, &known_addrs);
+                    broadcast_known_addrs(
+                        &mut swarm,
+                        &peer_exchange_topic,
+                        &known_addrs,
+                        tip_height.load(Ordering::Relaxed),
+                    );
 
                     // Redial the seeds while this node has no connection at all.
                     //
@@ -479,6 +534,25 @@ const MAX_KNOWN_PEER_ADDRS: usize = 200;
 /// version — the same reasoning the signed `node_version` block header relies on (#128).
 const OUR_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// How far behind a peer may be and still be served its missing blocks over gossip (#137).
+///
+/// Two jobs in one bound. It keeps the mechanism aimed at what it is for — healing the *small*,
+/// self-inflicted lag of a node that missed a one-shot commit broadcast, which is a handful of
+/// blocks at most — while a genuinely far-behind node (a fresh join, a long outage) still belongs
+/// on the bulk RPC sync path, where blocks are fetched in batches instead of splattered across a
+/// broadcast topic.
+///
+/// It is also the anti-amplification cap. The announced height is an unauthenticated number from
+/// the network: without a bound, one peer claiming `tip_height: 0` on a 26 000-block chain would
+/// have us republish the entire chain, every 30 seconds, to *every* peer. With it, the worst a
+/// lying announcement can extract is this many blocks per announcement — and claiming to be
+/// hopelessly behind (the cheap lie) buys nothing at all, because it fails the bound.
+/// Public so the node layer bounds its own serve loop against the *same* number rather than a
+/// second copy of it: the height in a [`P2PEvent::PeerBehind`] is peer-supplied, and re-checking it
+/// at the point where blocks are actually read and broadcast is what makes that loop safe on its
+/// own terms. One constant, two enforcement points — not two constants.
+pub const MAX_CATCHUP_SERVE_BLOCKS: u64 = 20;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PeerExchangeMsg {
     peers: Vec<String>,
@@ -488,6 +562,23 @@ struct PeerExchangeMsg {
     /// changes the topic's bincode payload — a coordinated upgrade, bundled with the release that
     /// already resets the chain.
     version: String,
+    /// The sender's committed tip height (#137). Purely informational — it can only ever make us
+    /// send blocks we have already committed, never influence what we accept: every block the
+    /// receiver takes back in is re-verified from scratch (proposer signature, known validator,
+    /// `prev_hash` chain, and the commit certificate's quorum). So a peer lying about its height
+    /// gains nothing but a bounded amount of our upload.
+    tip_height: u64,
+}
+
+/// Whether a peer announcing `peer_tip` should be served the blocks it is missing, given our own
+/// committed tip. Behind us, and by no more than [`MAX_CATCHUP_SERVE_BLOCKS`].
+///
+/// Split out as a pure function so the bound is testable without a `Swarm` — including the two
+/// cases that matter and are easy to get backwards: a peer *ahead* of us must never trigger a
+/// serve (we are the ones behind then, and we have nothing it needs), and a peer claiming an
+/// absurdly low height must be refused rather than served the whole chain.
+fn should_serve_catchup(peer_tip: u64, our_tip: u64) -> bool {
+    peer_tip < our_tip && our_tip - peer_tip <= MAX_CATCHUP_SERVE_BLOCKS
 }
 
 /// Merges `incoming` into `known`, skipping our own address and anything already known, and
@@ -533,20 +624,31 @@ fn foreign_version_warning(their: &str, ours: &str, warned: &mut HashSet<String>
     ))
 }
 
-/// Returns `true` if the message was malformed (i.e. the sender should be charged a
-/// misbehavior strike).
+/// What the caller has to act on after a peer-exchange message.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PeerExchangeOutcome {
+    /// The message was malformed — the sender should be charged a misbehavior strike.
+    malformed: bool,
+    /// The sender's announced tip, when it is behind us by a servable margin (#137). The caller
+    /// turns this into a [`P2PEvent::PeerBehind`]; `None` means nothing to serve.
+    serve_from_tip: Option<u64>,
+}
+
+/// Returns what the caller must act on: whether the sender misbehaved, and whether it is behind us
+/// and should be served the blocks it is missing.
 fn handle_peer_exchange_message(
     data: &[u8],
     known_addrs: &mut HashSet<String>,
     self_addr: Option<&str>,
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
     warned_versions: &mut HashSet<String>,
-) -> bool {
+    our_tip: u64,
+) -> PeerExchangeOutcome {
     let msg = match bincode::deserialize::<PeerExchangeMsg>(data) {
         Ok(m) => m,
         Err(e) => {
             warn!("Malformed peer-exchange message: {}", e);
-            return true;
+            return PeerExchangeOutcome { malformed: true, serve_from_tip: None };
         }
     };
 
@@ -567,7 +669,25 @@ fn handle_peer_exchange_message(
             }
         }
     }
-    false
+
+    // The other direction of the same comparison: a peer ahead of us means *we* are missing
+    // blocks. We cannot pull them (there is no request protocol — that is the remaining half of
+    // #137), but saying so out loud is the difference between an operator seeing "my node is
+    // behind and the network moved on" and seeing nothing at all, which is what a stalled node
+    // looked like from the outside for 14.5 hours. `debug!`, not `warn!`: while a node is doing a
+    // normal bulk sync this is true and unremarkable on every tick.
+    if msg.tip_height > our_tip {
+        debug!(
+            our_tip,
+            peer_tip = msg.tip_height,
+            "A peer reports a higher committed tip than ours — this node is behind"
+        );
+    }
+
+    PeerExchangeOutcome {
+        malformed: false,
+        serve_from_tip: should_serve_catchup(msg.tip_height, our_tip).then_some(msg.tip_height),
+    }
 }
 
 /// Publishes our full current `known_addrs` set on the peer-exchange topic, stamped with our
@@ -578,10 +698,12 @@ fn broadcast_known_addrs(
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
     topic: &gossipsub::IdentTopic,
     known_addrs: &HashSet<String>,
+    tip_height: u64,
 ) {
     let msg = PeerExchangeMsg {
         peers: known_addrs.iter().cloned().collect(),
         version: OUR_VERSION.to_string(),
+        tip_height,
     };
     if let Ok(data) = bincode::serialize(&msg) {
         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
@@ -672,8 +794,62 @@ mod multiaddr_ip_tests {
 
 #[cfg(test)]
 mod peer_exchange_tests {
-    use super::{foreign_version_warning, select_new_addrs, MAX_KNOWN_PEER_ADDRS};
+    use super::{
+        foreign_version_warning, select_new_addrs, should_serve_catchup, MAX_CATCHUP_SERVE_BLOCKS,
+        MAX_KNOWN_PEER_ADDRS,
+    };
     use std::collections::HashSet;
+
+    /// The production incident in one assertion (#137): a validator one block behind the rest of
+    /// the set. Before this mechanism existed there was no way for it to ever obtain that block,
+    /// and because it was part of the quorum the whole chain stopped with it.
+    #[test]
+    fn a_peer_one_block_behind_is_served() {
+        assert!(should_serve_catchup(26261, 26262));
+    }
+
+    /// The direction that must stay silent. When the peer is ahead, *we* are the ones missing
+    /// blocks — serving would mean broadcasting blocks it already has, and an off-by-one here
+    /// would have every node in a healthy set spraying its tip at every other node forever.
+    #[test]
+    fn a_peer_ahead_of_us_is_never_served() {
+        assert!(!should_serve_catchup(26263, 26262));
+    }
+
+    #[test]
+    fn a_peer_at_our_own_height_is_never_served() {
+        assert!(!should_serve_catchup(26262, 26262));
+    }
+
+    /// The anti-amplification bound. `tip_height` arrives unauthenticated over gossip, so the
+    /// cheapest lie — "I have nothing, send me everything" — must be the one that gains least.
+    #[test]
+    fn a_peer_claiming_to_be_hopelessly_behind_is_refused() {
+        assert!(
+            !should_serve_catchup(0, 26262),
+            "a peer claiming height 0 on a long chain must not make us republish the chain"
+        );
+    }
+
+    #[test]
+    fn the_serve_bound_is_inclusive_at_its_edge_and_refuses_beyond_it() {
+        let our_tip = 26262;
+        assert!(
+            should_serve_catchup(our_tip - MAX_CATCHUP_SERVE_BLOCKS, our_tip),
+            "exactly at the bound must still be served"
+        );
+        assert!(
+            !should_serve_catchup(our_tip - MAX_CATCHUP_SERVE_BLOCKS - 1, our_tip),
+            "one past the bound belongs on the bulk RPC sync path"
+        );
+    }
+
+    /// A fresh node with an empty store announces 0 and must not be treated as "behind" by another
+    /// fresh node — otherwise two empty nodes would serve each other nothing, noisily.
+    #[test]
+    fn two_nodes_at_genesis_do_not_serve_each_other() {
+        assert!(!should_serve_catchup(0, 0));
+    }
 
     #[test]
     fn a_matching_version_never_warns() {

@@ -5,7 +5,7 @@ pub mod service;
 
 pub use config::P2PConfig;
 pub use reputation::PeerReputation;
-pub use service::{P2PCommand, P2PEvent, P2PService};
+pub use service::{P2PCommand, P2PEvent, P2PService, MAX_CATCHUP_SERVE_BLOCKS};
 
 use thiserror::Error;
 
