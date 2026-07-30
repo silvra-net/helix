@@ -107,6 +107,13 @@ const META_GENESIS_VALIDATOR_STAKE: &str = "genesis_validator_stake";
 /// Height of the block whose execution produced the persisted state — see
 /// `ChainState::applied_height`. Written in the same transaction as the state itself.
 const META_APPLIED_HEIGHT: &str = "applied_height";
+/// Opaque serialized tip commit certificate (#134). The tip's certificate lives only in the live
+/// engine until block tip+1 is produced, so it is the one certificate a restarted node cannot
+/// reconstruct from stored blocks. Mirroring it here on every commit lets the node reload it at
+/// startup and serve `/sync/tip-certificate` immediately, instead of returning `height: 0` for the
+/// one block-interval it takes to commit again. The bytes are opaque to storage — the node owns the
+/// format (`helix_rpc::TipCertificate`), which storage must not depend on.
+const META_TIP_CERTIFICATE: &str = "tip_certificate";
 
 /// Page cache redb is allowed to hold, in MiB, unless `HELIX_DB_CACHE_MB` says otherwise.
 ///
@@ -868,6 +875,33 @@ impl HelixDb {
             None => Ok(None),
         }
     }
+
+    /// Persist the opaque tip-certificate bytes (#134), overwriting the previous value. Called on
+    /// every commit alongside the in-memory cell so a restart can reload the tip's certificate
+    /// rather than briefly serving `height: 0` from `/sync/tip-certificate`. The bytes are the
+    /// node's serialized `TipCertificate`; storage treats them as an opaque blob.
+    pub fn save_tip_certificate(&self, bytes: &[u8]) -> StorageResult<()> {
+        let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
+        {
+            let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
+            meta.insert(META_TIP_CERTIFICATE, bytes)
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| StorageError::Db(e.to_string()))
+    }
+
+    /// Load the persisted tip-certificate bytes (#134), or `None` if none was ever written (a fresh
+    /// database, or a chain that predates this feature). The caller deserializes; malformed or
+    /// missing bytes fall back to an empty certificate, exactly the pre-#134 startup state.
+    pub fn load_tip_certificate(&self) -> StorageResult<Option<Vec<u8>>> {
+        let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
+        let meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
+        let value = meta
+            .get(META_TIP_CERTIFICATE)
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .map(|v| v.value().to_vec());
+        Ok(value)
+    }
 }
 
 impl BlockStore for HelixDb {
@@ -1209,6 +1243,41 @@ mod tests {
             HelixDb::open(&path).is_ok(),
             "the same directory must open cleanly once the first handle is dropped"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A persisted tip certificate must survive a restart (#134): the whole point is that a node
+    /// which just reopened its database can serve the real tip's certificate at
+    /// `/sync/tip-certificate` immediately, not `height: 0` until it commits again. Simulated by
+    /// dropping the handle (the restart) and reopening the same path.
+    ///
+    /// Positive control: the fresh database reads `None` *before* anything is written, so the
+    /// `Some(bytes)` after reopening proves the persisted value — not a default — is what came back.
+    #[test]
+    fn a_persisted_tip_certificate_survives_a_restart() {
+        let (db, path) = fresh_db();
+
+        // Fresh database: nothing persisted yet — this is the pre-#134 startup state.
+        assert_eq!(db.load_tip_certificate().unwrap(), None, "a fresh db holds no tip certificate");
+
+        let payload = b"opaque-serialized-tip-certificate".to_vec();
+        db.save_tip_certificate(&payload).unwrap();
+
+        // Drop the handle (the restart) and reopen the same directory.
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        assert_eq!(
+            db.load_tip_certificate().unwrap(),
+            Some(payload),
+            "the persisted tip certificate must reload byte-for-byte after a restart"
+        );
+
+        // Overwrite must replace, not append — the cell only ever holds the latest tip.
+        let newer = b"a-newer-tip-certificate".to_vec();
+        db.save_tip_certificate(&newer).unwrap();
+        assert_eq!(db.load_tip_certificate().unwrap(), Some(newer), "save overwrites the previous value");
+
+        drop(db);
         let _ = std::fs::remove_file(&path);
     }
 

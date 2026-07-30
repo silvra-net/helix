@@ -610,6 +610,9 @@ impl HelixNode {
         // plus the RPC catch-up loop once it seeds one. Starts empty: this node has no tip
         // certificate to offer until it has committed (or adopted) its first block.
         let tip_certificate = Arc::new(RwLock::new(TipCertificate::default()));
+        // Reload the last persisted tip certificate so a restart serves the real tip immediately
+        // rather than `height: 0` for the block-interval it takes to commit again (#134).
+        load_persisted_tip_certificate(&self.store, &tip_certificate).await;
 
         let rpc_state = AppState {
             store: self.store.clone(),
@@ -1025,7 +1028,7 @@ async fn handle_p2p_event(
                             }
                             // Surface the certificate we just adopted (if any) so a follower syncing
                             // from *this* node can obtain the tip's too (#133).
-                            publish_tip_certificate(engine, tip_certificate, new_height, new_hash).await;
+                            publish_tip_certificate(engine, tip_certificate, store, new_height, new_hash).await;
                             info!("Gap filled: applied {} blocks", n);
                         }
                         Ok(_) => {}
@@ -1290,6 +1293,7 @@ fn commit_sigs_to_votes(sigs: Vec<CommitSig>, height: u64, block_hash: Hash) -> 
 async fn publish_tip_certificate(
     engine: &Arc<RwLock<BftEngine>>,
     cell: &Arc<RwLock<TipCertificate>>,
+    store: &Arc<RwLock<HelixDb>>,
     height: u64,
     block_hash: Hash,
 ) {
@@ -1306,7 +1310,46 @@ async fn publish_tip_certificate(
             signature: v.signature.clone(),
         })
         .collect();
-    *cell.write().await = TipCertificate { height, block_hash: block_hash.to_hex(), signatures };
+    let cert = TipCertificate { height, block_hash: block_hash.to_hex(), signatures };
+    // Mirror the tip certificate to redb so a restart can reload it instead of serving `height: 0`
+    // from `/sync/tip-certificate` for the one block-interval it takes to commit again (#134).
+    // Best-effort: a failed persist only loses that startup convenience — the live cell below still
+    // reflects the true tip, and a consumer treats a stale/empty on-disk certificate exactly like
+    // the endpoint returning a non-matching height (falls back to empty, no regression).
+    match bincode::serialize(&cert) {
+        Ok(bytes) => {
+            if let Err(e) = store.read().await.save_tip_certificate(&bytes) {
+                warn!("Could not persist tip certificate at height {height}: {e}");
+            }
+        }
+        Err(e) => warn!("Could not serialize tip certificate at height {height}: {e}"),
+    }
+    *cell.write().await = cert;
+}
+
+/// Reload the persisted tip certificate (#134) into the in-memory cell at startup, so a freshly
+/// restarted node serves the real tip's certificate at `/sync/tip-certificate` immediately rather
+/// than `height: 0`. Missing or malformed bytes leave the cell at its empty default — exactly the
+/// pre-#134 startup state, no regression.
+async fn load_persisted_tip_certificate(
+    store: &Arc<RwLock<HelixDb>>,
+    cell: &Arc<RwLock<TipCertificate>>,
+) {
+    let bytes = match store.read().await.load_tip_certificate() {
+        Ok(Some(b)) => b,
+        Ok(None) => return,
+        Err(e) => {
+            warn!("Could not read persisted tip certificate: {e}");
+            return;
+        }
+    };
+    match bincode::deserialize::<TipCertificate>(&bytes) {
+        Ok(cert) => {
+            info!("Loaded persisted tip certificate for height {}", cert.height);
+            *cell.write().await = cert;
+        }
+        Err(e) => warn!("Ignoring malformed persisted tip certificate: {e}"),
+    }
 }
 
 /// Fetch a sync peer's tip certificate for exactly `(expected_height, expected_hash)` (#133), for
@@ -1614,7 +1657,7 @@ async fn apply_finalized_block(
     // `sync_to_externally_finalized_block` call above) — so `commit_certificate()` now holds the
     // precommits that carried exactly this block. This is the one certificate `/sync/blocks` cannot
     // serve, since the block that would embed it (tip+1) does not exist yet.
-    publish_tip_certificate(engine, tip_certificate, height, block_hash).await;
+    publish_tip_certificate(engine, tip_certificate, store, height, block_hash).await;
 
     { mempool.write().await.remove_committed(&tx_hashes); }
 
@@ -2585,7 +2628,7 @@ async fn rpc_sync_loop(
                 }
                 // Surface the adopted certificate (if any) so a follower syncing from this node can
                 // obtain the tip's certificate too (#133).
-                publish_tip_certificate(&engine, &tip_certificate, new_height, new_hash).await;
+                publish_tip_certificate(&engine, &tip_certificate, &store, new_height, new_hash).await;
                 info!(
                     applied,
                     height = new_height,
@@ -3461,6 +3504,46 @@ mod handle_p2p_event_tests {
             follower2.commit_certificate().is_empty(),
             "signatures that do not attest the synced tip are verified out, never adopted"
         );
+    }
+
+    /// #134, positive control with a built-in negative case. The tip-certificate cell is in-memory
+    /// (#133), so a restart would serve `height: 0` from `/sync/tip-certificate` for the one
+    /// block-interval it takes to commit again — unless the last certificate was persisted and
+    /// reloaded. This proves the reload path: a certificate written to redb (as `publish_tip_certificate`
+    /// now does on every commit) repopulates the cell at startup, byte-for-byte, so the node serves the
+    /// real tip immediately. The negative case — a fresh store with nothing persisted — must leave the
+    /// cell empty, proving the reload is what filled it, not some default.
+    #[tokio::test]
+    async fn a_restart_reloads_the_persisted_tip_certificate_into_the_cell() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let tip_height = 7u64;
+        let tip_hash = Hash::digest(b"persisted-tip-7");
+
+        // Negative case first: a fresh store holds nothing, so the reload must leave the cell empty
+        // — exactly the pre-#134 startup state, no false positive from a stray default.
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let cell = Arc::new(RwLock::new(TipCertificate::default()));
+        load_persisted_tip_certificate(&store, &cell).await;
+        assert_eq!(cell.read().await.height, 0, "a fresh store leaves the cell at its empty default");
+        assert!(cell.read().await.signatures.is_empty(), "no signatures reload from an empty store");
+
+        // Persist a real tip certificate the way `publish_tip_certificate` serializes it, then reload.
+        let cert = TipCertificate {
+            height: tip_height,
+            block_hash: tip_hash.to_hex(),
+            signatures: tip_commit_sigs(tip_height, tip_hash, &[&a, &b]),
+        };
+        let bytes = bincode::serialize(&cert).unwrap();
+        store.read().await.save_tip_certificate(&bytes).unwrap();
+
+        // A fresh cell (the restarted process) reloaded from the same store must hold the real tip.
+        let reloaded = Arc::new(RwLock::new(TipCertificate::default()));
+        load_persisted_tip_certificate(&store, &reloaded).await;
+        let got = reloaded.read().await;
+        assert_eq!(got.height, tip_height, "the reloaded cell serves the real tip height, not 0");
+        assert_eq!(got.block_hash, tip_hash.to_hex(), "the reloaded tip hash matches what was persisted");
+        assert_eq!(got.signatures.len(), 2, "both persisted precommits reload with the certificate");
     }
 
     /// The free-throwaway-keypair attack this fix closes: a validly self-signed
