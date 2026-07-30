@@ -1,5 +1,9 @@
-use helix_crypto::Address;
+use std::collections::HashSet;
+
+use helix_crypto::{Address, Hash};
 use serde::{Deserialize, Serialize};
+
+use crate::{Vote, VoteType};
 
 /// A single validator in the Helix PoS set
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,12 +32,17 @@ pub struct Validator {
 
 impl Validator {
     pub fn new(address: Address, stake: u64, has_personhood: bool) -> Self {
-        let voting_power = compute_voting_power(stake, has_personhood);
         Validator {
             address,
             stake,
             has_personhood,
-            voting_power,
+            // Placeholder until this validator is placed in a `ValidatorSet` (audit B3). Effective
+            // power depends on the *set's* total stake (the 1% cap), which a lone `Validator` cannot
+            // know — `ValidatorSet::new` is the single place that computes it, and it overwrites this
+            // for every member. Left at 0, never the raw stake, so an accidental read of an
+            // un-setted validator's power is an obvious zero rather than a plausible-looking
+            // uncapped number that silently overstates its weight.
+            voting_power: 0,
             probationary: false,
         }
     }
@@ -45,19 +54,6 @@ impl Validator {
             probationary: true,
             ..Validator::new(address, stake, has_personhood)
         }
-    }
-}
-
-/// Voting power formula:
-/// - With personhood: min(stake, 1% of total) — enforces decentralization
-/// - Without personhood: min(stake, 0.5% of total) — still participates but capped harder
-fn compute_voting_power(stake: u64, has_personhood: bool) -> u64 {
-    // Actual cap is applied relative to total stake in ValidatorSet
-    // This returns raw stake; ValidatorSet normalizes it
-    if has_personhood {
-        stake
-    } else {
-        stake / 2
     }
 }
 
@@ -103,6 +99,48 @@ impl ValidatorSet {
     pub fn quorum_threshold(&self) -> u64 {
         // BFT: 2/3 + 1 of total voting power
         self.total_voting_power() * 2 / 3 + 1
+    }
+
+    /// Total voting power of the **distinct, in-set** validators that cast a valid precommit for
+    /// exactly `(height, block_hash)` among `votes`. This is the tally `verify_last_commit` and
+    /// `verified_commit_certificate` deliberately omit: those prove each signature genuine, this
+    /// answers how much of the set's power stands behind the block.
+    ///
+    /// A vote counts only if it is a precommit for this exact `(height, block_hash)`, its signature
+    /// verifies, its validator is in this set, and that validator has not already been counted
+    /// (equivocation or a duplicate contributes its power once, never twice). A signer outside this
+    /// set contributes nothing — its power here is zero by definition, which is what makes this a
+    /// tally *this* set can trust.
+    pub fn precommit_power(&self, votes: &[Vote], height: u64, block_hash: &Hash) -> u64 {
+        let mut seen: HashSet<Address> = HashSet::new();
+        votes
+            .iter()
+            .filter(|v| {
+                v.vote_type == VoteType::Precommit
+                    && v.height == height
+                    && &v.block_hash == block_hash
+                    && v.verify_signature().is_ok()
+                    && seen.insert(v.validator.clone())
+            })
+            .filter_map(|v| self.get(&v.validator))
+            .map(|val| val.voting_power)
+            .sum()
+    }
+
+    /// True if `votes` proves BFT finality for `(height, block_hash)`: the in-set precommit signers
+    /// among them sum to at least [`quorum_threshold`](Self::quorum_threshold). This is the gate a
+    /// node must apply before adopting an *externally* finalized block (the committed-block gossip
+    /// fast path, and any RPC catch-up that adopts a tip on a peer's word) — a proposer's own
+    /// self-consistent signature proves authorship, never that 2/3 of the set finalized the block.
+    /// Without it a single Byzantine validator can gossip a block it alone signed and fork every
+    /// receiver off the real chain.
+    pub fn precommits_reach_quorum(&self, votes: &[Vote], height: u64, block_hash: &Hash) -> bool {
+        // An empty set has a quorum threshold of 1 and no members to meet it, so nothing can ever
+        // reach quorum against it — reject rather than divide the network on a vacuous certificate.
+        if self.total_voting_power() == 0 {
+            return false;
+        }
+        self.precommit_power(votes, height, block_hash) >= self.quorum_threshold()
     }
 
     pub fn get(&self, address: &Address) -> Option<&Validator> {
@@ -161,7 +199,150 @@ impl ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helix_crypto::KeyPair;
+    use helix_core::block::CryptoVersion;
+    use helix_crypto::{KeyPair, Signature};
+
+    /// A precommit vote for `(height, block_hash)` genuinely signed by `kp`, the shape a real
+    /// commit certificate carries. `round` is fixed at 0 — irrelevant to the power tally.
+    fn precommit(kp: &KeyPair, height: u64, block_hash: Hash) -> Vote {
+        let mut v = Vote {
+            vote_type: VoteType::Precommit,
+            height,
+            round: 0,
+            block_hash,
+            validator: Address::from_public_key(&kp.public),
+            public_key: kp.public.clone(),
+            crypto_version: CryptoVersion::MlDsa,
+            signature: Signature::from_bytes(vec![]),
+        };
+        v.signature = kp.sign(&v.signing_bytes()).unwrap();
+        v
+    }
+
+    /// Two equal-stake, personhood-verified validators — a 2-of-2 set, matching the live chain.
+    fn two_validator_set(a: &KeyPair, b: &KeyPair) -> ValidatorSet {
+        ValidatorSet::new(
+            vec![
+                Validator::new(Address::from_public_key(&a.public), 100_000, true),
+                Validator::new(Address::from_public_key(&b.public), 100_000, true),
+            ],
+            0,
+        )
+    }
+
+    /// A1: a certificate with precommits from the whole set proves finality — this is the honest
+    /// path (a finalizer broadcasting the block it just committed) and must be adopted.
+    #[test]
+    fn a_full_certificate_reaches_quorum() {
+        let (a, b) = (KeyPair::generate(), KeyPair::generate());
+        let set = two_validator_set(&a, &b);
+        let hash = Hash::digest(b"block-5");
+        let cert = vec![precommit(&a, 5, hash), precommit(&b, 5, hash)];
+        assert!(set.precommits_reach_quorum(&cert, 5, &hash));
+    }
+
+    /// A1, the attack: a single Byzantine validator gossips a block it alone signed. Its lone
+    /// precommit is genuine, but one of two is below the 2/3 threshold — the certificate must NOT
+    /// reach quorum, so a receiver drops the block instead of forking onto it.
+    #[test]
+    fn a_single_signature_does_not_reach_quorum() {
+        let (a, b) = (KeyPair::generate(), KeyPair::generate());
+        let set = two_validator_set(&a, &b);
+        let hash = Hash::digest(b"evil-block");
+        let cert = vec![precommit(&a, 5, hash)];
+        assert!(!set.precommits_reach_quorum(&cert, 5, &hash));
+    }
+
+    /// A signer outside the set (a freshly generated throwaway key) contributes zero power, so
+    /// padding a certificate with out-of-set signatures can never manufacture a quorum.
+    #[test]
+    fn an_out_of_set_signer_contributes_no_power() {
+        let (a, b, outsider) = (KeyPair::generate(), KeyPair::generate(), KeyPair::generate());
+        let set = two_validator_set(&a, &b);
+        let hash = Hash::digest(b"block-5");
+        // One real signer plus a genuine signature from a non-member: still one-of-two.
+        let cert = vec![precommit(&a, 5, hash), precommit(&outsider, 5, hash)];
+        assert_eq!(set.precommit_power(&cert, 5, &hash), set.get(&Address::from_public_key(&a.public)).unwrap().voting_power);
+        assert!(!set.precommits_reach_quorum(&cert, 5, &hash));
+    }
+
+    /// Precommits for a different block, height, or of the wrong vote type never count toward this
+    /// block's quorum — the exact-match filter is what stops a certificate from one block being
+    /// replayed to finalize another.
+    #[test]
+    fn mismatched_votes_are_excluded_from_the_tally() {
+        let (a, b) = (KeyPair::generate(), KeyPair::generate());
+        let set = two_validator_set(&a, &b);
+        let hash = Hash::digest(b"block-5");
+        let other = Hash::digest(b"other-block");
+
+        let wrong_hash = vec![precommit(&a, 5, other), precommit(&b, 5, other)];
+        assert!(!set.precommits_reach_quorum(&wrong_hash, 5, &hash), "certificate for another block");
+
+        let wrong_height = vec![precommit(&a, 6, hash), precommit(&b, 6, hash)];
+        assert!(!set.precommits_reach_quorum(&wrong_height, 5, &hash), "certificate for another height");
+
+        let mut prevotes = vec![precommit(&a, 5, hash), precommit(&b, 5, hash)];
+        for v in &mut prevotes {
+            v.vote_type = VoteType::Prevote;
+            v.signature = match v.validator == Address::from_public_key(&a.public) {
+                true => a.sign(&v.signing_bytes()).unwrap(),
+                false => b.sign(&v.signing_bytes()).unwrap(),
+            };
+        }
+        assert!(!set.precommits_reach_quorum(&prevotes, 5, &hash), "prevotes are not precommits");
+    }
+
+    /// A forged signature (right validator address, wrong key) is filtered out before its power is
+    /// counted, so it cannot help reach quorum.
+    #[test]
+    fn a_forged_signature_contributes_no_power() {
+        let (a, b, attacker) = (KeyPair::generate(), KeyPair::generate(), KeyPair::generate());
+        let set = two_validator_set(&a, &b);
+        let hash = Hash::digest(b"block-5");
+        // A precommit claiming to be from `b` but signed by the attacker's key.
+        let mut forged = precommit(&attacker, 5, hash);
+        forged.validator = Address::from_public_key(&b.public);
+        let cert = vec![precommit(&a, 5, hash), forged];
+        assert!(!set.precommits_reach_quorum(&cert, 5, &hash), "a forged second signature is not real quorum");
+    }
+
+    /// One validator signing twice contributes its power once, never twice — equivocation cannot
+    /// inflate a lone validator into a quorum.
+    #[test]
+    fn a_duplicated_signer_is_counted_once() {
+        let (a, b) = (KeyPair::generate(), KeyPair::generate());
+        let set = two_validator_set(&a, &b);
+        let hash = Hash::digest(b"block-5");
+        let cert = vec![precommit(&a, 5, hash), precommit(&a, 5, hash)];
+        assert_eq!(
+            set.precommit_power(&cert, 5, &hash),
+            set.get(&Address::from_public_key(&a.public)).unwrap().voting_power,
+            "the same signer counts once"
+        );
+        assert!(!set.precommits_reach_quorum(&cert, 5, &hash));
+    }
+
+    /// B3: a bare `Validator::new` carries zero power (it cannot know the set's total stake); only
+    /// `ValidatorSet::new` computes the real, capped value. Guards against a future reader trusting
+    /// an un-setted validator's `voting_power`.
+    #[test]
+    fn a_bare_validator_has_zero_power_until_placed_in_a_set() {
+        let v = Validator::new(rand_address(), 100_000, true);
+        assert_eq!(v.voting_power, 0, "power is unknown until the set applies its cap");
+
+        let set = ValidatorSet::new(vec![v.clone()], 0);
+        assert!(set.get(&v.address).unwrap().voting_power > 0, "the set computes real power");
+    }
+
+    /// An empty set (no members) can never certify anything — guards the divide-by-nothing edge so
+    /// a vacuous certificate is rejected rather than trivially accepted.
+    #[test]
+    fn an_empty_set_never_reaches_quorum() {
+        let set = ValidatorSet::new(vec![], 0);
+        let hash = Hash::digest(b"block-5");
+        assert!(!set.precommits_reach_quorum(&[], 5, &hash));
+    }
 
     fn rand_address() -> Address {
         Address::from_public_key(&KeyPair::generate().public)

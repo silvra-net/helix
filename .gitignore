@@ -18,3 +18,5 @@
 /CLAUDE.md
 /CLAUDE-archiv.md
 /.claude-session-state*.md
+# Interne Security-Audit-Reports — Schwachstellen-Details, nicht öffentlich vor Deploy
+/SECURITY-AUDIT-*.md

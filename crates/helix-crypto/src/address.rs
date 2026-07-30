@@ -51,8 +51,13 @@ impl Address {
             .into_vec()
             .map_err(|e| CryptoError::InvalidAddress(e.to_string()))?;
 
-        if data.len() < 1 + 20 + CHECKSUM_LEN {
-            return Err(CryptoError::InvalidAddress("too short".into()));
+        // Exact length, not just a minimum (audit B1): `from_public_key` always produces exactly
+        // `version(1) + body(20) + checksum(4)` = 25 bytes. Accepting anything longer would let a
+        // padded-but-checksum-valid string parse as a "valid" address that can never correspond to
+        // a real public key — a footgun (funds sent there are unspendable), not an exploit, but
+        // there is no legitimate longer form to accept.
+        if data.len() != 1 + 20 + CHECKSUM_LEN {
+            return Err(CryptoError::InvalidAddress("wrong length".into()));
         }
 
         let payload = &data[..data.len() - CHECKSUM_LEN];
@@ -128,5 +133,24 @@ mod tests {
     fn test_invalid_address_rejected() {
         assert!(Address::from_str("invalid").is_err());
         assert!(Address::from_str("hlx1corrupted!!").is_err());
+    }
+
+    /// B1: an over-long payload with a *valid* checksum must still be rejected. Without the exact
+    /// length check, `from_str` accepts a 25+N-byte string whose last 4 bytes happen to check out,
+    /// producing an "address" that no public key can ever derive to.
+    #[test]
+    fn test_overlong_but_checksum_valid_address_is_rejected() {
+        // Build version(1) + body(20) + 5 extra bytes = 26-byte payload, then append a *correct*
+        // checksum over it — exactly the shape the old `len() < 25` check would have waved through.
+        let mut payload = vec![0x01u8];
+        payload.extend_from_slice(&[7u8; 25]); // 25 body bytes instead of 20 → overlong
+        let checksum_hash = Hash::digest(&Hash::digest(&payload).as_bytes()[..]);
+        payload.extend_from_slice(&checksum_hash.as_bytes()[..CHECKSUM_LEN]);
+        let addr = format!("{}{}", ADDRESS_PREFIX, bs58::encode(payload).into_string());
+
+        assert!(
+            Address::from_str(&addr).is_err(),
+            "an over-long payload must be rejected even with a valid checksum"
+        );
     }
 }
