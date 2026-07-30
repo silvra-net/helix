@@ -1363,6 +1363,72 @@ impl BftEngine {
         self.clear_locks();
     }
 
+    /// Cast this node's own precommit for the block it just adopted over the committed-block fast
+    /// path, so that the network has a record that this node was live and agreed with it.
+    ///
+    /// **This does not, on its own, resurrect #132's probation gate** — measured, see
+    /// `ChainState::rotate_active_validators`. The proposer can only fold a late precommit while it
+    /// is still on that height, so the delivery window is one block interval, and a peer under load
+    /// runs behind it. What this does buy is real and unconditional: certificates that name
+    /// everyone who stood behind a block rather than only whoever happened to be needed, and a
+    /// downtime counter that stops charging misses against nodes that are demonstrably keeping up.
+    ///
+    /// The problem it addresses (backlog #141): a node that adopts a finished block never voted on it,
+    /// and on a busy chain that is the *normal* case, not an edge case. Measured on a three-node
+    /// devnet: the two joiners adopted 186 and 190 blocks over the fast path and finalized only 12
+    /// and 14 through proposal/vote. The finished block and the proposal are gossiped on separate
+    /// topics microseconds apart, and whenever the block wins the race the peer is already at that
+    /// height, so `receive_proposal` discards the proposal unread and no vote is ever cast. A
+    /// validator can therefore run perfectly and appear in no `last_commit` at all — which is why
+    /// #132's probation gate could never be satisfied, and why the downtime counter charges misses
+    /// against nodes that are demonstrably keeping up.
+    ///
+    /// The vote is genuine, not a formality: it is cast only after the caller has verified the
+    /// block (in-set proposer, chains from our tip, quorum certificate) and adopted it. Committing
+    /// to a value this node has already accepted as final states nothing it does not believe.
+    ///
+    /// **The round comes from the adopted certificate, never invented.** Signing round 0 by default
+    /// would mean signing a second, different value for a round this node may already have voted
+    /// in — equivocation, and equivocation is what gets a validator slashed. Taking the round from
+    /// the certificate that carried the block makes this precommit agree with the one the network
+    /// already accepted, so a genuine conflict is a genuine double-sign and the node's signing
+    /// guard (which sees this vote like any other, via `take_outbound_votes`) correctly withholds
+    /// it. With no certificate there is no round to agree with, and nothing is cast.
+    ///
+    /// Deliberately not added to this node's own `last_commit`: a vote the signing guard refuses
+    /// must not reach the wire, and `last_commit` is stamped into the next block this node
+    /// proposes — which is the wire.
+    pub fn attest_adopted_block(&mut self, keypair: &KeyPair) {
+        let Some(block_hash) = self.last_committed else {
+            return;
+        };
+        if self.validator_set.get(&self.address).is_none() {
+            return;
+        }
+        // Already in the certificate — this node voted the block through itself (the salvage path
+        // in `sync_to_externally_finalized_block`), so there is nothing to add.
+        if self.last_commit.iter().any(|v| v.validator == self.address) {
+            return;
+        }
+        let Some(round) = self.last_commit.first().map(|v| v.round) else {
+            return;
+        };
+        if let Ok(vote) = cast_vote(
+            &self.address,
+            keypair,
+            VoteType::Precommit,
+            self.current_height,
+            round,
+            block_hash,
+        ) {
+            debug!(
+                height = self.current_height,
+                round, "Attesting a block adopted over the fast path"
+            );
+            self.outbound_votes.push(vote);
+        }
+    }
+
     /// Filter a commit certificate received over the wire down to the precommit votes that are
     /// genuinely usable as a `last_commit` for `(height, block_hash)`: a precommit (not a prevote)
     /// for exactly this block, with a signature that verifies, and no validator appearing twice.
@@ -1617,6 +1683,92 @@ mod tests {
                 .any(|v| v.validator == probationer_addr),
             "the probationer's signature must now be in the certificate — without it `probation_seen` \
              never records it and it can never be promoted"
+        );
+    }
+
+    /// A node that adopts a finished block over the fast path casts its own precommit for it —
+    /// the liveness signal #141 needs, and the one a probationer can actually produce (it never
+    /// wins a race it holds no voting power in).
+    #[test]
+    fn adopting_a_block_over_the_fast_path_produces_an_attesting_precommit() {
+        let (full_kp, full_addr, probationer_kp, probationer_addr, set) =
+            full_power_plus_probationer();
+        let block_hash = Hash::digest(b"externally finalized");
+
+        // The certificate the finalizer gossips alongside the block, cast in round 3 — the round
+        // this node must agree with rather than inventing one.
+        let finalizers_precommit = cast_vote(
+            &full_addr,
+            &full_kp,
+            VoteType::Precommit,
+            1,
+            3,
+            block_hash,
+        )
+        .unwrap();
+
+        let mut engine = BftEngine::new(set, probationer_addr.clone(), 0);
+        engine.sync_to_externally_finalized_block(1, block_hash, vec![finalizers_precommit]);
+        assert!(
+            engine.take_outbound_votes().is_empty(),
+            "precondition: adopting the block alone casts nothing"
+        );
+
+        engine.attest_adopted_block(&probationer_kp);
+
+        let outbound = engine.take_outbound_votes();
+        assert_eq!(outbound.len(), 1, "exactly one attestation");
+        let vote = &outbound[0];
+        assert_eq!(vote.validator, probationer_addr);
+        assert_eq!(vote.vote_type, VoteType::Precommit);
+        assert_eq!(vote.height, 1);
+        assert_eq!(vote.block_hash, block_hash);
+        assert_eq!(
+            vote.round, 3,
+            "the round must come from the adopted certificate — inventing round 0 would sign a \
+             second value for a round this node may already have voted in, i.e. equivocate"
+        );
+        assert!(vote.verify_signature().is_ok(), "and it must be a genuine signature");
+    }
+
+    /// Nothing is cast when there is no certificate to agree with: with no round the vote could
+    /// only be invented, which is the equivocation risk this must not take.
+    #[test]
+    fn a_block_adopted_without_a_certificate_is_not_attested() {
+        let (_full_kp, _full_addr, probationer_kp, probationer_addr, set) =
+            full_power_plus_probationer();
+        let mut engine = BftEngine::new(set, probationer_addr, 0);
+        engine.sync_to_externally_finalized_block(1, Hash::digest(b"no certificate"), vec![]);
+
+        engine.attest_adopted_block(&probationer_kp);
+
+        assert!(
+            engine.take_outbound_votes().is_empty(),
+            "no certificate means no round to agree with, so nothing may be signed"
+        );
+    }
+
+    /// A node that voted the block through itself is already in the certificate — attesting again
+    /// would duplicate its own signature in any tally computed over `last_commit`.
+    #[test]
+    fn a_node_already_in_the_certificate_does_not_attest_again() {
+        let (full_kp, full_addr, _p_kp, _p_addr, set) = full_power_plus_probationer();
+        let mut engine = BftEngine::new(set, full_addr.clone(), 0);
+        let block = engine
+            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .expect("finalizes alone");
+        assert!(
+            engine.commit_certificate().iter().any(|v| v.validator == full_addr),
+            "precondition: this node's own precommit carried the block"
+        );
+        let _ = engine.take_outbound_votes();
+
+        engine.attest_adopted_block(&full_kp);
+
+        assert!(
+            engine.take_outbound_votes().is_empty(),
+            "already attested by having voted — no second signature for {}",
+            block.height()
         );
     }
 

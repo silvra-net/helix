@@ -1165,6 +1165,14 @@ async fn handle_p2p_event(
                     // block came from a peer, not our own block_production_loop, so our
                     // local reward_address override must not apply to it.
                     apply_finalized_block(block, false, commit_certificate, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
+
+                    // Say out loud that we adopted it (#141). On a busy chain this path — not
+                    // proposal/vote — is how a validator sees most blocks, and a node that only
+                    // ever adopts appears in no `last_commit`, so nothing in the protocol records
+                    // that it is running. Goes out through the same signing guard as every other
+                    // vote, which is what makes it safe to sign a value we did not vote on live.
+                    engine.write().await.attest_adopted_block(keypair);
+                    broadcast_outbound_votes(engine, p2p_tx, signing_guard).await;
                 }
                 Err(e) => {
                     warn!(height = block_height, err = %e, "Committed block from peer failed signature check — dropping");

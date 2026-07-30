@@ -961,21 +961,30 @@ impl ChainState {
         // Promote everyone who has served the probation epoch.
         //
         // The liveness gate that used to stand here — promote only if the probationer's signature
-        // reached a committed `last_commit` — is DISABLED, because it could never be satisfied on
-        // the one path that matters. A probationer holds zero voting power by design, so its
-        // precommit is never what completes a quorum and is never waited for; and when the active
-        // set can finalize on its own, `produce_block` commits inside the same call and the node
-        // broadcasts a *committed block*, never a proposal (see `block_production_loop`). Peers
-        // therefore never see a proposal to vote on, cast no precommit at all, and `probation_seen`
-        // stays empty forever. Measured on a three-validator devnet: two correctly-running,
-        // correctly-staked joiners cycled probation → pending → probation from height 30 to 609
-        // and never activated. Shipping that would have made validator onboarding impossible.
+        // reached a committed `last_commit` — is DISABLED, and stays disabled until something can
+        // actually satisfy it. Measured, twice:
         //
-        // The phantom protection this gate was meant to provide is therefore not lost here — it
-        // never worked. Restoring it needs a liveness signal that does not depend on a vote nobody
-        // asks for (a proposer turn for probationers, or broadcasting the proposal even when the
-        // proposer could finalize alone). Both change consensus-core behaviour and belong in their
-        // own pass, not bolted onto a release. Backlog #141.
+        //  1. A probationer holds zero voting power by design, so its precommit never completes a
+        //     quorum and is never waited for. Worse, on a chain producing blocks the peer usually
+        //     receives the *finished* block before the proposal it would have voted on, and
+        //     `receive_proposal` then discards the proposal unread — so it casts no vote at all.
+        //     Two correctly-staked, correctly-running joiners cycled probation → pending →
+        //     probation from height 30 to 609 and never activated.
+        //  2. `BftEngine::attest_adopted_block` was added to close exactly that gap: a node
+        //     precommits the blocks it adopts over the fast path, so being live produces a
+        //     signature regardless of who wins any race. It works — and it is still not enough.
+        //     The proposer can only fold a late precommit for the height it is *still* on, i.e.
+        //     within one block interval, and a peer under load runs behind that. Measured on a
+        //     three-node devnet at a 250 ms cadence: the joiners attested 17 blocks each and the
+        //     proposer folded none of them, because their attestation for height 201 arrived
+        //     765 ms after it had committed 201 — by then it was on 204.
+        //
+        // A gate nobody can pass does not protect against phantoms; it stops every honest
+        // validator from ever activating, which is strictly worse than the problem. So: promotion
+        // is unconditional, and the protection #132 aimed for is not available today. Backlog #141
+        // holds what a real fix would need (a liveness signal whose delivery window is not one
+        // block interval). Until then #60 — four validators — is the answer that actually works:
+        // there a phantom neither freezes the chain nor stays in, since downtime jails it.
         //
         // The probation tier itself is kept and still does something: for one epoch a new validator
         // sits in the signing set with zero voting power, so it syncs and participates without
