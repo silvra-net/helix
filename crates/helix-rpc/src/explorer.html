@@ -651,8 +651,14 @@
     }
     $('vals').innerHTML = slice.map((v) => {
       const jailed = v.jailed_until != null && v.jailed_until > tip;
-      let st, sc;
+      // `active: false` covers three different situations that an operator waiting for a
+      // validator to come up needs to tell apart — still waiting out the pending epoch, on
+      // probation, or staked and not picked up at all. `tier` says which; fall back to the old
+      // flat "Inactive" when talking to a node that predates the field.
+      let st, sc, tt = '';
       if (jailed) { st = 'Jailed · #' + v.jailed_until; sc = 'jail'; }
+      else if (v.tier === 'pending') { st = 'Pending'; sc = 'off'; tt = 'staked, waiting out one epoch before entering the signing set'; }
+      else if (v.tier === 'probationary') { st = 'Probation'; sc = 'off'; tt = 'in the signing set for one epoch with no voting power and no proposer turn'; }
       else if (v.active === false) { st = 'Inactive'; sc = 'off'; }
       else { st = 'Bonded'; sc = 'bond'; }
       const signed = signersCache.has(v.address);
@@ -669,7 +675,7 @@
         <td class="num">${fmtHlx(v.effective_stake_hlx || 0)}</td>
         <td>${signed ? '<span class="sig-yes">● signing</span>' : '<span class="sig-no">— silent</span>'}</td>
         <td class="num">${v.missed_blocks != null ? v.missed_blocks : 0}</td>
-        <td><span class="badge ${sc}">${esc(st)}</span></td>
+        <td><span class="badge ${sc}"${tt ? ` title="${esc(tt)}"` : ''}>${esc(st)}</span></td>
       </tr>`;
     }).join('');
     const lo = page * VAL_PAGE + 1, hi = Math.min(total, page * VAL_PAGE + slice.length);

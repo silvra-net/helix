@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use helix_core::{Block, BlockHeader, CommitSig, Transaction};
 use helix_crypto::{merkle_root, Address, Hash, KeyPair, Signature};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     round::{RoundPhase, RoundState},
@@ -624,6 +624,60 @@ impl BftEngine {
                          never precommits nil"
                     .into(),
             });
+        }
+
+        // A precommit for the block we *just* committed still has a job to do, even though the
+        // round it belonged to is gone: it belongs in the commit certificate.
+        //
+        // Without this, a validator whose precommit was never *needed* for quorum can never get
+        // its signature into a certificate at all — and one class of validator is never needed by
+        // construction. A #132 probationer carries zero voting power on purpose, so it can never be
+        // the vote that tips a quorum, is never waited for, and its precommit lands after
+        // `finalize` has already taken the round. Promotion out of probation requires exactly that
+        // signature to appear in a committed `last_commit`, so the probationer cycled
+        // probation → pending → probation forever and no new validator could ever activate.
+        // Measured, not theorised: a three-validator devnet sat at height 500+ with two staked,
+        // correctly-running joiners still inactive.
+        //
+        // This alone does **not** fix that — measured too. When the active set can finalize on its
+        // own, the proposer never broadcasts a proposal at all (it commits inside `produce_block`
+        // and gossips the finished block), so peers cast no precommit for this to collect. Closing
+        // the probation loop needs that second half; see backlog #141, for which this is the
+        // prerequisite. It is worth having on its own regardless: a certificate that names
+        // everyone who actually stood behind a block is strictly better evidence than one that
+        // names only whoever happened to be needed.
+        //
+        // The certificate for height h is stamped into block h+1's header, a whole block interval
+        // later, so a late precommit collected here is in the block on time.
+        //
+        // Safe on every axis that matters:
+        // - It cannot change what was finalized. The commit already happened; this only enriches
+        //   the record of *who stood behind it*.
+        // - It cannot forge presence. The signature is verified and must come from an in-set
+        //   validator for exactly this `(height, block_hash)`, so only the key holder can produce
+        //   it — a phantom with no running node still never appears, which is the whole point of
+        //   probation.
+        // - It cannot diverge between nodes. Every node reads participation from the *committed
+        //   block's* `last_commit`, identical everywhere; the proposer's local view decides what
+        //   goes in, exactly as it already does for #114's certificate.
+        if vote.vote_type == VoteType::Precommit
+            && vote.height == self.current_height
+            && self.last_committed.as_ref() == Some(&vote.block_hash)
+        {
+            let in_set = self.validator_set.get(&vote.validator).is_some();
+            let already_known = self
+                .last_commit
+                .iter()
+                .any(|v| v.validator == vote.validator);
+            if in_set && !already_known && vote.verify_signature().is_ok() {
+                debug!(
+                    height = vote.height,
+                    validator = %vote.validator,
+                    "Late precommit folded into the commit certificate"
+                );
+                self.last_commit.push(vote);
+            }
+            return Ok(None);
         }
 
         // A vote for the next height but a round we're not currently running
@@ -1496,6 +1550,164 @@ mod tests {
     fn peer_vote(kp: &KeyPair, vote_type: VoteType, height: u64, round: u32, hash: Hash) -> Vote {
         let addr = Address::from_public_key(&kp.public);
         cast_vote(&addr, kp, vote_type, height, round, hash).unwrap()
+    }
+
+    /// Sets up one full-power validator that finalizes alone, plus a zero-power #132 probationer.
+    fn full_power_plus_probationer() -> (KeyPair, Address, KeyPair, Address, ValidatorSet) {
+        let full_kp = KeyPair::generate();
+        let full_addr = Address::from_public_key(&full_kp.public);
+        let probationer_kp = KeyPair::generate();
+        let probationer_addr = Address::from_public_key(&probationer_kp.public);
+        let set = ValidatorSet::new(
+            vec![
+                Validator::new(full_addr.clone(), 100_000, true),
+                Validator::new_probationary(probationer_addr.clone(), 100_000, true),
+            ],
+            0,
+        );
+        (full_kp, full_addr, probationer_kp, probationer_addr, set)
+    }
+
+    /// #132's activation was unreachable whenever the existing set already held quorum without the
+    /// probationer — which is *always*, because a probationer carries zero voting power by design.
+    ///
+    /// Promotion out of probation requires the probationer's signature to appear in a committed
+    /// `last_commit` (`ChainState::record_probation_liveness`). But `finalize` sets `last_commit`
+    /// from the precommits the round held at the instant it committed, and a round commits the
+    /// moment quorum is reached. A zero-power vote can never be the one that tips a quorum, so it
+    /// is never required and never waited for. With a single full-power validator the window is
+    /// exactly zero: it finalizes inside `produce_block`, before any peer vote can be delivered.
+    /// The probationer cycled probation → pending → probation forever, so no new validator could
+    /// activate at all. Measured against a real devnet, which sat at height 500+ with two staked,
+    /// correctly-running joiners still inactive.
+    ///
+    /// The fix collects a late precommit for the block just committed into the certificate, which
+    /// block h+1 stamps a full block interval later.
+    #[test]
+    fn a_late_precommit_for_the_committed_block_joins_the_certificate() {
+        let (full_kp, full_addr, probationer_kp, probationer_addr, set) =
+            full_power_plus_probationer();
+        assert_eq!(
+            set.get(&probationer_addr).unwrap().voting_power,
+            0,
+            "a probationer holds no voting power — the premise of the whole failure"
+        );
+
+        let mut engine = BftEngine::new(set, full_addr.clone(), 0);
+        let block = engine
+            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .expect("the sole full-power validator reaches quorum on its own precommit");
+        assert_eq!(engine.current_height(), 1, "it finalized without any peer vote");
+        assert!(
+            !engine
+                .commit_certificate()
+                .iter()
+                .any(|v| v.validator == probationer_addr),
+            "precondition: the probationer cannot have been in the certificate at commit time"
+        );
+
+        // Its precommit arrives now — as early as a real network ever could deliver it.
+        let late = peer_vote(&probationer_kp, VoteType::Precommit, 1, 0, block.hash());
+        engine.add_vote(&full_kp, late).expect("a late precommit is not an error");
+
+        assert!(
+            engine
+                .commit_certificate()
+                .iter()
+                .any(|v| v.validator == probationer_addr),
+            "the probationer's signature must now be in the certificate — without it `probation_seen` \
+             never records it and it can never be promoted"
+        );
+    }
+
+    /// The property that must survive the fix: folding in late precommits must not turn into
+    /// crediting presence that nobody proved. A phantom — staked, in the set, no node running —
+    /// sends nothing, so it stays absent from the certificate.
+    ///
+    /// That absence does not currently keep it out of the validator set (promotion is
+    /// unconditional, backlog #141), but it is the signal a fix for #141 has to build on, and it is
+    /// what `missed_blocks` scores it on either way.
+    #[test]
+    fn a_phantom_probationer_that_never_votes_stays_out_of_the_certificate() {
+        let (full_kp, full_addr, _phantom_kp, phantom_addr, set) = full_power_plus_probationer();
+        let mut engine = BftEngine::new(set, full_addr, 0);
+        engine
+            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .expect("finalizes alone");
+
+        assert!(
+            !engine.commit_certificate().iter().any(|v| v.validator == phantom_addr),
+            "a probationer whose node never signs must never appear in a certificate"
+        );
+    }
+
+    /// A late precommit for some *other* block must not be folded in. Otherwise a validator could
+    /// have its signature over one value recorded as backing a different one.
+    #[test]
+    fn a_late_precommit_for_a_different_block_is_not_folded_in() {
+        let (full_kp, full_addr, probationer_kp, probationer_addr, set) =
+            full_power_plus_probationer();
+        let mut engine = BftEngine::new(set, full_addr, 0);
+        engine
+            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .expect("finalizes alone");
+
+        let wrong = peer_vote(
+            &probationer_kp,
+            VoteType::Precommit,
+            1,
+            0,
+            Hash::digest(b"some other block"),
+        );
+        let _ = engine.add_vote(&full_kp, wrong);
+
+        assert!(
+            !engine.commit_certificate().iter().any(|v| v.validator == probationer_addr),
+            "a precommit for another block is not evidence about this one"
+        );
+    }
+
+    /// A validator outside the set cannot inject itself into the certificate by voting late.
+    #[test]
+    fn a_late_precommit_from_outside_the_set_is_not_folded_in() {
+        let (full_kp, full_addr, _p_kp, _p_addr, set) = full_power_plus_probationer();
+        let mut engine = BftEngine::new(set, full_addr, 0);
+        let block = engine
+            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .expect("finalizes alone");
+
+        let outsider_kp = KeyPair::generate();
+        let outsider_addr = Address::from_public_key(&outsider_kp.public);
+        let vote = peer_vote(&outsider_kp, VoteType::Precommit, 1, 0, block.hash());
+        let _ = engine.add_vote(&full_kp, vote);
+
+        assert!(
+            !engine.commit_certificate().iter().any(|v| v.validator == outsider_addr),
+            "an out-of-set signer must never reach the certificate"
+        );
+    }
+
+    /// The same signer arriving twice must be counted once — a duplicated entry would inflate any
+    /// power tally computed over the certificate (`precommits_reach_quorum`).
+    #[test]
+    fn a_late_precommit_is_not_folded_in_twice() {
+        let (full_kp, full_addr, probationer_kp, probationer_addr, set) =
+            full_power_plus_probationer();
+        let mut engine = BftEngine::new(set, full_addr, 0);
+        let block = engine
+            .produce_block(&full_kp, Hash::digest(b"genesis"), vec![])
+            .expect("finalizes alone");
+
+        let vote = peer_vote(&probationer_kp, VoteType::Precommit, 1, 0, block.hash());
+        let _ = engine.add_vote(&full_kp, vote.clone());
+        let _ = engine.add_vote(&full_kp, vote);
+
+        let count = engine
+            .commit_certificate()
+            .iter()
+            .filter(|v| v.validator == probationer_addr)
+            .count();
+        assert_eq!(count, 1, "a duplicate must not be appended a second time");
     }
 
     /// The point of #78: a validator waiting on a dead proposer prevotes nil after the short

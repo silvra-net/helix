@@ -378,10 +378,15 @@ pub struct ChainState {
     /// Probationary validators whose signature has appeared in a committed `last_commit` during
     /// the current probation epoch — the on-chain, identical-on-every-node proof that a real node
     /// is running this key. Populated by `record_probation_liveness` from the same verified signer
-    /// set `record_block_participation` uses, cleared at each rotation. `rotate_active_validators`
-    /// promotes exactly `probationary_validators ∩ probation_seen` to full membership. Hashed so a
-    /// divergence in who proved live surfaces immediately rather than silently changing a future
-    /// active set.
+    /// set `record_block_participation` uses, cleared at each rotation. Hashed so a divergence in
+    /// who proved live surfaces immediately rather than silently changing a future active set.
+    ///
+    /// **Currently written but not read as a gate.** `rotate_active_validators` used to promote
+    /// exactly `probationary_validators ∩ probation_seen`; that condition turned out to be
+    /// unsatisfiable in practice and is disabled — see the comment there and backlog #141. The
+    /// field is kept populated (it is part of `state_hash` and of the persisted state, so removing
+    /// it is a state change, and #141 needs it) and `/validators` exposes it as
+    /// `probation_liveness_seen`, which is what made the problem measurable in the first place.
     #[serde(default)]
     pub probation_seen: std::collections::HashSet<Address>,
     /// Height of the block whose execution produced the state currently in memory.
@@ -953,15 +958,29 @@ impl ChainState {
         self.pending_validators.retain(|a| qualifying.contains(a));
         self.probation_seen.retain(|a| qualifying.contains(a));
 
-        // Promote probationers that proved themselves live this epoch — their signature reached a
-        // committed `last_commit` (see `record_probation_liveness`) — to full active membership.
-        // A probationer that never signed (a phantom with no live node) is simply not here.
-        let promoted: Vec<Address> = self
-            .probationary_validators
-            .iter()
-            .filter(|a| self.probation_seen.contains(*a))
-            .cloned()
-            .collect();
+        // Promote everyone who has served the probation epoch.
+        //
+        // The liveness gate that used to stand here — promote only if the probationer's signature
+        // reached a committed `last_commit` — is DISABLED, because it could never be satisfied on
+        // the one path that matters. A probationer holds zero voting power by design, so its
+        // precommit is never what completes a quorum and is never waited for; and when the active
+        // set can finalize on its own, `produce_block` commits inside the same call and the node
+        // broadcasts a *committed block*, never a proposal (see `block_production_loop`). Peers
+        // therefore never see a proposal to vote on, cast no precommit at all, and `probation_seen`
+        // stays empty forever. Measured on a three-validator devnet: two correctly-running,
+        // correctly-staked joiners cycled probation → pending → probation from height 30 to 609
+        // and never activated. Shipping that would have made validator onboarding impossible.
+        //
+        // The phantom protection this gate was meant to provide is therefore not lost here — it
+        // never worked. Restoring it needs a liveness signal that does not depend on a vote nobody
+        // asks for (a proposer turn for probationers, or broadcasting the proposal even when the
+        // proposer could finalize alone). Both change consensus-core behaviour and belong in their
+        // own pass, not bolted onto a release. Backlog #141.
+        //
+        // The probation tier itself is kept and still does something: for one epoch a new validator
+        // sits in the signing set with zero voting power, so it syncs and participates without
+        // being quorum-critical. That is a delay, not a guarantee.
+        let promoted: Vec<Address> = self.probationary_validators.iter().cloned().collect();
         for a in &promoted {
             self.active_validators.insert(a.clone());
         }
@@ -1510,35 +1529,74 @@ mod tests {
         assert_eq!(prob_addrs(&state), vec![addr(2)]);
         assert!(state.pending_validators.is_empty());
 
-        // During the probation epoch its signature lands in a committed last_commit.
+        // During the probation epoch its signature lands in a committed last_commit. Recorded, and
+        // visible via `/validators`, but no longer a condition of promotion (backlog #141) — the
+        // sibling test below covers the case where this never happens, and reaches the same result.
         state.record_probation_liveness(&[addr(2)].into_iter().collect());
 
-        // Rotation 3: proven live, it is promoted to full active membership.
+        // Rotation 3: the probation epoch is served, so it is promoted to full active membership.
         state.rotate_active_validators();
-        assert_eq!(active_addrs(&state), vec![addr(1), addr(2)], "proven-live probationer activates");
+        assert_eq!(active_addrs(&state), vec![addr(1), addr(2)], "the probationer activates");
         assert!(prob_addrs(&state).is_empty());
     }
 
-    /// The whole point of probation: a validator that staked but never signs during its probation
-    /// epoch (a "phantom" with no live node) is dropped, not promoted — it cycles back to pending
-    /// instead of ever becoming quorum-critical, so it can never freeze the chain.
+    /// Serving the probation epoch is the entire requirement for promotion: `probation_seen` is
+    /// empty here and the probationer activates anyway. This used to assert the opposite — that an
+    /// unproven probationer is dropped back to pending — which described a gate that could never
+    /// fire for anyone (backlog #141), so the chain it protected was one where no validator ever
+    /// activated.
     #[test]
-    fn a_probationer_that_never_signs_is_dropped_not_promoted() {
+    fn a_probationer_is_promoted_after_its_epoch_without_a_liveness_proof() {
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100;
         stake(&mut state, 1, 100);
         stake(&mut state, 2, 100);
         state.active_validators = [addr(1)].into_iter().collect();
         state.probationary_validators = [addr(2)].into_iter().collect();
-        // probation_seen stays empty — the phantom never signed.
+        // `probation_seen` stays empty — and that no longer withholds promotion.
 
         state.rotate_active_validators();
-        assert_eq!(active_addrs(&state), vec![addr(1)], "the phantom must never gain voting power");
-        assert!(
-            state.pending_validators.contains(&addr(2)),
-            "an unproven probationer restarts the delay rather than activating",
+
+        let mut expected = vec![addr(1), addr(2)];
+        expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut got = active_addrs(&state);
+        got.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(
+            got, expected,
+            "serving the probation epoch is now the whole requirement: the liveness gate could \
+             never be satisfied (a zero-power probationer is never asked to vote), so requiring it \
+             made every joiner cycle probation → pending forever"
         );
-        assert!(prob_addrs(&state).is_empty());
+        assert!(prob_addrs(&state).is_empty(), "the probation cohort is consumed by promotion");
+        assert!(
+            !state.pending_validators.contains(&addr(2)),
+            "a promoted validator does not go back to waiting"
+        );
+    }
+
+    /// States the cost of that decision out loud, so nobody rediscovers it as a surprise: a phantom
+    /// — staked, no node running, never signs anything — now *does* reach the active set, and with
+    /// it a share of the quorum. That is the pre-#132 behaviour the chain has always run on.
+    ///
+    /// Deliberately not asserted as desirable. This test exists so that a future redesign (#141)
+    /// has an explicit statement of what it must change, and so the gap is visible in the suite
+    /// rather than only in a comment.
+    #[test]
+    fn a_phantom_currently_reaches_the_active_set_documenting_the_gap_141_must_close() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 100);
+        stake(&mut state, 2, 100);
+        state.active_validators = [addr(1)].into_iter().collect();
+        state.probationary_validators = [addr(2)].into_iter().collect();
+
+        state.rotate_active_validators();
+
+        assert!(
+            active_addrs(&state).contains(&addr(2)),
+            "documents the accepted gap: nothing currently keeps a validator without a running \
+             node out of the quorum. Restoring that protection is #141."
+        );
     }
 
     /// A staker that drops below the threshold before promotion forfeits its accrued wait —

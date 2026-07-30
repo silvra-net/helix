@@ -1867,14 +1867,26 @@ async fn apply_finalized_block(
     // `ChainState::state_hash()` exists to surface, but this particular cause is a
     // P2P/executor-boundary race, not a state-machine bug, so the fix belongs here rather than
     // in `helix-executor`.
-    {
-        let mut last = last_applied_height.lock().await;
-        if height <= *last {
-            debug!(height, "Skipping duplicate finalized-block application (already applied via a concurrent path)");
-            return;
-        }
-        *last = height;
+    // Held until this block is on disk, not just until the claim is made. Releasing it here — as
+    // this used to — leaves a window in which `*last` already says `height` while the block store
+    // still ends at `height - 1`, and the catch-up paths take their starting point from the
+    // *store*, not from this counter: `NewCommittedBlock`'s gap-fill branch and `apply_synced_batch`
+    // both read `store.latest_height()` after acquiring this very lock. Sampled inside the window
+    // they see `height - 1`, conclude they are behind, fetch block `height` from a peer and execute
+    // it a second time — the block reward is minted twice and that node's `total_issued` is
+    // permanently one reward ahead of everyone else's.
+    //
+    // Measured, not theorised: the three-validator integration test failed roughly every other run
+    // with node A one block reward *below* the two nodes that have a `sync_peer` (and therefore run
+    // the gap-fill path at all) — `circulating_supply` differing by exactly 1 HLX with identical
+    // block hashes and identical `total_burned`. Both other paths already hold this lock across
+    // their whole apply; this one is now consistent with them.
+    let mut applied_guard = last_applied_height.lock().await;
+    if height <= *applied_guard {
+        debug!(height, "Skipping duplicate finalized-block application (already applied via a concurrent path)");
+        return;
     }
+    *applied_guard = height;
 
     // `should_broadcast == false` means this block arrived already fully committed
     // (the NewCommittedBlock gossip topic) rather than through this node's own
@@ -2086,6 +2098,12 @@ async fn apply_finalized_block(
             fatal_storage_failure("chain state", height, &e);
         }
     }
+
+    // The store now agrees with the claim, so a catch-up path that starts from `latest_height()`
+    // can no longer conclude it is missing this block. Everything below is bookkeeping on state
+    // that is already committed, and holding the lock through it would serialise block application
+    // against every catch-up attempt for no benefit.
+    drop(applied_guard);
 
     // Advance the EIP-1559 base fee now that this block is committed: the next block produced
     // or validated by this node must carry `next_base_fee`. Both ingestion paths funnel through
@@ -4963,6 +4981,101 @@ mod handle_p2p_event_tests {
         assert_eq!(store.read().await.latest_height(), 1, "the duplicate must not re-touch storage either");
     }
 
+    /// The other direction of the same race, and the one that actually bit production code: the
+    /// guard used to be *released* the moment the height was claimed, long before the block
+    /// reached the store. Every catch-up path takes its starting point from
+    /// `store.latest_height()` *after* acquiring this lock — so one that ran inside that window
+    /// saw the store still one block short, concluded it was behind, re-fetched the block from a
+    /// peer and executed it a second time, minting the block reward twice.
+    ///
+    /// Asserted as an invariant rather than by trying to hit the window: no observer holding the
+    /// guard may ever see it claim a height the store does not have yet. The observer polls under
+    /// the real lock while a real `apply_finalized_block` runs, so with the fix reverted it
+    /// catches the violation on the first `.await` inside the apply.
+    /// Multi-threaded on purpose: on the single-threaded test runtime the observer would only get
+    /// a turn where `apply_finalized_block` actually pends, and its uncontended lock acquisitions
+    /// never do — the observer would sit at zero observations and the assertion would be vacuous
+    /// (which is exactly what the first version of this test did).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_height_guard_is_held_until_the_block_is_actually_stored() {
+        let kp = KeyPair::generate();
+        let block = signed_block(&kp, 1, Hash::ZERO);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        let engine = Arc::new(RwLock::new(BftEngine::new(
+            ValidatorSet::new(vec![], 0),
+            Address::from_public_key(&kp.public),
+            0,
+        )));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        let last_applied_height = Arc::new(Mutex::new(0u64));
+
+        let violations = Arc::new(AtomicUsize::new(0));
+        let observations = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let observer = tokio::spawn({
+            let (guard, store, violations, observations, stop) = (
+                last_applied_height.clone(),
+                store.clone(),
+                violations.clone(),
+                observations.clone(),
+                stop.clone(),
+            );
+            async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    observations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // `try_lock`, not `lock().await`: blocking on the guard would make this
+                    // observer trivially quiet once the fix holds it, and a quiet observer proves
+                    // nothing. Failing to acquire *is* the fix working; acquiring mid-apply is the
+                    // bug, and is exactly what a catch-up path would do with the lock it got.
+                    if let Ok(claimed) = guard.try_lock() {
+                        let stored = store.read().await.latest_height();
+                        if *claimed > stored {
+                            violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        apply_finalized_block(
+            block,
+            false,
+            vec![],
+            &store,
+            &mempool,
+            &chain_state,
+            &engine,
+            &p2p_tx,
+            None,
+            &last_applied_height,
+            &Arc::new(RwLock::new(TipCertificate::default())),
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        observer.await.unwrap();
+
+        assert!(
+            observations.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the observer never got a turn — it would report zero violations no matter what"
+        );
+        assert_eq!(
+            store.read().await.latest_height(),
+            1,
+            "precondition: the block really was applied, so the window existed to be observed"
+        );
+        assert_eq!(
+            violations.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a catch-up path holding the guard saw a claimed height the store did not have yet — \
+             it would fetch that block from a peer and execute it again, minting the reward twice"
+        );
+    }
+
     /// The bug this closes: `NewCommittedBlock`'s gap-fill branch called
     /// `sync_blocks_from_peer` — which mints block rewards via `execute_block` — entirely
     /// outside `last_applied_height`. A concurrent BFT-finalize or gossip apply for a height
@@ -5075,13 +5188,15 @@ mod handle_p2p_event_tests {
     /// brand-new staker through the full lifecycle at the node level:
     ///
     ///   pending (1 epoch, absent from the set) → probation (in the set, **zero voting power**,
-    ///   no proposer turn) → [its node signs a committed `last_commit`] → full active membership.
+    ///   no proposer turn) → full active membership.
     ///
-    /// Closes the gap found live on 2026-07-20 (a `Stake` tx alone made a second validator
+    /// Closes the gap found live on 2026-07-20: a `Stake` tx alone made a second validator
     /// quorum-critical the moment the epoch rotated, freezing the chain because its node wasn't
-    /// actually connected) *and* the phantom case of 2026-07-28 (#132): a staker whose node never
-    /// signs never gains power — the earlier one-epoch delay let it in unconditionally, probation
-    /// gates it on a proof of liveness.
+    /// actually connected. Two epochs of no voting power is the answer to that.
+    ///
+    /// It does **not** close the phantom case of 2026-07-28 (#132). The `last_commit` this fixture
+    /// feeds in makes the staker's signature visible, but nothing depends on it any more — the
+    /// silent staker in the companion test below reaches the same full membership. See #141.
     #[tokio::test]
     async fn epoch_rotation_walks_a_new_staker_through_probation_to_full_power() {
         let genesis_kp = KeyPair::generate();
@@ -5162,13 +5277,13 @@ mod handle_p2p_event_tests {
         )
         .await;
 
-        // Third epoch boundary: having proved itself live, the probationer is promoted to full
-        // active membership with real voting power.
+        // Third epoch boundary: having served the probation epoch, the probationer is promoted to
+        // full active membership with real voting power.
         apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * 3, Hash::ZERO), &store, &engine).await;
         {
             let eng = engine.read().await;
             let v = eng.validator_set().get(&new_staker_addr).cloned();
-            assert!(v.is_some(), "the prover stays in the set");
+            assert!(v.is_some(), "it stays in the set");
             assert!(v.unwrap().voting_power > 0, "and now carries real voting power — full member");
         }
         assert!(
@@ -5177,12 +5292,18 @@ mod handle_p2p_event_tests {
         );
     }
 
-    /// Companion to the promotion path above: a staker whose node never signs during probation
-    /// must *not* be promoted — it cycles back to pending rather than ever gaining quorum weight.
-    /// This is the phantom that froze the live 3-validator set on 2026-07-28 (#132); the earlier
-    /// one-epoch delay would have handed it full power at the second rotation regardless.
+    /// Companion to the promotion path above, run end-to-end through the node: a staker whose node
+    /// never signs anything crosses the same three epoch boundaries as the prover — and reaches the
+    /// same place. It is held at zero voting power for its pending and probation epochs, and is a
+    /// full member after that.
+    ///
+    /// This test used to assert the opposite (that the phantom which froze the live 3-validator set
+    /// on 2026-07-28 stays out forever), and it passed, because the fixture handed the *prover* its
+    /// `last_commit` by hand. On a real network nobody ever casts that vote — see backlog #141 —
+    /// so the gate held everyone out, not just phantoms. What survives is the delay: two epochs
+    /// before a new staker is quorum-critical, which is what this now pins.
     #[tokio::test]
-    async fn epoch_rotation_never_promotes_a_staker_that_stays_silent() {
+    async fn epoch_rotation_holds_a_new_staker_powerless_for_two_epochs_then_promotes_it() {
         let genesis_kp = KeyPair::generate();
         let genesis_addr = Address::from_public_key(&genesis_kp.public);
         let phantom_addr = Address::from_public_key(&KeyPair::generate().public);
@@ -5202,25 +5323,44 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0u64));
 
-        // Three epoch boundaries, and the phantom never signs a single `last_commit`.
-        for epoch in 1..=3u64 {
+        // The phantom never signs a single `last_commit` at any point below.
+        let boundary = |epoch: u64| signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * epoch, Hash::ZERO);
+        let apply_one = async |block, last: &Arc<Mutex<u64>>| {
             apply_finalized_block(
-                signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * epoch, Hash::ZERO),
-                false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+                block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, last,
                 &Arc::new(RwLock::new(TipCertificate::default())),
             )
             .await;
-        }
+        };
 
-        // It may sit in the set as a zero-power probationer, but it must never gain voting power…
-        if let Some(v) = engine.read().await.validator_set().get(&phantom_addr).cloned() {
-            assert_eq!(v.voting_power, 0, "a silent staker must never be handed voting power");
+        // First boundary: picked up as pending — not in the signing set at all.
+        apply_one(boundary(1), &last_applied_height).await;
+        assert!(
+            engine.read().await.validator_set().get(&phantom_addr).is_none(),
+            "a brand-new staker waits out its pending epoch outside the signing set"
+        );
+
+        // Second boundary: enters probation — in the set, but powerless, so quorum does not
+        // depend on it and a node that isn't really running cannot stall anything yet.
+        apply_one(boundary(2), &last_applied_height).await;
+        {
+            let eng = engine.read().await;
+            let v = eng.validator_set().get(&phantom_addr).cloned();
+            assert!(v.is_some(), "the probationer is in the signing set");
+            assert_eq!(v.unwrap().voting_power, 0, "…but carries no voting power during probation");
         }
-        // …and it must never be recorded active — the exact guarantee that keeps a phantom from
-        // freezing a small set.
         assert!(
             !chain_state.read().await.active_validators.contains(&phantom_addr),
-            "a staker whose node never signed must never become active (#132)"
+            "and is not active yet"
+        );
+
+        // Third boundary: promoted, having signed nothing at all. Not the behaviour #132 aimed
+        // for — the honest statement of what ships until #141 restores a workable liveness proof.
+        apply_one(boundary(3), &last_applied_height).await;
+        assert!(
+            chain_state.read().await.active_validators.contains(&phantom_addr),
+            "serving the probation epoch is currently the whole requirement — a staker with no \
+             running node behind it does become quorum-critical (#141)"
         );
     }
 

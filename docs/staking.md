@@ -41,10 +41,16 @@ mutually exclusive:
    ```
    The `--key` here must be the same file whose address you read in step 1. If `helix tx stake`
    uses any other key, you have just created a phantom validator — see the warning above.
-3. **Wait for the next epoch rotation** (every 100 blocks — at most a few minutes at the 2s
-   block time). The validator set is rebuilt from every account meeting the minimum stake —
-   counting both self-stake and anything delegated to it (see below) — once included, your
-   node starts getting round-robin proposer turns.
+3. **Wait for two epoch rotations** (an epoch is 100 blocks — a few minutes at the 2s block time).
+   The validator set is rebuilt at each boundary from every account meeting the minimum stake,
+   counting both self-stake and anything delegated to it (see below). A new staker waits out the
+   first epoch, spends the second on *probation* — in the signing set, but with zero voting power
+   and no proposer turn — and is a full voting validator from the boundary after that, when its
+   round-robin proposer turns begin.
+
+   Probation is a delay, not a safety net: promotion at the end of it is unconditional today, so a
+   staked address with no node behind it does become quorum-critical. The address check in step 1
+   is what prevents that, not the waiting period.
 4. **Earn**: every block you produce mints you a share of that block's transaction fees (50%
    of each fee; the other 50% is burned) plus a fixed block reward (starts at 1 HLX, halves
    yearly — see [Token Economics](internals.md#token-economics)), paid even on empty blocks. If you have

@@ -233,9 +233,16 @@ yesterday or years ago. Concretely, to add Bob and Carol to your network:
    staking from one wallet while the node signs as a *different* self-generated key produces a
    "phantom" validator that is in the set but never signs, which freezes a small set.
 4. The new staker is picked up at the next epoch boundary and becomes a full voting validator one
-   epoch after that (it spends that epoch on probation, in the signing set but with zero voting
-   power, and is promoted only once it has actually co-signed — so a node that staked but isn't
-   really running never gains power).
+   epoch after that. The epoch in between is a *probation* epoch: the validator is already in the
+   signing set, so it syncs and participates, but carries zero voting power and gets no proposer
+   turn, so nothing the chain needs depends on it yet.
+
+   > **Probation delays a phantom, it does not stop one.** Promotion at the end of the probation
+   > epoch is currently unconditional. A validator that staked without a matching running node is
+   > therefore quorum-critical two epochs after staking, exactly as before — which is why step 3's
+   > address check is the protection that actually matters. Making promotion conditional on proven
+   > liveness needs a liveness signal a zero-power validator can actually produce; see the note in
+   > `ChainState::rotate_active_validators`.
 
 **Wire the validators into a full mesh.** BFT relays prevotes and precommits between *all*
 validators, so every validator should have a direct P2P connection to every other — not

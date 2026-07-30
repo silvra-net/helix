@@ -4127,13 +4127,19 @@ mod tests {
         assert!(mid_epoch.rotated_validators.is_none(), "ordinary blocks must not rotate");
     }
 
-    /// The heart of backlog #132: probation activates only a validator that has proved a live node
-    /// signs for it. A validator that stakes but never signs (a "phantom") is held powerless
-    /// through probation and dropped — it never becomes quorum-critical, so it can never freeze the
-    /// chain. This also covers the post-upgrade migration case (`active_validators` starts empty):
-    /// nobody is handed instant quorum weight.
+    /// The three-tier ladder of backlog #132, end to end through `execute_block`: a new staker
+    /// waits an epoch in pending, spends an epoch on probation (in the signing set, zero voting
+    /// power, no proposer turn), and is promoted at the boundary after that. Also covers the
+    /// post-upgrade migration case (`active_validators` starts empty): nobody is handed instant
+    /// quorum weight.
+    ///
+    /// It deliberately runs both a validator that signs during probation and one that never does
+    /// (a "phantom"), and asserts they are treated *identically* — because they are. #132's
+    /// liveness gate is disabled (backlog #141), so what this pins is the delay, not a phantom
+    /// defence. Named for what it checks, so a future reader doesn't take the old name as a
+    /// guarantee the code stopped making.
     #[test]
-    fn probation_activates_only_a_validator_that_proves_it_is_live() {
+    fn probation_delays_every_new_validator_by_one_epoch_and_then_promotes_it() {
         let sitting_kp = KeyPair::generate();
         let sitting = Address::from_public_key(&sitting_kp.public);
         let phantom = Address::from_public_key(&KeyPair::generate().public);
@@ -4163,17 +4169,20 @@ mod tests {
         // Only `sitting` signs during the probation epoch; `phantom` has no node behind it.
         execute_block(&mut state, &block_with_commit(&sitting, epoch * 2 + 1, &[&sitting_kp]), None);
 
-        // Rotation 3: the prover is promoted; the phantom is not, and cycles back to pending
-        // rather than ever gaining voting power.
+        // Rotation 3: both are promoted. Serving the epoch is the whole requirement now — the
+        // liveness gate that used to distinguish these two is disabled, because it could never be
+        // satisfied by anyone (see `rotate_active_validators`). Whether a node is actually running
+        // behind an address is, for the moment, not something the chain establishes.
         execute_block(&mut state, &empty_block(&sitting, epoch * 3), None);
-        assert!(state.active_validators.contains(&sitting), "the validator that signed is promoted");
         assert!(
-            !state.active_validators.contains(&phantom),
-            "the phantom that never signed must never be handed quorum weight",
+            state.active_validators.contains(&sitting),
+            "a validator that served its probation epoch is promoted"
         );
         assert!(
-            state.pending_validators.contains(&phantom),
-            "it restarts the delay instead of becoming quorum-critical",
+            state.active_validators.contains(&phantom),
+            "and so is one that never signed — the accepted gap #141 must close. Requiring proof \
+             here is what made every joiner cycle probation → pending forever, because a zero-power \
+             probationer is never asked for the vote the proof depends on."
         );
     }
 

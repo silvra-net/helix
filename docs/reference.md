@@ -50,13 +50,18 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
   "circulating_supply_hlx": 1000141.9995,
   "total_burned_hlx": 0.0005,
   "state_hash": "b3f1a9...",
+  "state_height": 42,
   "p2p_port": 8546,
   "base_fee_per_byte": 1
 }
 ```
 
 `state_hash` is an operator-facing diagnostic (not part of consensus, not signed) — compare it
-across nodes at the same height to spot execution divergence. `p2p_port` is this node's own
+across nodes to spot execution divergence. **Match on `state_height`, not on `height`:** `height`
+and `best_hash` come from the block store while `state_hash` comes from the in-memory chain state,
+and a response sampled mid-commit carries height N−1 next to the state of N. `state_height` is read
+under the same lock as `state_hash`, so those two always belong together — comparing `state_hash`
+across nodes that merely share a `height` reports divergences that aren't there. `p2p_port` is this node's own
 libp2p listen port — used by a joining peer to dial it directly, see "Joining an Existing
 Network" above. `base_fee_per_byte` is what the next block will charge per transaction byte;
 price against it rather than hardcoding a fee, since a flat number is only right until the

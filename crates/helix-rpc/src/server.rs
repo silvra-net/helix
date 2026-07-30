@@ -845,6 +845,28 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                 } else {
                     serde_json::Value::Bool(chain.active_validators.contains(&addr))
                 },
+                // Which rung of the #132 activation ladder this validator is on. `active` alone
+                // cannot distinguish "waiting out the pending epoch" from "in probation" from
+                // "stuck in a loop because its node never signs" — three very different situations
+                // that all render as `active: false`. An operator staring at a staked validator
+                // that has not come up needs to know which one it is, and so does anyone
+                // diagnosing an activation stall.
+                "tier": if chain.active_validators.contains(&addr) {
+                    "active"
+                } else if chain.probationary_validators.contains(&addr) {
+                    "probationary"
+                } else if chain.pending_validators.contains(&addr) {
+                    "pending"
+                } else {
+                    "staked"
+                },
+                // Whether this validator's signature has been seen in a committed `last_commit`
+                // during the current probation window. It does **not** gate promotion today (that
+                // gate was unsatisfiable and is disabled — backlog #141); it is exposed because
+                // watching it stay `false` across epochs on a healthy, correctly-staked node is
+                // precisely how that was discovered, and #141 needs the same signal to verify a
+                // fix. Only meaningful while `tier` is `probationary`.
+                "probation_liveness_seen": chain.probation_seen.contains(&addr),
                 "jailed_until": chain.jailed_until.get(&key),
                 "missed_blocks": chain.missed_blocks.get(&key),
             })
