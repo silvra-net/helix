@@ -1071,6 +1071,10 @@ async fn handle_p2p_event(
                             .await
                             .map(|n| (n, s.latest_height(), s.latest_hash()))
                     };
+                    // Whatever the outcome, the guard must not be left behind the store: a sync
+                    // that applied blocks and then aborted returns `Err`, and the arm below would
+                    // never run (#145).
+                    settle_applied_height(&mut last, store).await;
                     match result {
                         Ok((n, new_height, new_hash)) if n > 0 => {
                             *last = new_height;
@@ -1201,6 +1205,32 @@ async fn handle_p2p_event(
         P2PEvent::BlocksSynced(batch, peer) => {
             apply_synced_batch(batch, peer, store, chain_state, engine, mempool, last_applied_height, tip_certificate, p2p_tx).await;
         }
+    }
+}
+
+/// Raise the applied-height guard to whatever the store actually holds (backlog #145).
+///
+/// Every catch-up path can end in a *partial* apply: some blocks written, then an abort — a
+/// tampered block, an unreachable peer mid-batch, a storage error. Those paths return `Err`, and
+/// their callers only advance the guard in the `Ok` arm, so the guard silently falls behind the
+/// store.
+///
+/// That gap is not cosmetic, because the guard is the *only* thing standing between two ingest
+/// paths and executing the same block twice: `apply_finalized_block` compares the incoming height
+/// against it and nothing else — there is no check that the block chains from the current tip. A
+/// height the aborted sync already applied therefore passes straight through and is executed
+/// again, minting its block reward a second time. Measured 2026-07-31: two nodes agreeing on
+/// `ba6128de…` at height 310 while a third sat on `c0771c6b…`, which is #142's failure exactly,
+/// reached through a different door.
+///
+/// The store is the authority here, not the return value: it knows what was persisted regardless
+/// of how the call ended. Only ever raises the guard — lowering it would reintroduce the very
+/// window it exists to close.
+async fn settle_applied_height(last: &mut u64, store: &Arc<RwLock<HelixDb>>) {
+    let stored = store.read().await.latest_height();
+    if *last < stored {
+        debug!(guard = *last, stored, "Catch-up ended part-way — raising the applied-height guard");
+        *last = stored;
     }
 }
 
@@ -3215,6 +3245,9 @@ async fn rpc_sync_loop(
                 .await
                 .map(|n| (n, s.latest_height(), s.latest_hash()))
         };
+        // Same as the gap-fill path: a partial apply returns `Err` and must still move the guard,
+        // or the next ingest path re-executes what this one already wrote (#145).
+        settle_applied_height(&mut last, &store).await;
         match result {
             Ok((applied, new_height, new_hash)) if applied > 0 => {
                 *last = new_height;
@@ -3732,6 +3765,82 @@ mod sync_blocks_from_peer_tests {
             eng.peers_needed_for_quorum(),
             2,
             "C carries no power, so from its seat it needs both full incumbents' votes to reach quorum"
+        );
+    }
+
+    /// Backlog #145. A catch-up that applies some blocks and *then* fails returns `Err` — and its
+    /// callers only advance `last_applied_height` in the `Ok` arm. The guard is therefore left
+    /// behind the store, and the guard is the only thing standing between two ingest paths and a
+    /// double execution: `apply_finalized_block` compares against it and nothing else — there is
+    /// no check that the block chains from the current tip.
+    ///
+    /// So a block already applied by the partial sync sails straight through and is executed a
+    /// second time, minting its reward twice. That is the divergence measured on 2026-07-31 (two
+    /// nodes on `ba6128de…`, one on `c0771c6b…` at height 310), and it is the #142 failure again
+    /// through a different door.
+    ///
+    /// Written as the caller sequence rather than against the guard directly, because the bug is
+    /// not in either function: each is correct on its own, and only the handover between them
+    /// loses the height.
+    #[tokio::test]
+    async fn a_partially_applied_sync_does_not_leave_a_block_open_to_double_execution() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        // Block 2 is tampered with, so the sync applies block 1 and then aborts.
+        let mut blocks = chained_blocks(&kp, &[1, 2]);
+        blocks[1].header.height = 99;
+        let peer_url = serve_blocks(blocks.clone()).await;
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            let min_stake = cs.governance_params.min_validator_stake;
+            let mut acc = helix_executor::AccountState::new(&addr);
+            acc.staked = min_stake;
+            cs.accounts.insert(addr.to_string(), acc);
+        }
+        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr.clone(), 0)));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        let last_applied_height = Arc::new(Mutex::new(0u64));
+
+        // The caller sequence, exactly as gap-fill and rpc_sync_loop run it.
+        let (applied_height, issued_after_sync) = {
+            let mut last = last_applied_height.lock().await;
+            let mut s = store.write().await;
+            let mut cs = chain_state.write().await;
+            let result = sync_blocks_from_peer(&peer_url, 0, &mut s, &mut cs).await;
+            assert!(result.is_err(), "precondition: the tampered block must abort the sync");
+            // Exactly what the callers do: advance the guard only on success — and then settle it
+            // against the store regardless, which is the fix.
+            if let Ok(n) = result {
+                if n > 0 {
+                    *last = s.latest_height();
+                }
+            }
+            drop(s);
+            settle_applied_height(&mut last, &store).await;
+            let s = store.read().await;
+            (s.latest_height(), cs.total_issued)
+        };
+        assert_eq!(applied_height, 1, "precondition: block 1 was applied before the abort");
+        assert!(issued_after_sync > 0, "precondition: applying block 1 minted its reward");
+
+        // Block 1 now arrives again through the other ingest path — gossip, a peer re-serving it,
+        // a racing gap-fill. Nothing about it is malformed; it is simply a height we already have.
+        apply_finalized_block(
+            blocks[0].clone(), false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx,
+            None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default())),
+        )
+        .await;
+
+        assert_eq!(
+            chain_state.read().await.total_issued,
+            issued_after_sync,
+            "block 1 was already applied by the aborted sync — executing it again mints its reward \
+             twice and puts this node on a different state than its peers",
         );
     }
 
