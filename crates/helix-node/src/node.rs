@@ -1198,8 +1198,8 @@ async fn handle_p2p_event(
         P2PEvent::PeerBehind { peer_tip } => {
             serve_catchup_blocks(peer_tip, store, tip_certificate, p2p_tx).await;
         }
-        P2PEvent::BlocksSynced(batch) => {
-            apply_synced_batch(batch, store, chain_state, engine, mempool, last_applied_height, tip_certificate).await;
+        P2PEvent::BlocksSynced(batch, peer) => {
+            apply_synced_batch(batch, peer, store, chain_state, engine, mempool, last_applied_height, tip_certificate, p2p_tx).await;
         }
     }
 }
@@ -1210,14 +1210,17 @@ async fn handle_p2p_event(
 /// whole apply, re-check the tip under that lock, then bring the engine back in step afterwards —
 /// with one difference that matters: nothing is written until [`verify_block_batch`] has passed on
 /// the batch as a whole, so a peer that lies costs a round trip rather than a corrupted store.
+#[allow(clippy::too_many_arguments)]
 async fn apply_synced_batch(
     batch: BlockSyncResponse,
+    peer: String,
     store: &Arc<RwLock<HelixDb>>,
     chain_state: &Arc<RwLock<ChainState>>,
     engine: &Arc<RwLock<BftEngine>>,
     mempool: &Arc<RwLock<Mempool>>,
     last_applied_height: &Arc<Mutex<u64>>,
     tip_certificate: &Arc<RwLock<TipCertificate>>,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
 ) {
     if batch.blocks.is_empty() {
         return;
@@ -1255,7 +1258,13 @@ async fn apply_synced_batch(
             &cs,
             &validator_set,
         ) {
-            warn!(err = %e, "Rejected a block-sync batch from a peer — nothing applied");
+            warn!(peer = %peer, err = %e, "Rejected a block-sync batch from a peer — nothing applied");
+            // Tell the P2P service, or it will ask this same peer again on the very next tick:
+            // it picks by highest claimed tip, and from its side a batch we threw away looks
+            // exactly like one that applied cleanly (backlog #140). Nothing here trusts the peer
+            // any less — the batch is already discarded — this only stops it from monopolising
+            // catch-up while a healthy peer sits one block lower, unasked.
+            let _ = p2p_tx.try_send(P2PCommand::BlocksyncBatchRejected(peer));
             return;
         }
     }
@@ -4535,7 +4544,7 @@ mod handle_p2p_event_tests {
     ) {
         let (p2p_tx, _rx) = mpsc::channel(8);
         handle_p2p_event(
-            P2PEvent::BlocksSynced(batch),
+            P2PEvent::BlocksSynced(batch, "12D3KooWtest".to_string()),
             &Arc::new(RwLock::new(Mempool::new())),
             &Arc::new(AtomicUsize::new(0)),
             store,

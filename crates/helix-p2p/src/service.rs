@@ -63,7 +63,9 @@ pub enum P2PEvent {
     /// A peer answered our block-sync request with a contiguous batch of committed blocks and a
     /// commit certificate for the last one (#138). Entirely untrusted: the node layer verifies the
     /// chain, every proposer signature, and the batch tip's quorum *before* anything is written.
-    BlocksSynced(BlockSyncResponse),
+    /// A block-sync batch, and the peer that served it — the node reports back via
+    /// `P2PCommand::BlocksyncBatchRejected` if it does not verify (backlog #140).
+    BlocksSynced(BlockSyncResponse, String),
 }
 
 /// Commands sent TO the P2P network FROM the node
@@ -76,6 +78,11 @@ pub enum P2PCommand {
     /// to help lagging peers catch up and carry finality with the block (#114).
     BroadcastBlock(Block, Vec<Vote>),
     ConnectPeer(Multiaddr),
+    /// The node could not verify the block-sync batch this peer served (backlog #140). The service
+    /// cannot tell that by itself: from here a batch that fails verification and one that applies
+    /// cleanly are both just a non-empty response. Without this the peer keeps being picked — it
+    /// is by definition the one claiming the highest tip — and catch-up never moves.
+    BlocksyncBatchRejected(String),
 }
 
 #[derive(NetworkBehaviour)]
@@ -324,6 +331,15 @@ impl P2PService {
         // a flood. Cleared on a response and on any failure, so a peer that never answers costs one
         // request and one timeout, not a wedged sync.
         let mut blocksync_in_flight = false;
+        // Driver ticks left before each peer may be asked for blocks again (backlog #140).
+        //
+        // `best_blocksync_peer` picks the highest claimed tip, which is deterministic — so a peer
+        // that never answers, or serves batches that do not verify, is picked again on every tick
+        // forever while a healthy peer one block lower sits untouched. Neither case is worth a ban
+        // (the first may be a slow link, the second may be an honest peer that raced our own tip),
+        // but both have to stop costing us the catch-up. A cooldown is the smallest thing that
+        // turns "always the same peer" into "work through the peers that are ahead of us".
+        let mut blocksync_cooldown: HashMap<PeerId, u32> = HashMap::new();
         if let Some(addr) = &config.public_addr {
             known_addrs.insert(addr.clone());
         }
@@ -416,14 +432,27 @@ impl P2PService {
                                 request_response::Message::Response { response, .. } => {
                                     blocksync_in_flight = false;
                                     if response.blocks.is_empty() {
-                                        debug!(peer = %peer, "Block-sync peer had nothing to serve");
+                                        // We only ask peers that claim a tip above ours, so an
+                                        // empty answer contradicts what this peer announced. It
+                                        // costs the peer nothing to keep claiming a high tip and
+                                        // serving nothing, and selection is by highest claim — so
+                                        // without a cooldown here that is a free way to occupy our
+                                        // one in-flight request forever (backlog #140). The
+                                        // charitable readings — pruned history, a tip announced a
+                                        // moment before a restart — are equally well served by
+                                        // asking someone else for the next ten seconds.
+                                        blocksync_cooldown
+                                            .insert(peer, BLOCKSYNC_PEER_COOLDOWN_TICKS);
+                                        debug!(peer = %peer, "Block-sync peer claimed to be ahead but served nothing — trying another peer");
                                     } else {
                                         info!(
                                             peer = %peer,
                                             blocks = response.blocks.len(),
                                             "Received a block-sync batch"
                                         );
-                                        let _ = event_tx.send(P2PEvent::BlocksSynced(response)).await;
+                                        let _ = event_tx
+                                            .send(P2PEvent::BlocksSynced(response, peer.to_string()))
+                                            .await;
                                     }
                                 }
                             }
@@ -431,11 +460,14 @@ impl P2PService {
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
                             request_response::Event::OutboundFailure { peer, error, .. }
                         )) => {
-                            // Clearing the in-flight flag is what keeps a dead or unwilling peer
-                            // from wedging catch-up forever: the next tick simply tries again,
-                            // possibly against a different peer.
+                            // Clearing the in-flight flag alone is not enough: `best_blocksync_peer`
+                            // is deterministic, so the next tick would pick this same unresponsive
+                            // peer again, and the one after that, forever — this comment used to
+                            // claim "possibly against a different peer", which was never true
+                            // (backlog #140). The cooldown is what actually moves us to someone else.
                             blocksync_in_flight = false;
-                            debug!(peer = %peer, err = %error, "Block-sync request failed");
+                            blocksync_cooldown.insert(peer, BLOCKSYNC_PEER_COOLDOWN_TICKS);
+                            debug!(peer = %peer, err = %error, "Block-sync request failed — trying another peer");
                         }
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
                             request_response::Event::InboundFailure { peer, error, .. }
@@ -522,9 +554,18 @@ impl P2PService {
                 }
 
                 _ = blocksync_interval.tick() => {
+                    // Age the cooldowns first, so a peer sat out its penalty by the time this tick
+                    // chooses. Entries are removed at zero rather than kept at zero, which is what
+                    // keeps this map bounded by the peers we actually failed against.
+                    blocksync_cooldown.retain(|_, ticks| {
+                        *ticks -= 1;
+                        *ticks > 0
+                    });
                     if !blocksync_in_flight {
                         let our_tip = tip_height.load(Ordering::Relaxed);
-                        if let Some((peer, peer_tip)) = best_blocksync_peer(&peer_tips, our_tip) {
+                        if let Some((peer, peer_tip)) =
+                            best_blocksync_peer(&peer_tips, our_tip, &blocksync_cooldown)
+                        {
                             let count = blocksync_request_count(our_tip, peer_tip);
                             if count > 0 {
                                 debug!(
@@ -623,6 +664,23 @@ impl P2PService {
                         }
                         P2PCommand::ConnectPeer(addr) => {
                             let _ = swarm.dial(addr);
+                        }
+                        P2PCommand::BlocksyncBatchRejected(peer) => {
+                            // The node verified the batch and threw it away. From the service's own
+                            // view that is indistinguishable from success — it only ever sees a
+                            // non-empty response — so without this report the same peer is asked
+                            // again every tick, being the one claiming the highest tip (#140).
+                            //
+                            // A cooldown, not a ban: an honest peer can serve a batch we reject
+                            // because our own tip moved underneath it. Repeat offenders simply keep
+                            // earning cooldowns, and never get to hold up catch-up in between.
+                            match peer.parse::<PeerId>() {
+                                Ok(peer_id) => {
+                                    blocksync_cooldown.insert(peer_id, BLOCKSYNC_PEER_COOLDOWN_TICKS);
+                                    warn!(peer = %peer, "Block-sync batch failed verification — asking a different peer");
+                                }
+                                Err(e) => debug!(peer = %peer, err = %e, "Unparseable peer id in block-sync rejection"),
+                            }
                         }
                     }
                 }
@@ -827,10 +885,23 @@ fn handle_peer_exchange_message(
 /// first*. A peer that lies about its height, or answers with junk, costs one round trip: the batch
 /// fails verification in the node layer, nothing is written, and the next tick tries again. That is
 /// why this can be a naive maximum rather than a reputation calculation.
-fn best_blocksync_peer(peer_tips: &HashMap<PeerId, u64>, our_tip: u64) -> Option<(PeerId, u64)> {
+/// Driver ticks a peer sits out after failing to serve us blocks — either by not answering at all,
+/// or by serving a batch the node could not verify (backlog #140).
+///
+/// Long enough that the next tick genuinely reaches someone else, short enough that a peer with a
+/// brief hiccup is not written off: at the 2 s driver interval this is ten seconds. Deliberately
+/// not a ban — neither failure proves misbehaviour, and the goal here is to keep catching up, not
+/// to punish.
+const BLOCKSYNC_PEER_COOLDOWN_TICKS: u32 = 5;
+
+fn best_blocksync_peer(
+    peer_tips: &HashMap<PeerId, u64>,
+    our_tip: u64,
+    cooldown: &HashMap<PeerId, u32>,
+) -> Option<(PeerId, u64)> {
     peer_tips
         .iter()
-        .filter(|(_, &tip)| tip > our_tip)
+        .filter(|(peer, &tip)| tip > our_tip && !cooldown.contains_key(*peer))
         .max_by_key(|(_, &tip)| tip)
         .map(|(peer, &tip)| (*peer, tip))
 }
@@ -1030,6 +1101,52 @@ mod peer_exchange_tests {
         libp2p::identity::Keypair::ed25519_from_bytes([n; 32]).unwrap().public().to_peer_id()
     }
 
+    /// No peer is sitting anything out — the default state, and what every test that is not about
+    /// the cooldown itself wants.
+    fn no_cooldown() -> std::collections::HashMap<libp2p::PeerId, u32> {
+        std::collections::HashMap::new()
+    }
+
+    /// Backlog #140. Selection is by highest claimed tip and nothing else, so a peer that never
+    /// answers — or serves batches we cannot verify — is chosen again on every single tick while a
+    /// healthy peer one block lower is never asked. That is not a slow catch-up, it is no catch-up
+    /// at all, in exactly the situation directed block sync exists for.
+    #[test]
+    fn a_peer_on_cooldown_is_skipped_for_the_next_best_one() {
+        let mut tips = std::collections::HashMap::new();
+        tips.insert(peer(1), 130); // the one that keeps failing us
+        tips.insert(peer(2), 129); // healthy, one block lower, previously never asked
+        tips.insert(peer(3), 90); // behind us — still must not be picked
+
+        let (chosen, _) = super::best_blocksync_peer(&tips, 100, &no_cooldown()).unwrap();
+        assert_eq!(chosen, peer(1), "precondition: the highest tip wins when nobody is penalised");
+
+        let cooling: std::collections::HashMap<_, _> = [(peer(1), 5)].into_iter().collect();
+        let (chosen, tip) = super::best_blocksync_peer(&tips, 100, &cooling).unwrap();
+        assert_eq!(chosen, peer(2), "the failing peer must not hold up catch-up");
+        assert_eq!(tip, 129);
+    }
+
+    /// The cooldown must not become a way to end up asking nobody: if every peer ahead of us is
+    /// sitting one out, there is genuinely nothing to do this tick, and the next tick — after the
+    /// counters age — has to be able to pick again. Pinned because the alternative failure is
+    /// silent (a node that simply stops catching up and logs nothing).
+    #[test]
+    fn when_everyone_ahead_is_cooling_down_we_ask_nobody_this_tick() {
+        let mut tips = std::collections::HashMap::new();
+        tips.insert(peer(1), 130);
+        tips.insert(peer(2), 129);
+        let cooling: std::collections::HashMap<_, _> =
+            [(peer(1), 5), (peer(2), 1)].into_iter().collect();
+
+        assert!(super::best_blocksync_peer(&tips, 100, &cooling).is_none());
+
+        // One tick later peer(2) has served its penalty — the driver's `retain` drops it at zero.
+        let cooling: std::collections::HashMap<_, _> = [(peer(1), 4)].into_iter().collect();
+        let (chosen, _) = super::best_blocksync_peer(&tips, 100, &cooling).unwrap();
+        assert_eq!(chosen, peer(2), "catch-up has to resume on its own, without a reconnect");
+    }
+
     /// Nobody ahead of us is the healthy steady state, and it must produce no request at all —
     /// otherwise every node in a synced network would poll its peers forever.
     #[test]
@@ -1037,7 +1154,7 @@ mod peer_exchange_tests {
         let mut tips = std::collections::HashMap::new();
         tips.insert(peer(1), 100);
         tips.insert(peer(2), 99);
-        assert!(super::best_blocksync_peer(&tips, 100).is_none());
+        assert!(super::best_blocksync_peer(&tips, 100, &no_cooldown()).is_none());
     }
 
     #[test]
@@ -1046,14 +1163,14 @@ mod peer_exchange_tests {
         tips.insert(peer(1), 105);
         tips.insert(peer(2), 130);
         tips.insert(peer(3), 90); // behind us — must not be picked
-        let (chosen, tip) = super::best_blocksync_peer(&tips, 100).unwrap();
+        let (chosen, tip) = super::best_blocksync_peer(&tips, 100, &no_cooldown()).unwrap();
         assert_eq!(chosen, peer(2));
         assert_eq!(tip, 130);
     }
 
     #[test]
     fn with_no_known_peers_there_is_nobody_to_ask() {
-        assert!(super::best_blocksync_peer(&std::collections::HashMap::new(), 0).is_none());
+        assert!(super::best_blocksync_peer(&std::collections::HashMap::new(), 0, &no_cooldown()).is_none());
     }
 
     /// The exact production shape: one block behind, so ask for exactly one block.

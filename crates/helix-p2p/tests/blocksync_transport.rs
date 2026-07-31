@@ -101,11 +101,16 @@ impl BlockProvider for NoBlocks {
 }
 
 fn config(port: u16, seed: Option<u16>) -> P2PConfig {
+    config_multi(port, seed.map(|p| vec![p]).unwrap_or_default())
+}
+
+fn config_multi(port: u16, seeds: Vec<u16>) -> P2PConfig {
     P2PConfig {
         listen_addr: format!("127.0.0.1:{port}").parse().unwrap(),
-        seed_peers: seed
-            .map(|p| vec![format!("/ip4/127.0.0.1/tcp/{p}")])
-            .unwrap_or_default(),
+        seed_peers: seeds
+            .into_iter()
+            .map(|p| format!("/ip4/127.0.0.1/tcp/{p}"))
+            .collect(),
         // Two independent Helix networks must never cross-wire through the LAN, and a test running
         // beside a live node would do exactly that.
         enable_mdns: false,
@@ -151,7 +156,7 @@ async fn a_node_that_is_behind_receives_the_missing_blocks_over_p2p() {
     let mut received: Option<BlockSyncResponse> = None;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(2), behind_events.recv()).await {
-            Ok(Some(P2PEvent::BlocksSynced(batch))) => {
+            Ok(Some(P2PEvent::BlocksSynced(batch, _peer))) => {
                 received = Some(batch);
                 break;
             }
@@ -205,7 +210,7 @@ async fn two_nodes_at_the_same_height_never_exchange_blocks() {
     let mut connected = false;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(2), b_events.recv()).await {
-            Ok(Some(P2PEvent::BlocksSynced(_))) => {
+            Ok(Some(P2PEvent::BlocksSynced(..))) => {
                 panic!("two nodes at the same height must not exchange blocks");
             }
             Ok(Some(P2PEvent::PeerConnected(_))) => {
@@ -220,5 +225,97 @@ async fn two_nodes_at_the_same_height_never_exchange_blocks() {
     assert!(
         connected,
         "the two nodes must actually have connected, or the absence of a batch means nothing"
+    );
+}
+
+/// Backlog #140, and the positive control that entry asked for: a peer claiming the highest tip and
+/// serving nothing must not be able to hold catch-up hostage.
+///
+/// Peer selection is by highest claimed tip and nothing else, and the answer costs the liar
+/// nothing — an empty response is cheap and, before the cooldown, indistinguishable to the service
+/// from "there was simply nothing new". So the node asked the same useless peer on every driver
+/// tick, forever, while a healthy peer one block lower was never asked once. Not a security hole
+/// (nothing unverified is ever adopted) but a liveness hole in exactly the scenario directed block
+/// sync was built for: a node that cannot reach an RPC endpoint and needs its peers.
+///
+/// **The ordering here is the whole test, not incidental setup.** Connecting to both peers at once
+/// is a race: if the healthy peer's tip announcement happens to land first, the liar is never asked
+/// and the run passes without exercising anything — measured, this test passed with the fix removed
+/// when the two were started together. So the liar goes first and gets several driver ticks alone,
+/// and only then does the healthy peer appear. Without the cooldown the liar's tip of 999 beats the
+/// honest 5 on every tick from then on, forever.
+///
+/// Deliberately over the real wire rather than against `best_blocksync_peer`: the unit tests can
+/// only show that a peer *on* cooldown is skipped. Whether anything ever puts it there — an empty
+/// response arriving as a perfectly successful round trip — is a property of the running service.
+#[tokio::test]
+async fn a_peer_that_claims_the_highest_tip_and_serves_nothing_cannot_stall_catch_up() {
+    let kp = KeyPair::generate();
+    let blocks = chained_blocks(&kp, 5);
+
+    // The liar: announces a tip far above everyone and answers every request with nothing.
+    let liar_tip = Arc::new(AtomicU64::new(999));
+    let (liar, _liar_cmd, mut liar_events) =
+        P2PService::new(config(19_651, None), liar_tip, Arc::new(NoBlocks));
+    tokio::spawn(async move { liar.run().await });
+    tokio::spawn(async move { while liar_events.recv().await.is_some() {} });
+
+    // The node that is behind, initially knowing only the liar.
+    let behind_tip = Arc::new(AtomicU64::new(0));
+    let (behind, behind_cmd, mut behind_events) =
+        P2PService::new(config(19_652, Some(19_651)), behind_tip, Arc::new(NoBlocks));
+    tokio::spawn(async move { behind.run().await });
+
+    // Let it connect, learn the liar's tip, and burn several 2s driver ticks against it — so the
+    // liar is established as the highest claim well before any honest peer exists.
+    let settle = tokio::time::Instant::now() + Duration::from_secs(40);
+    while tokio::time::Instant::now() < settle {
+        match tokio::time::timeout(Duration::from_secs(2), behind_events.recv()).await {
+            Ok(Some(P2PEvent::BlocksSynced(..))) => {
+                panic!("the liar serves nothing — no batch can legitimately arrive yet")
+            }
+            Ok(None) => break,
+            _ => continue,
+        }
+    }
+
+    // Now the honest peer appears, claiming a *lower* tip than the liar.
+    let healthy_tip = Arc::new(AtomicU64::new(5));
+    let (healthy, _healthy_cmd, mut healthy_events) = P2PService::new(
+        config(19_650, None),
+        healthy_tip,
+        Arc::new(FixedBlocks { blocks, certificate: stand_in_certificate(&kp) }),
+    );
+    tokio::spawn(async move { healthy.run().await });
+    tokio::spawn(async move { while healthy_events.recv().await.is_some() {} });
+    behind_cmd
+        .send(helix_p2p::P2PCommand::ConnectPeer(
+            "/ip4/127.0.0.1/tcp/19650".parse().unwrap(),
+        ))
+        .await
+        .expect("the behind node's command channel must be alive");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut received: Option<BlockSyncResponse> = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), behind_events.recv()).await {
+            Ok(Some(P2PEvent::BlocksSynced(batch, _))) => {
+                received = Some(batch);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
+    let batch = received.expect(
+        "catch-up must complete through the honest peer even though a peer claiming a higher tip \
+         keeps answering with nothing — before #140 this waited forever",
+    );
+    assert_eq!(
+        batch.blocks.iter().map(|b| b.height()).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5],
+        "and it must be the real range, from the peer that actually had it",
     );
 }
