@@ -2529,7 +2529,19 @@ async fn block_production_loop(
             let needed = engine.read().await.peers_needed_for_quorum();
             let under_connected =
                 peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed;
-            if needed == 0 {
+            // `needed == 0` alone used to skip the round clock entirely, on the reasoning that a
+            // sole validator "always proposes and never waits". The first half of that is what
+            // actually matters, and it is not implied by the second: a node whose own power meets
+            // quorum can still be sitting out a round that belongs to someone else — the other
+            // validator only has to be small enough (below the 1 % cap) not to be needed. Then
+            // nothing ran the clock, nothing advanced the round, and the height stopped for good.
+            // Measured on a three-node devnet 2026-07-30, twice out of twice: one proposal
+            // rejected as "prev_hash mismatch", then ten minutes of nothing (backlog #143). The
+            // proposer being *behind* rather than *silent* is incidental — from this node's side
+            // both are the same no-active-round wait, and the engine recovers from either once
+            // the clock is allowed to run.
+            let our_turn = engine.read().await.is_our_turn();
+            if needed == 0 && our_turn {
                 false
             } else if under_connected && !engine.write().await.note_peer_wait_tick() {
                 // Under-connected — don't burn rounds getting ahead of validators still
@@ -5425,6 +5437,87 @@ mod handle_p2p_event_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
+        loop_handle.abort();
+    }
+
+    /// Backlog #143. This node's own power meets quorum (`peers_needed_for_quorum() == 0`), but
+    /// the round it is on belongs to a *different* validator — one small enough to be below the
+    /// 1 % cap, so it is not needed for quorum, yet still takes its proposer turns. That other
+    /// validator produces nothing this node will accept: offline, or (the live case) behind and
+    /// proposing on a `prev_hash` we reject. Either way this node sits in the no-active-round
+    /// wait.
+    ///
+    /// The bug: `needed == 0` skipped the round clock outright, so the timeout never fired, the
+    /// round never advanced, and the height stopped for good — measured on a three-node devnet
+    /// 2026-07-30, twice out of twice, ten minutes with no progress. The chain has to reach the
+    /// next round on its own and produce there.
+    ///
+    /// `block_production_waits_for_the_initial_sync` above is the control for the other half:
+    /// a sole validator, where `needed == 0` *and* it is our turn, must still produce as before.
+    #[tokio::test]
+    async fn a_proposer_this_node_does_not_need_cannot_stop_the_height() {
+        let kp = Arc::new(KeyPair::generate());
+        let addr = Address::from_public_key(&kp.public);
+        let absent = Address::from_public_key(&KeyPair::generate().public);
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            cs.governance_params.min_validator_stake = 1;
+            cs.update_account(&addr, |acc| acc.staked = 10_000_000);
+            cs.update_account(&absent, |acc| acc.staked = 100);
+        }
+
+        // Order matters: `proposer_for_round` is `(height + round) % len`, so at height 1 round 0
+        // the turn belongs to index 1 — the absent validator — and only at round 1 to us.
+        let vset = ValidatorSet::new(
+            vec![
+                Validator::new(addr.clone(), 10_000_000, true),
+                Validator::new(absent.clone(), 100, true),
+            ],
+            0,
+        );
+        let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr.clone(), 0)));
+        {
+            let eng = engine.read().await;
+            assert_eq!(
+                eng.peers_needed_for_quorum(),
+                0,
+                "precondition: our power alone meets quorum, which is what used to skip the clock"
+            );
+            assert!(
+                !eng.is_our_turn(),
+                "precondition: round 0 of height 1 belongs to the absent validator"
+            );
+        }
+
+        let (p2p_tx, _rx) = mpsc::channel(64);
+        let loop_handle = tokio::spawn(block_production_loop(
+            store.clone(),
+            mempool.clone(),
+            chain_state.clone(),
+            kp.clone(),
+            engine.clone(),
+            Arc::new(Mutex::new(0u64)),
+            p2p_tx.clone(),
+            None,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            Arc::new(RwLock::new(TipCertificate::default())),
+        ));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while store.read().await.latest_height() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the height never moved: a proposer we do not need for quorum still held the \
+                 chain, because the round clock never ran (#143)"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         loop_handle.abort();
     }
 }

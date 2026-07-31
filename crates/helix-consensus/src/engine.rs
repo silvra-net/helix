@@ -297,6 +297,19 @@ impl BftEngine {
         self.round.as_ref().map(|r| r.round)
     }
 
+    /// Whether the next block is this node's to make: it is the designated proposer for the
+    /// height it is deciding, in the round it has actually reached.
+    ///
+    /// The block loop needs this to tell two very different silences apart. If it is our turn,
+    /// nothing is being waited on — `produce_block` opens the round on the next tick. If it is
+    /// *not* our turn, we are waiting on a proposer that may be dead, may be behind and
+    /// proposing on a `prev_hash` we rejected, or may simply be slow — and then the round clock
+    /// has to run, or the height never moves again (backlog #143).
+    pub fn is_our_turn(&self) -> bool {
+        self.validator_set
+            .is_proposer(&self.address, self.current_height + 1, self.pending_round)
+    }
+
     /// How many *other* validators must be connected and voting for this node to
     /// be able to reach quorum. While fewer than this are reachable, quorum is
     /// impossible no matter how many rounds are burned — so the caller holds the
@@ -1611,6 +1624,82 @@ mod tests {
         );
 
         FourValidators { self_kp, self_addr, a_kp, b_kp, c_kp, c_addr, validator_set }
+    }
+
+    /// Backlog #143: a proposer that is *behind* proposes on a `prev_hash` nobody else has. Every
+    /// peer rejects the block as invalid — and then the height must still advance, by timing the
+    /// round out and moving to the next proposer, exactly as it does for a proposer that says
+    /// nothing at all.
+    ///
+    /// This is not a hypothetical: it stalled a three-node devnet twice on 2026-07-30, dead, for
+    /// over ten minutes. The condition — "your turn arrives while you are still catching up" — is
+    /// the normal state of a node after a restart or a network blip, so it is not specific to the
+    /// misconfigured validator that happened to surface it.
+    ///
+    /// Engine-level first, to place the fault: if this passes, the round machinery recovers and the
+    /// stall lives in the node's block-production loop instead.
+    #[test]
+    fn an_invalid_proposal_does_not_prevent_the_round_from_advancing() {
+        let v = four_validators();
+
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 1);
+        // Give this node a committed tip, so it has something for the stale block to disagree with.
+        let our_tip = Hash::digest(b"the real tip");
+        engine.sync_to_externally_finalized_block(5, our_tip, vec![]);
+        let height = engine.current_height() + 1;
+
+        // b is the legitimate round-0 proposer for height 6 ((6 + 0) % 4 == 2, b's index) — the
+        // rejection below must come from the prev_hash, not from proposing out of turn.
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        assert!(v.validator_set.is_proposer(&b_addr, height, 0));
+
+        // It is on the right height, but building on a tip that is not ours: the state of any
+        // node whose turn arrives while it is still catching up.
+        let mut stale = BftEngine::new(v.validator_set.clone(), b_addr, height - 1);
+        let _ = stale.produce_block(&v.b_kp, Hash::digest(b"a tip nobody else has"), vec![]);
+        let bad_block = stale.pending_proposal().unwrap().clone();
+
+        // Rejected — the block does not chain from our tip.
+        let rejected = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, bad_block));
+        assert!(rejected.is_err(), "precondition: the stale proposal must be refused");
+
+        // Now run the round clock out, exactly as `block_production_loop` does.
+        let mut timed_out = false;
+        for _ in 0..ROUND_TIMEOUT_TICKS {
+            if engine.note_round_tick(&v.self_kp) {
+                timed_out = true;
+                break;
+            }
+        }
+        assert!(
+            timed_out,
+            "the round must time out after a rejected proposal — otherwise nothing ever moves the \
+             height on, which is the stall this pins"
+        );
+
+        // And advancing must reach a round this node can actually propose in, so the height
+        // continues rather than waiting forever on a proposer that cannot produce a valid block.
+        let mut advanced_to = None;
+        for _ in 0..v.validator_set.len() {
+            match engine.advance_round(&v.self_kp, our_tip, vec![]) {
+                Ok(block) => {
+                    advanced_to = Some(block.height());
+                    break;
+                }
+                Err(ConsensusError::AwaitingVotes { .. }) => {
+                    advanced_to = Some(height);
+                    break;
+                }
+                // Someone else's turn in that round — keep advancing, as the loop does.
+                Err(ConsensusError::NotProposer { .. }) => continue,
+                Err(e) => panic!("advancing after a rejected proposal must not error: {e}"),
+            }
+        }
+        assert_eq!(
+            advanced_to,
+            Some(height),
+            "after a rejected proposal the height must still be reachable through a later round"
+        );
     }
 
     fn peer_vote(kp: &KeyPair, vote_type: VoteType, height: u64, round: u32, hash: Hash) -> Vote {
