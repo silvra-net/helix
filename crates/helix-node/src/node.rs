@@ -2045,6 +2045,32 @@ async fn apply_finalized_block(
         debug!(height, "Skipping duplicate finalized-block application (already applied via a concurrent path)");
         return;
     }
+
+    // Second, independent gate: the block must actually build on what we have (backlog #146).
+    //
+    // Every caller already guarantees this — the two engine paths only return a block whose
+    // `prev_hash` `validate_block` checked, the gossip fast path checks it explicitly, and our own
+    // production builds on `store.latest_hash()` by construction. That is precisely why this is
+    // worth restating here: it is a guarantee made by *callers*, and this function exists because
+    // there are several of them.
+    //
+    // The height guard above cannot stand in for it. It compares a number, so it is only as good
+    // as whoever keeps it current — and when a partially-applied catch-up left it behind the store
+    // (backlog #145), a block that had already been executed sailed through and minted its reward
+    // a second time. A chain check would have refused that block on its own, whatever the guard
+    // said. Refusing costs nothing: a node that drops a block it cannot chain is simply behind,
+    // and the catch-up paths bring it back.
+    let expected_prev = store.read().await.latest_hash();
+    if block.header.prev_hash != expected_prev {
+        warn!(
+            height,
+            expected_prev = %expected_prev,
+            got_prev = %block.header.prev_hash,
+            "Refusing a finalized block that does not chain from our tip"
+        );
+        return;
+    }
+
     *applied_guard = height;
 
     // `should_broadcast == false` means this block arrived already fully committed
@@ -4084,6 +4110,11 @@ mod resolve_seed_peer_multiaddr_tests {
 
 #[cfg(test)]
 mod handle_p2p_event_tests {
+
+    /// The store's current tip hash — what a block must chain from to be accepted (#146).
+    async fn tip_of(store: &Arc<RwLock<HelixDb>>) -> Hash {
+        store.read().await.latest_hash()
+    }
     use super::*;
     use helix_core::genesis_block;
     use helix_crypto::{Hash, KeyPair, Signature as Sig};
@@ -5247,6 +5278,54 @@ mod handle_p2p_event_tests {
         assert_eq!(store.read().await.latest_height(), 1, "the duplicate must not re-touch storage either");
     }
 
+    /// Backlog #146: the chain check is an *independent* second gate, not a restatement of the
+    /// height guard. Here the guard is entirely correct — the incoming height is genuinely new —
+    /// and the block is still refused, because it does not build on our tip.
+    ///
+    /// That independence is the whole point. #145 was a case where the guard had gone stale and
+    /// was the only thing between two ingest paths and a double execution; with this gate the
+    /// block would have been refused whatever the guard said. Both are cheap, and they fail for
+    /// different reasons.
+    #[tokio::test]
+    async fn a_finalized_block_that_does_not_chain_from_our_tip_is_refused() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let first = signed_block(&kp, 1, Hash::ZERO);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr, 0)));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        let last_applied_height = Arc::new(Mutex::new(0u64));
+        let cert = Arc::new(RwLock::new(TipCertificate::default()));
+
+        apply_finalized_block(first, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &cert).await;
+        assert_eq!(store.read().await.latest_height(), 1, "precondition: block 1 applied");
+        let issued = chain_state.read().await.total_issued;
+
+        // Height 2 — new, so the height guard is satisfied — but built on a parent we never had.
+        let orphan = signed_block(&kp, 2, Hash::digest(b"a tip from some other branch"));
+        apply_finalized_block(orphan, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &cert).await;
+
+        assert_eq!(
+            store.read().await.latest_height(),
+            1,
+            "a block that does not chain from our tip must not be spliced into the chain",
+        );
+        assert_eq!(
+            chain_state.read().await.total_issued,
+            issued,
+            "and it must not have been executed either — no reward, no state change",
+        );
+        assert_eq!(
+            *last_applied_height.lock().await,
+            1,
+            "the guard must not be advanced by a block that was refused",
+        );
+    }
+
     /// The other direction of the same race, and the one that actually bit production code: the
     /// guard used to be *released* the moment the height was claimed, long before the block
     /// reached the store. Every catch-up path takes its starting point from
@@ -5492,6 +5571,10 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0u64));
 
+        // Each rotation block below is chained from the store's current tip (`tip_of(&store)`),
+        // because `apply_finalized_block` refuses blocks that do not chain (#146). The heights
+        // still jump a whole epoch at a time — this test is about what a rotation does, not about
+        // contiguity — but the hash chain is real, which is what the ingest path requires.
         let apply = |block: Block, store: &Arc<RwLock<HelixDb>>, engine: &Arc<RwLock<BftEngine>>| {
             let (store, engine, mempool, chain_state, p2p_tx, last_applied_height) = (
                 store.clone(), engine.clone(), mempool.clone(), chain_state.clone(),
@@ -5508,7 +5591,7 @@ mod handle_p2p_event_tests {
 
         // First epoch boundary: both accounts qualify, but the new staker was never active before,
         // so it enters the one-epoch pending delay — absent from the live set entirely.
-        apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH, Hash::ZERO), &store, &engine).await;
+        apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH, tip_of(&store).await), &store, &engine).await;
         assert!(
             engine.read().await.validator_set().get(&genesis_addr).is_some(),
             "the already-active validator must remain active"
@@ -5521,7 +5604,7 @@ mod handle_p2p_event_tests {
         // Second epoch boundary: the new staker enters PROBATION — now in the signing set so its
         // liveness is provable, but with zero voting power and no proposer turn, so it cannot make
         // the chain depend on it before it has shown a node is actually running.
-        apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * 2, Hash::ZERO), &store, &engine).await;
+        apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * 2, tip_of(&store).await), &store, &engine).await;
         {
             let eng = engine.read().await;
             let v = eng.validator_set().get(&new_staker_addr).cloned();
@@ -5537,7 +5620,7 @@ mod handle_p2p_event_tests {
         // node the promotion gate requires.
         apply(
             signed_block_with_commit(
-                &genesis_kp, helix_consensus::EPOCH_LENGTH * 2 + 1, Hash::ZERO, &[&new_staker_kp],
+                &genesis_kp, helix_consensus::EPOCH_LENGTH * 2 + 1, tip_of(&store).await, &[&new_staker_kp],
             ),
             &store, &engine,
         )
@@ -5545,7 +5628,7 @@ mod handle_p2p_event_tests {
 
         // Third epoch boundary: having served the probation epoch, the probationer is promoted to
         // full active membership with real voting power.
-        apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * 3, Hash::ZERO), &store, &engine).await;
+        apply(signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * 3, tip_of(&store).await), &store, &engine).await;
         {
             let eng = engine.read().await;
             let v = eng.validator_set().get(&new_staker_addr).cloned();
@@ -5588,7 +5671,10 @@ mod handle_p2p_event_tests {
         let last_applied_height = Arc::new(Mutex::new(0u64));
 
         // The phantom never signs a single `last_commit` at any point below.
-        let boundary = |epoch: u64| signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * epoch, Hash::ZERO);
+        // Chained from the current tip for the same reason as the sibling test above (#146).
+        let boundary = async |epoch: u64| {
+            signed_block(&genesis_kp, helix_consensus::EPOCH_LENGTH * epoch, tip_of(&store).await)
+        };
         let apply_one = async |block, last: &Arc<Mutex<u64>>| {
             apply_finalized_block(
                 block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, last,
@@ -5598,7 +5684,7 @@ mod handle_p2p_event_tests {
         };
 
         // First boundary: picked up as pending — not in the signing set at all.
-        apply_one(boundary(1), &last_applied_height).await;
+        apply_one(boundary(1).await, &last_applied_height).await;
         assert!(
             engine.read().await.validator_set().get(&phantom_addr).is_none(),
             "a brand-new staker waits out its pending epoch outside the signing set"
@@ -5606,7 +5692,7 @@ mod handle_p2p_event_tests {
 
         // Second boundary: enters probation — in the set, but powerless, so quorum does not
         // depend on it and a node that isn't really running cannot stall anything yet.
-        apply_one(boundary(2), &last_applied_height).await;
+        apply_one(boundary(2).await, &last_applied_height).await;
         {
             let eng = engine.read().await;
             let v = eng.validator_set().get(&phantom_addr).cloned();
@@ -5621,7 +5707,7 @@ mod handle_p2p_event_tests {
         // Third boundary: NOT promoted, having produced nothing at all — and, decisively, still
         // carrying no voting power in the set the engine actually votes with. Serving the epoch is
         // not the requirement; proving a node is running is.
-        apply_one(boundary(3), &last_applied_height).await;
+        apply_one(boundary(3).await, &last_applied_height).await;
         assert!(
             !chain_state.read().await.active_validators.contains(&phantom_addr),
             "a staker with no running node behind it must never become quorum-critical"
@@ -5637,8 +5723,8 @@ mod handle_p2p_event_tests {
 
         // Two more boundaries: it cycles and never gets in. The point is that this is stable,
         // not that it is delayed by one more epoch.
-        apply_one(boundary(4), &last_applied_height).await;
-        apply_one(boundary(5), &last_applied_height).await;
+        apply_one(boundary(4).await, &last_applied_height).await;
+        apply_one(boundary(5).await, &last_applied_height).await;
         assert!(
             !chain_state.read().await.active_validators.contains(&phantom_addr),
             "and it stays out for as long as nobody runs the node it staked for"
