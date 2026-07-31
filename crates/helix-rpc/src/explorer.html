@@ -658,7 +658,7 @@
       let st, sc, tt = '';
       if (jailed) { st = 'Jailed · #' + v.jailed_until; sc = 'jail'; }
       else if (v.tier === 'pending') { st = 'Pending'; sc = 'off'; tt = 'staked, waiting out one epoch before entering the signing set'; }
-      else if (v.tier === 'probationary') { st = 'Probation'; sc = 'off'; tt = 'in the signing set for one epoch with no voting power and no proposer turn'; }
+      else if (v.tier === 'probationary') { st = 'Probation'; sc = 'off'; tt = 'in the signing set with no voting power; must get a heartbeat or signature on-chain this epoch to be promoted'; }
       else if (v.active === false) { st = 'Inactive'; sc = 'off'; }
       else { st = 'Bonded'; sc = 'bond'; }
       const signed = signersCache.has(v.address);

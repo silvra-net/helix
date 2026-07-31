@@ -123,6 +123,31 @@ pub enum TxType {
     /// window has actually elapsed) and that `tx.from` still meets `min_validator_stake` —
     /// jailing never touches stake itself, only eligibility.
     Unjail,
+    /// `tx.from`, a validator serving its probation epoch, proves that a node is actually
+    /// running the key it staked from (backlog #132/#141). No payload. Recorded in
+    /// `ChainState::probation_seen`, which is what `rotate_active_validators` promotes on — a
+    /// staked address with no node behind it (a "phantom") never sends one, so it never joins
+    /// the quorum and can never freeze a small validator set.
+    ///
+    /// A transaction, deliberately, after three attempts to read the same fact out of the
+    /// consensus stream failed. A probationer holds zero voting power, so its precommit
+    /// completes no quorum and is never awaited; giving it reserved proposer turns instead let
+    /// a joiner that was behind build its own chain at its slot height and split the network
+    /// (measured 2026-07-31: two different blocks at height 225, chain stalled an epoch later).
+    /// A transaction has no delivery window to miss — it sits in the mempool until some block
+    /// includes it — and it touches neither the proposer schedule nor quorum, so it cannot
+    /// fork anything.
+    ///
+    /// **Base-fee-exempt, but only while it is the one thing the sender needs.** An operator
+    /// who stakes exactly `min_validator_stake` has no liquid balance left to pay a fee with,
+    /// and a liveness proof nobody can afford is a gate nobody can pass — the failure mode
+    /// #141 already lived through once. The exemption is bounded by the same condition that
+    /// makes the transaction meaningful at all: `tx.from` is in `probationary_validators` and
+    /// is not yet in `probation_seen`. That is at most one free transaction per probationer
+    /// per epoch, from an address with `min_validator_stake` locked up. Anyone else sending
+    /// one pays the full base fee like any other transaction, so there is no free lane here
+    /// (compare `SubmitDoubleSignEvidence`, the other exempt type).
+    ProbationHeartbeat,
 }
 
 /// Payload embedded in `Transaction::data` for `TxType::ProvePersonhood`.

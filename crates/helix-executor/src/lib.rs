@@ -157,7 +157,17 @@ pub fn execute_transaction(
     // fee at the *floor* base fee, so subjecting it to the fee market would price slashing reports
     // out of every block and silently disable slashing — the exact failure class fixed once before
     // when the evidence tx paid fee 0. Every other transaction pays the base fee for its size.
-    let base_fee_amount = if tx.tx_type == TxType::SubmitDoubleSignEvidence {
+    //
+    // `ProbationHeartbeat` is exempt on the same reasoning, and only while it is the one thing
+    // its sender needs: an operator who stakes exactly `min_validator_stake` has nothing liquid
+    // left, and a liveness proof they cannot afford is a gate nobody passes — which is precisely
+    // how #132's first three attempts failed. The exemption is bounded by the condition that
+    // makes the transaction meaningful at all (sender on probation, proof still outstanding), so
+    // it is at most one free transaction per probationer per epoch, from an address with
+    // `min_validator_stake` locked up. Anyone else sending one pays the full base fee.
+    let base_fee_amount = if tx.tx_type == TxType::SubmitDoubleSignEvidence
+        || (tx.tx_type == TxType::ProbationHeartbeat && state.probation_proof_outstanding(&tx.from))
+    {
         0
     } else {
         base_fee_per_byte.saturating_mul(tx.size_bytes())
@@ -211,6 +221,9 @@ pub fn execute_transaction(
         TxType::Redelegate => execute_redelegate(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::SetCommission => execute_set_commission(state, tx, validator, tx_hash, base_fee_amount),
         TxType::Unjail => execute_unjail(state, tx, validator, tx_hash, height, base_fee_amount),
+        TxType::ProbationHeartbeat => {
+            execute_probation_heartbeat(state, tx, validator, tx_hash, base_fee_amount)
+        }
     };
 
     if receipt.success {
@@ -543,6 +556,40 @@ fn execute_unjail(
 
     state.jailed_until.remove(&key);
     state.missed_blocks.remove(&key);
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// A probationer proves a node is running the key it staked from (backlog #132/#141). No
+/// payload — the signature over the transaction *is* the proof, and `verify_tx_signature` has
+/// already checked it against the account's registered key by the time this runs.
+///
+/// Rejected for anyone not currently serving probation, so this cannot be used to pre-arm a
+/// future probation epoch (`probation_seen` is cleared at every rotation anyway) and cannot be
+/// sent for free by an address that has nothing at stake. A second one in the same epoch is
+/// rejected too: the fact is already recorded, and letting it through would turn a bounded
+/// exemption into an unbounded one.
+fn execute_probation_heartbeat(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+    base_fee_amount: u64,
+) -> Receipt {
+    if !state.probationary_validators.contains(&tx.from) {
+        return Receipt::failure(tx_hash, "not a probationary validator", 0, 0);
+    }
+    if state.probation_seen.contains(&tx.from) {
+        return Receipt::failure(tx_hash, "liveness already proven this epoch", 0, 0);
+    }
+
+    state.probation_seen.insert(tx.from.clone());
     state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
         acc.nonce += 1;
@@ -3060,6 +3107,99 @@ mod tests {
         tx
     }
 
+    /// A probationer with **no liquid balance at all** must be able to prove it is live. This is
+    /// not a corner case: an operator funded with exactly `min_validator_stake` and staking all of
+    /// it is the normal way a validator joins, and every earlier #141 design failed for people in
+    /// exactly that position (a proof they could not deliver, here it would be one they could not
+    /// pay for). The base-fee exemption is what makes the gate passable.
+    #[test]
+    fn a_broke_probationer_can_still_prove_it_is_live() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.update_account(&addr, |acc| acc.staked = 100_000);
+        state.probationary_validators = [addr.clone()].into_iter().collect();
+        assert_eq!(state.get(&addr).unwrap().balance, 0, "precondition: nothing liquid");
+
+        let tx = signed_tx_simple(&kp, &addr, TxType::ProbationHeartbeat, 0, 0);
+        // A base fee high enough that any non-exempt transaction of this size could never pay it.
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 1_000_000);
+
+        assert!(receipt.success, "a broke probationer must still get its proof on-chain: {receipt:?}");
+        assert!(state.probation_seen.contains(&addr), "and the proof must be recorded");
+    }
+
+    /// The exemption is bounded by the condition that makes the transaction meaningful, so it
+    /// cannot become a free lane. An address that is not on probation pays the full base fee —
+    /// and here cannot, so it is not includable at all.
+    #[test]
+    fn a_heartbeat_from_a_non_probationer_is_not_free() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.update_account(&addr, |acc| acc.balance = 10);
+        // Not in `probationary_validators` — a stranger, or a validator that is already active.
+
+        let tx = signed_tx_simple(&kp, &addr, TxType::ProbationHeartbeat, 0, 0);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 1_000_000);
+
+        assert!(!receipt.success, "a heartbeat outside probation must not ride for free");
+        assert_eq!(
+            receipt.error.as_deref(),
+            Some("fee below block base fee"),
+            "and it must be turned away by the fee market, not by the executor's own check",
+        );
+        assert!(state.probation_seen.is_empty());
+    }
+
+    /// Second half of the same bound: once the proof is recorded, further heartbeats stop being
+    /// exempt. Otherwise a probationer could keep sending free transactions all epoch.
+    #[test]
+    fn a_second_heartbeat_in_the_same_epoch_is_not_free() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.update_account(&addr, |acc| acc.staked = 100_000);
+        state.probationary_validators = [addr.clone()].into_iter().collect();
+
+        let first = signed_tx_simple(&kp, &addr, TxType::ProbationHeartbeat, 0, 0);
+        assert!(execute_transaction(&mut state, &first, &validator, 0, 1_000_000).success);
+
+        let second = signed_tx_simple(&kp, &addr, TxType::ProbationHeartbeat, 1, 0);
+        let receipt = execute_transaction(&mut state, &second, &validator, 0, 1_000_000);
+        assert!(!receipt.success, "the exemption must end with the proof it exists for");
+        assert_eq!(receipt.error.as_deref(), Some("fee below block base fee"));
+    }
+
+    /// Nobody can prove someone *else* live. The signature is the proof, so a phantom's address
+    /// cannot be walked out of probation by whoever notices it is stuck — which would hand back
+    /// exactly the hole #132 exists to close.
+    #[test]
+    fn a_heartbeat_cannot_be_sent_on_another_validators_behalf() {
+        let helper_kp = KeyPair::generate();
+        let helper = Address::from_public_key(&helper_kp.public);
+        let phantom = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.update_account(&helper, |acc| acc.balance = 10_000_000);
+        state.probationary_validators = [phantom.clone()].into_iter().collect();
+
+        // The helper can only ever sign as itself: a transaction claiming `from: phantom` would
+        // not verify, so the closest it can get is its own heartbeat, which does nothing for the
+        // phantom.
+        let tx = signed_tx_simple(&helper_kp, &helper, TxType::ProbationHeartbeat, 0, 100_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+        assert!(!receipt.success, "the helper is not on probation");
+        assert!(
+            !state.probation_seen.contains(&phantom),
+            "and nothing it can send may vouch for the phantom",
+        );
+    }
+
     fn signed_unstake_tx(kp: &KeyPair, from: &Address, amount: u64, nonce: u64, fee: u64) -> Transaction {
         let mut tx = Transaction {
             version: 1,
@@ -4133,13 +4273,12 @@ mod tests {
     /// post-upgrade migration case (`active_validators` starts empty): nobody is handed instant
     /// quorum weight.
     ///
-    /// It deliberately runs both a validator that signs during probation and one that never does
-    /// (a "phantom"), and asserts they are treated *identically* — because they are. #132's
-    /// liveness gate is disabled (see `rotate_active_validators` for the three attempts and what
-    /// each measured), so what this pins is the delay, not a phantom defence. Named for what it
-    /// checks, so a future reader doesn't take the old name as a guarantee the code stopped making.
+    /// It runs a validator that proves itself live during probation *and* one that never does
+    /// (a "phantom") through the same rotations, and asserts they come out **differently** — the
+    /// phantom stays out. That difference is the whole of #132, and it is the assertion that was
+    /// inverted between 2026-07-30 and 2026-07-31 while the gate had no workable proof (#141).
     #[test]
-    fn probation_delays_every_new_validator_by_one_epoch_and_then_promotes_it() {
+    fn probation_promotes_a_live_validator_and_holds_a_phantom_back() {
         let sitting_kp = KeyPair::generate();
         let sitting = Address::from_public_key(&sitting_kp.public);
         let phantom = Address::from_public_key(&KeyPair::generate().public);
@@ -4169,17 +4308,19 @@ mod tests {
         // Only `sitting` signs during the probation epoch; `phantom` has no node behind it.
         execute_block(&mut state, &block_with_commit(&sitting, epoch * 2 + 1, &[&sitting_kp]), None);
 
-        // Rotation 3: both are promoted. Serving the epoch is the whole requirement while the
-        // liveness gate is off, so the two are indistinguishable to the chain — the honest
-        // statement of what ships until #141 produces a proof that works.
+        // Rotation 3: only the one that proved itself live is promoted.
         execute_block(&mut state, &empty_block(&sitting, epoch * 3), None);
         assert!(
             state.active_validators.contains(&sitting),
-            "a validator that served its probation epoch is promoted"
+            "a validator that served its probation epoch and signed is promoted"
         );
         assert!(
-            state.active_validators.contains(&phantom),
-            "and so is one that never signed — the accepted gap #141 must close"
+            !state.active_validators.contains(&phantom),
+            "one that produced nothing must not join the quorum — that is #132's whole point"
+        );
+        assert!(
+            state.pending_validators.contains(&phantom),
+            "it restarts the ladder instead of being evicted: the node may still show up"
         );
     }
 

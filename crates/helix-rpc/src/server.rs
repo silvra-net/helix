@@ -860,12 +860,16 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                 } else {
                     "staked"
                 },
-                // Whether this validator's signature has been seen in a committed `last_commit`
-                // during the current probation window. It does **not** gate promotion today (that
-                // gate was unsatisfiable and is disabled — backlog #141); it is exposed because
-                // watching it stay `false` across epochs on a healthy, correctly-staked node is
-                // precisely how that was discovered, and #141 needs the same signal to verify a
-                // fix. Only meaningful while `tier` is `probationary`.
+                // Whether this validator has put anything on-chain during the current probation
+                // window — a `ProbationHeartbeat` its node signed, or its signature in a committed
+                // `last_commit`. This **is** the promotion gate (#132/#141): a probationer showing
+                // `false` at the end of its epoch is not promoted.
+                //
+                // Exposed because it is the one field that separates "the network is slow" from
+                // "your node is signing as a different key than the one you staked from" — the
+                // most common onboarding mistake there is, and otherwise indistinguishable from
+                // nothing happening. It is also how the two earlier, unsatisfiable versions of
+                // this gate were caught. Only meaningful while `tier` is `probationary`.
                 "probation_liveness_seen": chain.probation_seen.contains(&addr),
                 "jailed_until": chain.jailed_until.get(&key),
                 "missed_blocks": chain.missed_blocks.get(&key),

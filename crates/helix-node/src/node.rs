@@ -210,6 +210,12 @@ mod keypair_file_tests {
 }
 
 const BLOCK_TIME_MS: u64 = 2_000;
+
+/// How many block-production ticks between probation heartbeats (see
+/// `send_probation_heartbeat_if_due`). Ten gives a probationer about ten attempts across its
+/// 100-block epoch, so no single dropped transaction costs it the epoch, while staying far below
+/// the noise of one per block.
+const HEARTBEAT_TICK_INTERVAL: u32 = 10;
 /// Block-production ticks to wait (after enough validators have connected) for the
 /// gossip mesh to finish forming before producing the first block, in a
 /// multi-validator set. See the startup gate in `block_production_loop`.
@@ -821,6 +827,10 @@ impl HelixNode {
         if let Ok(tip) = self.store.read().await.get_block_by_height(genesis_height) {
             publish_base_fee(&engine, &self.mempool, base_fee_for_next_block(&tip)).await;
         }
+        // Same reasoning one field over: a node restarting mid-probation would otherwise hold an
+        // empty exemption set until its first applied block, and refuse its own heartbeat in the
+        // window where it most wants to send one.
+        publish_fee_exempt_probationers(&self.chain_state, &self.mempool).await;
 
         // Guards against a genuine race between this node's two independent block-ingestion
         // paths — its own BFT engine reaching quorum (NewProposal/NewVote, in the P2P event
@@ -1609,6 +1619,83 @@ async fn report_double_sign_evidence(
     let _ = p2p_tx.try_send(P2PCommand::BroadcastTransaction(tx));
 }
 
+/// Send this node's probation heartbeat, if it is serving probation and has not yet proved
+/// itself live this epoch (backlog #132/#141). No-op otherwise, which is the common case — an
+/// active validator never sends one.
+///
+/// This is what turns "a node is running for this key" into a fact the chain can act on. It is a
+/// transaction rather than anything in the consensus stream because a probationer holds zero
+/// voting power and cannot be relied on to hold the tip: it may be catching up, and every
+/// consensus-side signal has a delivery window it can miss. A transaction has none — it waits in
+/// the mempool until some block includes it, and it works exactly when the node is behind, which
+/// is the case all three earlier designs failed on.
+///
+/// Fee 0: the exemption in `execute_transaction` covers precisely this transaction from precisely
+/// this sender, because an operator who staked their whole balance has nothing to pay with.
+async fn send_probation_heartbeat_if_due(
+    keypair: &KeyPair,
+    chain_state: &Arc<RwLock<ChainState>>,
+    mempool: &Arc<RwLock<Mempool>>,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
+) {
+    let self_address = Address::from_public_key(&keypair.public);
+    let (nonce, applied_height) = {
+        let state = chain_state.read().await;
+        if !state.probation_proof_outstanding(&self_address) {
+            return;
+        }
+        (
+            state.get(&self_address).map(|acc| acc.nonce).unwrap_or(0),
+            state.applied_height,
+        )
+    };
+
+    let mut tx = Transaction {
+        version: 1,
+        tx_type: TxType::ProbationHeartbeat,
+        from: self_address,
+        to: None,
+        amount: 0,
+        fee: 0,
+        nonce,
+        // The height this attempt was made at, and the reason retries work at all.
+        //
+        // Without it every attempt is byte-identical — ML-DSA signs deterministically, and the
+        // nonce cannot change — so gossipsub drops each repeat as "already been published" and
+        // the local mempool rejects it as a pending nonce. The result was one delivery attempt
+        // per epoch dressed up as ten: measured 2026-07-31, each joiner logged exactly one
+        // heartbeat, and losing that single message cost the whole epoch (one four-validator run
+        // in five). Varying the payload makes each retry a genuinely new message that peers have
+        // not seen, which is the entire point of retrying.
+        //
+        // Only one of them can ever execute — they share a nonce — so the extras cost a rejected
+        // transaction each and nothing else. Never read by the executor: the *signature* is the
+        // proof, not this.
+        data: applied_height.to_le_bytes().to_vec(),
+        crypto_version: keypair.scheme,
+        signature: Signature::from_bytes(vec![]),
+        public_key: keypair.public.clone(),
+    };
+    tx.signature = match keypair.sign(tx.signing_hash().as_bytes()) {
+        Ok(sig) => sig,
+        Err(e) => {
+            warn!(err = %e, "Failed to sign the probation heartbeat — will retry next tick");
+            return;
+        }
+    };
+
+    // The pool rejects every attempt after the first (same nonce still pending) — expected, and
+    // not a reason to skip the broadcast: it is the *peers'* pools that decide whether this ever
+    // reaches a block, and each retry is a distinct message to them.
+    let first_attempt = mempool.write().await.add(tx.clone()).is_ok();
+    if first_attempt {
+        info!(height = applied_height, "Proving this node is live so the validator can leave probation");
+    } else {
+        debug!(height = applied_height, "Re-sending the probation heartbeat");
+    }
+    let _ = p2p_tx.try_send(P2PCommand::BroadcastTransaction(tx));
+}
+
 /// Execute, rotate, broadcast, and persist a block that just reached BFT finality —
 /// whether that happened locally (this node cast the deciding vote itself in
 /// `block_production_loop`) or via a peer's vote arriving through P2P
@@ -1648,6 +1735,31 @@ async fn publish_base_fee(
 ) {
     engine.write().await.set_base_fee_per_byte(base_fee_per_byte);
     mempool.write().await.set_base_fee_per_byte(base_fee_per_byte);
+}
+
+/// Mirror into the mempool which validators may currently send a fee-free probation heartbeat
+/// (backlog #141). Without this the pool's set stays empty, every heartbeat is charged a fee its
+/// sender may not have, and the promotion gate becomes unpassable again — the failure the whole
+/// design exists to avoid, reintroduced one layer below where anyone would look for it.
+///
+/// Deliberately a separate function from `publish_base_fee` despite the identical shape: this one
+/// reads chain state, and the sites that learn a new base fee are not all sites where the
+/// probation cohort can change. Called from the commit funnel, which every applied block passes
+/// through exactly once.
+async fn publish_fee_exempt_probationers(
+    chain_state: &Arc<RwLock<ChainState>>,
+    mempool: &Arc<RwLock<Mempool>>,
+) {
+    let exempt: std::collections::HashSet<Address> = {
+        let state = chain_state.read().await;
+        state
+            .probationary_validators
+            .iter()
+            .filter(|a| !state.probation_seen.contains(*a))
+            .cloned()
+            .collect()
+    };
+    mempool.write().await.set_fee_exempt_probationers(exempt);
 }
 
 /// Build the live BFT validator inputs from chain state — the set every node must run to agree
@@ -2117,6 +2229,7 @@ async fn apply_finalized_block(
     // or validated by this node must carry `next_base_fee`. Both ingestion paths funnel through
     // here, so the engine's expected base fee stays in lockstep with the persisted tip.
     publish_base_fee(engine, mempool, next_base_fee).await;
+    publish_fee_exempt_probationers(chain_state, mempool).await;
 
     // Surface this tip's commit certificate for RPC-only followers (#133). Both ingestion paths
     // funnel through here with the engine's `last_commit` already settled — set by `finalize` on
@@ -2377,6 +2490,11 @@ async fn block_production_loop(
     let mut announced_wait = false;
     // Ticks spent waiting for peers, for the periodic "this is why nothing is happening" line.
     let mut waited_ticks: u32 = 0;
+    // Ticks between probation heartbeats. Not every tick: the transaction is only useful once per
+    // epoch, and re-broadcasting it constantly would be pure gossip noise. Not once per epoch
+    // either — a single attempt that lands in a moment of packet loss would cost a whole epoch,
+    // and the whole point of this design is that it does not depend on catching one moment.
+    let mut heartbeat_ticks: u32 = 0;
 
     loop {
         interval.tick().await;
@@ -2393,6 +2511,16 @@ async fn block_production_loop(
                 announced_wait = true;
             }
             continue;
+        }
+
+        // Prove liveness while on probation (#132/#141). Placed here, before every gate below,
+        // deliberately: a probationer is at its least healthy exactly when it most needs to be
+        // counted — catching up, below quorum, waiting on peers — and none of those states should
+        // silence the one signal that gets it out of probation. Cheap when it does not apply: an
+        // active validator's check is a single read of the chain state.
+        heartbeat_ticks = heartbeat_ticks.saturating_add(1);
+        if heartbeat_ticks % HEARTBEAT_TICK_INTERVAL == 1 {
+            send_probation_heartbeat_if_due(&keypair, &chain_state, &mempool, &p2p_tx).await;
         }
 
         if !mesh_ready {
@@ -5313,12 +5441,15 @@ mod handle_p2p_event_tests {
     }
 
     /// Companion to the promotion path above, run end-to-end through the node: a staker whose node
-    /// never produces anything crosses the same three epoch boundaries as the prover — and reaches
-    /// the same place, because the liveness gate is off (see `ChainState::rotate_active_validators`
-    /// for the three attempts and what each measured). What this pins is the delay: two epochs at
-    /// zero voting power before a new staker is quorum-critical.
+    /// never sends a heartbeat crosses the same epoch boundaries as one that does — and does *not*
+    /// reach the same place. It waits its pending epoch outside the signing set, spends its
+    /// probation epoch in the set at zero voting power, and is then held there rather than
+    /// promoted (#132/#141).
+    ///
+    /// The node-level path matters on its own: the executor decides, but it is the node that has
+    /// to carry that decision into the live `ValidatorSet` the engine actually votes with.
     #[tokio::test]
-    async fn epoch_rotation_holds_a_new_staker_powerless_for_two_epochs_then_promotes_it() {
+    async fn epoch_rotation_never_gives_a_phantom_staker_voting_power() {
         let genesis_kp = KeyPair::generate();
         let genesis_addr = Address::from_public_key(&genesis_kp.public);
         let phantom_addr = Address::from_public_key(&KeyPair::generate().public);
@@ -5369,13 +5500,144 @@ mod handle_p2p_event_tests {
             "and is not active yet"
         );
 
-        // Third boundary: promoted, having produced nothing at all. Not the behaviour #132 aimed
-        // for — the honest statement of what ships until #141 produces a workable liveness proof.
+        // Third boundary: NOT promoted, having produced nothing at all — and, decisively, still
+        // carrying no voting power in the set the engine actually votes with. Serving the epoch is
+        // not the requirement; proving a node is running is.
         apply_one(boundary(3), &last_applied_height).await;
         assert!(
-            chain_state.read().await.active_validators.contains(&phantom_addr),
-            "serving the probation epoch is currently the whole requirement — a staker with no \
-             running node behind it does become quorum-critical (#141)"
+            !chain_state.read().await.active_validators.contains(&phantom_addr),
+            "a staker with no running node behind it must never become quorum-critical"
+        );
+        {
+            let eng = engine.read().await;
+            let power = eng.validator_set().get(&phantom_addr).map(|v| v.voting_power);
+            assert!(
+                matches!(power, None | Some(0)),
+                "and the live set must not hand it power either — got {power:?}"
+            );
+        }
+
+        // Two more boundaries: it cycles and never gets in. The point is that this is stable,
+        // not that it is delayed by one more epoch.
+        apply_one(boundary(4), &last_applied_height).await;
+        apply_one(boundary(5), &last_applied_height).await;
+        assert!(
+            !chain_state.read().await.active_validators.contains(&phantom_addr),
+            "and it stays out for as long as nobody runs the node it staked for"
+        );
+    }
+
+    /// End to end through the node's own machinery: a validator on probation with **zero liquid
+    /// balance** must produce a heartbeat that its own mempool actually accepts. Both halves have
+    /// bitten before — a transaction the node happily signs and the pool silently drops is
+    /// indistinguishable from one that was never sent, and it would put the promotion gate right
+    /// back to unpassable (#141), one layer below where anyone would look.
+    ///
+    /// The mirrored exemption set is published here the same way the node does it, so this also
+    /// pins that `publish_fee_exempt_probationers` is what makes the pool agree with the executor.
+    #[tokio::test]
+    async fn a_broke_probationer_sends_a_heartbeat_its_own_mempool_accepts() {
+        let kp = Arc::new(KeyPair::generate());
+        let addr = Address::from_public_key(&kp.public);
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            cs.update_account(&addr, |acc| acc.staked = 100_000);
+            cs.probationary_validators.insert(addr.clone());
+            assert_eq!(cs.get(&addr).unwrap().balance, 0, "precondition: nothing liquid");
+        }
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
+
+        publish_fee_exempt_probationers(&chain_state, &mempool).await;
+        send_probation_heartbeat_if_due(&kp, &chain_state, &mempool, &p2p_tx).await;
+
+        let pending = mempool.write().await.take(10);
+        assert_eq!(pending.len(), 1, "the heartbeat must reach this node's own pool");
+        assert_eq!(pending[0].tx_type, TxType::ProbationHeartbeat);
+        assert_eq!(pending[0].from, addr);
+        assert_eq!(pending[0].fee, 0, "an operator who staked everything has nothing to pay with");
+
+        assert!(
+            matches!(p2p_rx.try_recv(), Ok(P2PCommand::BroadcastTransaction(_))),
+            "and it must be gossiped — a heartbeat only this node knows about proves nothing",
+        );
+    }
+
+    /// Retries have to be *distinct messages*, or they are not retries.
+    ///
+    /// This is the trap the design walked into once already: ML-DSA signs deterministically and
+    /// the nonce cannot change, so two attempts built from the same state are byte-identical —
+    /// gossipsub drops the repeat as "already been published" and the local pool rejects it as a
+    /// pending nonce. What looked like ten attempts per epoch was one, and losing that single
+    /// message cost the joiner a whole epoch (one four-validator run in five, 2026-07-31).
+    ///
+    /// Asserted on the hash rather than on the payload, because what matters is not that some
+    /// field differs but that the network sees something it has not seen before.
+    #[tokio::test]
+    async fn each_heartbeat_retry_is_a_message_the_network_has_not_seen() {
+        let kp = Arc::new(KeyPair::generate());
+        let addr = Address::from_public_key(&kp.public);
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            cs.update_account(&addr, |acc| acc.staked = 100_000);
+            cs.probationary_validators.insert(addr.clone());
+            cs.applied_height = 210;
+        }
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
+        publish_fee_exempt_probationers(&chain_state, &mempool).await;
+
+        send_probation_heartbeat_if_due(&kp, &chain_state, &mempool, &p2p_tx).await;
+        // A later tick, same epoch, same nonce — only the chain has moved on.
+        chain_state.write().await.applied_height = 220;
+        send_probation_heartbeat_if_due(&kp, &chain_state, &mempool, &p2p_tx).await;
+
+        let mut hashes = Vec::new();
+        while let Ok(P2PCommand::BroadcastTransaction(tx)) = p2p_rx.try_recv() {
+            assert_eq!(tx.tx_type, TxType::ProbationHeartbeat);
+            assert_eq!(tx.nonce, 0, "retries keep the nonce — only one of them may ever execute");
+            hashes.push(tx.hash().to_hex());
+        }
+        assert_eq!(hashes.len(), 2, "both attempts must be gossiped, not just the first");
+        assert_ne!(
+            hashes[0], hashes[1],
+            "a retry identical to the original is silently dropped by gossipsub and reaches nobody",
+        );
+    }
+
+    /// The other direction, so the test above cannot pass by simply always sending: an active
+    /// validator, and a probationer that has already proved itself, send nothing at all. Without
+    /// this the node would gossip a useless transaction every ten ticks forever.
+    #[tokio::test]
+    async fn nobody_else_sends_a_probation_heartbeat() {
+        let kp = Arc::new(KeyPair::generate());
+        let addr = Address::from_public_key(&kp.public);
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            cs.update_account(&addr, |acc| acc.staked = 100_000);
+            cs.active_validators.insert(addr.clone());
+        }
+        let (p2p_tx, _rx) = mpsc::channel(8);
+
+        send_probation_heartbeat_if_due(&kp, &chain_state, &mempool, &p2p_tx).await;
+        assert_eq!(mempool.read().await.len(), 0, "an active validator sends none");
+
+        // Now on probation, but the proof is already recorded: still nothing to say.
+        {
+            let mut cs = chain_state.write().await;
+            cs.active_validators.clear();
+            cs.probationary_validators.insert(addr.clone());
+            cs.probation_seen.insert(addr.clone());
+        }
+        send_probation_heartbeat_if_due(&kp, &chain_state, &mempool, &p2p_tx).await;
+        assert_eq!(
+            mempool.read().await.len(),
+            0,
+            "and one that has already proved itself does not keep repeating it",
         );
     }
 

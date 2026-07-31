@@ -48,9 +48,17 @@ mutually exclusive:
    and no proposer turn — and is a full voting validator from the boundary after that, when its
    round-robin proposer turns begin.
 
-   Probation is a delay, not a safety net: promotion at the end of it is unconditional today, so a
-   staked address with no node behind it does become quorum-critical. The address check in step 1
-   is what prevents that, not the waiting period.
+   Probation is a test, not just a delay. During that epoch your node automatically sends a
+   small, fee-free **heartbeat transaction** signed with the staking key, and promotion happens
+   only if one of them (or a co-signed block) actually reached the chain. A staked address with
+   no node behind it sends nothing, is never promoted, and so never becomes quorum-critical — it
+   simply stays powerless and tries again. Nothing is slashed and nothing is lost.
+
+   You do not have to do anything for this, and it costs nothing: the heartbeat is exempt from
+   the base fee precisely because an operator who staked their whole balance has nothing liquid
+   left to pay with. If your validator never leaves probation, the near-certain cause is that
+   your node is signing as a *different* key than the one you staked from — check step 1 again.
+   `GET /validators` shows `tier` and `probation_liveness_seen` for exactly this diagnosis.
 4. **Earn**: every block you produce mints you a share of that block's transaction fees (50%
    of each fee; the other 50% is burned) plus a fixed block reward (starts at 1 HLX, halves
    yearly — see [Token Economics](internals.md#token-economics)), paid even on empty blocks. If you have

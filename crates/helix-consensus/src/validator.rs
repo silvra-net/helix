@@ -18,15 +18,22 @@ pub struct Validator {
     /// Effective voting power after personhood cap is applied
     pub voting_power: u64,
     /// A newly-activated validator serving its one-epoch **probation** (see backlog #132): it is
-    /// in the set so its precommits are gathered and land in `last_commit` — the on-chain proof
-    /// that a node is actually running this key — but it carries **zero voting power** and is
-    /// excluded from proposer selection. So a validator that staked but has no live node behind
-    /// it (a "phantom") cannot become quorum-critical and freeze a small set; it simply never
-    /// proves itself live and is dropped at the next rotation instead of activated. A live one's
-    /// signature shows up in a committed `last_commit`, and `rotate_active_validators` promotes
-    /// it to a full member. Quorum and proposer therefore run over full members only, which is
-    /// what keeps this decision deterministic across nodes (it reads committed state, never a
-    /// node's local view — the lesson of the #116/#117 fork).
+    /// in the set so it syncs and participates, but it carries **zero voting power** and is
+    /// excluded from proposer selection, so nothing the chain needs can come to depend on it yet.
+    /// A validator that staked but has no live node behind it (a "phantom") therefore cannot
+    /// freeze a small set — and it is never promoted either: it proves nothing, so
+    /// `rotate_active_validators` returns it to the queue instead of activating it.
+    ///
+    /// What counts as proof is a `TxType::ProbationHeartbeat` its node signs (or, as a free
+    /// second chance, its signature turning up in a committed `last_commit`). Deliberately a
+    /// transaction: a zero-power precommit completes no quorum and is never awaited, so three
+    /// earlier designs that tried to read liveness out of the consensus stream all failed —
+    /// backlog #141 records what each one measured, including the one that forked the chain.
+    ///
+    /// Quorum and the proposer schedule run over full members only, which is what keeps this
+    /// decision deterministic across nodes: it reads committed state, never a node's local view
+    /// (the lesson of the #116/#117 fork, and the trap the third #141 attempt fell into by making
+    /// the proposer schedule depend on probationary membership).
     #[serde(default)]
     pub probationary: bool,
 }

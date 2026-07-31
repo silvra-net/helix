@@ -237,12 +237,18 @@ yesterday or years ago. Concretely, to add Bob and Carol to your network:
    signing set, so it syncs and participates, but carries zero voting power and gets no proposer
    turn, so nothing the chain needs depends on it yet.
 
-   > **Probation delays a phantom, it does not stop one.** Promotion at the end of the probation
-   > epoch is currently unconditional. A validator that staked without a matching running node is
-   > therefore quorum-critical two epochs after staking, exactly as before — which is why step 3's
-   > address check is the protection that actually matters. Making promotion conditional on proven
-   > liveness needs a liveness signal a zero-power validator can actually produce; see the note in
-   > `ChainState::rotate_active_validators`.
+   > **Promotion is earned, not waited out.** During the probation epoch the node automatically
+   > sends a small, fee-free heartbeat transaction signed with its validator key, and the
+   > validator joins the voting set only if one of those (or a co-signed block) actually reached
+   > the chain. A key with no node behind it sends neither, so it is never promoted: it stays in
+   > the signing set at zero voting power, returns to the queue, and tries again whenever a node
+   > does show up. It is not slashed and not evicted, and the chain never comes to depend on it.
+   >
+   > Step 3's address check still matters — it is the difference between activating and waiting
+   > forever. If your node signs as a different key than the one you staked from, the staked
+   > address will never be promoted, and the only symptom is that nothing happens. Check
+   > `GET /validators`: a `probationary` entry whose `probation_liveness_seen` stays `false`
+   > across a whole epoch is that mistake, not a slow network.
 
 **Wire the validators into a full mesh.** BFT relays prevotes and precommits between *all*
 validators, so every validator should have a direct P2P connection to every other — not

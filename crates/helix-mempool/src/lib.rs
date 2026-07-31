@@ -1,6 +1,6 @@
 use helix_core::{transaction::Amount, Transaction, TxType};
-use helix_crypto::{Hash, PublicKey};
-use std::collections::{BTreeMap, HashMap};
+use helix_crypto::{Address, Hash, PublicKey};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -58,6 +58,10 @@ pub struct Mempool {
     entered_at: HashMap<String, Instant>,
     max_size: usize,
     min_fee: Amount,
+    /// Addresses whose `ProbationHeartbeat` is admitted without a fee — see `is_fee_exempt`.
+    /// Mirrored from committed state by the node; empty on a pool that nobody updates, which
+    /// makes the default strict rather than permissive.
+    fee_exempt_probationers: HashSet<Address>,
     ttl: Duration,
     /// The EIP-1559 base fee (nano-HLX per tx byte) the next block will charge, mirrored from
     /// consensus via `set_base_fee_per_byte` after every commit. The pool holds a copy rather
@@ -84,6 +88,7 @@ impl Mempool {
             min_fee: DEFAULT_MIN_FEE,
             ttl: DEFAULT_TTL,
             base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
+            fee_exempt_probationers: HashSet::new(),
         }
     }
 
@@ -100,6 +105,7 @@ impl Mempool {
             min_fee,
             ttl: DEFAULT_TTL,
             base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
+            fee_exempt_probationers: HashSet::new(),
         }
     }
 
@@ -116,6 +122,7 @@ impl Mempool {
             min_fee,
             ttl,
             base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
+            fee_exempt_probationers: HashSet::new(),
         }
     }
 
@@ -159,12 +166,44 @@ impl Mempool {
     /// reports to the bottom of every block: their flat reporter fee minus a base fee on ~16 KB
     /// would saturate to tip 0. Same trap as the admission check above.
     fn tip(&self, tx: &Transaction) -> Amount {
-        if tx.tx_type == TxType::SubmitDoubleSignEvidence {
+        if self.is_fee_exempt(tx) {
             tx.fee
         } else {
             tx.fee
                 .saturating_sub(self.base_fee_per_byte.saturating_mul(tx.size_bytes()))
         }
+    }
+
+    /// Whether `tx` pays no base fee at execution, so this pool must neither charge it one nor
+    /// subtract one when ranking it. There are exactly two such transactions, and both are
+    /// consensus-safety public goods that a fee would silently switch off:
+    ///
+    ///  - `SubmitDoubleSignEvidence`: ~16 KB of self-proving evidence against a flat reporter
+    ///    fee. Charging it would sink every slashing report to the bottom of every block.
+    ///  - `ProbationHeartbeat` from an address this pool has been told is on probation and still
+    ///    owes its proof (see `set_fee_exempt_probationers`): an operator who staked their whole
+    ///    balance has nothing to pay with, and a liveness proof nobody can afford is a gate
+    ///    nobody passes — the failure mode backlog #141 already lived through three times. The
+    ///    sender set is what bounds it: small, mirrored from committed state, and every member
+    ///    has `min_validator_stake` locked up. A heartbeat from anyone else pays like any other
+    ///    transaction.
+    ///
+    /// The mirrored set may lag the chain by a block. That is harmless in the strict direction
+    /// (a stale member's transaction simply fails at execution, costing nothing) and is why the
+    /// executor re-derives the condition itself rather than trusting this.
+    fn is_fee_exempt(&self, tx: &Transaction) -> bool {
+        match tx.tx_type {
+            TxType::SubmitDoubleSignEvidence => true,
+            TxType::ProbationHeartbeat => self.fee_exempt_probationers.contains(&tx.from),
+            _ => false,
+        }
+    }
+
+    /// Mirror the set of validators currently serving probation without a recorded liveness
+    /// proof, so admission can let their (fee-free) heartbeats through. Called from the same
+    /// place as `set_base_fee_per_byte` — startup and after every commit.
+    pub fn set_fee_exempt_probationers(&mut self, probationers: HashSet<Address>) {
+        self.fee_exempt_probationers = probationers;
     }
 
     /// Remove a transaction from every index it appears in. The `by_tip` bucket is found via
@@ -223,7 +262,12 @@ impl Mempool {
     fn add_inner(&mut self, tx: Transaction, recovery_key: Option<&PublicKey>) -> MempoolResult<()> {
         self.evict_expired();
 
-        if tx.fee < self.min_fee {
+        // Both fee gates below have to agree with `execute_transaction`'s, or this pool starts
+        // either admitting transactions that cannot execute or — far worse, and the reason both
+        // exemptions exist — refusing ones that could. `fee_exempt` is that shared answer.
+        let fee_exempt = self.is_fee_exempt(&tx);
+
+        if tx.fee < self.min_fee && !fee_exempt {
             return Err(MempoolError::FeeTooLow {
                 got: tx.fee,
                 min: self.min_fee,
@@ -236,7 +280,7 @@ impl Mempool {
         // at the pool — silently disabling slashing, exactly as a fee-0 evidence tx once did.
         // The two checks must agree; if they ever drift, this pool starts either admitting
         // transactions that cannot execute or refusing ones that could.
-        if tx.tx_type != TxType::SubmitDoubleSignEvidence {
+        if !fee_exempt {
             let size_bytes = tx.size_bytes();
             let need = self.base_fee_per_byte.saturating_mul(size_bytes);
             if tx.fee < need {
@@ -386,6 +430,52 @@ mod tests {
         make_tx_with_data(keypair, fee, nonce, 0)
     }
 
+    /// The gate a probation heartbeat has to clear before it can ever reach a block, and the one
+    /// that nearly swallowed it: `min_fee` is checked before the base fee and knows nothing about
+    /// exemptions, so a fee-0 heartbeat was refused here and never made it on-chain — the pool
+    /// silently reinstating exactly the unpassable gate backlog #141 spent three attempts on.
+    /// Same class as the fee-0 slashing report that once disabled slashing.
+    #[test]
+    fn a_probationers_free_heartbeat_is_admitted_and_a_strangers_is_not() {
+        let probationer = KeyPair::generate();
+        let stranger = KeyPair::generate();
+        let mut pool = Mempool::new();
+        pool.set_fee_exempt_probationers(
+            [Address::from_public_key(&probationer.public)].into_iter().collect(),
+        );
+
+        assert!(
+            pool.add(make_heartbeat(&probationer, 0, 0)).is_ok(),
+            "a probationer with nothing liquid must still get its proof into the pool",
+        );
+
+        assert!(
+            pool.add(make_heartbeat(&stranger, 0, 0)).is_err(),
+            "but the exemption must not be a free lane for everyone else",
+        );
+    }
+
+    /// The pool ranks by what a transaction actually pays the validator, and an exempt one burns
+    /// nothing — so subtracting a base fee it never owes would sink it to tip 0 and park it at
+    /// the bottom of every block. Admission alone is not enough; it has to be includable too.
+    #[test]
+    fn an_exempt_heartbeat_is_not_ranked_as_if_it_paid_a_base_fee() {
+        let probationer = KeyPair::generate();
+        let addr = Address::from_public_key(&probationer.public);
+        let mut pool = Mempool::new();
+        pool.set_fee_exempt_probationers([addr].into_iter().collect());
+
+        let hb = make_heartbeat(&probationer, 0, 0);
+        assert_eq!(pool.tip(&hb), 0, "a fee-0 heartbeat tips nothing — but must not underflow");
+
+        let paying = make_heartbeat(&probationer, 7_000, 1);
+        assert_eq!(
+            pool.tip(&paying),
+            7_000,
+            "and none of an exempt transaction's fee is burned, so all of it tips",
+        );
+    }
+
     /// `data_len` pads the transaction to a chosen size — what the base fee, and so the tip,
     /// is charged against.
     fn make_tx_with_data(keypair: &KeyPair, fee: Amount, nonce: u64, data_len: usize) -> Transaction {
@@ -399,6 +489,28 @@ mod tests {
             fee,
             nonce,
             data: vec![0u8; data_len],
+            crypto_version: keypair.scheme,
+            signature: Signature::from_bytes(vec![0u8; 32]),
+            public_key: keypair.public.clone(),
+        };
+        let hash = tx.signing_hash();
+        tx.signature = keypair.sign(hash.as_bytes()).unwrap();
+        tx
+    }
+
+    /// A signed heartbeat. Built as one from the start rather than by patching `tx_type` onto a
+    /// transfer — the signature covers the type, so patching it afterwards produces a transaction
+    /// the pool rejects for the wrong reason and a test that proves nothing.
+    fn make_heartbeat(keypair: &KeyPair, fee: Amount, nonce: u64) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::ProbationHeartbeat,
+            from: Address::from_public_key(&keypair.public),
+            to: None,
+            amount: 0,
+            fee,
+            nonce,
+            data: vec![],
             crypto_version: keypair.scheme,
             signature: Signature::from_bytes(vec![0u8; 32]),
             public_key: keypair.public.clone(),

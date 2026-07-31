@@ -960,11 +960,16 @@ impl ChainState {
 
         // Promote everyone who has served the probation epoch.
         //
-        // The liveness gate that belongs here — promote only a probationer that demonstrably has a
-        // node running — is DISABLED, because three attempts have failed to produce a proof it can
-        // rest on, and a gate nobody can pass stops every honest validator from activating, which
-        // is strictly worse than the phantom it was meant to stop. All three are measured, not
-        // reasoned:
+        // Promote only a probationer that demonstrably has a node running: its address is in
+        // `probation_seen`. A phantom — a stake with no node behind it, the #132 failure mode —
+        // never lands there, so it stays at zero voting power indefinitely and quorum never comes
+        // to depend on it. It is not slashed and not evicted; it returns to the queue and joins
+        // for real the epoch after someone finally runs the node it staked for.
+        //
+        // What fills `probation_seen` is `TxType::ProbationHeartbeat` — a transaction the
+        // probationer signs. Three earlier designs tried to read the same fact out of the
+        // consensus stream instead, and all three are worth remembering, because each looked
+        // sufficient beforehand and each was disproved by measurement, not by argument:
         //
         //  1. **Its signature in a committed `last_commit`** (as #132 shipped). A probationer holds
         //     zero voting power, so its precommit never completes a quorum and is never awaited;
@@ -977,22 +982,29 @@ impl ChainState {
         //     fold a late precommit while it is still on that height, so the delivery window is one
         //     block interval and a peer under load runs behind it. At a 250 ms cadence the joiners
         //     attested 17 blocks each and the proposer folded none.
-        //  3. **Give probationers fixed proposer slots**, so a running node puts a block bearing
-        //     its own address on-chain — no delivery window at all. This *worked* as a proof and
-        //     stalled the chain doing it: a probationer a few blocks behind (the normal state of a
-        //     node catching up) proposes on a `prev_hash` no peer has, everyone rejects the block,
-        //     and the height never recovers. Stuck at the block before the second slot, twice.
-        //     Reverted. The recovery gap it exposed is backlog #143.
+        //  3. **Reserved proposer turns**, so a running node puts a block bearing its own address
+        //     on-chain. This proved liveness on the first try and **forked the chain**: a joiner
+        //     that is behind proposes at its slot height on a tip nobody else has, and the network
+        //     splits. Measured 2026-07-31 — two different blocks at height 225, the joiner stuck
+        //     there while the incumbent ran on, and a full stall once the promotion made it
+        //     quorum-critical. Reverted in full. It also made the proposer schedule depend on the
+        //     probationary membership, which is exactly the class of local-view-dependent decision
+        //     the #116/#117 fork taught us not to build.
         //
-        // So: promotion is unconditional, and the protection #132 aimed for is not available today.
-        // Backlog #141 holds what a fourth attempt would need. Until then #60 — four validators —
-        // is the answer that actually works: there a phantom neither freezes the chain nor stays
-        // in, since downtime jails it.
+        // The transaction avoids all three failure modes structurally rather than by tuning: it
+        // has no delivery window (it waits in the mempool), it needs no voting power, and it
+        // touches neither the proposer schedule nor quorum, so it cannot fork anything. Signatures
+        // still count when they do arrive — that path costs nothing and is a free second chance.
         //
-        // The probation tier itself is kept and still does something: for one epoch a new validator
-        // sits in the signing set with zero voting power, so it syncs and participates without
-        // being quorum-critical. That is a delay, not a guarantee.
-        let promoted: Vec<Address> = self.probationary_validators.iter().cloned().collect();
+        // The probation tier does two things now: for one epoch a new validator sits in the
+        // signing set with zero voting power, so it syncs and participates without being
+        // quorum-critical — and in that epoch it has to prove it exists.
+        let promoted: Vec<Address> = self
+            .probationary_validators
+            .iter()
+            .filter(|a| self.probation_seen.contains(*a))
+            .cloned()
+            .collect();
         for a in &promoted {
             self.active_validators.insert(a.clone());
         }
@@ -1032,6 +1044,16 @@ impl ChainState {
     /// `record_block_participation` scores against (see `execute_block`), so a proposer can neither
     /// fabricate nor omit a probationer's liveness beyond what it can already do for any signature.
     /// Accumulated across the probation epoch and consumed by `rotate_active_validators`.
+    /// Whether `address` is serving probation *and* still owes the network its liveness proof.
+    ///
+    /// The single condition that bounds `TxType::ProbationHeartbeat`'s base-fee exemption: it is
+    /// true for at most one transaction per probationer per epoch, and only for an address with
+    /// `min_validator_stake` locked up. Read by the fee path *before* execution, so it must not
+    /// depend on anything the transaction itself changes.
+    pub fn probation_proof_outstanding(&self, address: &Address) -> bool {
+        self.probationary_validators.contains(address) && !self.probation_seen.contains(address)
+    }
+
     pub fn record_probation_liveness(
         &mut self,
         signers: &std::collections::HashSet<Address>,
@@ -1568,22 +1590,18 @@ mod tests {
         assert!(prob_addrs(&state).is_empty());
     }
 
-    /// Serving the probation epoch is the whole requirement for promotion right now:
-    /// `probation_seen` is empty here and the probationer activates anyway.
-    ///
-    /// This asserted the opposite until 2026-07-30. Requiring a proof described a gate no
-    /// validator could pass — see `rotate_active_validators` for the three attempts and what each
-    /// measured — so the chain it protected was one where nobody ever activated. Named and
-    /// asserted for what the code does, not for what #132 intended.
+    /// A probationer that proved it is running activates. Paired deliberately with the phantom
+    /// test below: identical setup, one difference — this address is in `probation_seen`. Without
+    /// the pair, a gate that promotes nobody would look exactly like a gate that works.
     #[test]
-    fn a_probationer_is_promoted_after_its_epoch_without_a_liveness_proof() {
+    fn a_probationer_that_proved_liveness_is_promoted() {
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100;
         stake(&mut state, 1, 100);
         stake(&mut state, 2, 100);
         state.active_validators = [addr(1)].into_iter().collect();
         state.probationary_validators = [addr(2)].into_iter().collect();
-        // `probation_seen` stays empty — and that no longer withholds promotion.
+        state.probation_seen = [addr(2)].into_iter().collect();
 
         state.rotate_active_validators();
 
@@ -1591,17 +1609,20 @@ mod tests {
         got.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let mut expected = vec![addr(1), addr(2)];
         expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        assert_eq!(got, expected, "serving the epoch is currently the whole requirement");
+        assert_eq!(got, expected, "a probationer that proved it is running activates");
         assert!(prob_addrs(&state).is_empty(), "the probation cohort is consumed by promotion");
+        assert!(state.probation_seen.is_empty(), "and the window resets for the next cohort");
     }
 
-    /// States the accepted gap out loud so nobody rediscovers it as a surprise: a phantom —
-    /// staked, no node running, produces nothing — does reach the active set and a share of the
-    /// quorum. That is the pre-#132 behaviour the chain has always run on. Not asserted as
-    /// desirable; it exists so a future attempt (#141) has an explicit statement of what it must
-    /// change, visible in the suite rather than only in a comment.
+    /// The phantom case, and the whole point of #132: a stake with no node behind it sends no
+    /// heartbeat, so `probation_seen` never names it, so it is not promoted. It returns to the
+    /// queue and stays at zero voting power for as long as nobody runs the node it staked for —
+    /// not slashed, not evicted, just not counted.
+    ///
+    /// This asserted the exact opposite between 2026-07-30 and 2026-07-31, while the gate had no
+    /// proof it could rest on. Its inversion is the clearest statement that the protection is back.
     #[test]
-    fn a_phantom_currently_reaches_the_active_set_documenting_the_gap_141_must_close() {
+    fn a_phantom_is_not_promoted_and_stays_powerless() {
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100;
         stake(&mut state, 1, 100);
@@ -1611,10 +1632,18 @@ mod tests {
 
         state.rotate_active_validators();
 
+        assert_eq!(
+            active_addrs(&state),
+            vec![addr(1)],
+            "a validator whose node never sent a heartbeat must not join the quorum",
+        );
         assert!(
-            active_addrs(&state).contains(&addr(2)),
-            "documents the accepted gap: nothing currently keeps a validator without a running \
-             node out of the quorum. Restoring that protection is #141."
+            state.pending_validators.contains(&addr(2)),
+            "it goes back to pending and may try again — this is a delay, not an eviction",
+        );
+        assert!(
+            !state.tagged_engine_set().iter().any(|(a, _, probationary)| a == &addr(2) && !probationary),
+            "and it must never appear as a full member",
         );
     }
 
