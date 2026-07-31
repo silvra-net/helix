@@ -1945,6 +1945,29 @@ async fn load_persisted_tip_certificate(
     };
     match bincode::deserialize::<TipCertificate>(&bytes) {
         Ok(cert) => {
+            // Only if it actually attests the tip we hold (#135). The certificate and the block are
+            // written in separate redb transactions, so a crash in the window between them leaves a
+            // certificate for tip−1 on disk while the store is already at tip. Serving that would
+            // hand a syncing follower a certificate for a block it did not ask about; it discards
+            // it on the hash mismatch, so nothing breaks — but it discards it after a round trip,
+            // and only because it happens to re-check. Checking here costs one read and keeps the
+            // stale certificate out of circulation entirely.
+            //
+            // Dropping it is the correct fallback, not a loss: an empty cell is exactly the
+            // pre-#134 startup state, and the next commit republishes a real certificate.
+            let (tip_height, tip_hash) = {
+                let s = store.read().await;
+                (s.latest_height(), s.latest_hash())
+            };
+            if cert.height != tip_height || cert.block_hash != tip_hash.to_hex() {
+                warn!(
+                    cert_height = cert.height,
+                    tip_height,
+                    "Ignoring a persisted tip certificate that does not attest our tip — most \
+                     likely a crash between storing the block and its certificate"
+                );
+                return;
+            }
             info!("Loaded persisted tip certificate for height {}", cert.height);
             *cell.write().await = cert;
         }
@@ -4274,7 +4297,6 @@ mod handle_p2p_event_tests {
         let a = KeyPair::generate();
         let b = KeyPair::generate();
         let tip_height = 7u64;
-        let tip_hash = Hash::digest(b"persisted-tip-7");
 
         // Negative case first: a fresh store holds nothing, so the reload must leave the cell empty
         // — exactly the pre-#134 startup state, no false positive from a stray default.
@@ -4283,6 +4305,11 @@ mod handle_p2p_event_tests {
         load_persisted_tip_certificate(&store, &cell).await;
         assert_eq!(cell.read().await.height, 0, "a fresh store leaves the cell at its empty default");
         assert!(cell.read().await.signatures.is_empty(), "no signatures reload from an empty store");
+
+        // A real tip in the store, because the reload now checks the certificate against it (#135).
+        let tip_block = signed_block(&a, tip_height, Hash::digest(b"parent-of-7"));
+        let tip_hash = tip_block.hash();
+        store.write().await.put_block(tip_block).unwrap();
 
         // Persist a real tip certificate the way `publish_tip_certificate` serializes it, then reload.
         let cert = TipCertificate {
@@ -4300,6 +4327,46 @@ mod handle_p2p_event_tests {
         assert_eq!(got.height, tip_height, "the reloaded cell serves the real tip height, not 0");
         assert_eq!(got.block_hash, tip_hash.to_hex(), "the reloaded tip hash matches what was persisted");
         assert_eq!(got.signatures.len(), 2, "both persisted precommits reload with the certificate");
+    }
+
+    /// Backlog #135: the block and its certificate are written in separate redb transactions, so a
+    /// crash between them leaves a certificate for tip−1 on disk while the store already holds tip.
+    /// Reloading that would put a certificate for the wrong block into `/sync/tip-certificate`.
+    ///
+    /// A follower does re-check and discards it on the hash mismatch, so this was never a consensus
+    /// regression — but it is a stale certificate handed out for a round trip, and the node has
+    /// everything it needs to notice locally. Dropping it restores exactly the pre-#134 startup
+    /// state, and the next commit republishes a real one.
+    #[tokio::test]
+    async fn a_persisted_certificate_for_the_wrong_block_is_not_reloaded() {
+        let kp = KeyPair::generate();
+        let store = Arc::new(RwLock::new(fresh_store()));
+
+        // The store advanced to height 8 …
+        let older = signed_block(&kp, 7, Hash::digest(b"parent-of-7"));
+        let older_hash = older.hash();
+        store.write().await.put_block(older).unwrap();
+        let tip = signed_block(&kp, 8, older_hash);
+        store.write().await.put_block(tip).unwrap();
+
+        // … but the certificate on disk still attests height 7: the crash window.
+        let stale = TipCertificate {
+            height: 7,
+            block_hash: older_hash.to_hex(),
+            signatures: tip_commit_sigs(7, older_hash, &[&kp]),
+        };
+        store
+            .read()
+            .await
+            .save_tip_certificate(&bincode::serialize(&stale).unwrap())
+            .unwrap();
+
+        let cell = Arc::new(RwLock::new(TipCertificate::default()));
+        load_persisted_tip_certificate(&store, &cell).await;
+
+        let got = cell.read().await;
+        assert_eq!(got.height, 0, "a certificate for a block that is not our tip must not load");
+        assert!(got.signatures.is_empty(), "and it must not leak its signatures into the cell either");
     }
 
     /// The free-throwaway-keypair attack this fix closes: a validly self-signed
