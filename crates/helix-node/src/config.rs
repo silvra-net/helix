@@ -30,6 +30,23 @@ pub struct NodeConfig {
     /// own network. Set it for the production origin node itself and for any local devnet.
     /// Overridable via `HELIX_NEW_CHAIN`. Ignored if a sync peer is explicitly configured.
     pub new_chain: Option<String>,
+    /// Hex hash of the genesis block this node expects to join — a checkpoint, in the sense
+    /// Bitcoin and Ethereum use the word. Checked against whatever a peer serves *before* any of
+    /// it is written; a mismatch aborts startup instead of adopting the wrong chain.
+    ///
+    /// This is the only thing that makes joining verifiable at all (backlog #139). A brand-new
+    /// node has no state, no validator set and no chain_id, so it can check an offered genesis
+    /// against nothing — and `verify_genesis_reconstruction` does not close that gap: it compares
+    /// our rebuild against a `state_hash` supplied by *the same peer*, so a peer serving a
+    /// consistent fake passes it. Trust has to enter from outside the connection, and 32 bytes
+    /// published out-of-band (release notes, README, anywhere) is the cheapest form of that: it
+    /// needs no infrastructure of ours to stay reachable, unlike the sync peer itself.
+    ///
+    /// Absent means "trust whatever the sync peer says", which is the historical behaviour and is
+    /// fine for a devnet — the node warns once so the choice is visible. Overridable via
+    /// `HELIX_GENESIS_HASH`. Ignored when this node creates its own genesis (`new_chain`), since
+    /// there is no peer to disagree with.
+    pub genesis_hash: Option<String>,
     /// Path to this node's validator key file (the unified KeyFile JSON format `hlx wallet`
     /// also produces). Defaults to `validator-key.json` in the working directory. Overridable
     /// via `HELIX_VALIDATOR_KEY`.

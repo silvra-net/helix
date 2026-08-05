@@ -448,6 +448,13 @@ impl HelixNode {
             let peer_genesis = fetch_genesis_from_peer(peer_url).await?;
             let genesis = peer_genesis.block.clone();
 
+            // Before the block is rebuilt, hashed against the peer's own claim, or written
+            // (backlog #139). This is the one check in the join path that does not originate with
+            // the peer being trusted.
+            let expected_genesis =
+                config::resolve("HELIX_GENESIS_HASH", &cfg.genesis_hash);
+            verify_genesis_checkpoint(expected_genesis.as_deref(), &genesis)?;
+
             // Rebuild through the same function the peer hashed, taking every field from the
             // peer rather than from this binary's own defaults — they describe a chain this node
             // isn't joining. `allocations` in particular is replaced, never merged: adding a
@@ -3087,6 +3094,51 @@ async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
 /// Comparing hashes turns that into a refusal to start. A peer too old to send one leaves us
 /// where we were before it existed — no check possible — so we warn rather than refuse, since
 /// refusing would make a new node unable to join a chain of older ones.
+/// Checks a peer-supplied genesis block against an operator-configured checkpoint hash, before any
+/// of it is adopted (backlog #139).
+///
+/// Why this is the join path's only real anchor: a node with no chain yet has nothing to judge an
+/// offered genesis by — no state, no validator set, no chain_id. `verify_genesis_reconstruction`
+/// looks like it covers this and does not: it compares our rebuild against a `state_hash` that
+/// arrived in the same response, so a peer serving an internally consistent fake satisfies it
+/// completely. Both halves come from whoever we are asking. That is the same self-certifying shape
+/// #138 had to design around, and here it decides which chain the node spends its life on.
+///
+/// The hash is the whole trust anchor, so it must be compared against the block's *own* hash
+/// rather than anything the peer says about it — `Block::hash()`, recomputed locally.
+///
+/// Unconfigured stays permitted: it is what every existing deployment does, and refusing would
+/// lock operators out on upgrade. It warns, because "I trust this endpoint completely" should be a
+/// visible choice rather than a default nobody noticed making.
+fn verify_genesis_checkpoint(expected_hex: Option<&str>, genesis: &Block) -> Result<()> {
+    let actual = genesis.hash().to_hex();
+
+    let Some(expected) = expected_hex.map(str::trim).filter(|s| !s.is_empty()) else {
+        warn!(
+            genesis_hash = %actual,
+            "No expected genesis hash configured — adopting whatever this sync peer serves. A \
+             compromised or impersonated peer could hand this node a different chain and every \
+             balance it reports would be wrong. Set genesis_hash (or HELIX_GENESIS_HASH) to the \
+             network's published genesis hash to make joining verifiable."
+        );
+        return Ok(());
+    };
+
+    // Case-insensitive: operators copy this out of logs, release notes and block explorers, which
+    // do not agree on casing. Nothing else about the comparison is lenient.
+    if actual.eq_ignore_ascii_case(expected) {
+        info!(genesis_hash = %actual, "Genesis matches the configured checkpoint");
+        return Ok(());
+    }
+
+    bail!(
+        "refusing to join: this sync peer serves genesis {actual}, but this node is configured to \
+         join the chain whose genesis is {expected}. Either the peer is on a different chain (a \
+         reset creates a new genesis — check for a published new hash), or it is not the peer it \
+         claims to be. Nothing has been written."
+    )
+}
+
 fn verify_genesis_reconstruction(peer_genesis: &PeerGenesis, local: &ChainState) -> Result<()> {
     let Some(expected) = peer_genesis.state_hash.as_deref() else {
         warn!(
@@ -6068,6 +6120,60 @@ mod genesis_verification_tests {
     use super::*;
     use helix_core::genesis_block;
     use helix_crypto::{KeyPair, Signature};
+
+    fn some_genesis(ts: u64) -> Block {
+        let kp = KeyPair::generate();
+        genesis_block(
+            Address::from_public_key(&kp.public),
+            kp.public.clone(),
+            Signature::from_bytes(vec![0u8; 8]),
+            ts,
+        )
+    }
+
+    /// The gap #139 is about, stated as a test: a peer that serves a *different chain's* genesis
+    /// must not get this node to adopt it. Nothing else in the join path catches this — the peer
+    /// supplies both the genesis and the `state_hash` it is checked against.
+    #[test]
+    fn a_genesis_that_is_not_the_configured_one_is_refused() {
+        let genesis = some_genesis(1);
+        let other = some_genesis(2);
+        assert_ne!(genesis.hash(), other.hash(), "the two must actually differ");
+
+        let err = verify_genesis_checkpoint(Some(&other.hash().to_hex()), &genesis)
+            .expect_err("a genesis that is not the configured one must be refused");
+        // The operator has to be able to tell the two apart from the message alone.
+        let msg = err.to_string();
+        assert!(msg.contains(&genesis.hash().to_hex()), "must name what was served");
+        assert!(msg.contains(&other.hash().to_hex()), "must name what was expected");
+    }
+
+    #[test]
+    fn the_configured_genesis_is_accepted() {
+        let genesis = some_genesis(1);
+        assert!(verify_genesis_checkpoint(Some(&genesis.hash().to_hex()), &genesis).is_ok());
+    }
+
+    /// Operators copy this hash out of logs, release notes and explorers, which disagree on casing.
+    #[test]
+    fn the_checkpoint_comparison_ignores_hex_casing_and_whitespace() {
+        let genesis = some_genesis(1);
+        let hex = genesis.hash().to_hex();
+        assert!(verify_genesis_checkpoint(Some(&hex.to_uppercase()), &genesis).is_ok());
+        assert!(verify_genesis_checkpoint(Some(&format!("  {hex}  ")), &genesis).is_ok());
+    }
+
+    /// No regression for existing deployments: unconfigured must still join, or every operator is
+    /// locked out by the upgrade itself. An empty string counts as unconfigured — that is what a
+    /// blank env var or an unfilled config line produces, and treating it as a hash to match would
+    /// fail every start with a baffling message.
+    #[test]
+    fn an_unconfigured_checkpoint_still_joins() {
+        let genesis = some_genesis(1);
+        assert!(verify_genesis_checkpoint(None, &genesis).is_ok());
+        assert!(verify_genesis_checkpoint(Some(""), &genesis).is_ok());
+        assert!(verify_genesis_checkpoint(Some("   "), &genesis).is_ok());
+    }
 
     fn peer_genesis_with(validator_stake: u64, state_hash: Option<String>) -> PeerGenesis {
         let kp = KeyPair::generate();
