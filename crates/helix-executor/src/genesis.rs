@@ -448,6 +448,84 @@ mod tests {
         assert_eq!(scheduled_block_reward(3 * HALVING_INTERVAL_BLOCKS), initial / 8);
     }
 
+    /// The whole schedule has to fit under the cap — the one property nothing else checks.
+    ///
+    /// Every existing test asks what a *single* height pays. None sums the series, so the number
+    /// that decides whether the monetary policy is coherent at all was never asserted anywhere.
+    /// Getting it wrong is invisible for decades: `execute_block` clamps each mint to
+    /// `mintable_headroom()`, so an over-issuing schedule does not fail loudly, it silently stops
+    /// paying validators partway through an era that was supposed to still be subsidised.
+    ///
+    /// Guards the three constants against each other. Raising `INITIAL_BLOCK_REWARD_HLX` or
+    /// `HALVING_INTERVAL_BLOCKS`, or lowering `TOTAL_SUPPLY_HLX`, breaks this immediately rather
+    /// than in year twelve.
+    #[test]
+    fn the_entire_emission_schedule_fits_under_the_supply_cap() {
+        let mut emitted: u128 = 0;
+        for era in 0..64u32 {
+            let reward = scheduled_block_reward(u64::from(era) * HALVING_INTERVAL_BLOCKS);
+            if reward == 0 {
+                break;
+            }
+            emitted += u128::from(reward) * u128::from(HALVING_INTERVAL_BLOCKS);
+        }
+
+        // Genesis is minted too, and counts against the same ceiling.
+        let genesis_issued = u128::from(VALIDATOR_GENESIS_STAKE_HLX + VALIDATOR_GENESIS_LIQUID_HLX)
+            * u128::from(NANO_PER_HLX)
+            + GENESIS_PREFUND
+                .iter()
+                .map(|(_, hlx)| u128::from(*hlx) * u128::from(NANO_PER_HLX))
+                .sum::<u128>();
+
+        let cap = u128::from(TOTAL_SUPPLY_HLX) * u128::from(NANO_PER_HLX);
+        assert!(
+            emitted + genesis_issued <= cap,
+            "schedule plus genesis issues {} nano against a cap of {} — validators would stop \
+             being paid mid-era, silently",
+            emitted + genesis_issued,
+            cap,
+        );
+    }
+
+    /// The counterweight: the schedule must also not leave most of the supply unissuable. A
+    /// "safe" schedule that emits a tenth of the cap would pass the test above and quietly make
+    /// the stated supply a fiction.
+    #[test]
+    fn the_emission_schedule_issues_most_of_the_supply() {
+        let mut emitted: u128 = 0;
+        for era in 0..64u32 {
+            let reward = scheduled_block_reward(u64::from(era) * HALVING_INTERVAL_BLOCKS);
+            if reward == 0 {
+                break;
+            }
+            emitted += u128::from(reward) * u128::from(HALVING_INTERVAL_BLOCKS);
+        }
+        let cap = u128::from(TOTAL_SUPPLY_HLX) * u128::from(NANO_PER_HLX);
+        assert!(
+            emitted * 100 / cap >= 90,
+            "the schedule issues only {}% of the stated supply",
+            emitted * 100 / cap,
+        );
+    }
+
+    /// The boundary itself, at the exact block. An off-by-one here shifts every era by one block
+    /// and is invisible in any test that samples era starts only.
+    #[test]
+    fn the_halving_lands_on_the_first_block_of_the_new_era() {
+        let full = scheduled_block_reward(0);
+        assert_eq!(
+            scheduled_block_reward(HALVING_INTERVAL_BLOCKS - 1),
+            full,
+            "the last block of era 0 still pays the full reward",
+        );
+        assert_eq!(
+            scheduled_block_reward(HALVING_INTERVAL_BLOCKS),
+            full / 2,
+            "and the very next one pays half",
+        );
+    }
+
     #[test]
     fn scheduled_block_reward_decays_to_zero_and_stays_there() {
         // 1 HLX = 1e9 nano needs ~30 halvings to integer-divide down to 0.

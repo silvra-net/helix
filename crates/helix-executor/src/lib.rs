@@ -4338,6 +4338,76 @@ mod tests {
         assert_eq!(state.total_issued, expected);
     }
 
+    /// Year thirty and beyond: the subsidy is gone, and the chain still has to work.
+    ///
+    /// After ~30 halvings the scheduled reward integer-divides to zero — around 473 million
+    /// blocks, or three decades at 2 s. Nothing exercises the chain in that state, and it is the
+    /// state it spends most of its existence in. What must hold: blocks still execute, transfers
+    /// still settle, and the validator is still paid — from fees alone, which is the entire
+    /// security budget from then on (see TOKENOMICS / backlog #81).
+    #[test]
+    fn the_chain_still_works_and_pays_validators_after_the_subsidy_ends() {
+        let sender_kp = KeyPair::generate();
+        let sender = Address::from_public_key(&sender_kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state =
+            ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.update_account(&sender, |a| a.balance = 10 * crate::genesis::NANO_PER_HLX);
+
+        // A height past the last era that pays anything at all.
+        let height = 31 * crate::genesis::HALVING_INTERVAL_BLOCKS;
+        assert_eq!(
+            crate::genesis::scheduled_block_reward(height),
+            0,
+            "precondition: the subsidy really is over at this height",
+        );
+
+        let fee = 2 * crate::genesis::NANO_PER_HLX;
+        let tx = signed_tx(
+            &sender_kp,
+            &sender,
+            TxType::Transfer,
+            Some(recipient.clone()),
+            crate::genesis::NANO_PER_HLX,
+            vec![],
+            0,
+            fee,
+        );
+        let mut block = empty_block(&validator, height);
+        block.transactions = vec![tx];
+        // Base fee zero so the whole fee tips the validator — this test is about whether anything
+        // reaches them at all once minting stops, not about the burn split.
+        block.header.base_fee_per_byte = 0;
+
+        let issued_before = state.total_issued;
+        let receipt = execute_block(&mut state, &block, None);
+
+        assert_eq!(receipt.block_reward_minted, 0, "nothing may be minted after the schedule ends");
+        assert_eq!(state.total_issued, issued_before, "and total supply must stop growing");
+        assert_eq!(
+            receipt.tx_receipts.len(),
+            1,
+            "the block still executes its transactions",
+        );
+        assert_eq!(
+            state.get(&recipient).map(|a| a.balance).unwrap_or(0),
+            crate::genesis::NANO_PER_HLX,
+            "the transfer still settles",
+        );
+        assert!(
+            receipt.validator_reward > 0,
+            "the validator must still earn from fees — otherwise nobody has a reason to produce \
+             blocks once the subsidy ends, and the chain stops for economic rather than technical \
+             reasons",
+        );
+        assert_eq!(
+            state.get(&validator).map(|a| a.balance).unwrap_or(0),
+            receipt.validator_reward,
+            "and that fee revenue actually reaches them",
+        );
+    }
+
     #[test]
     fn execute_block_mints_to_reward_address_override_not_the_block_validator() {
         let validator = Address::from_public_key(&KeyPair::generate().public);
