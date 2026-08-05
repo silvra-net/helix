@@ -907,6 +907,8 @@ impl HelixNode {
         // One shared truth for "is the chain held up by missing validators?", so the health
         // heartbeat and the production loop cannot contradict each other about it (#150).
         let quorum_peers_missing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Proof of life for the production loop, watched by the health heartbeat (#151).
+        let production_ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         tokio::spawn(validator_health_loop(
             self.store.clone(),
@@ -915,6 +917,7 @@ impl HelixNode {
             peer_count.clone(),
             self.syncing.clone(),
             quorum_peers_missing.clone(),
+            production_ticks.clone(),
         ));
 
         // Block production loop
@@ -932,6 +935,7 @@ impl HelixNode {
             signing_guard,
             tip_certificate,
             quorum_peers_missing,
+            production_ticks,
         ));
 
         tokio::select! {
@@ -2429,6 +2433,27 @@ fn health_verdict(
     }
 }
 
+/// Consecutive health beats the block production loop may show no progress before it is reported
+/// as dead (backlog #151).
+///
+/// At the production 2 s cadence and a 60 s health beat, one beat is ~30 loop ticks, so two beats
+/// means the loop has missed sixty in a row — far outside any normal pause, including a slow
+/// storage write or a peer wait (which keeps ticking; the counter sits ahead of every `continue`).
+/// Erring generous on purpose: a false "this node is dead" is worse than a late true one, because
+/// it teaches operators to ignore the line — and this warning exists for the case where they must
+/// not.
+const PRODUCTION_STALL_BEATS: u32 = 2;
+
+/// Folds one health-beat observation of the production loop's tick counter into a run length of
+/// beats without progress. `0` means it moved.
+fn production_stall_beats(current_ticks: u64, previous_ticks: u64, beats_so_far: u32) -> u32 {
+    if current_ticks == previous_ticks {
+        beats_so_far.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 /// What to tell an operator whose node is active but not co-signing (backlog #150).
 ///
 /// Separated out and tested because operators act on this sentence, and for months it said the
@@ -2472,6 +2497,9 @@ async fn validator_health_loop(
     // by `block_production_loop`. Read, never written, and never via a lock: this loop has to
     // keep talking precisely when the consensus path is stuck (backlog #150).
     quorum_peers_missing: Arc<std::sync::atomic::AtomicBool>,
+    // Monotonic tick counter of the block production loop (backlog #151). Its *movement* is the
+    // only local evidence that the loop is alive at all; its value means nothing on its own.
+    production_ticks: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use std::sync::atomic::Ordering;
     let started = std::time::Instant::now();
@@ -2479,6 +2507,10 @@ async fn validator_health_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_height = 0u64;
     let mut last_height_change = std::time::Instant::now();
+    // Production-loop liveness tracking (#151).
+    let mut last_production_ticks = production_ticks.load(Ordering::Relaxed);
+    let mut stall_beats = 0u32;
+    let mut reported_dead = false;
 
     loop {
         ticker.tick().await;
@@ -2542,6 +2574,34 @@ async fn validator_health_loop(
             started.elapsed().as_secs() >= HEALTH_START_GRACE_SECS && height > HEALTH_SIGN_WINDOW;
 
         let quorum_missing = quorum_peers_missing.load(Ordering::Relaxed);
+
+        // Is the loop that produces blocks still running at all (#151)? Reported separately from
+        // the verdict below, and before it, because if that loop is dead every other line here is
+        // misleading: this node can still look "validating" from a block it co-signed minutes ago,
+        // and the advice would send the operator looking at the network instead of at this node.
+        {
+            let ticks = production_ticks.load(Ordering::Relaxed);
+            stall_beats = production_stall_beats(ticks, last_production_ticks, stall_beats);
+            last_production_ticks = ticks;
+            if stall_beats >= PRODUCTION_STALL_BEATS {
+                // Once per stall, not once per beat: this does not resolve on its own, and
+                // repeating it every minute would bury the surrounding context an operator needs.
+                if !reported_dead {
+                    reported_dead = true;
+                    warn!(
+                        beats = stall_beats,
+                        "Health: ⛔ block production loop has STOPPED — it has not run for at \
+                         least {}s while this process kept going. The chain cannot advance from \
+                         this node regardless of the network. Restart the node; keep its chain \
+                         data and validator key.",
+                        u64::from(PRODUCTION_STALL_BEATS) * VALIDATOR_HEALTH_SECS
+                    );
+                }
+            } else if reported_dead {
+                reported_dead = false;
+                info!("Health: block production loop is running again");
+            }
+        }
 
         match health_verdict(staked, in_active, jailed_until, last_signed, stalled, stalled_secs, past_grace) {
             HealthVerdict::Following => {
@@ -2617,6 +2677,9 @@ async fn block_production_loop(
     // Set whenever the chain is waiting on validators rather than on this node — read by the
     // health heartbeat so its advice matches what this loop already reports (backlog #150).
     quorum_peers_missing: Arc<std::sync::atomic::AtomicBool>,
+    // Incremented on every iteration, ahead of every gate — the health heartbeat watches it move
+    // to tell a running loop from a dead one (backlog #151).
+    production_ticks: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Pure production cadence — it enters no hash, no signature and not the proposer schedule
     // (`proposer_for_round` is `(height+round) % len`, timestamp-free), so overriding it cannot
@@ -2651,6 +2714,19 @@ async fn block_production_loop(
 
     loop {
         interval.tick().await;
+
+        // Proof of life for the health heartbeat (backlog #151). Deliberately the very first thing
+        // after the tick, ahead of every gate and every `continue` below: this counter answers
+        // "is this loop still running?", not "is it producing blocks". A loop legitimately parked
+        // in the sync gate or a peer wait is alive and must keep counting, or the health loop would
+        // report every normal wait as a crash — the false positive that would get the warning
+        // ignored, and with it the true positive it exists for.
+        //
+        // Which is the case that matters: "the process is up" has now twice been the observation
+        // that misled us (#137's 14.5 hours, and 2026-08-04's 21). A dead production task and a
+        // healthy one look identical from outside — same process, same RPC, same logs from every
+        // other loop. This is the difference, and it costs one relaxed store per tick.
+        production_ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Nothing gets proposed while history is still downloading. The startup sync moved out
         // of the constructor so the RPC can answer during it (see `run`), which means this loop
@@ -4200,6 +4276,54 @@ mod validator_health_tests {
             advice.contains("Do NOT delete"),
             "must warn against wiping the data directory: {advice}"
         );
+    }
+
+    /// Backlog #151. A production loop that keeps ticking must never be reported dead — a normal
+    /// peer wait or sync gate ticks the counter (it sits ahead of every `continue`), and a warning
+    /// that cries wolf on those is a warning operators learn to scroll past.
+    #[test]
+    fn a_loop_that_keeps_ticking_is_never_reported_dead() {
+        let mut beats = 0u32;
+        let mut previous = 0u64;
+        for tick in 1..=100u64 {
+            beats = production_stall_beats(tick, previous, beats);
+            previous = tick;
+            assert_eq!(beats, 0, "a moving counter must never accumulate stall beats");
+        }
+    }
+
+    /// The case this exists for: the process is up, every other loop still logs, but the one that
+    /// drives consensus is gone. "The process is up" has twice been the observation that misled
+    /// us — #137's 14.5 hours and the 21-hour stall of 2026-08-04.
+    #[test]
+    fn a_frozen_counter_is_reported_once_the_threshold_is_reached() {
+        let frozen = 4_242u64;
+        let mut beats = 0u32;
+        for beat in 1..=PRODUCTION_STALL_BEATS {
+            beats = production_stall_beats(frozen, frozen, beats);
+            assert_eq!(beats, beat);
+        }
+        assert!(beats >= PRODUCTION_STALL_BEATS, "must trip once the threshold is reached");
+    }
+
+    /// One slow beat is not death. The threshold is deliberately more than one so a single delayed
+    /// tick — a slow storage write, a busy machine — does not produce a false alarm.
+    #[test]
+    fn a_single_missed_beat_is_not_enough_to_declare_it_dead() {
+        let beats = production_stall_beats(7, 7, 0);
+        assert_eq!(beats, 1);
+        assert!(beats < PRODUCTION_STALL_BEATS, "one quiet beat must not trip the warning");
+    }
+
+    /// And it has to recover: a loop that starts moving again resets the run, so a node that was
+    /// briefly wedged is not reported dead forever.
+    #[test]
+    fn progress_after_a_stall_clears_the_run() {
+        let mut beats = production_stall_beats(7, 7, 0);
+        beats = production_stall_beats(7, 7, beats);
+        assert!(beats >= PRODUCTION_STALL_BEATS);
+        beats = production_stall_beats(8, 7, beats);
+        assert_eq!(beats, 0, "movement must clear the stall run");
     }
 
     /// The control: when this node really is the stuck one, restarting is the right advice and has
@@ -6091,6 +6215,64 @@ mod handle_p2p_event_tests {
     ///
     /// This pins that the sync flag alone holds it: with the flag set, the loop must not
     /// advance the chain; with it cleared, it must.
+    /// Backlog #151, and the half the unit tests cannot reach: that the counter the health loop
+    /// watches is actually driven by the real loop, and driven *ahead of the gates*.
+    ///
+    /// A node held in the sync gate takes the earliest `continue` there is. It is alive and must
+    /// keep counting — if the counter sat after any gate, this parked-but-healthy node would be
+    /// reported dead, which is the false alarm that would get the warning ignored. Testing the
+    /// pure fold alone would have passed happily with the increment placed anywhere, or nowhere.
+    #[tokio::test]
+    async fn a_loop_parked_in_the_sync_gate_still_proves_it_is_alive() {
+        let kp = Arc::new(KeyPair::generate());
+        let addr = Address::from_public_key(&kp.public);
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            cs.governance_params.min_validator_stake = 1;
+            cs.update_account(&addr, |acc| acc.staked = 1_000_000);
+        }
+        let vset = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr.clone(), 0)));
+        let (p2p_tx, _rx) = mpsc::channel(64);
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Held in the sync gate for the whole test.
+        let syncing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let loop_handle = tokio::spawn(block_production_loop(
+            store.clone(),
+            mempool.clone(),
+            chain_state.clone(),
+            kp.clone(),
+            engine.clone(),
+            Arc::new(Mutex::new(0u64)),
+            p2p_tx.clone(),
+            None,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            syncing.clone(),
+            Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            Arc::new(RwLock::new(TipCertificate::default())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ticks.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(BLOCK_TIME_MS * 4)).await;
+        loop_handle.abort();
+
+        assert_eq!(
+            store.read().await.latest_height(),
+            0,
+            "precondition: the node really was parked, not producing"
+        );
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "a loop parked in the sync gate must still prove it is alive — got {}",
+            ticks.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
     #[tokio::test]
     async fn block_production_waits_for_the_initial_sync() {
         let kp = Arc::new(KeyPair::generate());
@@ -6124,6 +6306,7 @@ mod handle_p2p_event_tests {
             Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
         // Well past several block intervals: nothing may be produced while syncing.
@@ -6213,6 +6396,7 @@ mod handle_p2p_event_tests {
             Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
