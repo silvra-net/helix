@@ -6,10 +6,17 @@
 
 The client subcommands of the `helix` binary (`helix wallet`, `helix tx`, `helix chain`, …)
 talk to a node over its REST API — the same binary that runs the node with `helix start`, but
-these commands never boot a node or open the chain database. They target the public network
-(`https://helix.silvra.net`) by default; point them at your own node with `--node
-http://127.0.0.1:8545` (or `HELIX_NODE=...`). The client itself holds no state beyond whatever
-wallet file you point it at.
+these commands never boot a node or open the chain database.
+
+They pick a node in this order: whatever you passed with `--node` (or `HELIX_NODE=...`), then a
+node running on this machine, then the public network (`https://helix.silvra.net`). So running
+your own node is enough to be asked — you do not have to configure anything — while a freshly
+downloaded binary still works against the live chain out of the box. When a local node answers,
+the client says so on stderr, and says it too if that node is still catching up, so a balance
+from an unsynced chain is never presented as current. `stdout` is unaffected, so piping into
+`jq` works exactly as before.
+
+The client itself holds no state beyond whatever wallet file you point it at.
 
 ### Wallets
 

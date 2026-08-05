@@ -125,9 +125,10 @@ helix tx send hlx... 10 --key alice.json     # send 10 HLX to another address
 helix tx status <hash>                        # check it landed
 ```
 
-Every client command targets `https://helix.silvra.net` (the public testnet) by
-default. Point it somewhere else any time with `--node <url>` or `HELIX_NODE=<url>` — e.g. at
-your own local node (below).
+Every client command uses a node running on this machine if one answers, and
+`https://helix.silvra.net` (the public testnet) otherwise — so a fresh download works with no
+setup, and running your own node is enough for the client to use it. Override either with
+`--node <url>` or `HELIX_NODE=<url>`.
 
 ### Running your own node
 
@@ -141,7 +142,8 @@ helix start          # or ./target/release/helix start
 # REST API on http://127.0.0.1:8545, P2P on 0.0.0.0:8546
 ```
 
-Point your client at it with `helix --node http://127.0.0.1:8545 <command>`.
+Client commands find it automatically — `helix chain status` now answers from your own node,
+and says so. Use `--node <url>` only to point somewhere else.
 
 ### Running your own private devnet
 
