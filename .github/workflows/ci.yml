@@ -31,3 +31,11 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      # Runs in release on purpose. `cargo test` above builds in debug, where Rust turns overflow
+      # checks on regardless of what `[profile.release]` says — so the same test passing there
+      # would prove nothing about the binary operators actually run. This is the only step that
+      # can catch someone dropping the profile section, and a release build that wraps on
+      # overflow is how a contract call quietly minted 18.4 billion HLX on 2026-08-05.
+      - name: Overflow checks survive the release profile
+        run: cargo test --release -p helix-executor arithmetic_overflow

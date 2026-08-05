@@ -120,3 +120,23 @@ helix-rpc = { path = "crates/helix-rpc" }
 helix-vm = { path = "crates/helix-vm" }
 helix-zkp = { path = "crates/helix-zkp" }
 helix-cli = { path = "crates/helix-cli" }
+
+# Arithmetic overflow panics instead of wrapping, in release as well as debug.
+#
+# Rust's default for release is to wrap. On a chain that is the worst failure mode available: a
+# wrapped `u64` on the ledger is money created from nothing, every node computes the same wrong
+# number, nothing forks, and nothing complains. That is not hypothetical here — a contract call
+# reached exactly that on 2026-08-05, reporting success while putting 18.4 billion HLX into an
+# account on a chain capped at 33 million. The identical code panicked immediately in the test
+# build. The bug was fixed; the reason it was silent in the shipped binary was this setting.
+#
+# Measured cost: ~15% on transaction execution (2000 transfers, 377ms -> 435ms). Signature and
+# hash throughput are unchanged — blake3 and ml-dsa use explicit `wrapping_*`, as good crypto
+# crates do. A block that currently carries no transactions at all can afford this many times over,
+# and a supply cap that cannot be trusted is worth nothing at any speed.
+#
+# The trade is deliberate: a panic mid-block is a liveness failure, and a loud one. Wrapping is a
+# safety failure, and a silent one. Given the choice, take the loud one — a halted chain gets
+# patched, minted money does not get un-minted.
+[profile.release]
+overflow-checks = true

@@ -2945,6 +2945,33 @@ mod tests {
         assert!(contract_commit_would_go_negative(&state, &tx, &contract, 10_000, &[(rich, 1)]));
     }
 
+    /// Ledger arithmetic must fail loudly rather than wrap.
+    ///
+    /// Rust's release default is to wrap, and on a chain that is the worst failure mode there is:
+    /// every node computes the same wrong number, so nothing forks and nothing complains. A
+    /// contract call reached exactly that on 2026-08-05 — success reported, 18.4 billion HLX in an
+    /// account, on a chain capped at 33 million. The same code panicked at once in the test build.
+    ///
+    /// **This test proves nothing when run in debug**, where overflow checks are on whatever
+    /// `[profile.release]` says. CI runs it a second time with `--release`; that run is the one
+    /// that can fail, and it is the reason the test is worth having at all.
+    #[test]
+    fn arithmetic_overflow_panics_instead_of_wrapping() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // the panic here is the expected result, not news
+        let wrapped = std::panic::catch_unwind(|| {
+            std::hint::black_box(u64::MAX) + std::hint::black_box(1u64)
+        });
+        std::panic::set_hook(previous);
+
+        assert!(
+            wrapped.is_err(),
+            "this build wraps on arithmetic overflow instead of panicking — \
+             `overflow-checks` is off, and every balance subtraction on the ledger can now mint \
+             money silently instead of failing (see [profile.release] in the workspace Cargo.toml)",
+        );
+    }
+
     /// `MAX_INPUT_LEN` is published as part of the VM's ABI. Until this check existed it was a
     /// number in a doc comment: the only thing actually bounding a call's input was the two-megabyte
     /// block limit.
