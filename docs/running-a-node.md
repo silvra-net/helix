@@ -158,6 +158,30 @@ reachable. (The node also asks the seed via `GET /status` for its P2P address an
 directly for lower-latency gossip on top — preferring the seed's announced public multiaddr,
 including a `/tls/ws` WebSocket address behind a proxy, over a raw-TCP guess it can't reach.)
 
+### The chain has stopped — what to do
+
+**Do not delete your chain data.** It is almost never the problem, and it is the one action that
+makes things worse: a node starting from an empty database has to sync the whole chain from
+scratch, and until it does it cannot vote — so a validator that wipes its data removes itself from
+the quorum for as long as the sync takes, on top of whatever stopped the chain in the first place.
+This has happened, and it turned a recoverable outage into a 21-hour one.
+
+Read the node's own health line first — it distinguishes the two cases:
+
+- **"the chain is waiting for other validators to reconnect"** — your node is fine. Nothing you do
+  locally will help; the chain resumes when enough validators are back. Restarting is harmless but
+  pointless, and it restarts the internal wait timers.
+- **"restarting the node re-establishes its round"** — this node is the stuck one. Restart it
+  (`pm2 restart <name>`, `systemctl restart …`, or however you run it). Your chain data and
+  validator key stay where they are; that is exactly what makes the restart safe.
+
+A stalled chain is normal when the validator set is small: consensus needs more than two-thirds of
+voting power, so with three validators all three must be online. The chain does not lose anything
+while it waits — it resumes from the same height once quorum is back.
+
+If your node needs to catch up afterwards, it does so on its own (over P2P from any peer, or over
+the RPC sync peer). Nothing needs to be reset for that.
+
 ### Network Resilience (Peer Exchange)
 
 Two independent discovery mechanisms feed a node's P2P connections: mDNS (LAN-only) and the

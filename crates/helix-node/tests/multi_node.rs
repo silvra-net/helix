@@ -53,6 +53,21 @@ const NODE_B_P2P: u16 = 29_556;
 const NODE_C_RPC: u16 = 29_565;
 const NODE_C_P2P: u16 = 29_566;
 
+/// Serializes the tests in this file that spawn real node processes.
+///
+/// Each of them brings up three or four complete BFT nodes with real sockets, real gossip and
+/// wall-clock round timeouts. `cargo test` runs tests within a binary concurrently, so all of them
+/// at once is fifteen-odd nodes competing for the same cores — and a consensus timeout that fires
+/// because the machine was busy looks exactly like a consensus timeout that fires because the code
+/// is wrong. Measured 2026-08-05: run in parallel, one or two fail; run with `--test-threads=1`,
+/// all four pass; run individually, each passes.
+///
+/// Enforced here rather than by documenting `--test-threads=1`, because a test whose correctness
+/// depends on a flag not present in the file is a test that will eventually be run without it —
+/// and its failure will be read as a bug in the chain. Distinct port ranges (below) keep the tests
+/// from colliding; this keeps them from starving each other.
+static NODE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Separate port range for the multi-validator test below — it runs as a distinct
 /// `#[tokio::test]` in the same test binary, and `cargo test` runs tests within a binary
 /// concurrently by default, so it can't share ports with the test above.
@@ -444,6 +459,7 @@ fn run_cli(node_url: &str, args: &[&str]) -> bool {
 #[tokio::test]
 #[ignore = "spawns 2 real node processes, funds+stakes a validator via the real CLI, and waits out its ~200-block activation at an accelerated block time (~1-2 min wall-clock) — run explicitly with --ignored"]
 async fn a_validator_funded_and_staked_at_runtime_activates_and_co_signs() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
     let kp_a = KeyPair::generate();
     let kp_b = KeyPair::generate();
     let addr_b = Address::from_public_key(&kp_b.public).to_string();
@@ -589,6 +605,7 @@ async fn fund_and_stake(
 
 #[tokio::test]
 async fn three_nodes_converge_on_identical_height_hash_and_state() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
     // Node A: fresh devnet genesis, produces blocks alone — exactly today's production setup.
     let _node_a = spawn_node(NODE_A_RPC, NODE_A_P2P, None);
     wait_until_reachable(NODE_A_RPC, Duration::from_secs(15)).await;
@@ -643,6 +660,7 @@ async fn three_nodes_converge_on_identical_height_hash_and_state() {
 #[tokio::test]
 #[ignore = "spawns 3 real validator processes and grows the set by funding+staking two at runtime, waiting out their activation epochs at an accelerated block time (~2 min wall-clock) — run explicitly with --ignored, not on every CI push"]
 async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
     // B and C's validator identities are generated up front so their processes can start with a
     // matching `validator-key.json` (so they control the stake staked to their addresses) and so
     // the test can address the funding transfers.
@@ -739,6 +757,7 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
 #[tokio::test]
 #[ignore = "spawns 4 real validator processes (grown by funding+staking three at runtime), kills one, and waits out several round timeouts at an accelerated block time (~2-3 min wall-clock) — run explicitly with --ignored, not on every CI push"]
 async fn four_validators_survive_one_going_offline() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
     let kp_a = KeyPair::generate();
     let kp_b = KeyPair::generate();
     let kp_c = KeyPair::generate();
@@ -826,6 +845,7 @@ async fn four_validators_survive_one_going_offline() {
 #[tokio::test]
 #[ignore = "spawns two real node processes and runs a WebSocket-transport sync (~20-30s wall-clock) — run explicitly with --ignored, not on every CI push"]
 async fn a_follower_syncs_over_a_websocket_transport() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
     // A is the genesis node, listening on BOTH raw TCP and WebSocket for P2P.
     let _node_a = spawn_node_with(
         WS_A_RPC,

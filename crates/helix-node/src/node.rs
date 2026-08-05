@@ -904,12 +904,17 @@ impl HelixNode {
         // Validator health heartbeat — logs "am I actually validating?" on its own timer, so an
         // operator watching the console sees the truth even when the consensus loop has silently
         // stalled. Independent of block production and purely observational.
+        // One shared truth for "is the chain held up by missing validators?", so the health
+        // heartbeat and the production loop cannot contradict each other about it (#150).
+        let quorum_peers_missing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         tokio::spawn(validator_health_loop(
             self.store.clone(),
             self.chain_state.clone(),
             self.address.clone(),
             peer_count.clone(),
             self.syncing.clone(),
+            quorum_peers_missing.clone(),
         ));
 
         // Block production loop
@@ -926,6 +931,7 @@ impl HelixNode {
             self.syncing.clone(),
             signing_guard,
             tip_certificate,
+            quorum_peers_missing,
         ));
 
         tokio::select! {
@@ -2423,6 +2429,29 @@ fn health_verdict(
     }
 }
 
+/// What to tell an operator whose node is active but not co-signing (backlog #150).
+///
+/// Separated out and tested because operators act on this sentence, and for months it said the
+/// same thing regardless of cause: "restarting the node re-establishes its round." That is right
+/// when this node alone is stuck, and wrong when the chain is waiting for *other* validators —
+/// where a restart achieves nothing. The block production loop reports that case correctly, so the
+/// two contradicted each other a minute apart in the same log.
+///
+/// On 2026-08-04 an operator followed the actionable half. The restart was survivable; starting
+/// again with an empty chain database was not — it pinned that node at height 1 and turned a
+/// recoverable outage into a 21-hour stall (#147). Hence the explicit line about the data
+/// directory: the mistake that actually cost the time was not the restart.
+fn not_validating_advice(quorum_peers_missing: bool) -> &'static str {
+    if quorum_peers_missing {
+        "This node is healthy — the chain is waiting for other validators to reconnect, and \
+         restarting will not speed that up. Do NOT delete this node's chain data: a node that \
+         starts with an empty database has to sync from scratch and cannot vote until it does."
+    } else {
+        "The process is up but not participating in consensus; restarting the node re-establishes \
+         its round."
+    }
+}
+
 /// Heartbeat that answers "am I actually validating right now?" in the node's own log.
 ///
 /// An operator watching the console — the GUI Node tab streams exactly this stdout — otherwise
@@ -2439,6 +2468,10 @@ async fn validator_health_loop(
     address: Address,
     peer_count: Arc<std::sync::atomic::AtomicUsize>,
     syncing: Arc<std::sync::atomic::AtomicBool>,
+    // Whether block production is currently held up by validators being below quorum, published
+    // by `block_production_loop`. Read, never written, and never via a lock: this loop has to
+    // keep talking precisely when the consensus path is stuck (backlog #150).
+    quorum_peers_missing: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
     let started = std::time::Instant::now();
@@ -2508,6 +2541,8 @@ async fn validator_health_loop(
         let past_grace =
             started.elapsed().as_secs() >= HEALTH_START_GRACE_SECS && height > HEALTH_SIGN_WINDOW;
 
+        let quorum_missing = quorum_peers_missing.load(Ordering::Relaxed);
+
         match health_verdict(staked, in_active, jailed_until, last_signed, stalled, stalled_secs, past_grace) {
             HealthVerdict::Following => {
                 info!("Health: following the chain · height {} · peers {}", height, peers);
@@ -2539,11 +2574,23 @@ async fn validator_health_loop(
                     Some(secs) => format!("chain STALLED at #{} for {}s", height, secs),
                     None => format!("height {}", height),
                 };
+                // The advice has to match the cause, because operators act on it. This warning
+                // used to end with "restarting the node re-establishes its round" no matter what
+                // — including when this node is fine and the chain is held up by *other*
+                // validators being absent, where a restart does nothing. The block production
+                // loop says so correctly in that case ("restarting this node does not speed it
+                // up"), so the two contradicted each other a minute apart in the same log.
+                //
+                // That is not cosmetic: on 2026-08-04 an operator followed the actionable half and
+                // restarted with an empty chain database, pinning that node at height 1 and
+                // turning a recoverable outage into a 21-hour stall (#147/#150). Hence also the
+                // explicit warning about the data directory — the restart itself was survivable,
+                // wiping the chain was not.
+                let advice = not_validating_advice(quorum_missing);
                 warn!(
-                    "Health: ⚠ NOT validating — this node is an active validator but is not co-signing \
-                     ({}, {}, peers {}). The process is up but not participating in consensus; \
-                     restarting the node re-establishes its round.",
-                    last, chain, peers
+                    "Health: ⚠ NOT validating — this node is an active validator but is not \
+                     co-signing ({}, {}, peers {}). {}",
+                    last, chain, peers, advice
                 );
             }
             HealthVerdict::Settling => {
@@ -2567,6 +2614,9 @@ async fn block_production_loop(
     syncing: Arc<std::sync::atomic::AtomicBool>,
     signing_guard: Arc<std::sync::Mutex<SigningGuard>>,
     tip_certificate: Arc<RwLock<TipCertificate>>,
+    // Set whenever the chain is waiting on validators rather than on this node — read by the
+    // health heartbeat so its advice matches what this loop already reports (backlog #150).
+    quorum_peers_missing: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Pure production cadence — it enters no hash, no signature and not the proposer schedule
     // (`proposer_for_round` is `(height+round) % len`, timestamp-free), so overriding it cannot
@@ -2624,6 +2674,27 @@ async fn block_production_loop(
         heartbeat_ticks = heartbeat_ticks.saturating_add(1);
         if heartbeat_ticks % HEARTBEAT_TICK_INTERVAL == 1 {
             send_probation_heartbeat_if_due(&keypair, &chain_state, &mempool, &p2p_tx).await;
+        }
+
+        // Publish, for the health heartbeat, whether the chain is held up by missing validators
+        // rather than by anything wrong with this node (backlog #150).
+        //
+        // Every branch below already knows this and says so correctly — "restarting this node does
+        // not speed it up". The health loop is the one voice that did not know, and it appended
+        // "restarting the node re-establishes its round" unconditionally, including in exactly the
+        // case where a restart is useless. The two ran a minute apart in production and an
+        // operator, reading the actionable one, restarted with an empty chain database on
+        // 2026-08-04 — turning a recoverable outage into a 21-hour stall (#147).
+        //
+        // An atomic rather than letting the health loop ask the engine: that loop exists to keep
+        // reporting when the consensus loop is wedged, so it must never block on a lock the wedged
+        // path holds. A slightly stale value is harmless here — `peers_needed_for_quorum` only
+        // moves on set rotation, unlike the height.
+        {
+            let needed = engine.read().await.peers_needed_for_quorum();
+            let have = peer_count.load(std::sync::atomic::Ordering::Relaxed);
+            quorum_peers_missing
+                .store(needed > 0 && have < needed, std::sync::atomic::Ordering::Relaxed);
         }
 
         if !mesh_ready {
@@ -4102,6 +4173,46 @@ mod validator_health_tests {
         assert_eq!(health_verdict(true, true, Some(500), None, true, 99, true), HealthVerdict::Jailed(500));
         assert_eq!(health_verdict(true, false, None, None, true, 99, true), HealthVerdict::WaitingActivation);
         assert_eq!(health_verdict(false, false, None, None, true, 99, true), HealthVerdict::Following);
+    }
+
+    /// Backlog #150. The advice attached to "NOT validating" is the one line an operator acts on,
+    /// and it used to be the same regardless of cause — telling someone to restart a node that is
+    /// perfectly fine while the chain waits for absent validators.
+    #[test]
+    fn a_node_held_up_by_missing_validators_is_not_told_to_restart() {
+        let advice = not_validating_advice(true);
+        assert!(
+            advice.contains("will not speed that up"),
+            "must say plainly that restarting does not help: {advice}"
+        );
+        assert!(
+            !advice.contains("re-establishes its round"),
+            "must not also carry the opposite recommendation: {advice}"
+        );
+    }
+
+    /// The line that actually cost the time on 2026-08-04: the operator restarted *and* wiped the
+    /// chain database, which pinned that node at height 1 (#147). The restart was survivable.
+    #[test]
+    fn the_waiting_advice_warns_against_deleting_chain_data() {
+        let advice = not_validating_advice(true);
+        assert!(
+            advice.contains("Do NOT delete"),
+            "must warn against wiping the data directory: {advice}"
+        );
+    }
+
+    /// The control: when this node really is the stuck one, restarting is the right advice and has
+    /// to survive. A fix that simply removed the recommendation everywhere would pass the tests
+    /// above and leave a genuinely wedged validator with nothing to do.
+    #[test]
+    fn a_node_that_is_itself_stuck_is_still_told_to_restart() {
+        let advice = not_validating_advice(false);
+        assert!(
+            advice.contains("re-establishes its round"),
+            "a genuinely stuck node must still be told to restart: {advice}"
+        );
+        assert!(!advice.contains("Do NOT delete"));
     }
 }
 
@@ -6012,6 +6123,7 @@ mod handle_p2p_event_tests {
             syncing.clone(),
             Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
             Arc::new(RwLock::new(TipCertificate::default())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));
 
         // Well past several block intervals: nothing may be produced while syncing.
@@ -6100,6 +6212,7 @@ mod handle_p2p_event_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
             Arc::new(RwLock::new(TipCertificate::default())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(30);

@@ -47,6 +47,25 @@ pub struct P2PConfig {
     /// complete the handshake, independent of the established-connection caps.
     pub max_pending_incoming: u32,
     /// Maximum established connections to a single peer ID.
+    ///
+    /// Two nodes need *one* connection. Extras arise from both sides dialing at once, or a redial
+    /// racing a link that is still up — none of them carry anything the first does not, and each
+    /// costs its own streams, buffers and gossipsub bookkeeping. This was 4, which on a 4-node
+    /// network meant up to 12 connections where 3 would do.
+    ///
+    /// Not 1: an overlapping handover (new connection up before the old one is torn down) is
+    /// normal and would otherwise be refused, turning a routine reconnect into a gap. 2 leaves
+    /// room for exactly that and nothing more.
+    ///
+    /// Measured, and the reason this moved (backlog #147/#148): with 4 allowed, a live two-node
+    /// run really does reach 4, and multiple connections per peer are what made a single
+    /// `ConnectionClosed` look like the peer leaving. Lowering this does not fix that — the
+    /// accounting fix does — but it stops the network manufacturing the condition for no benefit.
+    ///
+    /// Explicitly *not* what fixed the integration tests that were failing when this changed.
+    /// That was machine load from running several multi-node tests at once, and it is fixed by
+    /// serializing them; lowering this value was tried first and changed nothing. Recorded so the
+    /// next person does not read a fix into it that it never provided.
     pub max_established_per_peer: u32,
     /// Maximum concurrent connections (pending + established) from a single
     /// remote IP address, regardless of how many distinct peer IDs it presents.
@@ -74,7 +93,7 @@ impl Default for P2PConfig {
             max_message_size: 4 * 1024 * 1024, // 4 MB — fits a full block
             max_established_incoming: 40,
             max_pending_incoming: 64,
-            max_established_per_peer: 4,
+            max_established_per_peer: 2,
             max_connections_per_ip: 8,
             enable_mdns: true,
         }
