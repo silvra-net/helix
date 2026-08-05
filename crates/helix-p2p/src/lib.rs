@@ -1,5 +1,7 @@
 pub mod blocksync;
 pub mod config;
+pub mod genesis_bootstrap;
+pub mod genesis_sync;
 mod conn_limits;
 mod net_addr;
 pub mod reputation;
@@ -9,6 +11,10 @@ pub use blocksync::{
     BlockProvider, BlockSyncRequest, BlockSyncResponse, BLOCKSYNC_PROTOCOL, MAX_BLOCKSYNC_BATCH,
 };
 pub use config::P2PConfig;
+pub use genesis_bootstrap::{fetch_genesis_over_p2p, GENESIS_FETCH_TIMEOUT};
+pub use genesis_sync::{
+    GenesisPayload, GenesisProvider, GenesisRequest, GenesisResponse, GENESIS_PROTOCOL,
+};
 pub use reputation::PeerReputation;
 pub use service::{P2PCommand, P2PEvent, P2PService, MAX_CATCHUP_SERVE_BLOCKS};
 

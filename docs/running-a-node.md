@@ -66,7 +66,7 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_FAUCET_KEY_PASSPHRASE` | (none) | Passphrase for `HELIX_FAUCET_KEY` if that file was encrypted. |
 | `HELIX_DB_CACHE_MB` | `128` | Page cache the embedded database may hold, in MiB. Sized so a node fits comfortably on a 1 GB machine: a full sync of the live chain peaks around 280 MB of RSS in total and stays there. Raise it (e.g. `512`) on a server with memory to spare and RPC read traffic to serve; there is no reason to lower it. |
 | `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable address, announced to peers via peer exchange (see "Network Resilience" below). Either a bare host (a domain or public IP, no scheme/port — the configured raw-TCP P2P port is appended automatically), or, for a node behind a proxy/tunnel, a full multiaddr starting with `/` (e.g. `/dns4/host/tcp/443/tls/ws`). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
-| `HELIX_P2P_SEED_PEERS` | (none) | Comma-separated libp2p multiaddrs (e.g. `/ip4/1.2.3.4/tcp/8546,/dns4/peer.example/tcp/8546`) to dial directly, in addition to the one derived from `sync_peer`. Use this to wire a validator set into a full mesh — every validator should peer with every other, not hub-and-spoke through one node. Overrides `p2p_seed_peers` in `helix.toml`. |
+| `HELIX_P2P_SEED_PEERS` | (none) | Comma-separated libp2p multiaddrs (e.g. `/ip4/1.2.3.4/tcp/8546,/dns4/peer.example/tcp/8546`) to dial directly, in addition to the one derived from `sync_peer`. With no local chain and no `sync_peer`, these are also where the genesis block is fetched from — see "Joining without an HTTP endpoint". Use this to wire a validator set into a full mesh — every validator should peer with every other, not hub-and-spoke through one node. Overrides `p2p_seed_peers` in `helix.toml`. |
 | `HELIX_P2P_DISABLE_MDNS` | (off) | Set truthy (`1`/`true`) to turn off mDNS LAN auto-discovery, leaving only seed peers + peer exchange. Needed only when two independent Helix networks share a LAN (mDNS would otherwise cross-wire them). Overrides `p2p_disable_mdns` in `helix.toml`. |
 
 ```bash
@@ -116,11 +116,31 @@ or `HELIX_SYNC_PEER=http://seed-host:8545 helix start`. To not join any network 
 devnet or the origin node of a brand-new network — set `HELIX_NEW_CHAIN=1` (or `new_chain =
 true`) and the node self-signs its own genesis instead.
 
+### Joining without an HTTP endpoint
+
+`sync_peer` is an HTTP address, which means joining used to require somebody on the network to run
+a reachable web server. It no longer does: a node with no local chain and no `sync_peer` will fetch
+the genesis over P2P from whatever `p2p_seed_peers` it was given.
+
+```toml
+# helix.toml
+p2p_seed_peers = "/dns4/peer.example/tcp/443/tls/ws"
+genesis_hash   = "7bc4…"
+```
+
+Every node serves its own genesis, so this does not depend on any one machine staying up. Set
+`genesis_hash` when you use it — see the next section for why it matters more here than over RPC.
+
+If both are configured, `sync_peer` wins. Naming an RPC peer is an explicit choice about where your
+chain comes from, and quietly preferring a different source would answer a question you already
+answered.
+
 ### Verifying which chain you joined
 
-A node with no local chain yet takes its genesis block from the sync peer. It has no state, no
-validator set and no chain id at that point, so it cannot judge what it is handed: whoever answers
-decides which chain this node spends its life on. Joining the wrong one is not a loud failure —
+A node with no local chain yet takes its genesis block from a peer. It has no state, no validator
+set and no chain id at that point, so it cannot judge what it is handed: whoever answers decides
+which chain this node spends its life on. Over P2P that is sharper still — the answer comes from
+whichever peer replied first, not from an address you named. Joining the wrong one is not a loud failure —
 every later block applies perfectly on top of the wrong ledger, and every balance the node reports
 is quietly wrong.
 

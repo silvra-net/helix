@@ -484,6 +484,64 @@ impl HelixNode {
             info!(validator = %genesis.header.validator, "Adopted peer's genesis block (height 0)");
             store.save_chain_state(&state)?;
             state
+        } else if joins_over_p2p(new_chain, &configured_seed_peers(&cfg)) {
+            // No local chain and no RPC `sync_peer`, but the operator named P2P peers — join from
+            // those alone (#139). Until this branch existed, adopting a genesis was possible only
+            // through `GET /genesis`, so joining the network required somebody to run a reachable
+            // HTTP server; in practice that somebody was us, and it was the last hard dependency on
+            // one machine left in the join path.
+            //
+            // Ordered *after* the `sync_peer` branch on purpose: an operator who configured an RPC
+            // peer named a specific source, and silently preferring a different one would answer a
+            // question they had already answered.
+            //
+            // Gated on `!new_chain` for the same reason, and that gate is not decoration. Seed peers
+            // and "start a standalone chain" are routinely set together — every local devnet and the
+            // production origin node do exactly that, because the seed list is how a validator set
+            // is wired into a mesh, not a statement about where the chain came from. Without the
+            // gate those nodes stop self-signing, spend the fetch timeout asking peers that do not
+            // exist yet, and then fail to start at all. Caught by the multi-node integration tests
+            // after the unit suite was entirely green.
+            let peers = configured_seed_peers(&cfg);
+            info!(peers = peers.len(), "No local chain and no sync peer — fetching genesis over P2P");
+            let payload =
+                helix_p2p::fetch_genesis_over_p2p(&peers, helix_p2p::GENESIS_FETCH_TIMEOUT).await?;
+            let genesis = payload.block.clone();
+
+            // The same checkpoint the RPC path applies, and for a stronger reason here: over P2P
+            // the answer comes from whichever peer replied first, not from a source the operator
+            // named. Compared against a locally recomputed `Block::hash()` — never against anything
+            // the peer says about the block — and before anything is rebuilt or written.
+            let expected_genesis = config::resolve("HELIX_GENESIS_HASH", &cfg.genesis_hash);
+            verify_genesis_checkpoint(expected_genesis.as_deref(), &genesis)?;
+
+            let state = helix_executor::genesis::rebuild_genesis_state(
+                genesis.header.validator.clone(),
+                payload.personhood_authorities.clone(),
+                payload.validator_stake,
+                payload.allocations.clone(),
+                helix_executor::GovernanceParams {
+                    min_validator_stake: payload.min_validator_stake,
+                    fuel_per_fee_unit: payload.fuel_per_fee_unit,
+                },
+            );
+
+            // Same self-certifying caveat as over RPC: both halves came from the same peer, so this
+            // catches an inconsistent answer, never a coherently false one. The checkpoint above is
+            // the check that does not originate with the peer.
+            if let Some(claimed) = &payload.state_hash {
+                let ours = state.state_hash().to_hex();
+                if &ours != claimed {
+                    anyhow::bail!(
+                        "rebuilt genesis state does not match the peer's: ours {ours}, theirs {claimed}"
+                    );
+                }
+            }
+
+            store.put_block(genesis.clone())?;
+            info!(validator = %genesis.header.validator, "Adopted genesis received over P2P (height 0)");
+            store.save_chain_state(&state)?;
+            state
         } else {
             let sig = keypair.sign(b"helix-genesis-v1")?;
             // Wall-clock timestamp, not the historical hardcoded 0: it makes this genesis hash
@@ -575,11 +633,7 @@ impl HelixNode {
         // into a full mesh (every validator dials every other) rather than hub-and-spoke,
         // which both survives any single node's outage and gives consensus vote gossip more
         // than one relay path. Malformed entries are dialed-and-ignored by the P2P layer.
-        if let Some(seeds) = config::resolve("HELIX_P2P_SEED_PEERS", &cfg.p2p_seed_peers) {
-            for s in seeds.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                p2p_config.seed_peers.push(s.to_string());
-            }
-        }
+        p2p_config.seed_peers.extend(configured_seed_peers(&cfg));
 
         // mDNS LAN auto-discovery is on by default (zero-config peering). Disable it for
         // deterministic seed-peer-only peering — required when another independent Helix
@@ -608,6 +662,9 @@ impl HelixNode {
         // provider up front. Both handles are shared with the node, so what the provider serves is
         // always the node's live store and live tip certificate, never a snapshot.
         let shared_store = Arc::new(RwLock::new(store));
+        // Shared before the P2P service is built, because the genesis provider (#139) needs it and
+        // the service is constructed above the point where the node struct is assembled.
+        let shared_chain_state = Arc::new(RwLock::new(chain_state));
         let shared_tip_certificate = Arc::new(RwLock::new(TipCertificate::default()));
         let block_provider: Arc<dyn helix_p2p::BlockProvider> = Arc::new(StoreBlockProvider {
             store: shared_store.clone(),
@@ -619,7 +676,14 @@ impl HelixNode {
             announced_tip_height.clone(),
             block_provider,
         );
-        let p2p_service = p2p_service.with_peer_tip_reporting(highest_peer_tip.clone());
+        let p2p_service = p2p_service
+            .with_peer_tip_reporting(highest_peer_tip.clone())
+            // Every node serves its own genesis, so joining never depends on one particular
+            // machine being up — the point of #139.
+            .with_genesis_provider(Arc::new(StoreGenesisProvider {
+                store: shared_store.clone(),
+                chain_state: shared_chain_state.clone(),
+            }));
 
         let rpc_bind = resolve_rpc_bind(&cfg)?;
 
@@ -639,7 +703,7 @@ impl HelixNode {
             sync_peer,
             store: shared_store,
             mempool: Arc::new(RwLock::new(mempool)),
-            chain_state: Arc::new(RwLock::new(chain_state)),
+            chain_state: shared_chain_state,
             p2p_command_tx,
             p2p_event_rx,
             p2p_service: Some(p2p_service),
@@ -1610,6 +1674,68 @@ fn verify_block_batch(
 struct StoreBlockProvider {
     store: Arc<RwLock<HelixDb>>,
     tip_certificate: Arc<RwLock<TipCertificate>>,
+}
+
+/// Serves this node's genesis to peers joining over P2P (#139).
+///
+/// The fields are the same ones `GET /genesis` reports, assembled a second time here because the
+/// two answers cross different boundaries — JSON out of `helix-rpc`, bincode out of `helix-p2p` —
+/// and neither crate can own the other's type. **Both must be updated together when a genesis field
+/// is added.**
+///
+/// What keeps that from being a silent trap: `state_hash` is computed by `rebuild_genesis_state`
+/// from the very fields being sent, so a field left out here produces a hash that disagrees with
+/// the joining node's own rebuild, and the join is refused rather than quietly landing on a subtly
+/// different chain.
+struct StoreGenesisProvider {
+    store: Arc<RwLock<HelixDb>>,
+    chain_state: Arc<RwLock<ChainState>>,
+}
+
+impl helix_p2p::GenesisProvider for StoreGenesisProvider {
+    fn genesis<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = helix_p2p::GenesisResponse> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // No height 0 means this node has no chain to describe — a node still bootstrapping.
+            // Answering honestly beats silence: a requester cannot tell silence from unreachable.
+            let block = match self.store.read().await.get_block_by_height(0) {
+                Ok(b) => b,
+                Err(_) => return helix_p2p::GenesisResponse::empty(),
+            };
+            let cs = self.chain_state.read().await;
+
+            // Rebuilt through the same function the joining node runs, so this answers "what should
+            // your reconstruction come out as" rather than "what does my chain look like now",
+            // which has moved on since height 0.
+            let state_hash = helix_executor::genesis::rebuild_genesis_state(
+                block.header.validator.clone(),
+                cs.personhood_authorities.clone(),
+                cs.genesis_validator_stake,
+                cs.genesis_allocations.clone(),
+                cs.governance_params.clone(),
+            )
+            .state_hash()
+            .to_hex();
+
+            helix_p2p::GenesisResponse {
+                genesis: Some(helix_p2p::GenesisPayload {
+                    block,
+                    personhood_authorities: cs.personhood_authorities.clone(),
+                    validator_stake: cs.genesis_validator_stake,
+                    allocations: cs.genesis_allocations.clone(),
+                    // This node's *current* governance params, not necessarily its genesis-time
+                    // ones — the same caveat `GET /genesis` carries. A param changed by a proposal
+                    // since genesis is applied retroactively from height 0 by a joining node. Both
+                    // paths share the limitation; neither should grow it silently.
+                    min_validator_stake: cs.governance_params.min_validator_stake,
+                    fuel_per_fee_unit: cs.governance_params.fuel_per_fee_unit,
+                    state_hash: Some(state_hash),
+                }),
+            }
+        })
+    }
 }
 
 impl helix_p2p::BlockProvider for StoreBlockProvider {
@@ -3194,6 +3320,37 @@ struct PeerGenesis {
     state_hash: Option<String>,
 }
 
+/// Whether a node with no local chain and no RPC `sync_peer` should fetch its genesis from the
+/// configured P2P seed peers (#139).
+///
+/// `new_chain` is the operator saying "self-sign, do not join anything", and it has to win. Seed
+/// peers and that flag are routinely set together — every local devnet and the production origin
+/// node do, because the seed list wires a validator set into a mesh and says nothing about where
+/// the chain came from. Reading the seed list alone as an instruction to join stops those nodes
+/// self-signing and leaves them failing to start.
+fn joins_over_p2p(new_chain: bool, seed_peers: &[String]) -> bool {
+    !new_chain && !seed_peers.is_empty()
+}
+
+/// The explicit P2P seed peers an operator configured, as multiaddr strings.
+///
+/// Read through one function because two callers need it at different moments: the P2P config
+/// built during startup, and — before any of that exists — the genesis bootstrap, which has only a
+/// peer address to work with and no chain to put it in context (#139). Two copies of this parsing
+/// would be the duplicated invariant that drifts the first time the format changes.
+fn configured_seed_peers(cfg: &config::NodeConfig) -> Vec<String> {
+    config::resolve("HELIX_P2P_SEED_PEERS", &cfg.p2p_seed_peers)
+        .map(|seeds| {
+            seeds
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The HTTP client every outbound peer request uses.
 ///
 /// Carries an honest `User-Agent` (`helix/<version>`). reqwest sends none at all by default, and
@@ -3873,6 +4030,35 @@ async fn sync_blocks_from_peer(
 
     store.save_chain_state(chain_state)?;
     Ok(total_applied)
+}
+
+#[cfg(test)]
+mod genesis_join_tests {
+    use super::joins_over_p2p;
+
+    fn seeds() -> Vec<String> {
+        vec!["/ip4/127.0.0.1/tcp/8546".to_string()]
+    }
+
+    #[test]
+    fn a_node_with_seed_peers_and_no_chain_of_its_own_joins_over_p2p() {
+        assert!(joins_over_p2p(false, &seeds()));
+    }
+
+    /// The regression this exists for. `HELIX_NEW_CHAIN` and seed peers are set together by every
+    /// local devnet and by the production origin node — the seed list wires a mesh, it does not say
+    /// where the chain came from. Reading it as an instruction to join left those nodes waiting out
+    /// the fetch timeout and then failing to start at all, which the unit suite did not notice and
+    /// the multi-node integration tests did.
+    #[test]
+    fn a_node_starting_its_own_chain_never_joins_however_many_peers_it_lists() {
+        assert!(!joins_over_p2p(true, &seeds()));
+    }
+
+    #[test]
+    fn a_node_with_no_peers_has_nowhere_to_join_from() {
+        assert!(!joins_over_p2p(false, &[]));
+    }
 }
 
 #[cfg(test)]

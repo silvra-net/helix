@@ -23,6 +23,7 @@ use crate::blocksync::{
     BLOCKSYNC_PROTOCOL, MAX_BLOCKSYNC_BATCH,
 };
 use crate::config::P2PConfig;
+use crate::genesis_sync::{GenesisCodec, GenesisProvider, GenesisResponse, GENESIS_PROTOCOL};
 use crate::conn_limits::IpConnLimiter;
 use crate::reputation::PeerReputation;
 use crate::{
@@ -86,7 +87,7 @@ pub enum P2PCommand {
 }
 
 #[derive(NetworkBehaviour)]
-struct HelixBehaviour {
+pub(crate) struct HelixBehaviour {
     gossipsub: gossipsub::Behaviour,
     /// LAN peer auto-discovery — `Toggle`d off when `P2PConfig::enable_mdns` is false
     /// (deterministic seed-peer-only peering; see that field's doc comment). When off it
@@ -104,6 +105,11 @@ struct HelixBehaviour {
     /// something instead of shouting into a topic — which is what a node needs to catch up without
     /// an operator-configured RPC endpoint. See the `blocksync` module.
     blocksync: request_response::Behaviour<BlockSyncCodec>,
+    /// Serving the genesis block itself (#139). Separate protocol from `blocksync`, so a peer
+    /// running an older build is simply never asked rather than being handed a message it would
+    /// misparse. This is what lets a node with no chain at all join from a peer address alone,
+    /// instead of needing somebody to run a reachable HTTP endpoint.
+    pub(crate) genesis_sync: request_response::Behaviour<GenesisCodec>,
 }
 
 pub struct P2PService {
@@ -119,6 +125,9 @@ pub struct P2PService {
     /// or zero tip forever and be refused as "too far behind" by `should_serve_catchup`. Reading
     /// the store's real height cannot drift.
     tip_height: Arc<AtomicU64>,
+    /// Answers inbound genesis requests (#139). `None` on a node with nothing to serve — every
+    /// test in this crate, and any endpoint that is itself still bootstrapping.
+    genesis_provider: Option<Arc<dyn GenesisProvider>>,
     /// Answers inbound block-sync requests (#138). Supplied by the node, which owns the store —
     /// see [`BlockProvider`] for why the dependency points this way.
     block_provider: Arc<dyn BlockProvider>,
@@ -148,6 +157,7 @@ impl P2PService {
                 command_rx,
                 tip_height,
                 block_provider,
+                genesis_provider: None,
                 highest_peer_tip: None,
             },
             command_tx,
@@ -164,6 +174,16 @@ impl P2PService {
         self
     }
 
+    /// Serve the local genesis to peers that ask for it (#139).
+    ///
+    /// Opt-in for the same reason as `with_peer_tip_reporting`: the tests in this crate and every
+    /// other caller that has no genesis to offer stay exactly as they are, and a node that does not
+    /// set one answers honestly that it has nothing rather than pretending the protocol is absent.
+    pub fn with_genesis_provider(mut self, provider: Arc<dyn GenesisProvider>) -> Self {
+        self.genesis_provider = Some(provider);
+        self
+    }
+
     pub async fn run(self) -> P2PResult<()> {
         // Destructure so we can move fields into the loop without borrowing `self`
         let event_tx = self.event_tx;
@@ -171,111 +191,10 @@ impl P2PService {
         let config = self.config;
         let tip_height = self.tip_height;
         let block_provider = self.block_provider;
+        let genesis_provider = self.genesis_provider;
         let highest_peer_tip = self.highest_peer_tip;
 
-        let max_msg_size = config.max_message_size;
-
-        let mut swarm = SwarmBuilder::with_new_identity()
-            .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default(),
-                libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
-            )
-            .map_err(|e| P2PError::Transport(e.to_string()))?
-            .with_dns()
-            .map_err(|e| P2PError::Transport(e.to_string()))?
-            // Added unconditionally, unlike the `ws_listen_addr` listener below: dialing a
-            // `/ws` or `/tls/ws` peer must work for every node, including ones that are not
-            // themselves reachable that way. A node that only listens on raw TCP still has to
-            // be able to reach a tunnelled peer.
-            .with_websocket(
-                libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
-            )
-            .await
-            .map_err(|e| P2PError::Transport(e.to_string()))?
-            .with_behaviour(|key| {
-                let message_id_fn = |msg: &gossipsub::Message| {
-                    let mut hasher = DefaultHasher::new();
-                    msg.data.hash(&mut hasher);
-                    gossipsub::MessageId::from(hasher.finish().to_string())
-                };
-
-                let gossipsub_config = gossipsub::ConfigBuilder::default()
-                    // 1s (down from libp2p's 1s default that a prior 10s override had
-                    // slowed right down): the heartbeat drives both mesh maintenance and
-                    // the IHAVE/IWANT gossip that recovers messages a peer missed while its
-                    // mesh was still forming. At 10s, a consensus vote dropped during the
-                    // first seconds of a round was not re-offered until long after the round
-                    // had already timed out — so in a multi-validator set some node was
-                    // always short a prevote or precommit and no round ever reached quorum.
-                    // At 1s the recovery lands well within a round. Cheap at Helix's small
-                    // validator-set scale.
-                    .heartbeat_interval(Duration::from_secs(1))
-                    .validation_mode(gossipsub::ValidationMode::Strict)
-                    .message_id_fn(message_id_fn)
-                    .max_transmit_size(max_msg_size)
-                    .build()
-                    .expect("gossipsub config is valid");
-
-                let gossipsub = gossipsub::Behaviour::new(
-                    gossipsub::MessageAuthenticity::Signed(key.clone()),
-                    gossipsub_config,
-                )
-                .expect("gossipsub behaviour is valid");
-
-                let mdns: Toggle<mdns::tokio::Behaviour> = if config.enable_mdns {
-                    Some(
-                        mdns::tokio::Behaviour::new(
-                            mdns::Config::default(),
-                            key.public().to_peer_id(),
-                        )
-                        .expect("mdns behaviour is valid"),
-                    )
-                    .into()
-                } else {
-                    None.into()
-                };
-
-                let connection_limits = libp2p::connection_limits::Behaviour::new(
-                    libp2p::connection_limits::ConnectionLimits::default()
-                        .with_max_established(Some(config.max_peers as u32))
-                        .with_max_established_incoming(Some(config.max_established_incoming))
-                        .with_max_pending_incoming(Some(config.max_pending_incoming))
-                        .with_max_established_per_peer(Some(config.max_established_per_peer)),
-                );
-                let ip_limits = IpConnLimiter::new(config.max_connections_per_ip);
-
-                // `ProtocolSupport::Full` — every node both asks and answers. A node that only
-                // asked would be a free-rider on a network whose whole point (#138) is that any
-                // peer can bootstrap any other without a central RPC endpoint.
-                let blocksync = request_response::Behaviour::with_codec(
-                    BlockSyncCodec,
-                    [(BLOCKSYNC_PROTOCOL, request_response::ProtocolSupport::Full)],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(30)),
-                );
-
-                HelixBehaviour { gossipsub, mdns, connection_limits, ip_limits, blocksync }
-            })
-            .expect("behaviour setup never fails")
-            .with_swarm_config(|cfg| {
-                // libp2p-swarm defaults this to Duration::ZERO — a connection with no
-                // substream open AT THE EXACT INSTANT it's checked is torn down
-                // immediately, no grace period. Right after a fresh connection
-                // establishes, there's a brief window before gossipsub/mdns have
-                // finished negotiating their own substreams; racing that window against
-                // a zero-duration idle check flakily kills freshly-established
-                // connections before they ever get used — found by running a real
-                // multi-node local testnet (a single-node devnet never has a peer to
-                // race against, so this never showed up before). Once a connection is
-                // actually in use (gossip flowing every ~2s per block), the zero
-                // default was never a problem — this only bites the handshake window
-                // right at connection setup.
-                cfg.with_idle_connection_timeout(Duration::from_secs(60))
-            })
-            .build();
+        let mut swarm = build_swarm(&config).await?;
 
         let local_peer_id = swarm.local_peer_id().to_string();
 
@@ -447,6 +366,38 @@ impl P2PService {
                             }
                         }
 
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::GenesisSync(
+                            request_response::Event::Message { peer, message, .. }
+                        )) => {
+                            match message {
+                                request_response::Message::Request { channel, .. } => {
+                                    // Answered inside the swarm loop like a block-sync request, and
+                                    // read-only in the same way: the requester supplies nothing at
+                                    // all, so there is no input here to get wrong.
+                                    let response = match &genesis_provider {
+                                        Some(provider) => provider.genesis().await,
+                                        // Honest "nothing to give" rather than silence. A node that
+                                        // is itself still bootstrapping speaks the protocol but has
+                                        // no genesis, and letting the request time out instead would
+                                        // be indistinguishable from an unreachable peer.
+                                        None => GenesisResponse::empty(),
+                                    };
+                                    debug!(
+                                        peer = %peer,
+                                        served = response.genesis.is_some(),
+                                        "Answering a genesis request"
+                                    );
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .genesis_sync
+                                        .send_response(channel, response);
+                                }
+                                // Outbound genesis requests are made by the one-shot bootstrap in
+                                // `genesis_bootstrap`, which owns its own swarm and never reaches
+                                // this loop — a running node already has a genesis and never asks.
+                                request_response::Message::Response { .. } => {}
+                            }
+                        }
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
                             request_response::Event::Message { peer, message, .. }
                         )) => {
@@ -1648,4 +1599,127 @@ mod peer_exchange_tests {
         assert!(new_addrs.is_empty());
         assert_eq!(known.len(), MAX_KNOWN_PEER_ADDRS);
     }
+}
+
+
+/// Build the libp2p swarm every Helix endpoint uses — the long-lived [`P2PService`] and the
+/// one-shot genesis bootstrap in [`crate::genesis_bootstrap`] alike.
+///
+/// Extracted so those two cannot drift apart. They have to speak the same transports and the
+/// same protocols to reach each other at all, and a second copy of this builder is exactly the
+/// duplicated invariant that goes stale the first time a transport is added to one of them —
+/// silently, and only on the path nobody exercises by hand.
+pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<HelixBehaviour>> {
+    let max_msg_size = config.max_message_size;
+
+    let swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .map_err(|e| P2PError::Transport(e.to_string()))?
+        .with_dns()
+        .map_err(|e| P2PError::Transport(e.to_string()))?
+        // Added unconditionally, unlike the `ws_listen_addr` listener below: dialing a
+        // `/ws` or `/tls/ws` peer must work for every node, including ones that are not
+        // themselves reachable that way. A node that only listens on raw TCP still has to
+        // be able to reach a tunnelled peer.
+        .with_websocket(
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .await
+        .map_err(|e| P2PError::Transport(e.to_string()))?
+        .with_behaviour(|key| {
+            let message_id_fn = |msg: &gossipsub::Message| {
+                let mut hasher = DefaultHasher::new();
+                msg.data.hash(&mut hasher);
+                gossipsub::MessageId::from(hasher.finish().to_string())
+            };
+
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                // 1s (down from libp2p's 1s default that a prior 10s override had
+                // slowed right down): the heartbeat drives both mesh maintenance and
+                // the IHAVE/IWANT gossip that recovers messages a peer missed while its
+                // mesh was still forming. At 10s, a consensus vote dropped during the
+                // first seconds of a round was not re-offered until long after the round
+                // had already timed out — so in a multi-validator set some node was
+                // always short a prevote or precommit and no round ever reached quorum.
+                // At 1s the recovery lands well within a round. Cheap at Helix's small
+                // validator-set scale.
+                .heartbeat_interval(Duration::from_secs(1))
+                .validation_mode(gossipsub::ValidationMode::Strict)
+                .message_id_fn(message_id_fn)
+                .max_transmit_size(max_msg_size)
+                .build()
+                .expect("gossipsub config is valid");
+
+            let gossipsub = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )
+            .expect("gossipsub behaviour is valid");
+
+            let mdns: Toggle<mdns::tokio::Behaviour> = if config.enable_mdns {
+                Some(
+                    mdns::tokio::Behaviour::new(
+                        mdns::Config::default(),
+                        key.public().to_peer_id(),
+                    )
+                    .expect("mdns behaviour is valid"),
+                )
+                .into()
+            } else {
+                None.into()
+            };
+
+            let connection_limits = libp2p::connection_limits::Behaviour::new(
+                libp2p::connection_limits::ConnectionLimits::default()
+                    .with_max_established(Some(config.max_peers as u32))
+                    .with_max_established_incoming(Some(config.max_established_incoming))
+                    .with_max_pending_incoming(Some(config.max_pending_incoming))
+                    .with_max_established_per_peer(Some(config.max_established_per_peer)),
+            );
+            let ip_limits = IpConnLimiter::new(config.max_connections_per_ip);
+
+            // `ProtocolSupport::Full` — every node both asks and answers. A node that only
+            // asked would be a free-rider on a network whose whole point (#138) is that any
+            // peer can bootstrap any other without a central RPC endpoint.
+            let blocksync = request_response::Behaviour::with_codec(
+                BlockSyncCodec,
+                [(BLOCKSYNC_PROTOCOL, request_response::ProtocolSupport::Full)],
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(30)),
+            );
+
+            let genesis_sync = request_response::Behaviour::with_codec(
+                GenesisCodec,
+                [(GENESIS_PROTOCOL, request_response::ProtocolSupport::Full)],
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(30)),
+            );
+
+            HelixBehaviour { gossipsub, mdns, connection_limits, ip_limits, blocksync, genesis_sync }
+        })
+        .expect("behaviour setup never fails")
+        .with_swarm_config(|cfg| {
+            // libp2p-swarm defaults this to Duration::ZERO — a connection with no
+            // substream open AT THE EXACT INSTANT it's checked is torn down
+            // immediately, no grace period. Right after a fresh connection
+            // establishes, there's a brief window before gossipsub/mdns have
+            // finished negotiating their own substreams; racing that window against
+            // a zero-duration idle check flakily kills freshly-established
+            // connections before they ever get used — found by running a real
+            // multi-node local testnet (a single-node devnet never has a peer to
+            // race against, so this never showed up before). Once a connection is
+            // actually in use (gossip flowing every ~2s per block), the zero
+            // default was never a problem — this only bites the handshake window
+            // right at connection setup.
+            cfg.with_idle_connection_timeout(Duration::from_secs(60))
+        })
+        .build();
+
+    Ok(swarm)
 }
