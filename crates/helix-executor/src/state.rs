@@ -1378,6 +1378,41 @@ mod tests {
     /// on whose turn it is to propose, silently halting the chain the moment more
     /// than one validator is active. `stakers()` must return the same order no
     /// matter what order the underlying HashMap happens to iterate in.
+    /// What an out-of-range `min_validator_stake` does, demonstrated rather than assumed.
+    ///
+    /// This is the failure the governance path guards against, shown directly: `stakers()` filters
+    /// on `effective >= min_stake`, so a value above what anyone holds leaves no set, no finalized
+    /// blocks, and no way back — repealing it would need a vote counted by stake weight among
+    /// validators that no longer exist.
+    ///
+    /// Reachable only by writing the parameter directly, as here. A *proposal* carrying such a
+    /// value is refused at creation, capped against the largest single stake in existence — see
+    /// `a_proposal_that_would_disqualify_every_validator_is_refused_at_creation` in the executor.
+    /// This test exists to keep that guard's reason legible, and to fail loudly if `stakers()`
+    /// ever stops filtering the way the guard assumes.
+    ///
+    /// Not hypothetical in the way it sounds: the units are the trap. `min_validator_stake` is
+    /// nano-HLX, and proposing "200000" while meaning HLX is off by a factor of a billion. That
+    /// exact confusion has already shipped once — `hlx governance propose` took nano where it
+    /// documented HLX (fixed in 928c21f).
+    #[test]
+    fn a_min_stake_above_everyones_balance_empties_the_validator_set() {
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        let v = addr(1);
+        state.update_account(&v, |a| a.staked = 100_000 * crate::genesis::NANO_PER_HLX);
+        assert_eq!(state.stakers().len(), 1, "precondition: a normal validator qualifies");
+
+        // A plausible fat-finger: the whole supply, in nano, as the minimum.
+        state.governance_params.min_validator_stake =
+            crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX;
+
+        assert!(
+            state.stakers().is_empty(),
+            "documents the failure mode: no validator can qualify, so no block can be finalized \
+             and no vote can be counted to undo it",
+        );
+    }
+
     #[test]
     fn stakers_is_stable_regardless_of_account_insertion_order() {
         let mut forward = ChainState::new(1_000_000);

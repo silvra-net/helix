@@ -2896,6 +2896,80 @@ mod tests {
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
     }
 
+    /// The guard that stops governance from killing the chain outright — and it had no test.
+    ///
+    /// `min_validator_stake` decides who `ChainState::stakers()` admits. A value above every
+    /// staker's holding disqualifies all of them at once: no validator set, no finalized blocks,
+    /// and no way back, because repealing it needs a vote counted by stake weight among
+    /// validators that no longer exist. One accepted proposal, chain permanently dead.
+    ///
+    /// The realistic route in is the unit: this parameter is nano-HLX, so proposing "200000"
+    /// while meaning HLX is off by a billion. That exact confusion has shipped before — `hlx
+    /// governance propose` took nano where it documented HLX (928c21f).
+    ///
+    /// The guard caps a proposal at the largest single stake that currently exists, which
+    /// guarantees at least that one account stays eligible. It is refused at *creation*, so the
+    /// proposal never reaches a vote where people might approve it without doing the arithmetic.
+    #[test]
+    fn a_proposal_that_would_disqualify_every_validator_is_refused_at_creation() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let proposer_kp = KeyPair::generate();
+        let proposer = Address::from_public_key(&proposer_kp.public);
+
+        // Stake comfortably above the static floor, so this test exercises the *dynamic*
+        // ceiling rather than tripping the floor check that runs before it.
+        let staked = 5 * crate::genesis::MIN_VALIDATOR_STAKE;
+        let mut state = ChainState::new(0);
+        state.update_account(&proposer, |acc| {
+            acc.balance = 1_000_000_000;
+            acc.staked = staked;
+        });
+
+        // One nano above the largest stake in existence — nobody could qualify.
+        let data = governance::encode_proposal(
+            governance::GovernanceParam::MinValidatorStake,
+            staked + 1,
+        );
+        let tx =
+            signed_governance_tx(&proposer_kp, &proposer, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+        assert!(!receipt.success, "such a proposal must not even be created");
+        assert!(
+            receipt.error.as_deref().unwrap_or("").contains("disqualify every validator"),
+            "and must say why: {:?}",
+            receipt.error,
+        );
+        assert!(state.proposal(0).is_none(), "nothing may be recorded for it");
+    }
+
+    /// The control: raising the minimum up to what the largest staker actually holds must still
+    /// work. A guard that refused every increase would replace a rare catastrophe with a
+    /// permanent inability to tune the parameter at all.
+    #[test]
+    fn a_proposal_up_to_the_largest_stake_is_still_allowed() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let proposer_kp = KeyPair::generate();
+        let proposer = Address::from_public_key(&proposer_kp.public);
+
+        let staked = 5 * crate::genesis::MIN_VALIDATOR_STAKE;
+        let mut state = ChainState::new(0);
+        state.update_account(&proposer, |acc| {
+            acc.balance = 1_000_000_000;
+            acc.staked = staked;
+        });
+
+        // Exactly the largest stake: that holder stays eligible, so the set cannot empty.
+        let data =
+            governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, staked);
+        let tx =
+            signed_governance_tx(&proposer_kp, &proposer, TxType::CreateProposal, data, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+        assert!(receipt.success, "a survivable increase must remain proposable: {:?}", receipt.error);
+        assert!(state.proposal(0).is_some());
+    }
+
     #[test]
     fn vote_reaching_supermajority_applies_param_change_immediately() {
         let validator = Address::from_public_key(&KeyPair::generate().public);
