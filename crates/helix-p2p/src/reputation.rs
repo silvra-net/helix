@@ -4,16 +4,7 @@ use std::collections::VecDeque;
 
 use tracing::warn;
 
-/// Whether this address belongs to a local reverse proxy rather than to the peer itself, in which
-/// case it is shared by every peer arriving through it and says nothing about who misbehaved.
-/// Mirrors `conn_limits::is_proxy_local` — same deployment fact, two places that must both respect
-/// it (backlog #148).
-fn is_shared_proxy_ip(ip: &str) -> bool {
-    match ip.parse::<std::net::IpAddr>() {
-        Ok(addr) => addr.is_loopback(),
-        Err(_) => false,
-    }
-}
+use crate::net_addr::is_shared_proxy_address;
 
 /// Number of protocol infractions (malformed gossipsub payloads, failed session
 /// handshakes, etc.) a peer may commit before it is disconnected and refused
@@ -122,7 +113,7 @@ impl PeerReputation {
                 //
                 // The peer ban above is untouched and does the real work: it is keyed on the
                 // PeerId, which stays meaningful no matter what the connection travelled through.
-                if is_shared_proxy_ip(ip) {
+                if is_shared_proxy_address(ip) {
                     warn!(
                         peer = %peer,
                         ip = %ip,

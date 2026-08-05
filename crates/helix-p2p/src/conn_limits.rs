@@ -45,6 +45,7 @@ use libp2p::swarm::{
 
 use tracing::warn;
 
+use crate::net_addr::is_shared_proxy_address;
 use crate::service::multiaddr_ip;
 
 #[derive(Debug, Clone, Copy)]
@@ -59,17 +60,6 @@ impl std::fmt::Display for IpLimitExceeded {
 }
 
 impl std::error::Error for IpLimitExceeded {}
-
-/// A source address the per-IP cap cannot meaningfully account for: it belongs to a local reverse
-/// proxy, not to the peer behind it. See the module docs for why this is an exemption rather than
-/// a stricter rule.
-fn is_proxy_local(ip: &str) -> bool {
-    match ip.parse::<std::net::IpAddr>() {
-        Ok(addr) => addr.is_loopback(),
-        // Unparseable means we cannot key a count on it either; the global limits still apply.
-        Err(_) => false,
-    }
-}
 
 pub struct IpConnLimiter {
     max_per_ip: u32,
@@ -125,7 +115,7 @@ impl NetworkBehaviour for IpConnLimiter {
         // Peers behind a local reverse proxy all share its address — counting them together caps
         // the whole validator set at one bucket while separating nobody. Module docs for the full
         // reasoning; the global limits still bound this.
-        if is_proxy_local(&ip) {
+        if is_shared_proxy_address(&ip) {
             if !self.warned_proxy_local {
                 self.warned_proxy_local = true;
                 warn!(

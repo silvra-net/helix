@@ -1,6 +1,7 @@
 pub mod blocksync;
 pub mod config;
 mod conn_limits;
+mod net_addr;
 pub mod reputation;
 pub mod service;
 
