@@ -65,6 +65,39 @@ const DEFAULT_VALIDATOR_KEY_FILE: &str = "validator-key.json";
 /// local devnet do this). Override the endpoint itself with `HELIX_SYNC_PEER`.
 pub const DEFAULT_SEED_PEER: &str = "https://helix.silvra.net";
 
+/// The genesis hash of the public Helix chain, compiled in so joining it is verified by default.
+///
+/// Bitcoin puts its genesis block in the source and asserts the hash (`chainparams.cpp`), so a node
+/// cannot be talked onto another chain and nobody configures anything. This is the same idea with
+/// one deliberate softening: it is the *default* value of the checkpoint, not a law. A Helix devnet
+/// reset produces a new genesis, and a hard-coded hash that outlived a reset would lock every
+/// operator out of the network until a release shipped — trading a real outage for a hypothetical
+/// impersonation. `HELIX_GENESIS_HASH` still overrides it, so after a reset an operator is told
+/// clearly what happened and has a way through rather than being stranded.
+///
+/// Only applies when joining the default seed. An operator who named their own `sync_peer` is
+/// joining a network this constant knows nothing about, and silently checking ours against theirs
+/// would refuse a perfectly good join.
+///
+/// **Update this together with any chain reset**, in the release that accompanies it.
+pub const DEFAULT_GENESIS_HASH: &str =
+    "ff271e4a9e4d61f769a8d7dc543facca7dc17a3968398a730c5863a93f2d030b";
+
+/// The genesis hash this node should insist on: the operator's if they set one, otherwise the
+/// compiled-in default — but only when joining the public chain the default describes.
+///
+/// Split out as a pure function because the "only for the default seed" condition is the whole
+/// safety argument, and it is one `&&` away from silently refusing every private network.
+fn expected_genesis_hash(configured: Option<String>, sync_peer: Option<&str>) -> Option<String> {
+    if let Some(explicit) = configured.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        return Some(explicit);
+    }
+    match sync_peer {
+        Some(peer) if peer == DEFAULT_SEED_PEER => Some(DEFAULT_GENESIS_HASH.to_string()),
+        _ => None,
+    }
+}
+
 /// Interval between periodic RPC catch-up polls of the sync peer (see [`rpc_sync_loop`]).
 const RPC_SYNC_POLL_SECS: u64 = 4;
 
@@ -460,8 +493,10 @@ impl HelixNode {
             // Before the block is rebuilt, hashed against the peer's own claim, or written
             // (backlog #139). This is the one check in the join path that does not originate with
             // the peer being trusted.
-            let expected_genesis =
-                config::resolve("HELIX_GENESIS_HASH", &cfg.genesis_hash);
+            let expected_genesis = expected_genesis_hash(
+                config::resolve("HELIX_GENESIS_HASH", &cfg.genesis_hash),
+                Some(peer_url.as_str()),
+            );
             verify_genesis_checkpoint(expected_genesis.as_deref(), &genesis)?;
 
             // Rebuild through the same function the peer hashed, taking every field from the
@@ -676,7 +711,18 @@ impl HelixNode {
             announced_tip_height.clone(),
             block_provider,
         );
+        // Which chain this node is on, announced to peers so one on a different chain is named
+        // rather than silently rejecting everything we send it (#164). Read from the store, which
+        // by this point holds the genesis whether it was loaded, adopted or self-signed.
+        let our_genesis_hash = shared_store
+            .read()
+            .await
+            .get_block_by_height(0)
+            .map(|b| b.hash().to_hex())
+            .unwrap_or_default();
+
         let p2p_service = p2p_service
+            .announcing_genesis(our_genesis_hash)
             .with_peer_tip_reporting(highest_peer_tip.clone())
             // Every node serves its own genesis, so joining never depends on one particular
             // machine being up — the point of #139.
@@ -4076,7 +4122,48 @@ async fn sync_blocks_from_peer(
 
 #[cfg(test)]
 mod genesis_join_tests {
-    use super::joins_over_p2p;
+    use super::{expected_genesis_hash, joins_over_p2p, DEFAULT_GENESIS_HASH, DEFAULT_SEED_PEER};
+
+    /// Joining the public chain is verified without the operator configuring anything — Bitcoin's
+    /// model, where the genesis is compiled in and nobody is asked. Before this, the default was to
+    /// adopt whatever the peer served and the safe path took manual work, which is backwards.
+    #[test]
+    fn joining_the_public_chain_checks_the_compiled_in_genesis_by_default() {
+        assert_eq!(
+            expected_genesis_hash(None, Some(DEFAULT_SEED_PEER)).as_deref(),
+            Some(DEFAULT_GENESIS_HASH),
+        );
+    }
+
+    /// The condition the whole safety argument rests on. An operator who named their own peer is
+    /// joining a network this binary knows nothing about; checking our hash against theirs would
+    /// refuse every private network and every devnet, including our own integration tests.
+    #[test]
+    fn joining_someone_elses_network_does_not_check_our_hash() {
+        assert_eq!(expected_genesis_hash(None, Some("http://some-other-host:8545")), None);
+        assert_eq!(expected_genesis_hash(None, None), None);
+    }
+
+    /// An explicit setting always wins — that is what keeps a reset from stranding anyone: the
+    /// compiled-in hash goes stale the moment the chain is reset, and this is the way through.
+    #[test]
+    fn an_explicit_setting_overrides_the_compiled_in_default() {
+        assert_eq!(
+            expected_genesis_hash(Some("abc123".into()), Some(DEFAULT_SEED_PEER)).as_deref(),
+            Some("abc123"),
+        );
+    }
+
+    /// An empty or whitespace value is an unset environment variable, not a hash. Treating it as
+    /// one would abort every start with a mismatch against the empty string.
+    #[test]
+    fn a_blank_setting_falls_through_to_the_default() {
+        assert_eq!(
+            expected_genesis_hash(Some("   ".into()), Some(DEFAULT_SEED_PEER)).as_deref(),
+            Some(DEFAULT_GENESIS_HASH),
+        );
+    }
+
 
     fn seeds() -> Vec<String> {
         vec!["/ip4/127.0.0.1/tcp/8546".to_string()]

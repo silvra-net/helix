@@ -125,6 +125,10 @@ pub struct P2PService {
     /// or zero tip forever and be refused as "too far behind" by `should_serve_catchup`. Reading
     /// the store's real height cannot drift.
     tip_height: Arc<AtomicU64>,
+    /// This node's genesis hash, announced in peer exchange so a peer on a different chain can be
+    /// named as such instead of silently rejecting everything (see `foreign_chain_warning`). Empty
+    /// on a service that was never told, which simply announces nothing.
+    genesis_hash: String,
     /// Answers inbound genesis requests (#139). `None` on a node with nothing to serve — every
     /// test in this crate, and any endpoint that is itself still bootstrapping.
     genesis_provider: Option<Arc<dyn GenesisProvider>>,
@@ -157,6 +161,7 @@ impl P2PService {
                 command_rx,
                 tip_height,
                 block_provider,
+                genesis_hash: String::new(),
                 genesis_provider: None,
                 highest_peer_tip: None,
             },
@@ -171,6 +176,16 @@ impl P2PService {
     /// test in this crate among them — stay as they are.
     pub fn with_peer_tip_reporting(mut self, slot: Arc<AtomicU64>) -> Self {
         self.highest_peer_tip = Some(slot);
+        self
+    }
+
+    /// Announce which chain this node is on, so a peer on another one can be told (#164).
+    ///
+    /// Opt-in like the other two, so every test in this crate stays as it is — and a service that
+    /// does not set it announces an empty hash, which reads as "did not say" rather than as a
+    /// mismatch.
+    pub fn announcing_genesis(mut self, genesis_hash: String) -> Self {
+        self.genesis_hash = genesis_hash;
         self
     }
 
@@ -192,6 +207,7 @@ impl P2PService {
         let tip_height = self.tip_height;
         let block_provider = self.block_provider;
         let genesis_provider = self.genesis_provider;
+        let our_genesis = self.genesis_hash;
         let highest_peer_tip = self.highest_peer_tip;
 
         let mut swarm = build_swarm(&config).await?;
@@ -267,7 +283,7 @@ impl P2PService {
         let mut known_addrs: HashSet<String> = HashSet::new();
         // Peer versions we've already warned about, so a persistent mismatch on the 30s
         // peer-exchange tick is logged once rather than every tick (#109).
-        let mut warned_versions: HashSet<String> = HashSet::new();
+        let mut peer_warnings = PeerWarnings::default();
         // Tip each peer last announced, so the block-sync driver below knows who to ask (#138).
         // Bounded by the connection limit and pruned on disconnect, so it cannot grow unbounded.
         let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
@@ -343,8 +359,9 @@ impl P2PService {
                                     &mut known_addrs,
                                     config.public_addr.as_deref(),
                                     &mut swarm,
-                                    &mut warned_versions,
+                                    &mut peer_warnings,
                                     tip_height.load(Ordering::Relaxed),
+                                    &our_genesis,
                                 );
                                 if let Some(tip) = outcome.announced_tip {
                                     peer_tips.insert(propagation_source, tip);
@@ -549,6 +566,7 @@ impl P2PService {
                                 &peer_exchange_topic,
                                 &known_addrs,
                                 tip_height.load(Ordering::Relaxed),
+                                &our_genesis,
                             );
 
                             let _ = event_tx.send(P2PEvent::PeerConnected(peer_str)).await;
@@ -627,6 +645,7 @@ impl P2PService {
                         &peer_exchange_topic,
                         &known_addrs,
                         tip_height.load(Ordering::Relaxed),
+                        &our_genesis,
                     );
 
                     // Redial the seeds while this node has no connection at all.
@@ -790,6 +809,21 @@ struct PeerExchangeMsg {
     /// `prev_hash` chain, and the commit certificate's quorum). So a peer lying about its height
     /// gains nothing but a bounded amount of our upload.
     tip_height: u64,
+    /// The sender's genesis hash — which chain it is actually on.
+    ///
+    /// Nothing carried this before, and two nodes on different chains connected perfectly happily:
+    /// they gossiped at each other and every single message was rejected on its own merits, one at
+    /// a time, with nobody ever saying why. An operator whose chain data predates a reset sees only
+    /// that their chain stopped moving — the same symptom as every other stall, and the one that
+    /// has cost this project days of diagnosis more than once.
+    ///
+    /// Bitcoin solves this a layer lower, with per-network magic bytes that stop a wrong-network
+    /// peer completing the handshake at all. This is the diagnostic half of the same idea: it does
+    /// not prevent the connection, it explains it.
+    ///
+    /// Empty from a node that has no genesis yet, which is not a lie worth acting on.
+    #[serde(default)]
+    genesis_hash: String,
 }
 
 /// Whether a peer announcing `peer_tip` should be served the blocks it is missing, given our own
@@ -846,6 +880,34 @@ fn foreign_version_warning(their: &str, ours: &str, warned: &mut HashSet<String>
     ))
 }
 
+/// The warning text for a peer on a different chain, or `None` when it matches, when either side
+/// has no genesis to compare, or when we have already warned about this exact hash.
+///
+/// Deduped like [`foreign_version_warning`] so a peer that keeps announcing on the 30-second tick
+/// is logged once rather than forever. Pure, so every branch is testable without a `Swarm`.
+///
+/// Warns and does not disconnect, deliberately and consistently with how this codebase treats every
+/// other peer-level disagreement (version mismatch, flapping): the value here is the sentence, not
+/// the enforcement. A comparison bug that disconnected instead would partition the network, and a
+/// foreign-chain peer already costs nothing — every message it sends is rejected on its own merits,
+/// and the block-sync cooldown (#140) stops us asking it twice.
+fn foreign_chain_warning(theirs: &str, ours: &str, warned: &mut HashSet<String>) -> Option<String> {
+    // An empty hash is a node that has no genesis yet, not a node on another chain.
+    if theirs.is_empty() || ours.is_empty() || theirs == ours {
+        return None;
+    }
+    if !warned.insert(theirs.to_string()) {
+        return None;
+    }
+    Some(format!(
+        "A peer on the network is on a DIFFERENT CHAIN: its genesis is {theirs}, ours is {ours}. \
+         Nothing it sends can be accepted and nothing we send can be accepted by it. The usual \
+         cause is chain data left over from before a reset — clear the data directory and let the \
+         node re-join, or point it at the right network. Until then that peer's chain is stopped \
+         and this one cannot help it."
+    ))
+}
+
 /// What the caller has to act on after a peer-exchange message.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PeerExchangeOutcome {
@@ -859,6 +921,61 @@ struct PeerExchangeOutcome {
     serve_from_tip: Option<u64>,
 }
 
+/// What has already been reported about peers, so a disagreement that arrives on every
+/// 30-second peer-exchange tick is logged once instead of forever.
+///
+/// The two sets are grouped rather than passed separately because they are the same kind of thing —
+/// a fact about a peer that is worth saying exactly once — and they are always needed together.
+#[derive(Default)]
+struct PeerWarnings {
+    /// Software versions already reported (#109).
+    versions: HashSet<String>,
+    /// Genesis hashes already reported as foreign (#164).
+    chains: HashSet<String>,
+}
+
+/// The peer-exchange payload as it was before `genesis_hash` existed.
+///
+/// Kept so a peer running the previous release stays readable. bincode is not self-describing, so
+/// `#[serde(default)]` on the new field cannot rescue a shorter payload — measured, the older
+/// message fails to decode as the newer struct with "unexpected end of file", while the newer
+/// message decodes fine as the older struct (trailing bytes are ignored). The break is one-way,
+/// and this is the side that has to absorb it.
+#[derive(Debug, Serialize, Deserialize)]
+struct PeerExchangeMsgV1 {
+    peers: Vec<String>,
+    version: String,
+    tip_height: u64,
+}
+
+/// Decode a peer-exchange message, accepting the previous release's shape as well.
+///
+/// The fallback is not leniency about malformed input — it is the difference between "older build"
+/// and "misbehaving", and getting that wrong here is expensive: an unparseable peer-exchange message
+/// charges a misbehavior strike, the message arrives every 30 seconds, and five strikes ban the
+/// peer. Without this, adding one field would have banned a healthy co-signing validator inside
+/// three minutes and stalled a two-validator chain — while every test passed, because no test runs
+/// two different builds against each other.
+fn decode_peer_exchange(data: &[u8]) -> Option<PeerExchangeMsg> {
+    if let Ok(msg) = bincode::deserialize::<PeerExchangeMsg>(data) {
+        return Some(msg);
+    }
+    match bincode::deserialize::<PeerExchangeMsgV1>(data) {
+        Ok(old) => Some(PeerExchangeMsg {
+            peers: old.peers,
+            version: old.version,
+            tip_height: old.tip_height,
+            // Not "no genesis" but "did not say" — `foreign_chain_warning` treats the two the same
+            // and stays quiet, which is right: an older peer's chain is not knowable from here.
+            genesis_hash: String::new(),
+        }),
+        Err(e) => {
+            warn!("Malformed peer-exchange message: {}", e);
+            None
+        }
+    }
+}
+
 /// Returns what the caller must act on: whether the sender misbehaved, and whether it is behind us
 /// and should be served the blocks it is missing.
 fn handle_peer_exchange_message(
@@ -866,13 +983,13 @@ fn handle_peer_exchange_message(
     known_addrs: &mut HashSet<String>,
     self_addr: Option<&str>,
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
-    warned_versions: &mut HashSet<String>,
+    warnings: &mut PeerWarnings,
     our_tip: u64,
+    our_genesis: &str,
 ) -> PeerExchangeOutcome {
-    let msg = match bincode::deserialize::<PeerExchangeMsg>(data) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("Malformed peer-exchange message: {}", e);
+    let msg = match decode_peer_exchange(data) {
+        Some(m) => m,
+        None => {
             return PeerExchangeOutcome {
                 malformed: true,
                 announced_tip: None,
@@ -883,7 +1000,12 @@ fn handle_peer_exchange_message(
 
     // Catch a peer that upgraded (or downgraded) while we keep running — the gap join-time
     // `peer_version_warning` cannot see (#109).
-    if let Some(warning) = foreign_version_warning(&msg.version, OUR_VERSION, warned_versions) {
+    if let Some(warning) = foreign_version_warning(&msg.version, OUR_VERSION, &mut warnings.versions) {
+        warn!("{warning}");
+    }
+
+    // And catch the peer that is not on this chain at all.
+    if let Some(warning) = foreign_chain_warning(&msg.genesis_hash, our_genesis, &mut warnings.chains) {
         warn!("{warning}");
     }
 
@@ -1058,11 +1180,13 @@ fn broadcast_known_addrs(
     topic: &gossipsub::IdentTopic,
     known_addrs: &HashSet<String>,
     tip_height: u64,
+    genesis_hash: &str,
 ) {
     let msg = PeerExchangeMsg {
         peers: known_addrs.iter().cloned().collect(),
         version: OUR_VERSION.to_string(),
         tip_height,
+        genesis_hash: genesis_hash.to_string(),
     };
     if let Ok(data) = bincode::serialize(&msg) {
         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
@@ -1346,8 +1470,9 @@ mod multiaddr_ip_tests {
 #[cfg(test)]
 mod peer_exchange_tests {
     use super::{
-        foreign_version_warning, select_new_addrs, should_serve_catchup, MAX_CATCHUP_SERVE_BLOCKS,
-        MAX_KNOWN_PEER_ADDRS,
+        decode_peer_exchange, foreign_chain_warning, foreign_version_warning, select_new_addrs,
+        should_serve_catchup, PeerExchangeMsg, PeerExchangeMsgV1, MAX_CATCHUP_SERVE_BLOCKS,
+        MAX_KNOWN_PEER_ADDRS, OUR_VERSION,
     };
     use std::collections::HashSet;
 
@@ -1536,6 +1661,82 @@ mod peer_exchange_tests {
     fn being_level_or_ahead_requests_nothing() {
         assert_eq!(super::blocksync_request_count(100, 100), 0);
         assert_eq!(super::blocksync_request_count(100, 90), 0);
+    }
+
+    /// A peer on a different chain has to be named as such.
+    ///
+    /// Nothing carried the genesis before, so two nodes on different chains gossiped at each other
+    /// and rejected every message one at a time with nobody ever saying why. The operator sees only
+    /// that their chain stopped — indistinguishable from every other stall.
+    #[test]
+    fn a_peer_on_another_chain_is_reported_once() {
+        let mut warned = HashSet::new();
+        let first = foreign_chain_warning("aaaa", "bbbb", &mut warned);
+        assert!(first.expect("a different genesis must be reported").contains("DIFFERENT CHAIN"));
+        assert!(
+            foreign_chain_warning("aaaa", "bbbb", &mut warned).is_none(),
+            "the same mismatch arrives every 30 seconds — it must be logged once",
+        );
+    }
+
+    #[test]
+    fn a_peer_on_our_own_chain_is_not_reported() {
+        let mut warned = HashSet::new();
+        assert!(foreign_chain_warning("aaaa", "aaaa", &mut warned).is_none());
+    }
+
+    /// "Did not say" is not "different". A peer on a build without the field announces nothing, and
+    /// a node that has not loaded a genesis yet has nothing to announce — neither is a mismatch, and
+    /// treating them as one would put a false alarm in front of every operator during every upgrade.
+    #[test]
+    fn a_peer_that_announces_no_genesis_is_not_reported() {
+        let mut warned = HashSet::new();
+        assert!(foreign_chain_warning("", "bbbb", &mut warned).is_none());
+        assert!(foreign_chain_warning("aaaa", "", &mut warned).is_none());
+    }
+
+    /// The one that matters most, and the reason this crate now carries two message shapes.
+    ///
+    /// A peer running the previous release sends the payload without `genesis_hash`. bincode is not
+    /// self-describing, so it does not decode as the new struct — and an undecodable peer-exchange
+    /// message charges a misbehavior strike, arrives every 30 seconds, and bans the peer after five.
+    /// Adding one field would have banned a healthy co-signing validator inside three minutes and
+    /// stalled a two-validator chain. No existing test could catch it: none of them runs two
+    /// different builds against each other.
+    #[test]
+    fn a_peer_on_the_previous_release_is_still_understood() {
+        let old = PeerExchangeMsgV1 {
+            peers: vec!["/ip4/127.0.0.1/tcp/8546".to_string()],
+            version: "0.10.0".to_string(),
+            tip_height: 4419,
+        };
+        let bytes = bincode::serialize(&old).expect("serializes");
+
+        let decoded = decode_peer_exchange(&bytes).expect("an older peer is not a malformed one");
+        assert_eq!(decoded.version, "0.10.0");
+        assert_eq!(decoded.tip_height, 4419);
+        assert_eq!(decoded.peers, old.peers);
+        assert!(decoded.genesis_hash.is_empty(), "it did not say, and must not appear to have");
+    }
+
+    #[test]
+    fn a_peer_on_this_release_is_understood_with_its_genesis() {
+        let msg = PeerExchangeMsg {
+            peers: vec![],
+            version: OUR_VERSION.to_string(),
+            tip_height: 1,
+            genesis_hash: "ff271e4a".to_string(),
+        };
+        let bytes = bincode::serialize(&msg).expect("serializes");
+        assert_eq!(decode_peer_exchange(&bytes).unwrap().genesis_hash, "ff271e4a");
+    }
+
+    /// The control that keeps the fallback honest: genuine rubbish must still be malformed, or the
+    /// tolerance has quietly disabled the misbehavior accounting it was carved out of.
+    #[test]
+    fn actual_rubbish_is_still_malformed() {
+        assert!(decode_peer_exchange(&[0xff; 8]).is_none());
+        assert!(decode_peer_exchange(b"not bincode at all").is_none());
     }
 
     #[test]
