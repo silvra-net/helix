@@ -46,6 +46,30 @@ pub type ExecutionResult<T> = Result<T, ExecutionError>;
 ///
 /// `reward_address` — where the validator's 50 % fee share *and* the block reward land.
 /// Falls back to the block's validator address when `None`.
+/// Ceiling on the fuel one contract call may be granted, however large a fee it offers.
+///
+/// Without it, `fuel_limit = tx.fee × fuel_per_fee_unit` had no upper bound at all: the fee is
+/// limited only by the sender's balance, so a single transaction could buy arbitrary execution
+/// time on every validator. Measured on the production server, wasmi in release: **1e9 fuel takes
+/// ~1.22 s**. At the default rate of 1 fuel per nano, a fee under 2 HLX therefore bought more
+/// than a whole 2-second block interval, and the faucet hands out 10 HLX.
+///
+/// 1e8 is ~0.12 s here — room for a substantial contract, while no single transaction can take
+/// the block on its own.
+pub const MAX_TX_FUEL: u64 = 100_000_000;
+
+/// Ceiling on the fuel every contract call in one block may consume between them.
+///
+/// `MAX_TX_FUEL` alone bounds one transaction; a block holds up to `MAX_TXS_PER_BLOCK` (1000) of
+/// them, so without a block-level budget the total was still unbounded. 4e8 is ~0.5 s of the
+/// 2-second block interval on this hardware — a quarter of the budget for contract execution,
+/// leaving the rest for signature verification, storage and consensus.
+///
+/// Only contract calls draw on this. Transfers, stakes and votes are flat-priced work that the
+/// transaction-count limit already bounds, and starving them would be a much bigger change in
+/// behaviour than the problem warrants.
+pub const MAX_BLOCK_FUEL: u64 = 400_000_000;
+
 pub fn execute_block(
     state: &mut ChainState,
     block: &Block,
@@ -82,8 +106,15 @@ pub fn execute_block(
     // so a phantom that never signs is simply never promoted rather than freezing the chain.
     state.record_probation_liveness(&signers, &validator);
 
+    // One budget for the whole block, spent down by contract calls in transaction order. This is
+    // what bounds how long a block can take to execute — see `MAX_BLOCK_FUEL`. Deterministic:
+    // every node replays the same transactions in the same order against the same starting budget,
+    // so everyone reaches the same verdict on which calls fit.
+    let mut block_fuel = MAX_BLOCK_FUEL;
+
     for tx in &block.transactions {
-        let receipt = execute_transaction(state, tx, fee_recipient, height, base_fee_per_byte);
+        let receipt =
+            execute_transaction_metered(state, tx, fee_recipient, height, base_fee_per_byte, &mut block_fuel);
         total_burned += receipt.fee_burned;
         total_validator_reward += receipt.fee_to_validator;
         receipts.push(receipt);
@@ -128,16 +159,38 @@ pub fn execute_block(
     }
 }
 
-/// Execute a single transaction against the current chain state. `base_fee_per_byte` is this
-/// block's EIP-1559 base fee (`block.header.base_fee_per_byte`); the base-fee portion of the
-/// transaction's fee (`base_fee_per_byte × tx.size_bytes()`) is burned and the rest tips the
-/// validator (see [`distribute_fee`]).
+/// Execute a single transaction on its own, outside any block-level fuel budget: a contract call
+/// gets whatever its fee buys, capped only by [`MAX_TX_FUEL`].
+///
+/// **Block execution must not use this.** [`execute_block`] meters the whole block through
+/// [`execute_transaction_metered`], and that shared budget is what bounds how long one block can
+/// take to run. This entry point is for callers executing a transaction by itself, where there is
+/// no block to bound.
 pub fn execute_transaction(
     state: &mut ChainState,
     tx: &Transaction,
     validator: &Address,
     height: u64,
     base_fee_per_byte: u64,
+) -> Receipt {
+    let mut unbudgeted = u64::MAX;
+    execute_transaction_metered(state, tx, validator, height, base_fee_per_byte, &mut unbudgeted)
+}
+
+/// Execute a single transaction against the current chain state. `base_fee_per_byte` is this
+/// block's EIP-1559 base fee (`block.header.base_fee_per_byte`); the base-fee portion of the
+/// transaction's fee (`base_fee_per_byte × tx.size_bytes()`) is burned and the rest tips the
+/// validator (see [`distribute_fee`]).
+///
+/// `block_fuel` is the block's remaining contract-execution budget, drawn down by contract calls
+/// and left untouched by every other transaction type.
+pub fn execute_transaction_metered(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    height: u64,
+    base_fee_per_byte: u64,
+    block_fuel: &mut u64,
 ) -> Receipt {
     let tx_hash = tx.hash();
 
@@ -209,7 +262,9 @@ pub fn execute_transaction(
         TxType::RegisterGuardians => execute_register_guardians(state, tx, validator, tx_hash, base_fee_amount),
         TxType::ApproveRecovery => execute_approve_recovery(state, tx, validator, tx_hash, base_fee_amount),
         TxType::DeployContract => execute_deploy_contract(state, tx, validator, tx_hash, base_fee_amount),
-        TxType::CallContract => execute_call_contract(state, tx, validator, tx_hash, height, base_fee_amount),
+        TxType::CallContract => {
+            execute_call_contract(state, tx, validator, tx_hash, height, base_fee_amount, block_fuel)
+        }
         TxType::CreateProposal => execute_create_proposal(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::VoteProposal => execute_vote_proposal(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash, base_fee_amount),
@@ -1505,6 +1560,7 @@ fn execute_call_contract(
     tx_hash: Hash,
     height: u64,
     base_fee_amount: u64,
+    block_fuel: &mut u64,
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
@@ -1549,7 +1605,30 @@ fn execute_call_contract(
         );
     }
 
-    let fuel_limit = tx.fee.saturating_mul(state.governance_params.fuel_per_fee_unit);
+    // Three ceilings, lowest wins: what the fee buys, what any one transaction may take
+    // (`MAX_TX_FUEL`), and what is left of this block's shared budget (`MAX_BLOCK_FUEL`).
+    //
+    // Only the first existed. `tx.fee` is bounded by nothing but the sender's balance, so a single
+    // transaction could buy arbitrary execution time on every validator — measured at ~1.22 s per
+    // 1e9 fuel, a fee under 2 HLX outran a whole 2-second block, and a block could hold a thousand
+    // of them. Every validator re-executes the block when validating it, so the cost lands on the
+    // whole network, not just the proposer.
+    let fuel_limit = tx
+        .fee
+        .saturating_mul(state.governance_params.fuel_per_fee_unit)
+        .min(MAX_TX_FUEL)
+        .min(*block_fuel);
+    if fuel_limit == 0 {
+        // Either the block's budget is spent or the fee buys nothing. Failing here rather than
+        // running the call with zero fuel keeps the reason in the receipt instead of reporting it
+        // as a generic out-of-gas trap.
+        return Receipt::failure(
+            tx_hash,
+            "no execution fuel available: this block's contract budget is exhausted",
+            0,
+            0,
+        );
+    }
 
     // What this contract may pay out during the call: its on-chain balance, plus the value
     // arriving with the call, minus whatever this same transaction is about to take out of that
@@ -1584,7 +1663,25 @@ fn execute_call_contract(
         height,
         tx.data.clone(),
     );
-    let call_result = helix_vm::call(&code, fuel_limit, &mut ctx);
+    let (call_result, fuel_spent) = helix_vm::call_reporting_fuel(&code, fuel_limit, &mut ctx);
+
+    // Charge the block's budget before anything can return: a call that trapped or ran out of fuel
+    // still burned the validator CPU this budget exists to bound. Charged on what was actually
+    // spent, which is why `call_reporting_fuel` exists — billing a failed call its whole grant
+    // would let a contract that traps on its first instruction cost the block as much as one that
+    // ran to the end, and four of those would crowd every other contract call out of the block.
+    //
+    // The grant was capped at the remaining budget above, and a call cannot spend past its grant,
+    // so this cannot go negative. The assertion is the red-run instrument for that cap: drop the
+    // `.min(*block_fuel)` and this fires, which the budget counter alone could never show — the
+    // saturation below hides an overshoot, and the block would simply run one call's ceiling longer
+    // than `MAX_BLOCK_FUEL` allows. Kept out of release builds because the consequence is a bounded
+    // overshoot, not a broken ledger, and halting a validator over it would be the worse trade.
+    debug_assert!(
+        fuel_spent <= *block_fuel,
+        "a contract call spent {fuel_spent} fuel with only {block_fuel} left in the block budget",
+    );
+    *block_fuel = block_fuel.saturating_sub(fuel_spent);
 
     if let Err(e) = call_result {
         // `ctx` (and every storage_write/transfer it buffered) is simply dropped here, never
@@ -2943,6 +3040,129 @@ mod tests {
 
         let tx = signed_contract_tx(&sender_kp, &sender, TxType::CallContract, Some(contract.clone()), 0, vec![], 0, 10_000);
         assert!(contract_commit_would_go_negative(&state, &tx, &contract, 10_000, &[(rich, 1)]));
+    }
+
+    // Execution budgets. Until these existed, `fuel_limit = tx.fee × fuel_per_fee_unit` had no
+    // ceiling at all and `tx.fee` is bounded only by the sender's balance — so one transaction
+    // could buy arbitrary execution time on every validator, and a block could hold a thousand.
+
+    /// A contract that never returns, so the only thing that ends the call is running out of fuel.
+    fn endless_loop_wasm() -> Vec<u8> {
+        wat::parse_str(r#"(module (func (export "call") (loop br 0)))"#).unwrap()
+    }
+
+    /// Paying more must not buy more than [`MAX_TX_FUEL`].
+    ///
+    /// The budget parameter is the instrument here: it makes the grant directly observable, so the
+    /// test asserts the exact fuel charged rather than timing the call. Without the ceiling the fee
+    /// below would buy 1e11 fuel — about two minutes of a two-second block.
+    #[test]
+    fn no_fee_buys_more_fuel_than_the_per_transaction_ceiling() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = state_with_contract(&deployer_kp, &deployer, &validator, endless_loop_wasm(), 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000_000_000);
+
+        let huge_fee = 100_000_000_000; // 100 HLX — a thousand times the ceiling
+        let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, vec![], 0, huge_fee);
+
+        let mut budget = u64::MAX;
+        let receipt = execute_transaction_metered(&mut state, &call_tx, &validator, 1, 0, &mut budget);
+
+        assert!(!receipt.success, "an endless loop must run out of fuel");
+        assert_eq!(
+            u64::MAX - budget,
+            MAX_TX_FUEL,
+            "the call must be granted exactly the ceiling, not what its fee could pay for",
+        );
+    }
+
+    /// Once a block's shared budget is gone, further contract calls do not run at all.
+    ///
+    /// Started at a deliberately small budget rather than the real [`MAX_BLOCK_FUEL`]: the logic
+    /// under test is the drawdown and the refusal, and burning 4e8 fuel to reach the same assertion
+    /// would add seconds to the suite for nothing.
+    #[test]
+    fn a_block_stops_running_contracts_once_its_fuel_budget_is_gone() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = state_with_contract(&deployer_kp, &deployer, &validator, endless_loop_wasm(), 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000_000);
+
+        let mut budget = 50_000u64;
+
+        let first = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, vec![], 0, 1_000_000);
+        let r1 = execute_transaction_metered(&mut state, &first, &validator, 1, 0, &mut budget);
+        assert!(!r1.success, "the loop runs out of fuel");
+        assert_eq!(budget, 0, "it must consume the whole remaining budget");
+
+        let second = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, vec![], 1, 1_000_000);
+        let r2 = execute_transaction_metered(&mut state, &second, &validator, 1, 0, &mut budget);
+        assert!(!r2.success);
+        assert!(
+            r2.error.as_deref().unwrap_or_default().contains("budget is exhausted"),
+            "the second call must be refused for want of budget, not run with zero fuel: {:?}",
+            r2.error,
+        );
+        // Still charged: the transaction took a block slot and was the sender's own.
+        assert_eq!(state.get(&caller).unwrap().nonce, 2);
+    }
+
+    /// The control: ordinary transactions must not draw on the contract budget, or a block full of
+    /// transfers would start refusing them. The budget bounds contract execution, nothing else.
+    #[test]
+    fn transactions_that_run_no_contract_do_not_touch_the_fuel_budget() {
+        let alice_kp = KeyPair::generate();
+        let alice = Address::from_public_key(&alice_kp.public);
+        let bob = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&alice, |acc| acc.balance = 10_000_000);
+
+        let mut budget = 12_345u64;
+        for nonce in 0..3u64 {
+            let tx = signed_contract_tx(&alice_kp, &alice, TxType::Transfer, Some(bob.clone()), 100, vec![], nonce, 10_000);
+            assert!(execute_transaction_metered(&mut state, &tx, &validator, 1, 0, &mut budget).success);
+        }
+        assert_eq!(budget, 12_345, "a transfer must not spend contract fuel");
+    }
+
+    /// A call that fails is charged what it actually burned, not its whole grant.
+    ///
+    /// This is why `call_reporting_fuel` exists. Billing the grant would let a contract that traps
+    /// on its first instruction cost the block as much as one that ran to the end — four of those
+    /// would crowd every other contract call out of the block for the price of four fees.
+    #[test]
+    fn a_call_that_traps_immediately_barely_touches_the_budget() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let wasm = wat::parse_str(r#"(module (func (export "call") (unreachable)))"#).unwrap();
+        let mut state = state_with_contract(&deployer_kp, &deployer, &validator, wasm, 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 1_000_000_000_000);
+
+        let mut budget = MAX_BLOCK_FUEL;
+        let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, vec![], 0, 100_000_000_000);
+        let receipt = execute_transaction_metered(&mut state, &call_tx, &validator, 1, 0, &mut budget);
+
+        assert!(!receipt.success, "the contract traps");
+        let spent = MAX_BLOCK_FUEL - budget;
+        assert!(
+            spent < 1_000,
+            "a call that traps at once must cost the block almost nothing, spent {spent}",
+        );
     }
 
     /// Ledger arithmetic must fail loudly rather than wrap.

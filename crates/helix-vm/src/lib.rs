@@ -193,8 +193,30 @@ struct StoreState<'a, C: HostContext> {
 /// `fuel_limit` units of execution fuel (roughly: interpreted instructions plus the flat
 /// per-call costs of any host functions it invokes — see the `FUEL_*` constants).
 pub fn call<C: HostContext>(code: &[u8], fuel_limit: u64, ctx: &mut C) -> VmResult<CallOutcome> {
+    call_reporting_fuel(code, fuel_limit, ctx).0
+}
+
+/// Like [`call`], but reports the fuel consumed even when the call *fails*.
+///
+/// [`call`] can only report fuel on success — its failure path returns a `VmError` and the number
+/// is lost. That is fine for a caller who just wants to know what happened, and wrong for one
+/// metering a budget shared across a block: charging a failed call its whole grant would let a
+/// contract that traps on its first instruction cost the block exactly as much as one that ran to
+/// the end, which is a cheap way to crowd every other contract call out of a block.
+///
+/// The number is exact for a call that reached execution. Failures *before* that (bad bytecode, a
+/// missing entry point) report the fuel the store actually consumed, which is zero or the little
+/// that instantiation spent.
+pub fn call_reporting_fuel<C: HostContext>(
+    code: &[u8],
+    fuel_limit: u64,
+    ctx: &mut C,
+) -> (VmResult<CallOutcome>, u64) {
     let engine = engine();
-    let module = Module::new(&engine, code).map_err(|e| VmError::InvalidModule(e.to_string()))?;
+    let module = match Module::new(&engine, code) {
+        Ok(m) => m,
+        Err(e) => return (Err(VmError::InvalidModule(e.to_string())), 0),
+    };
 
     let limits = StoreLimitsBuilder::new()
         .memory_size(MAX_MEMORY_BYTES)
@@ -203,33 +225,50 @@ pub fn call<C: HostContext>(code: &[u8], fuel_limit: u64, ctx: &mut C) -> VmResu
         .build();
     let mut store = Store::new(&engine, StoreState { limits, host: ctx });
     store.limiter(|state| &mut state.limits);
-    store
-        .add_fuel(fuel_limit)
-        .map_err(|e| VmError::Instantiation(e.to_string()))?;
+    if let Err(e) = store.add_fuel(fuel_limit) {
+        return (Err(VmError::Instantiation(e.to_string())), 0);
+    }
 
     let mut linker = Linker::new(&engine);
-    link_host_functions(&mut linker).map_err(|e| VmError::Instantiation(e.to_string()))?;
+    if let Err(e) = link_host_functions(&mut linker) {
+        return (Err(VmError::Instantiation(e.to_string())), 0);
+    }
 
-    let instance = linker
+    // Instantiation runs the module's `start` function, which can burn fuel of its own, so from
+    // here on every exit reads the store rather than assuming zero.
+    let instance = match linker
         .instantiate(&mut store, &module)
-        .map_err(|e| VmError::Instantiation(e.to_string()))?
-        .start(&mut store)
-        .map_err(|e| VmError::Instantiation(e.to_string()))?;
-
-    let entry = instance
-        .get_typed_func::<(), ()>(&store, "call")
-        .map_err(|_| VmError::MissingEntryPoint)?;
-
-    entry.call(&mut store, ()).map_err(|trap| {
-        if matches!(trap.trap_code(), Some(TrapCode::OutOfFuel)) {
-            VmError::OutOfGas
-        } else {
-            VmError::Trap(trap.to_string())
+        .and_then(|pre| pre.start(&mut store))
+    {
+        Ok(i) => i,
+        Err(e) => {
+            let spent = store.fuel_consumed().unwrap_or(0);
+            return (Err(VmError::Instantiation(e.to_string())), spent);
         }
-    })?;
+    };
 
+    let entry = match instance.get_typed_func::<(), ()>(&store, "call") {
+        Ok(f) => f,
+        Err(_) => {
+            let spent = store.fuel_consumed().unwrap_or(0);
+            return (Err(VmError::MissingEntryPoint), spent);
+        }
+    };
+
+    let outcome = entry.call(&mut store, ());
     let fuel_used = store.fuel_consumed().unwrap_or(0);
-    Ok(CallOutcome { fuel_used })
+
+    match outcome {
+        Ok(()) => (Ok(CallOutcome { fuel_used }), fuel_used),
+        Err(trap) => {
+            let err = if matches!(trap.trap_code(), Some(TrapCode::OutOfFuel)) {
+                VmError::OutOfGas
+            } else {
+                VmError::Trap(trap.to_string())
+            };
+            (Err(err), fuel_used)
+        }
+    }
 }
 
 /// Read `len` bytes from the guest's exported `"memory"` at `ptr`, capped at `max_len` — used
