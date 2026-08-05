@@ -1314,6 +1314,10 @@ mod tests {
             stake(&mut forwards, i, 1_000 + u64::from(i));
             forwards.names.insert(format!("name{i}"), addr(i).to_string());
             forwards.jailed_until.insert(addr(i).to_string(), u64::from(i) * 10);
+            // Contract storage is the one map here whose keys and insertion order are chosen by
+            // user code rather than by the protocol, so it is the one an attacker could actually
+            // steer if it were ever hashed in iteration order.
+            forwards.contract_storage_write(&addr(1), vec![i], vec![i, i]);
         }
 
         let mut backwards = ChainState::new(1_000_000);
@@ -1321,6 +1325,7 @@ mod tests {
             stake(&mut backwards, i, 1_000 + u64::from(i));
             backwards.names.insert(format!("name{i}"), addr(i).to_string());
             backwards.jailed_until.insert(addr(i).to_string(), u64::from(i) * 10);
+            backwards.contract_storage_write(&addr(1), vec![i], vec![i, i]);
         }
 
         assert_eq!(

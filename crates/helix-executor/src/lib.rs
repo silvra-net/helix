@@ -1320,6 +1320,12 @@ struct ContractHostContext<'a> {
     value: u64,
     height: u64,
     input: Vec<u8>,
+    /// Everything this call is allowed to pay out, fixed by `execute_call_contract` before
+    /// execution began: exactly the balance the contract account will hold once this
+    /// transaction's own debit and credit have landed. Deliberately *not* re-read from `state`
+    /// during the call — see the comment where it is computed for what reading the raw
+    /// on-chain balance cost.
+    spendable: u64,
     storage_writes: std::collections::HashMap<Vec<u8>, Vec<u8>>,
     transfers: Vec<(Address, u64)>,
     /// Running total already earmarked for `transfers` this call — `available_balance()`
@@ -1337,12 +1343,21 @@ struct ContractCommitData {
 }
 
 impl<'a> ContractHostContext<'a> {
-    fn new(state: &'a ChainState, contract: Address, caller: Address, value: u64, height: u64, input: Vec<u8>) -> Self {
+    fn new(
+        state: &'a ChainState,
+        contract: Address,
+        caller: Address,
+        value: u64,
+        spendable: u64,
+        height: u64,
+        input: Vec<u8>,
+    ) -> Self {
         ContractHostContext {
             contract_str: contract.to_string(),
             caller_str: caller.to_string(),
             contract,
             value,
+            spendable,
             height,
             input,
             state,
@@ -1353,13 +1368,10 @@ impl<'a> ContractHostContext<'a> {
         }
     }
 
-    /// What this contract could still send via `transfer()` right now: its real on-chain
-    /// balance, plus the value sent with this call (not yet credited to real state — that
-    /// only happens on commit, like everything else here), minus whatever this same call has
-    /// already earmarked.
+    /// What this contract could still send via `transfer()` right now: everything this call may
+    /// pay out at all, minus whatever this same call has already earmarked.
     fn available_balance(&self) -> u64 {
-        let real = self.state.get(&self.contract).map(|a| a.balance).unwrap_or(0);
-        real.saturating_add(self.value).saturating_sub(self.pending_debit)
+        self.spendable.saturating_sub(self.pending_debit)
     }
 
     fn into_commit_data(self) -> ContractCommitData {
@@ -1421,6 +1433,67 @@ impl helix_vm::HostContext for ContractHostContext<'_> {
     }
 }
 
+/// Replay the balance arithmetic `execute_call_contract`'s commit is about to perform — against
+/// real state, with checked arithmetic — and report whether any step of it would go negative.
+///
+/// Deliberately independent of the `spendable` budget the call ran under. The first version of
+/// this guard compared the buffered transfers against `spendable` itself, which restates the
+/// number being guarded rather than checking it: mutating the budget in a red run made the guard
+/// wrong in exactly the same way and it let the bad commit straight through. So this starts from
+/// chain state and replays the operations themselves, and a mistake in how the budget was
+/// computed surfaces here as a subtraction that cannot be made.
+///
+/// It is worth the twenty lines because the commit subtracts from a `u64` on a consensus path and
+/// release builds do not check overflow: being wrong there does not fail loudly, it wraps into
+/// money the ledger never issued — and every node computes the same wrong number, so nothing
+/// diverges and nothing complains. Same silent class as the double-minted block reward (#142).
+///
+/// The scratch overlay is what makes it a replay rather than a formula: sender and contract can
+/// be the same account, and tracking balances by address is what keeps that case honest without
+/// naming it as a special case.
+fn contract_commit_would_go_negative(
+    state: &ChainState,
+    tx: &Transaction,
+    target: &Address,
+    total_cost: u64,
+    transfers: &[(Address, u64)],
+) -> bool {
+    let mut scratch: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let on_chain = |addr: &Address| state.get(addr).map(|a| a.balance).unwrap_or(0);
+
+    // Every step below mirrors one line of the commit, in the same order.
+    let apply = |scratch: &mut std::collections::HashMap<String, u64>,
+                     addr: &Address,
+                     delta: i128|
+     -> bool {
+        let key = addr.to_string();
+        let current = *scratch.entry(key.clone()).or_insert_with(|| on_chain(addr));
+        match u64::try_from(i128::from(current) + delta) {
+            Ok(next) => {
+                scratch.insert(key, next);
+                true
+            }
+            Err(_) => false,
+        }
+    };
+
+    if !apply(&mut scratch, &tx.from, -i128::from(total_cost)) {
+        return true;
+    }
+    if !apply(&mut scratch, target, i128::from(tx.amount)) {
+        return true;
+    }
+    for (to, amount) in transfers {
+        if !apply(&mut scratch, target, -i128::from(*amount)) {
+            return true;
+        }
+        if !apply(&mut scratch, to, i128::from(*amount)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Call a deployed contract at `tx.to`, running its exported `call()` entry point with fuel
 /// metering. `tx.amount` (if any) is credited to the contract's balance only on successful
 /// execution, matching normal transfer semantics — and, as of host imports, so is everything
@@ -1454,8 +1527,63 @@ fn execute_call_contract(
         return Receipt::failure(tx_hash, "target address has no deployed contract", 0, 0);
     };
 
+    // `helix_vm` documents `MAX_INPUT_LEN` as the ceiling on a call's raw input and exports it as
+    // part of its ABI, but nothing anywhere enforced it — the only real bound was `MAX_BLOCK_BYTES`,
+    // two megabytes. The check belongs here for the same reason the bytecode-size check does: an
+    // RPC body limit is not a consensus rule, and a P2P-gossiped transaction never passes one.
+    //
+    // It also puts a bound on `get_input`, which copies the entire input into a fresh buffer on
+    // every invocation for a flat 50 fuel. Unbounded, a contract could call it in a loop and turn
+    // one transaction into gigabytes of copying on every validator — the same under-pricing that
+    // `storage_write` already answers with a per-byte term.
+    if tx.data.len() > helix_vm::MAX_INPUT_LEN {
+        return Receipt::failure(
+            tx_hash,
+            &format!(
+                "call input {} bytes exceeds the {}-byte limit",
+                tx.data.len(),
+                helix_vm::MAX_INPUT_LEN
+            ),
+            0,
+            0,
+        );
+    }
+
     let fuel_limit = tx.fee.saturating_mul(state.governance_params.fuel_per_fee_unit);
-    let mut ctx = ContractHostContext::new(state, target.clone(), tx.from.clone(), tx.amount, height, tx.data.clone());
+
+    // What this contract may pay out during the call: its on-chain balance, plus the value
+    // arriving with the call, minus whatever this same transaction is about to take out of that
+    // same account as its *sender*. That last term is zero in the ordinary case and non-zero
+    // only when the caller is the contract itself — which is not exotic here: a contract's
+    // address *is* its deployer's address, so the deploying key driving its own contract is the
+    // normal way to use one.
+    //
+    // By construction this equals the balance the contract account holds by the time the commit
+    // below starts paying transfers out of it, which is the property the commit's subtraction
+    // depends on.
+    //
+    // Measuring against the raw on-chain balance instead minted money. The fee and the value are
+    // debited from the sender only at commit time, so for a self-call both were still sitting in
+    // the balance the contract was measured against: it could earmark `amount + fee` more than it
+    // would ever hold, and `balance -= amount` below then wrapped a u64 — release builds do not
+    // check overflow — into ~1.8e19 HLX on a chain capped at 33 million. The call reported
+    // success while doing it.
+    let spendable = state
+        .get(&target)
+        .map(|a| a.balance)
+        .unwrap_or(0)
+        .saturating_add(tx.amount)
+        .saturating_sub(if tx.from == target { total_cost } else { 0 });
+
+    let mut ctx = ContractHostContext::new(
+        state,
+        target.clone(),
+        tx.from.clone(),
+        tx.amount,
+        spendable,
+        height,
+        tx.data.clone(),
+    );
     let call_result = helix_vm::call(&code, fuel_limit, &mut ctx);
 
     if let Err(e) = call_result {
@@ -1476,6 +1604,13 @@ fn execute_call_contract(
     // `ctx` is consumed here, ending the immutable borrow of `state` it held for reads —
     // only past this point can `state` be borrowed mutably again to apply the call's effects.
     let commit = ctx.into_commit_data();
+
+    // Second line of defence over the budget `available_balance()` enforced during the call.
+    // Runs before any mutation, because a failing executor must leave chain state untouched —
+    // `charge_failed_transaction` charges the fee on exactly that assumption.
+    if contract_commit_would_go_negative(state, tx, &target, total_cost, &commit.transfers) {
+        return Receipt::failure(tx_hash, "contract tried to send more than it holds", 0, 0);
+    }
 
     state.update_account(&tx.from, |acc| {
         acc.balance -= total_cost;
@@ -2632,6 +2767,231 @@ mod tests {
         // even though the call itself failed — real (fuel-metered) CPU was still spent.
         assert_eq!(state.get(&caller).unwrap().balance, 1_000_000 - 10_000);
         assert_eq!(state.get(&caller).unwrap().nonce, 1);
+    }
+
+    /// Deploy `wasm` from `deployer` and return the state, with the deployer funded and the
+    /// deploy fee already paid — the starting point for the self-call tests below.
+    fn state_with_contract(deployer_kp: &KeyPair, deployer: &Address, validator: &Address, wasm: Vec<u8>, funding: u64) -> ChainState {
+        let mut state = ChainState::new(0);
+        state.update_account(deployer, |acc| acc.balance = funding);
+        let deploy_tx = signed_contract_tx(deployer_kp, deployer, TxType::DeployContract, None, 0, wasm, 0, 10_000);
+        assert!(execute_transaction(&mut state, &deploy_tx, validator, 0, 0).success);
+        state
+    }
+
+    /// A contract account can never pay out the fee its own caller still owes.
+    ///
+    /// The caller being the contract is the ordinary case here, not a corner: a contract's
+    /// address *is* its deployer's address, so the deploying key driving its own contract is how
+    /// one is normally used. The fee and the value are debited from the sender only at commit
+    /// time, so measuring the contract against its raw on-chain balance counted money that was
+    /// already spoken for — the contract could earmark `amount + fee` more than it would hold,
+    /// and the commit's `balance -= amount` wrapped a u64 rather than failing.
+    ///
+    /// The assertion that matters is the last one: nothing detects a wrapped balance by looking
+    /// at the transaction, which reported success. It is visible only as value appearing on the
+    /// ledger that nobody issued.
+    #[test]
+    fn a_contract_cannot_pay_out_the_fee_its_caller_still_owes() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        // After the 10_000 deploy fee the contract account holds 990_000 — and tries to send
+        // every last unit of it while owing another 10_000 for the call itself.
+        let mut state = state_with_contract(&deployer_kp, &deployer, &validator, transfer_wasm(&recipient, 990_000), 1_000_000);
+        assert_eq!(state.get(&deployer).unwrap().balance, 990_000);
+
+        let held_before = total_value_held(&state);
+        let call_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::CallContract, Some(deployer.clone()), 0, vec![], 1, 10_000);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
+
+        // The transfer is refused inside the call, which the contract is free to ignore — an
+        // unaffordable transfer is a contract-visible outcome, not a trap.
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert!(state.get(&recipient).is_none(), "the recipient must not have been paid");
+        assert_eq!(state.get(&deployer).unwrap().balance, 980_000, "only the call fee may leave");
+
+        let held_after = total_value_held(&state);
+        assert_eq!(
+            held_after + u128::from(receipt.fee_burned),
+            held_before,
+            "a contract call must not change how much value the ledger holds, beyond the burn",
+        );
+    }
+
+    /// The control for the test above: the fix must cost the contract exactly the fee, not its
+    /// ability to spend. A fix that simply refused transfers on a self-call — or one that
+    /// deducted the fee twice — passes the test above and breaks every real contract.
+    #[test]
+    fn a_self_call_can_still_spend_everything_the_fee_leaves_behind() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        // 990_000 on hand, 10_000 owed for the call: 980_000 is exactly spendable.
+        let mut state = state_with_contract(&deployer_kp, &deployer, &validator, transfer_wasm(&recipient, 980_000), 1_000_000);
+
+        let held_before = total_value_held(&state);
+        let call_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::CallContract, Some(deployer.clone()), 0, vec![], 1, 10_000);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.get(&recipient).unwrap().balance, 980_000, "the transfer must go through");
+        assert_eq!(state.get(&deployer).unwrap().balance, 0, "the contract may spend down to nothing");
+        assert_eq!(
+            total_value_held(&state) + u128::from(receipt.fee_burned),
+            held_before,
+        );
+    }
+
+    /// The same accounting, reached the other way: value sent *along with* a self-call is the
+    /// sender's own money moving from the account to itself, so it must not raise what the
+    /// contract can spend. Counting it twice was the larger half of the original defect —
+    /// `amount + fee` over budget rather than `fee`.
+    #[test]
+    fn value_sent_with_a_self_call_does_not_raise_what_the_contract_can_spend() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        // Holds 990_000 and sends itself 500_000 with the call. Its spendable total is still
+        // 980_000 (990_000 less the fee) — the 500_000 never left the account.
+        let mut state = state_with_contract(&deployer_kp, &deployer, &validator, transfer_wasm(&recipient, 1_480_000), 1_000_000);
+
+        let held_before = total_value_held(&state);
+        let call_tx = signed_contract_tx(&deployer_kp, &deployer, TxType::CallContract, Some(deployer.clone()), 500_000, vec![], 1, 10_000);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert!(state.get(&recipient).is_none(), "990_000 held plus 500_000 of its own money is still 990_000");
+        assert_eq!(state.get(&deployer).unwrap().balance, 980_000);
+        assert_eq!(
+            total_value_held(&state) + u128::from(receipt.fee_burned),
+            held_before,
+        );
+    }
+
+    // The replay guard below `execute_call_contract`. With the budget computed correctly it is
+    // unreachable from the outside — which is the point of a second line of defence, and also the
+    // reason it has to be exercised directly. Untested code that only runs once something else
+    // has already gone wrong is not a safety net.
+
+    /// Build the arguments the guard takes, without going through a real call.
+    fn commit_replay(from_balance: u64, contract_balance: u64, self_call: bool, amount: u64, fee: u64, transfers: &[(Address, u64)]) -> bool {
+        let sender_kp = KeyPair::generate();
+        let sender = Address::from_public_key(&sender_kp.public);
+        let contract = if self_call { sender.clone() } else { Address::from_public_key(&KeyPair::generate().public) };
+
+        let mut state = ChainState::new(0);
+        state.update_account(&sender, |acc| acc.balance = from_balance);
+        if !self_call {
+            state.update_account(&contract, |acc| acc.balance = contract_balance);
+        }
+
+        let tx = signed_contract_tx(&sender_kp, &sender, TxType::CallContract, Some(contract.clone()), amount, vec![], 0, fee);
+        contract_commit_would_go_negative(&state, &tx, &contract, amount.saturating_add(fee), transfers)
+    }
+
+    #[test]
+    fn a_commit_the_contract_can_afford_replays_cleanly() {
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        // Self-call: 990_000 on hand, 10_000 owed for the call, sending exactly the remainder.
+        assert!(!commit_replay(990_000, 0, true, 0, 10_000, &[(recipient, 980_000)]));
+    }
+
+    #[test]
+    fn a_commit_that_would_take_a_balance_below_zero_is_caught() {
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        // One unit past what the fee leaves behind — the case a wrong budget produced, and the
+        // one that wrapped a u64 into ~1.8e19 HLX instead of failing.
+        assert!(commit_replay(990_000, 0, true, 0, 10_000, &[(recipient, 980_001)]));
+    }
+
+    /// A contract paying itself must not trip the guard: the commit subtracts before it credits,
+    /// so the balance dips and recovers within one iteration. Checking a summed total instead of
+    /// replaying the steps would get this wrong in the safe direction — and a guard that refuses
+    /// legitimate calls gets removed, taking the real protection with it.
+    #[test]
+    fn a_contract_paying_itself_is_not_mistaken_for_an_overdraft() {
+        let mut state = ChainState::new(0);
+        let sender_kp = KeyPair::generate();
+        let sender = Address::from_public_key(&sender_kp.public);
+        let contract = Address::from_public_key(&KeyPair::generate().public);
+        state.update_account(&sender, |acc| acc.balance = 10_000);
+        state.update_account(&contract, |acc| acc.balance = 100);
+
+        let tx = signed_contract_tx(&sender_kp, &sender, TxType::CallContract, Some(contract.clone()), 0, vec![], 0, 10_000);
+        assert!(!contract_commit_would_go_negative(&state, &tx, &contract, 10_000, &[(contract.clone(), 100)]));
+    }
+
+    /// The other end of the same arithmetic: a credit that would overflow `u64` is just as much
+    /// invented value as a debit that would underflow it.
+    #[test]
+    fn a_credit_that_would_overflow_a_balance_is_caught() {
+        let mut state = ChainState::new(0);
+        let sender_kp = KeyPair::generate();
+        let sender = Address::from_public_key(&sender_kp.public);
+        let contract = Address::from_public_key(&KeyPair::generate().public);
+        let rich = Address::from_public_key(&KeyPair::generate().public);
+        state.update_account(&sender, |acc| acc.balance = 10_000);
+        state.update_account(&contract, |acc| acc.balance = 100);
+        state.update_account(&rich, |acc| acc.balance = u64::MAX);
+
+        let tx = signed_contract_tx(&sender_kp, &sender, TxType::CallContract, Some(contract.clone()), 0, vec![], 0, 10_000);
+        assert!(contract_commit_would_go_negative(&state, &tx, &contract, 10_000, &[(rich, 1)]));
+    }
+
+    /// `MAX_INPUT_LEN` is published as part of the VM's ABI. Until this check existed it was a
+    /// number in a doc comment: the only thing actually bounding a call's input was the two-megabyte
+    /// block limit.
+    #[test]
+    fn a_call_input_past_the_published_ceiling_is_refused() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = state_with_contract(&deployer_kp, &deployer, &validator, storage_writer_wasm(), 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 10_000_000);
+
+        let oversized = vec![0u8; helix_vm::MAX_INPUT_LEN + 1];
+        let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, oversized, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
+
+        assert!(!receipt.success, "an input past the ceiling must be refused");
+        assert!(
+            receipt.error.as_deref().unwrap_or_default().contains("exceeds"),
+            "unexpected error: {:?}",
+            receipt.error
+        );
+        // Refused before execution, so the contract never ran.
+        assert_eq!(state.contract_storage_read(&deployer, b"greeting"), None);
+    }
+
+    /// The control: an input exactly at the ceiling is still a legitimate call. A limit set one
+    /// byte too tight would pass the test above and quietly break the boundary case.
+    #[test]
+    fn a_call_input_exactly_at_the_ceiling_still_runs() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = state_with_contract(&deployer_kp, &deployer, &validator, storage_writer_wasm(), 1_000_000);
+        state.update_account(&caller, |acc| acc.balance = 10_000_000);
+
+        let at_limit = vec![0u8; helix_vm::MAX_INPUT_LEN];
+        let call_tx = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, at_limit, 0, 10_000);
+        let receipt = execute_transaction(&mut state, &call_tx, &validator, 1, 0);
+
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(state.contract_storage_read(&deployer, b"greeting"), Some(b"hello".to_vec()));
     }
 
     #[test]
