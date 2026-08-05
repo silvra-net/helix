@@ -1505,6 +1505,36 @@ impl BftEngine {
     /// check would silently skip validation for every proposal until this engine's
     /// own first `finalize()` — the exact restart window where a stale/diverged
     /// proposal is most likely to slip through unnoticed.
+    /// Resume at `round` for the pending height after a restart, instead of starting over at 0.
+    ///
+    /// A round number lives only in memory, so a restarting validator rejoins wherever the network
+    /// happens to be — which can be *below* where this node had already climbed. Its double-sign
+    /// guard then correctly refuses every vote at a round it has already signed, and the node is
+    /// mute until the network works its way back up. Measured on production 2026-08-05: a validator
+    /// that had reached round 10 restarted into round 7 and withheld its votes for three and a half
+    /// minutes at roughly thirty seconds a round, with the chain stopped the whole time because a
+    /// two-validator set needs both. The longer the stall before the restart, the longer the
+    /// silence after it — and the health log was recommending exactly that restart.
+    ///
+    /// Resuming *above* the guard's mark is the safe direction, and it is not merely safe but
+    /// actively useful: `receive_proposal` adopts a higher round from a peer, so this node pulls
+    /// the others up to it rather than waiting for them to time out to where it already is.
+    ///
+    /// No-op unless `height` is the pending height and `round` is genuinely ahead — this must never
+    /// be able to drag a healthy engine backwards.
+    pub fn resume_at_round(&mut self, height: u64, round: u32) {
+        if height != self.current_height + 1 || round <= self.pending_round {
+            return;
+        }
+        self.pending_round = round;
+    }
+
+    /// The round this engine would next act at for the pending height. Exposed so the node can
+    /// report it and so tests can pin the resume behaviour.
+    pub fn pending_round(&self) -> u32 {
+        self.pending_round
+    }
+
     pub fn seed_last_committed(&mut self, hash: Hash) {
         self.last_committed = Some(hash);
     }
@@ -2934,6 +2964,50 @@ mod tests {
             signature: helix_crypto::Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         }
+    }
+
+    /// The production incident of 2026-08-05 in one assertion.
+    ///
+    /// A validator that had climbed to round 10 restarted and rejoined at round 7, below its own
+    /// double-sign mark. The guard then correctly refused every vote — a value was already signed
+    /// at those rounds — so the node stayed mute for three and a half minutes while a
+    /// two-validator chain that needed both of them stood still.
+    #[test]
+    fn a_restart_resumes_above_the_round_this_key_already_signed() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        assert_eq!(engine.pending_round(), 0, "a fresh engine starts at round 0");
+
+        engine.resume_at_round(1, 11);
+        assert_eq!(engine.pending_round(), 11);
+    }
+
+    /// The control that matters more than the test above: this must never drag an engine backwards.
+    /// A stale mark that pulled a healthy node down to an older round would re-open the very
+    /// equivocation window the double-sign guard exists to close.
+    #[test]
+    fn resuming_can_never_move_an_engine_to_an_earlier_round() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        engine.resume_at_round(1, 11);
+
+        engine.resume_at_round(1, 4);
+        assert_eq!(engine.pending_round(), 11, "an older mark must be ignored");
+        engine.resume_at_round(1, 11);
+        assert_eq!(engine.pending_round(), 11, "the same mark changes nothing");
+    }
+
+    /// A mark for a height this engine is not working on says nothing about its current round.
+    /// Applying it would be reading one height's round number into another's.
+    #[test]
+    fn a_mark_for_another_height_is_ignored() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+
+        engine.resume_at_round(7, 11);
+        assert_eq!(engine.pending_round(), 0);
+        engine.resume_at_round(0, 11);
+        assert_eq!(engine.pending_round(), 0);
     }
 
     /// The core safety property: a node locked on value A withholds its prevote

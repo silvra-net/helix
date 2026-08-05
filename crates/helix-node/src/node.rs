@@ -1007,6 +1007,37 @@ impl HelixNode {
             let tip_hash = self.store.read().await.latest_hash();
             engine.write().await.seed_last_committed(tip_hash);
         }
+
+        // Resume above the round this key already signed, instead of rejoining wherever the
+        // network happens to be (backlog #165).
+        //
+        // A round number lives only in memory. A restarting validator therefore rejoins at whatever
+        // round its peers are on, which can be *below* the round it had already climbed to — and
+        // its own double-sign guard then correctly refuses every vote at a round it has already
+        // signed. The node is mute until the network works its way back up, one round timeout at a
+        // time, and the longer the stall that prompted the restart, the longer the silence
+        // afterwards. Live on 2026-08-05: reached round 10, restarted into round 7, withheld its
+        // votes for three and a half minutes with the chain stopped throughout, because a
+        // two-validator set needs both of them.
+        //
+        // `+ 1` because the guard's own round is burned: it holds a value signed there already.
+        if let Some((signed_height, signed_round)) = signing_guard
+            .lock()
+            .map(|g| g.last_signed())
+            .unwrap_or(None)
+        {
+            let resume_round = signed_round.saturating_add(1);
+            let mut e = engine.write().await;
+            e.resume_at_round(signed_height, resume_round);
+            if e.pending_round() == resume_round {
+                info!(
+                    height = signed_height,
+                    round = resume_round,
+                    "Resuming above the last round this key signed — rejoining below it would gag \
+                     this validator until the network caught back up"
+                );
+            }
+        }
         // Seed the EIP-1559 base fee the next block must carry, deterministically derived from
         // the persisted chain tip — otherwise a restart resumes at `INITIAL_BASE_FEE_PER_BYTE`
         // and would stamp/expect the wrong base fee for its first produced/validated block,

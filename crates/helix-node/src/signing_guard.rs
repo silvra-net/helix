@@ -161,6 +161,15 @@ impl SigningGuard {
     /// signed. A durable-write failure is treated as `Refuse` — if we cannot record that we signed
     /// here, a later restart would not know either, so allowing it would reopen the exact hole
     /// this guard closes.
+    /// The `(height, round)` this key last signed at, if it is guarded at all.
+    ///
+    /// Read at startup so the engine can resume above it rather than below — see
+    /// `BftEngine::resume_at_round` for why coming back *under* this mark gags the node.
+    pub fn last_signed(&self) -> Option<(u64, u32)> {
+        self.path.as_ref()?;
+        Some((self.last.position.height, self.last.position.round))
+    }
+
     pub fn check(&mut self, vote: &Vote) -> Decision {
         let Some(path) = self.path.clone() else {
             return Decision::Allow; // unguarded (tests / non-signing nodes)
@@ -251,6 +260,41 @@ mod tests {
         assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(1))), Decision::Allow);
         // Same height/round/step, different value — the double-sign we exist to stop.
         assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(2))), Decision::Refuse);
+    }
+
+    /// Why `BftEngine::resume_at_round` exists, stated as the guard sees it.
+    ///
+    /// After a restart the engine rejoins wherever the network is, which can be below the round
+    /// this key already signed. Every vote there is refused — correctly, a value was signed at that
+    /// round already and signing another is the slash two operators took in July. The node is
+    /// simply mute until the network climbs back past the mark. Resuming *above* it is what makes
+    /// the difference between voting now and voting in three and a half minutes.
+    #[test]
+    fn a_vote_below_the_mark_is_refused_while_one_above_it_is_allowed() {
+        let (mut g, _d) = guard(100);
+        // Climb to round 10 at height 101, as a validator does while a chain is stalled.
+        assert_eq!(g.check(&vote(101, 10, VoteType::Prevote, hash(1))), Decision::Allow);
+
+        // Rejoining at round 7 after a restart: refused, and rightly so.
+        assert_eq!(g.check(&vote(101, 7, VoteType::Prevote, hash(2))), Decision::Refuse);
+        assert_eq!(g.check(&vote(101, 9, VoteType::Prevote, hash(2))), Decision::Refuse);
+
+        // Resuming above the mark instead: allowed immediately.
+        assert_eq!(g.check(&vote(101, 11, VoteType::Prevote, hash(2))), Decision::Allow);
+    }
+
+    /// The mark has to be readable, or the engine cannot resume above something it cannot see.
+    #[test]
+    fn the_last_signed_position_is_reportable() {
+        let (mut g, _d) = guard(100);
+        assert_eq!(g.check(&vote(101, 10, VoteType::Prevote, hash(1))), Decision::Allow);
+        assert_eq!(g.last_signed(), Some((101, 10)));
+    }
+
+    /// An unguarded node has no mark to resume from, and must not invent one.
+    #[test]
+    fn an_unguarded_node_reports_no_mark() {
+        assert_eq!(SigningGuard::unguarded().last_signed(), None);
     }
 
     #[test]
