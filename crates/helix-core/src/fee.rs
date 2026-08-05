@@ -23,8 +23,15 @@ pub const TARGET_BLOCK_BYTES: u64 = 1_000_000;
 
 /// The elasticity ceiling the fee curve is calibrated against — twice the target, the same 2×
 /// elasticity EIP-1559 uses (a block exactly at this size raises the base fee by the full
-/// +12.5%). NOTE: a hard block-production/validation byte cap at this value is not yet wired in
-/// (blocks are currently bounded by `MAX_TXS_PER_BLOCK` count, not bytes) — see the backlog.
+/// +12.5%). Also the hard cap on a block's transaction bytes, enforced when packing
+/// (`Mempool::take_within`) and on every path that admits a block
+/// (`Block::exceeds_size_limit`).
+///
+/// It was neither for a long time: blocks were bounded by transaction *count* alone, and at ~5.4 KB
+/// per transfer the 1000-transaction cap allowed a 5.2 MB block — larger than gossipsub will
+/// transmit, so it could never be broadcast, never collected votes, and was rebuilt identically by
+/// the next proposer. The note that used to sit here said the cap was "not yet wired in" and
+/// pointed at a backlog item that no longer existed.
 pub const MAX_BLOCK_BYTES: u64 = 2 * TARGET_BLOCK_BYTES;
 
 /// Max fractional change of the base fee per block: `1/8` = ±12.5%, matching EIP-1559.

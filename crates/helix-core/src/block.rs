@@ -186,9 +186,51 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
 }
 
+/// The default `P2PConfig::max_message_size`, restated here rather than imported — `helix-core`
+/// does not depend on `helix-p2p`, and this is exactly the relationship that broke: the comment on
+/// that field read "4 MB — fits a full block" while a full block was 5.2 MB and could not be
+/// transmitted at all.
+const GOSSIP_MAX_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A block at the size limit, plus a header whose `last_commit` grows by ~3.3 KB per validator,
+/// has to fit inside a gossip message with room to spare — otherwise the limit permits blocks the
+/// network cannot carry, which is the whole failure this constant exists to prevent.
+///
+/// A compile error rather than a test: it relates two constants, so there is nothing to run and
+/// nothing to skip. Raising either one past the other stops the build.
+const _: () = assert!(crate::fee::MAX_BLOCK_BYTES * 2 <= GOSSIP_MAX_MESSAGE_BYTES);
+
 impl Block {
     pub fn hash(&self) -> Hash {
         self.header.hash()
+    }
+
+    /// Serialized size of this block's transactions.
+    ///
+    /// The quantity the EIP-1559 base fee meters (`next_base_fee_per_byte`) and the one
+    /// [`Block::exceeds_size_limit`] bounds — deliberately the same number for both, so the fee
+    /// market steers toward exactly the thing that is capped. Transactions only: the header's own
+    /// size is not something a proposer chooses, and `last_commit` grows with the validator set
+    /// rather than with what was packed.
+    pub fn transaction_bytes(&self) -> u64 {
+        self.transactions.iter().map(|t| t.size_bytes()).sum()
+    }
+
+    /// Whether this block carries more transaction bytes than a block is allowed to.
+    ///
+    /// One definition, called from every path that admits a block, because a size rule that some
+    /// nodes apply and others do not is not a size rule — it is a fork. `MAX_BLOCK_BYTES` is the
+    /// elasticity ceiling the fee curve is already calibrated against (2× target, as EIP-1559
+    /// uses), so capping here is what that constant always described.
+    ///
+    /// The bound that made this urgent is a different one: gossipsub refuses to transmit a message
+    /// over `max_message_size` (4 MB). Measured, a plain transfer is ~5.4 KB, so the old
+    /// 1000-transaction cap permitted a 5.2 MB block — one that cannot be broadcast, gets no votes,
+    /// times the round out, and is rebuilt identically by the next proposer from the same mempool.
+    /// 2 MB of transactions leaves room for a header whose `last_commit` grows by ~3.3 KB per
+    /// validator.
+    pub fn exceeds_size_limit(&self) -> bool {
+        self.transaction_bytes() > crate::fee::MAX_BLOCK_BYTES
     }
 
     pub fn height(&self) -> u64 {
@@ -314,6 +356,49 @@ mod tests {
         let sig = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
         block.header.signature = sig;
         block
+    }
+
+    /// A block with a `data` payload of `size` bytes — the cheap way to reach a byte budget
+    /// without signing hundreds of real transactions.
+    fn block_with_transaction_bytes(size: usize) -> Block {
+        let kp = helix_crypto::KeyPair::generate();
+        let mut block = signed_test_block(&kp);
+        let mut t = tx(0);
+        t.data = vec![0u8; size];
+        // Trim to land exactly on `size` total, since the envelope costs bytes of its own.
+        let envelope = t.size_bytes() as usize - size;
+        t.data = vec![0u8; size.saturating_sub(envelope)];
+        block.transactions = vec![t];
+        block
+    }
+
+    /// The limit exists because gossipsub refuses to transmit a message over `max_message_size`
+    /// (4 MB). A block past it reaches no peer, collects no vote, times its round out, and is
+    /// rebuilt identically by the next proposer out of the same mempool — a permanent stall whose
+    /// only visible symptom is a climbing round number.
+    #[test]
+    fn a_block_over_the_byte_limit_is_recognised_as_oversized() {
+        let block = block_with_transaction_bytes(crate::fee::MAX_BLOCK_BYTES as usize + 1);
+        assert!(block.exceeds_size_limit(), "{} bytes", block.transaction_bytes());
+    }
+
+    /// The control, and the one that matters for liveness: a block *at* the ceiling is legal. The
+    /// limit is the elasticity ceiling the fee curve is calibrated against, so blocks have to be
+    /// able to reach it — a limit set one byte tight would pass the test above and quietly halve
+    /// what the fee market can price.
+    #[test]
+    fn a_block_exactly_at_the_byte_limit_is_still_legal() {
+        let block = block_with_transaction_bytes(crate::fee::MAX_BLOCK_BYTES as usize);
+        assert_eq!(block.transaction_bytes(), crate::fee::MAX_BLOCK_BYTES);
+        assert!(!block.exceeds_size_limit());
+    }
+
+    #[test]
+    fn an_empty_block_carries_no_transaction_bytes() {
+        let kp = helix_crypto::KeyPair::generate();
+        let block = signed_test_block(&kp);
+        assert_eq!(block.transaction_bytes(), 0);
+        assert!(!block.exceeds_size_limit());
     }
 
     #[test]

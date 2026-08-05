@@ -1621,6 +1621,14 @@ fn verify_block_batch(
                 block.header.prev_hash
             ));
         }
+        if block.exceeds_size_limit() {
+            return Err(format!(
+                "block {} carries {} transaction bytes, over the {}-byte limit",
+                block.height(),
+                block.transaction_bytes(),
+                helix_core::fee::MAX_BLOCK_BYTES
+            ));
+        }
         expected_prev = block.hash();
     }
 
@@ -2313,6 +2321,20 @@ async fn apply_finalized_block(
             expected_prev = %expected_prev,
             got_prev = %block.header.prev_hash,
             "Refusing a finalized block that does not chain from our tip"
+        );
+        return;
+    }
+
+    // Same argument as the chain check above, for the block size rule: every caller checks it, and
+    // this function exists because there are several of them. Independent of those checks rather
+    // than a restatement of them — it reads the block in front of it, not a number somebody else
+    // maintained.
+    if block.exceeds_size_limit() {
+        warn!(
+            height,
+            bytes = block.transaction_bytes(),
+            limit = helix_core::fee::MAX_BLOCK_BYTES,
+            "Refusing a finalized block larger than the network will carry"
         );
         return;
     }
@@ -3193,7 +3215,16 @@ async fn block_production_loop(
             }
         };
 
-        let txs = { mempool.write().await.take(MAX_TXS_PER_BLOCK) };
+        // Bounded by bytes as well as count. Counting alone bounded nothing that matters: at
+        // ~5.4 KB per transfer, 1000 transactions is a 5.2 MB block, past what gossipsub will
+        // transmit — so it would never reach a peer, never collect a vote, and be rebuilt
+        // identically by the next proposer out of the same mempool.
+        let txs = {
+            mempool
+                .write()
+                .await
+                .take_within(MAX_TXS_PER_BLOCK, helix_core::fee::MAX_BLOCK_BYTES)
+        };
         let prev_hash = store.read().await.latest_hash();
 
         let produced = if stalled {
@@ -3925,6 +3956,17 @@ async fn sync_blocks_from_peer(
             // fail to build on the block we just applied (peer serving a different
             // branch, a stale/reordered batch, etc.) — applying it anyway would splice
             // an unrelated block into our chain instead of just failing the sync.
+            if block.exceeds_size_limit() {
+                store.save_chain_state(chain_state)?;
+                anyhow::bail!(
+                    "block {} from sync peer carries {} transaction bytes, over the {}-byte \
+                     limit — aborting sync, {} block(s) already applied",
+                    h,
+                    block.transaction_bytes(),
+                    helix_core::fee::MAX_BLOCK_BYTES,
+                    total_applied
+                );
+            }
             if block.header.prev_hash != expected_prev_hash {
                 store.save_chain_state(chain_state)?;
                 anyhow::bail!(
@@ -5919,6 +5961,58 @@ mod handle_p2p_event_tests {
         deliver_batch(batch, &store, &chain_state, &engine, &cell).await;
 
         assert_eq!(store.read().await.latest_height(), 0);
+    }
+
+    /// An oversized block must not ride in over block sync.
+    ///
+    /// This is the door that actually matters for the size rule. Gossip cannot deliver such a block
+    /// at all — it is past the transmit limit, which is the whole problem — but block sync will
+    /// carry up to 8 MB, so without a check here a peer could hand us a block that our own proposer
+    /// would never build and that no other node would accept. That is a fork, not a nuisance: a size
+    /// limit some nodes enforce and others do not is two different chains.
+    #[tokio::test]
+    async fn a_batch_containing_an_oversized_block_is_refused() {
+        let kp = KeyPair::generate();
+        let (store, chain_state, engine, cell) = blocksync_fixture(&kp).await;
+
+        let mut b1 = signed_block(&kp, 1, Hash::ZERO);
+        let mut fat = helix_core::Transaction {
+            version: 1,
+            tx_type: helix_core::transaction::TxType::Transfer,
+            from: Address::from_public_key(&kp.public),
+            to: Some(Address::from_public_key(&kp.public)),
+            amount: 1,
+            fee: 1,
+            nonce: 0,
+            data: vec![0u8; helix_core::fee::MAX_BLOCK_BYTES as usize + 1],
+            crypto_version: kp.scheme,
+            signature: Sig::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        fat.signature = kp.sign(fat.signing_hash().as_bytes()).unwrap();
+        b1.transactions = vec![fat];
+        // Merkle root and proposer signature made correct, so size is the only thing left to
+        // refuse it on — otherwise this would pass for the wrong reason.
+        let tx_hashes: Vec<_> = b1.transactions.iter().map(|t| t.hash()).collect();
+        b1.header.merkle_root = helix_crypto::merkle_root(&tx_hashes);
+        b1.header.signature = kp.sign(b1.header.signing_hash().as_bytes()).unwrap();
+
+        let batch = BlockSyncResponse {
+            tip_certificate: commit_sigs_to_votes(
+                tip_commit_sigs(1, b1.hash(), &[&kp]),
+                1,
+                b1.hash(),
+            ),
+            blocks: vec![b1],
+        };
+
+        deliver_batch(batch, &store, &chain_state, &engine, &cell).await;
+
+        assert_eq!(
+            store.read().await.latest_height(),
+            0,
+            "an oversized block must not be spliced into the chain"
+        );
     }
 
     /// A block signed by someone outside the validator set is refused even when the batch tip

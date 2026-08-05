@@ -663,7 +663,11 @@ impl P2PService {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
                                     .publish(block_topic.clone(), data)
                                 {
-                                    debug!("Proposal broadcast: {}", e);
+                                    // Was `debug!`, i.e. invisible by default. A proposal that
+                                    // does not go out produces a round that cannot finish, and the
+                                    // only other symptom is a climbing round number — the single
+                                    // most expensive thing to diagnose in this codebase's history.
+                                    warn!(error = %e, "Proposal broadcast failed — this round cannot reach a quorum");
                                 }
                             }
                         }
@@ -694,7 +698,7 @@ impl P2PService {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
                                     .publish(committed_topic.clone(), data)
                                 {
-                                    debug!("Committed block broadcast: {}", e);
+                                    warn!(error = %e, "Committed block broadcast failed — peers will have to fetch this block instead");
                                 }
                             }
                         }

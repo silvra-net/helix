@@ -405,14 +405,40 @@ impl Mempool {
     /// sender's sequential nonces always land in the correct order in the block.
     /// Without this, nonce N+1 arriving before N would be dropped by the executor.
     pub fn take(&mut self, max_count: usize) -> Vec<Transaction> {
+        self.take_within(max_count, u64::MAX)
+    }
+
+    /// Like [`Mempool::take`], but also stops once the selected transactions would exceed
+    /// `max_bytes` of serialized size.
+    ///
+    /// Counting transactions alone was not a bound on anything that matters. A plain transfer
+    /// serializes to ~5.4 KB — ML-DSA signatures and public keys dominate — so the 1000-transaction
+    /// cap allowed a 5.2 MB block, past the 4 MB gossipsub transmit limit. Such a block cannot be
+    /// broadcast at all: the proposal is never delivered, no peer votes on it, the round times out,
+    /// and the next proposer draws the same transactions from the same mempool and fails the same
+    /// way. A permanent stall, reachable by anyone willing to submit ~800 transactions, whose only
+    /// visible symptom is a climbing round number.
+    ///
+    /// A transaction that is *itself* larger than `max_bytes` would otherwise wedge the pool
+    /// forever, so the first one is always taken: a block containing it can still be produced, and
+    /// the alternative is a transaction that is admitted and can never be mined.
+    pub fn take_within(&mut self, max_count: usize, max_bytes: u64) -> Vec<Transaction> {
         self.evict_expired();
-        let mut result = Vec::with_capacity(max_count);
+        let mut result = Vec::with_capacity(max_count.min(1024));
+        let mut bytes = 0u64;
         'outer: for hashes in self.by_tip.values() {
             for hash in hashes {
                 if result.len() >= max_count {
                     break 'outer;
                 }
                 if let Some(tx) = self.by_hash.get(hash) {
+                    let size = tx.size_bytes();
+                    // Skip rather than stop: a single oversized transaction low in the tip order
+                    // must not shut the gate on everything cheaper behind it.
+                    if !result.is_empty() && bytes.saturating_add(size) > max_bytes {
+                        continue;
+                    }
+                    bytes = bytes.saturating_add(size);
                     result.push(tx.clone());
                 }
             }
@@ -479,6 +505,68 @@ mod tests {
     /// actually be spent.
     fn make_tx(keypair: &KeyPair, fee: Amount, nonce: u64) -> Transaction {
         make_tx_with_data(keypair, fee, nonce, 0)
+    }
+
+    /// Packing must stop at a byte budget, not only at a transaction count.
+    ///
+    /// The count cap bounded nothing that matters: at ~5.4 KB per transfer, 1000 transactions is a
+    /// 5.2 MB block, larger than gossipsub will transmit. Such a block reaches no peer, collects no
+    /// vote, times its round out, and is rebuilt identically by the next proposer from the same
+    /// mempool — a permanent stall whose only symptom is a climbing round number.
+    #[test]
+    fn packing_stops_at_the_byte_budget_not_just_the_count() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::with_limits(1_000, 1_000);
+        for nonce in 0..20 {
+            pool.add(make_tx(&kp, 10_000 + nonce, nonce)).unwrap();
+        }
+
+        let one = make_tx(&kp, 10_000, 0).size_bytes();
+        // Room for five and a bit — the sixth must not be squeezed in.
+        let taken = pool.take_within(1_000, one * 5 + one / 2);
+
+        assert_eq!(taken.len(), 5, "the budget, not the count, has to decide");
+        let packed: u64 = taken.iter().map(|t| t.size_bytes()).sum();
+        assert!(packed <= one * 5 + one / 2, "packed {packed} bytes over budget");
+    }
+
+    /// The control. A budget so tight that nothing fits must still produce a block containing the
+    /// first transaction, or a transaction larger than the budget is admitted to the pool and can
+    /// never be mined out of it — the pool wedges and every later transaction starves behind it.
+    #[test]
+    fn a_transaction_larger_than_the_whole_budget_is_still_taken() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::with_limits(1_000, 1_000);
+        pool.add(make_tx(&kp, 10_000, 0)).unwrap();
+
+        let taken = pool.take_within(1_000, 1);
+        assert_eq!(taken.len(), 1, "the first transaction always goes in, budget or not");
+    }
+
+    /// The other control: the count limit has to keep working. A fix that only ever consulted bytes
+    /// would pass the test above and quietly let a block hold ten thousand tiny transactions.
+    #[test]
+    fn the_count_limit_still_applies_under_a_generous_budget() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::with_limits(1_000, 1_000);
+        for nonce in 0..20 {
+            pool.add(make_tx(&kp, 10_000 + nonce, nonce)).unwrap();
+        }
+
+        assert_eq!(pool.take_within(7, u64::MAX).len(), 7);
+    }
+
+    /// `take` is the same selection with no byte budget — existing callers must be unaffected.
+    #[test]
+    fn take_is_take_within_without_a_byte_budget() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::with_limits(1_000, 1_000);
+        for nonce in 0..6 {
+            pool.add(make_tx(&kp, 10_000 + nonce, nonce)).unwrap();
+        }
+        let plain: Vec<_> = pool.take(4).iter().map(|t| t.hash()).collect();
+        let budgeted: Vec<_> = pool.take_within(4, u64::MAX).iter().map(|t| t.hash()).collect();
+        assert_eq!(plain, budgeted);
     }
 
     /// Backlog #156: a transaction dropped for sitting past its TTL must be answerable as

@@ -1042,6 +1042,26 @@ impl BftEngine {
             }
         }
 
+        // A block larger than the network will carry is not a block anyone can act on. Voting for
+        // one is voting for a round that cannot finish: gossipsub will not transmit it, so no peer
+        // ever sees it and no quorum ever forms. See `Block::exceeds_size_limit` — the same rule
+        // every other admission path applies, and it has to be the same one, because a size limit
+        // half the network enforces is a fork.
+        //
+        // Ahead of the merkle root and the proposer signature deliberately. Both walk the whole
+        // block; measuring it is the cheaper question, and there is no reason to hash and verify
+        // megabytes that are going to be thrown away for their size regardless.
+        if block.exceeds_size_limit() {
+            return Err(ConsensusError::InvalidBlock {
+                height: h,
+                reason: format!(
+                    "block carries {} transaction bytes, over the {}-byte limit",
+                    block.transaction_bytes(),
+                    helix_core::fee::MAX_BLOCK_BYTES
+                ),
+            });
+        }
+
         block
             .header
             .verify_signature()
@@ -1056,6 +1076,7 @@ impl BftEngine {
                 reason: "merkle root mismatch".into(),
             });
         }
+
 
         // EIP-1559: the base fee is not the proposer's to choose — it's deterministically
         // derived from the parent block (the node refreshes `current_base_fee_per_byte` after
@@ -2841,6 +2862,78 @@ mod tests {
             .advance_round(&v.b_kp, Hash::digest(b"genesis"), vec![])
             .unwrap_err();
         b_engine.pending_proposal().unwrap().clone()
+    }
+
+    /// A proposal too large for the network to carry must be refused before a vote is cast.
+    ///
+    /// Voting for one is voting for a round that cannot finish: gossipsub will not transmit a block
+    /// past `max_message_size`, so no peer ever sees it, no quorum ever forms, and the next proposer
+    /// rebuilds the same block from the same mempool. Until the size limit existed, a 1000-
+    /// transaction block was 5.2 MB against a 4 MB transmit limit, and nothing anywhere said no.
+    #[test]
+    fn a_proposal_larger_than_the_network_will_carry_is_refused() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+
+        // Produced by this node, so every other property (height, signature, base fee, chaining)
+        // is correct and size is the only thing left to reject it on.
+        engine
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        let mut block = engine.pending_proposal().unwrap().clone();
+
+        let mut t = oversized_transaction();
+        t.data = vec![0u8; helix_core::fee::MAX_BLOCK_BYTES as usize + 1];
+        block.transactions = vec![t];
+
+        let mut verifier = BftEngine::new(v.validator_set.clone(), v.c_addr.clone(), 0);
+        verifier.seed_last_committed(Hash::digest(b"genesis"));
+        let err = verifier
+            .validate_block(&block, 0, None, &[])
+            .expect_err("an oversized proposal must not be votable");
+        assert!(
+            format!("{err}").contains("over the"),
+            "expected a size rejection, got: {err}"
+        );
+    }
+
+    /// The control. The same block under the limit has to pass, or the rule is a liveness bug
+    /// rather than a fix — and a limit that rejected ordinary blocks would look identical from the
+    /// outside to the stall it was built to prevent.
+    #[test]
+    fn a_proposal_within_the_limit_is_not_refused_for_its_size() {
+        let v = four_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        engine
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .unwrap_err();
+        let block = engine.pending_proposal().unwrap().clone();
+
+        let mut verifier = BftEngine::new(v.validator_set.clone(), v.c_addr.clone(), 0);
+        verifier.seed_last_committed(Hash::digest(b"genesis"));
+        // May still fail for unrelated reasons in other tests' setups; here it must simply not be
+        // the size that stops it.
+        if let Err(e) = verifier.validate_block(&block, 0, None, &[]) {
+            assert!(!format!("{e}").contains("over the"), "rejected for size: {e}");
+        }
+    }
+
+    fn oversized_transaction() -> helix_core::Transaction {
+        use helix_core::transaction::TxType;
+        let kp = KeyPair::generate();
+        helix_core::Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: Address::from_public_key(&kp.public),
+            to: Some(Address::from_public_key(&kp.public)),
+            amount: 1,
+            fee: 1,
+            nonce: 0,
+            data: vec![],
+            crypto_version: kp.scheme,
+            signature: helix_crypto::Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        }
     }
 
     /// The core safety property: a node locked on value A withholds its prevote
