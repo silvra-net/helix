@@ -3707,7 +3707,7 @@ async fn sync_blocks_from_peer(
         if blocks.is_empty() {
             break; // caught up
         }
-        for block in &blocks {
+        for (idx, block) in blocks.iter().enumerate() {
             let h = block.height();
             if let Err(e) = block.header.verify_signature() {
                 store.save_chain_state(chain_state)?;
@@ -3768,6 +3768,59 @@ async fn sync_blocks_from_peer(
                     total_applied
                 );
             }
+            // Quorum proof, the check this path never had (backlog #136).
+            //
+            // Signature + set membership + prev_hash together still allow one byzantine validator
+            // — or anyone holding a validator key who can answer as this node's `sync_peer` — to
+            // serve a self-signed branch that satisfies all three. That is the hole audit item A1
+            // closed on the gossip fast path, left open here.
+            //
+            // The proof is already in the stream: a block's successor carries, in its
+            // `last_commit`, the precommits that finalized it — `BftEngine` fills that field from
+            // `precommits.quorum_votes()`, so it is a quorum by construction. Checking against the
+            // *next* block rather than fetching a certificate per block is what makes this
+            // workable at all; the 2026-07-31 attempt tried to obtain one per segment, could not
+            // for any segment not ending exactly on the peer tip, and broke catch-up outright.
+            //
+            // Verified against the set as of *before* this block: `chain_state` has had every
+            // earlier block applied and nothing later, and a rotation happens while executing the
+            // block whose height is a multiple of EPOCH_LENGTH — so this is the set that signed
+            // the certificate. Deriving it from the batch instead would be self-certifying.
+            if let Some(successor) = blocks.get(idx + 1) {
+                let set = ValidatorSet::new(validators_from_state(chain_state), h);
+                // Bootstrap, mirroring the `stakers().is_empty()` fallback above: before anyone
+                // has staked there is no set to weigh a certificate against, and every node's own
+                // engine falls back to itself as sole validator. Demanding a quorum here would
+                // make the first blocks of any chain unsyncable, for everyone, forever. As soon as
+                // a set exists this check applies with no exception.
+                if set.total_voting_power() > 0 {
+                let certificate = commit_sigs_to_votes(
+                    successor.header.last_commit.clone(),
+                    h,
+                    block.hash(),
+                );
+                if !set.precommits_reach_quorum(&certificate, h, &block.hash()) {
+                    store.save_chain_state(chain_state)?;
+                    anyhow::bail!(
+                        "block {} from sync peer is not backed by a BFT quorum — its successor's \
+                         commit certificate does not reach the threshold for the validator set of \
+                         that height. Aborting sync, {} block(s) already applied",
+                        h,
+                        total_applied
+                    );
+                }
+                }
+            }
+            if let Err(e) = block.header.verify_signature() {
+                store.save_chain_state(chain_state)?;
+                anyhow::bail!(
+                    "block {} from sync peer failed signature verification ({}) — \
+                     aborting sync, {} block(s) already applied",
+                    h,
+                    e,
+                    total_applied
+                );
+            }
             execute_block(chain_state, block, None);
             // Same stamp as the consensus path in `apply_finalized_block` — a node catching up
             // over RPC serves `/status` throughout, and a state height frozen at whatever it was
@@ -3813,15 +3866,62 @@ mod sync_blocks_from_peer_tests {
         block
     }
 
+    /// A precommit by `kp` for `(height, block_hash)`, in the form a block header carries it.
+    ///
+    /// Real blocks carry these: `BftEngine` fills `last_commit` from the precommits that finalized
+    /// the parent. The test helpers below build them too, because since #136 the sync path checks
+    /// them — a block whose successor carries no quorum is exactly what an attacker serves.
+    fn commit_sig_for(kp: &KeyPair, height: u64, block_hash: &Hash) -> CommitSig {
+        let bytes = helix_core::block::precommit_signing_bytes(
+            height,
+            0,
+            block_hash,
+            helix_core::CryptoVersion::MlDsa,
+        );
+        CommitSig {
+            validator: Address::from_public_key(&kp.public),
+            public_key: kp.public.clone(),
+            crypto_version: helix_core::CryptoVersion::MlDsa,
+            round: 0,
+            signature: kp.sign(&bytes).unwrap(),
+        }
+    }
+
     /// Builds `heights.len()` blocks that properly chain from `Hash::ZERO` (a
     /// fresh store's initial tip) through each other in order.
+    ///
+    /// Each block carries a commit certificate for its predecessor, as a real chain does — the
+    /// sync path verifies a block's quorum from its successor's `last_commit` (#136), so blocks
+    /// without one describe a chain that could never have been produced.
     fn chained_blocks(kp: &KeyPair, heights: &[u64]) -> Vec<Block> {
+        chained_blocks_certified_by(kp, &[kp], heights)
+    }
+
+    /// Like `chained_blocks`, but the commit certificates are signed by `certifiers` — needed
+    /// wherever the state has more than one active validator, since one precommit out of two is
+    /// short of a quorum and the sync path now checks that (#136).
+    fn chained_blocks_certified_by(
+        proposer: &KeyPair,
+        certifiers: &[&KeyPair],
+        heights: &[u64],
+    ) -> Vec<Block> {
         let mut prev_hash = Hash::ZERO;
+        let mut prev_height: Option<u64> = None;
         heights
             .iter()
             .map(|&h| {
-                let block = signed_block(kp, h, prev_hash);
+                let mut block = signed_block(proposer, h, prev_hash);
+                if let Some(ph) = prev_height {
+                    block.header.last_commit = certifiers
+                        .iter()
+                        .map(|c| commit_sig_for(c, ph, &prev_hash))
+                        .collect();
+                    // Re-sign: the certificate is folded into the header's signing hash.
+                    block.header.signature =
+                        proposer.sign(block.header.signing_hash().as_bytes()).unwrap();
+                }
                 prev_hash = block.hash();
+                prev_height = Some(h);
                 block
             })
             .collect()
@@ -4087,7 +4187,11 @@ mod sync_blocks_from_peer_tests {
         // enforces validator-set membership, not per-height proposer identity, so a solo producer's
         // blocks are valid to apply right across both the incumbents' and the joiner's activation.
         let heights: Vec<u64> = (1..=helix_consensus::EPOCH_LENGTH * 4).collect();
-        let (phase1, phase2): (Vec<Block>, Vec<Block>) = chained_blocks(&genesis_kp, &heights)
+        // Certified by both sitting validators: with A and B equally weighted, one precommit is
+        // half the power and short of quorum — a real chain's `last_commit` carries both.
+        let certifiers = [&genesis_kp, &kp_b];
+        let (phase1, phase2): (Vec<Block>, Vec<Block>) =
+            chained_blocks_certified_by(&genesis_kp, &certifiers, &heights)
             .into_iter()
             .partition(|b| b.height() <= helix_consensus::EPOCH_LENGTH * 2);
         let peer1 = serve_blocks(phase1).await;
@@ -4287,6 +4391,67 @@ mod sync_blocks_from_peer_tests {
         );
     }
 
+    /// Backlog #136, the hole this path had since it was written: signature + set membership +
+    /// prev_hash are all satisfiable by a single validator serving a branch it alone signed.
+    ///
+    /// The attacker here is exactly that — a real, staked validator (so membership passes),
+    /// signing well-formed blocks that chain properly (so continuity passes), on a chain where the
+    /// set is large enough that one signature is not a quorum. Before this check the node adopted
+    /// the branch outright; audit item A1 closed the same hole on the gossip fast path and left
+    /// this one open, reachable through a compromised or impersonated `sync_peer`.
+    #[tokio::test]
+    async fn rejects_a_branch_one_validator_signed_alone() {
+        let attacker = KeyPair::generate();
+        let honest = KeyPair::generate();
+
+        // Well-formed blocks, correctly chained, signed by a genuine set member — but certified
+        // only by itself.
+        let blocks = chained_blocks_certified_by(&attacker, &[&attacker], &[1, 2, 3]);
+        let peer_url = serve_blocks(blocks).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &attacker);
+        stake_validator(&mut chain_state, &honest);
+
+        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+
+        let err = result.expect_err("a branch without a quorum must not be adopted").to_string();
+        assert!(err.contains("not backed by a BFT quorum"), "{err}");
+        assert_eq!(
+            store.latest_height(),
+            0,
+            "and nothing from that branch may be persisted — a single applied block from it puts \
+             this node on a fork the rest of the network will never extend",
+        );
+    }
+
+    /// The control, and the one that decides whether this is a fix or an outage: an honest chain
+    /// must still sync. The 2026-07-31 attempt at #136 failed exactly here — it demanded a
+    /// certificate per segment, could not obtain one for any segment not ending on the peer tip,
+    /// and broke catch-up for everyone.
+    #[tokio::test]
+    async fn an_honestly_certified_chain_still_syncs() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3, 4, 5]);
+        let peer_url = serve_blocks(blocks).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &a);
+        stake_validator(&mut chain_state, &b);
+
+        let applied = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+            .await
+            .expect("a properly certified chain must sync");
+
+        assert_eq!(applied, 5);
+        // The last block has no successor in the stream, so it carries no proof yet — it is
+        // applied on the same terms as before this check, and certified on the next poll.
+        assert_eq!(store.latest_height(), 5);
+    }
+
     #[tokio::test]
     async fn rejects_tampered_block_and_aborts_cleanly() {
         let kp = KeyPair::generate();
@@ -4339,7 +4504,12 @@ mod sync_blocks_from_peer_tests {
         let real_kp = KeyPair::generate();
         let block1 = signed_block(&real_kp, 1, Hash::ZERO);
         let attacker_kp = KeyPair::generate();
-        let block2 = signed_block(&attacker_kp, 2, block1.hash());
+        let mut block2 = signed_block(&attacker_kp, 2, block1.hash());
+        // Block 2 certifies block 1 honestly — otherwise block 1 is rejected for want of a quorum
+        // and this test never reaches the membership check it exists for (#136).
+        block2.header.last_commit = vec![commit_sig_for(&real_kp, 1, &block1.hash())];
+        block2.header.signature =
+            attacker_kp.sign(block2.header.signing_hash().as_bytes()).unwrap();
         let peer_url = serve_blocks(vec![block1, block2]).await;
 
         let mut store = fresh_store();
@@ -4360,7 +4530,12 @@ mod sync_blocks_from_peer_tests {
         // doesn't match block 1's actual hash (e.g. peer serving a different branch).
         let kp = KeyPair::generate();
         let block1 = signed_block(&kp, 1, Hash::ZERO);
-        let non_chaining_block2 = signed_block(&kp, 2, Hash::ZERO); // should be block1.hash()
+        let mut non_chaining_block2 = signed_block(&kp, 2, Hash::ZERO); // should be block1.hash()
+        // Certifies block 1, so this test reaches the continuity check rather than stopping at
+        // block 1 for want of a quorum (#136).
+        non_chaining_block2.header.last_commit = vec![commit_sig_for(&kp, 1, &block1.hash())];
+        non_chaining_block2.header.signature =
+            kp.sign(non_chaining_block2.header.signing_hash().as_bytes()).unwrap();
         let blocks = vec![block1, non_chaining_block2];
         let peer_url = serve_blocks(blocks).await;
 
