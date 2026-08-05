@@ -122,6 +122,15 @@ pub struct P2PService {
     /// Answers inbound block-sync requests (#138). Supplied by the node, which owns the store —
     /// see [`BlockProvider`] for why the dependency points this way.
     block_provider: Arc<dyn BlockProvider>,
+    /// Highest tip any connected peer currently claims, published for the node (backlog #154).
+    ///
+    /// Peer-supplied and therefore untrusted, which is why the node may only use it in the safe
+    /// direction: as a reason to keep *holding* block production, never as a reason to start. A
+    /// peer claiming too low cannot release us early — this is a maximum over all peers, so one
+    /// honest higher claim dominates. A peer claiming too high can hold us, which costs this node
+    /// its own liveness and nothing else, and only while the RPC catch-up (the other, independent
+    /// release path) also stays unavailable.
+    highest_peer_tip: Option<Arc<AtomicU64>>,
 }
 
 impl P2PService {
@@ -133,10 +142,26 @@ impl P2PService {
         let (event_tx, event_rx) = mpsc::channel(256);
         let (command_tx, command_rx) = mpsc::channel(256);
         (
-            P2PService { config, event_tx, command_rx, tip_height, block_provider },
+            P2PService {
+                config,
+                event_tx,
+                command_rx,
+                tip_height,
+                block_provider,
+                highest_peer_tip: None,
+            },
             command_tx,
             event_rx,
         )
+    }
+
+    /// Publish the highest tip claimed by any connected peer into `slot` (backlog #154).
+    ///
+    /// Opt-in rather than a constructor argument so the many call sites that do not care — every
+    /// test in this crate among them — stay as they are.
+    pub fn with_peer_tip_reporting(mut self, slot: Arc<AtomicU64>) -> Self {
+        self.highest_peer_tip = Some(slot);
+        self
     }
 
     pub async fn run(self) -> P2PResult<()> {
@@ -146,6 +171,7 @@ impl P2PService {
         let config = self.config;
         let tip_height = self.tip_height;
         let block_provider = self.block_provider;
+        let highest_peer_tip = self.highest_peer_tip;
 
         let max_msg_size = config.max_message_size;
 
@@ -403,6 +429,7 @@ impl P2PService {
                                 );
                                 if let Some(tip) = outcome.announced_tip {
                                     peer_tips.insert(propagation_source, tip);
+                                    publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
                                 }
                                 if let Some(peer_tip) = outcome.serve_from_tip {
                                     let _ = event_tx
@@ -600,6 +627,7 @@ impl P2PService {
                             // level. A lost peer is exactly as newsworthy as a gained one.
                             info!(peer = %peer_id, "Peer disconnected");
                             peer_tips.remove(&peer_id);
+                            publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
                             swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                             reputation.on_disconnect(&peer_id.to_string());
                             let _ = event_tx
@@ -1001,6 +1029,15 @@ impl FlapTracker {
     }
 }
 
+/// Publishes the highest tip any peer currently claims (backlog #154). Called wherever `peer_tips`
+/// changes, so a peer that leaves cannot leave its claim standing behind it — a stale high claim
+/// would hold a caught-up node out of block production indefinitely.
+fn publish_highest_peer_tip(slot: &Option<Arc<AtomicU64>>, peer_tips: &HashMap<PeerId, u64>) {
+    if let Some(slot) = slot {
+        slot.store(peer_tips.values().copied().max().unwrap_or(0), Ordering::Relaxed);
+    }
+}
+
 /// Whether a closed connection means the *peer* is gone and its state must be torn down.
 ///
 /// A named function rather than two inline conditions because getting this wrong is expensive and
@@ -1132,6 +1169,65 @@ async fn handle_app_message(topic: &str, data: &[u8], event_tx: &mpsc::Sender<P2
         }
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod highest_peer_tip_tests {
+    use super::publish_highest_peer_tip;
+    use libp2p::PeerId;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn the_highest_claim_wins() {
+        let slot = Arc::new(AtomicU64::new(0));
+        let mut tips = HashMap::new();
+        tips.insert(PeerId::random(), 10u64);
+        tips.insert(PeerId::random(), 900);
+        tips.insert(PeerId::random(), 42);
+
+        publish_highest_peer_tip(&Some(slot.clone()), &tips);
+
+        assert_eq!(slot.load(Ordering::Relaxed), 900, "the maximum, not the last one seen");
+    }
+
+    /// The reason this is recomputed on *every* change to `peer_tips` rather than only on insert:
+    /// a peer that leaves must not leave its claim behind. A stale high claim would hold a
+    /// caught-up node out of block production forever (#154), and it would look like nothing.
+    #[test]
+    fn a_departed_peers_claim_does_not_linger() {
+        let slot = Arc::new(AtomicU64::new(0));
+        let staying = PeerId::random();
+        let leaving = PeerId::random();
+        let mut tips = HashMap::new();
+        tips.insert(staying, 100u64);
+        tips.insert(leaving, 5_000);
+
+        publish_highest_peer_tip(&Some(slot.clone()), &tips);
+        assert_eq!(slot.load(Ordering::Relaxed), 5_000);
+
+        tips.remove(&leaving);
+        publish_highest_peer_tip(&Some(slot.clone()), &tips);
+        assert_eq!(slot.load(Ordering::Relaxed), 100, "the claim must leave with the peer");
+    }
+
+    /// No peers, no claim — and specifically 0, which the node reads as "nothing to compare
+    /// against" and therefore never releases on.
+    #[test]
+    fn no_peers_publishes_zero() {
+        let slot = Arc::new(AtomicU64::new(777));
+        publish_highest_peer_tip(&Some(slot.clone()), &HashMap::new());
+        assert_eq!(slot.load(Ordering::Relaxed), 0);
+    }
+
+    /// Reporting is opt-in; a service without a slot must not panic or otherwise care.
+    #[test]
+    fn reporting_is_optional() {
+        let mut tips = HashMap::new();
+        tips.insert(PeerId::random(), 1u64);
+        publish_highest_peer_tip(&None, &tips);
     }
 }
 

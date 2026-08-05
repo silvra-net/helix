@@ -457,3 +457,61 @@ async fn a_peer_that_really_leaves_is_still_reported_as_gone() {
          node keeps counting a peer that no longer exists toward quorum",
     );
 }
+
+
+/// Backlog #154: the highest tip peers claim must be published, and must fall again when the peer
+/// that claimed it leaves.
+///
+/// Over the wire because this is a wiring property, not a logic one: the pure function is covered
+/// by unit tests and stays green whether or not anything ever calls it. What can actually break —
+/// and would be invisible — is the update on peer *departure*. A claim that outlived its peer would
+/// hold a caught-up node out of block production indefinitely, which is exactly the failure #152's
+/// hold is only acceptable because it can be released from.
+#[tokio::test]
+async fn the_highest_peer_claim_is_published_and_retracted_with_its_peer() {
+    let kp = KeyPair::generate();
+    let blocks = chained_blocks(&kp, 5);
+
+    let ahead_tip = Arc::new(AtomicU64::new(5));
+    let (ahead, _ahead_cmd, mut ahead_events) = P2PService::new(
+        config(19_670, None),
+        ahead_tip,
+        Arc::new(FixedBlocks { blocks, certificate: stand_in_certificate(&kp) }),
+    );
+    let ahead_task = tokio::spawn(async move { ahead.run().await });
+    tokio::spawn(async move { while ahead_events.recv().await.is_some() {} });
+
+    let claimed = Arc::new(AtomicU64::new(0));
+    let (behind, _behind_cmd, mut behind_events) =
+        P2PService::new(config(19_671, Some(19_670)), Arc::new(AtomicU64::new(0)), Arc::new(NoBlocks));
+    let behind = behind.with_peer_tip_reporting(claimed.clone());
+    tokio::spawn(async move { behind.run().await });
+    tokio::spawn(async move { while behind_events.recv().await.is_some() {} });
+
+    // The peer announces its tip on the peer-exchange interval.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline
+        && claimed.load(std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        claimed.load(std::sync::atomic::Ordering::Relaxed),
+        5,
+        "the peer's announced tip must be published"
+    );
+
+    // It leaves; its claim must go with it, or a caught-up node stays held forever.
+    ahead_task.abort();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline
+        && claimed.load(std::sync::atomic::Ordering::Relaxed) != 0
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        claimed.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a departed peer's claim must not linger — it would hold production indefinitely"
+    );
+}

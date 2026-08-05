@@ -327,6 +327,15 @@ pub struct HelixNode {
     /// [`P2PService`], which reads it on every announcement; written here at startup, after the
     /// initial sync, and by `publish_tip_certificate` at every commit.
     announced_tip_height: Arc<std::sync::atomic::AtomicU64>,
+    /// Highest tip any connected peer claims, published by [`P2PService`] (backlog #154).
+    ///
+    /// Untrusted, and used only in the safe direction: to decide that a node held back after a
+    /// failed startup sync (#152) has caught up with what the network is offering. A peer claiming
+    /// too low cannot release us early (this is a maximum, so an honest higher claim wins); one
+    /// claiming too high can only keep holding us, which costs this node its own liveness and
+    /// nothing else — and only while the RPC catch-up, the independent second release path, is
+    /// also unavailable.
+    highest_peer_tip: Arc<std::sync::atomic::AtomicU64>,
     /// Live commit certificate for the current tip — served at `/sync/tip-certificate` (#133) and
     /// used to certify a block handed to a peer over block sync (#138). Created in the constructor
     /// rather than in `run()` because [`StoreBlockProvider`] needs to share the very same cell.
@@ -604,11 +613,13 @@ impl HelixNode {
             store: shared_store.clone(),
             tip_certificate: shared_tip_certificate.clone(),
         });
+        let highest_peer_tip = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (p2p_service, p2p_command_tx, p2p_event_rx) = P2PService::new(
             p2p_config,
             announced_tip_height.clone(),
             block_provider,
         );
+        let p2p_service = p2p_service.with_peer_tip_reporting(highest_peer_tip.clone());
 
         let rpc_bind = resolve_rpc_bind(&cfg)?;
 
@@ -641,6 +652,7 @@ impl HelixNode {
             syncing: Arc::new(std::sync::atomic::AtomicBool::new(has_sync_peer)),
             sync_target_height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             announced_tip_height,
+            highest_peer_tip,
             tip_certificate: shared_tip_certificate,
             signing_state_path,
         })
@@ -779,12 +791,39 @@ impl HelixNode {
         tokio::spawn({
             let store = self.store.clone();
             let announced_tip_height = self.announced_tip_height.clone();
+            let highest_peer_tip = self.highest_peer_tip.clone();
+            let syncing = self.syncing.clone();
             async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     tick.tick().await;
                     let tip = store.read().await.latest_height();
                     announced_tip_height.store(tip, std::sync::atomic::Ordering::Relaxed);
+
+                    // Second release path for production held after a failed startup sync
+                    // (backlog #154). #152 releases via the RPC catch-up, which ties resuming to
+                    // the one central dependency the P2P block sync exists to remove: a node that
+                    // catches up purely over P2P would otherwise stay mute until the RPC peer
+                    // happened to answer.
+                    //
+                    // Safe because the claim is only ever used to *stop* holding, never to hold
+                    // longer or to skip ahead: releasing needs our own verified height to have
+                    // reached the highest claim, so a peer claiming too low cannot release us
+                    // early (an honest higher claim wins the maximum), and one claiming too high
+                    // merely keeps this node quiet — its own liveness, nobody else's, and only
+                    // while the RPC path is also down. Both paths are ORed, never ANDed.
+                    if syncing.load(std::sync::atomic::Ordering::Relaxed) {
+                        let claimed = highest_peer_tip.load(std::sync::atomic::Ordering::Relaxed);
+                        if claimed > 0 && tip >= claimed {
+                            syncing.store(false, std::sync::atomic::Ordering::Relaxed);
+                            info!(
+                                height = tip,
+                                claimed,
+                                "Caught up with what peers are announcing — resuming block \
+                                 production"
+                            );
+                        }
+                    }
                 }
             }
         });
