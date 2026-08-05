@@ -506,6 +506,16 @@ async fn tx_status(hash: String, node: &str) -> Result<()> {
     let found = response.status().is_success();
     let res: serde_json::Value = response.json().await?;
     if !found {
+        // "Expired" and "never seen" are both 404s — the transaction is genuinely not on the
+        // chain either way — but they mean opposite things to a sender, and only one of them
+        // calls for resubmitting (backlog #156). Leading with "Not found" for an expiry would
+        // deny a transaction that demonstrably existed and was accepted by this node.
+        if res["status"].as_str() == Some("expired") {
+            bail!(
+                "Expired: {}",
+                res["error"].as_str().unwrap_or("it was dropped from the pool before inclusion")
+            );
+        }
         bail!(
             "Not found: {}",
             res["error"].as_str().unwrap_or("no such transaction")
@@ -587,5 +597,41 @@ mod tx_status_tests {
             .await
             .expect_err("an unknown hash must not report as a real transaction");
         assert!(err.to_string().contains("Not found"), "got: {}", err);
+    }
+
+    /// Backlog #156: an expired transaction must not be reported the way a mistyped hash is.
+    /// Both are 404s, but only one of them means "this existed, we accepted it, and it aged out —
+    /// send it again". Leading with "Not found" there denies a transaction the node did have.
+    #[tokio::test]
+    async fn an_expired_transaction_is_not_announced_as_not_found() {
+        let node = mock_node(
+            StatusCode::NOT_FOUND,
+            json!({
+                "hash": "ab".repeat(32),
+                "status": "expired",
+                "error": "transaction abab… expired before it was included in a block",
+            }),
+        )
+        .await;
+
+        let err = tx_status("ab".repeat(32), &node).await.unwrap_err().to_string();
+
+        assert!(err.starts_with("Expired:"), "must lead with what happened: {err}");
+        assert!(!err.contains("Not found"), "and must not also deny it existed: {err}");
+    }
+
+    /// The control: a hash the node never saw must still be reported as not found, or the
+    /// distinction carries no information.
+    #[tokio::test]
+    async fn an_unknown_transaction_is_still_announced_as_not_found() {
+        let node = mock_node(
+            StatusCode::NOT_FOUND,
+            json!({ "error": "transaction cdcd… not found" }),
+        )
+        .await;
+
+        let err = tx_status("cd".repeat(32), &node).await.unwrap_err().to_string();
+
+        assert!(err.starts_with("Not found:"), "{err}");
     }
 }

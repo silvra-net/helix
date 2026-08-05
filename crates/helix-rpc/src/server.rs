@@ -1217,15 +1217,43 @@ async fn get_transaction_status(
         }
         Ok(None) => {
             drop(store);
-            if state.mempool.read().await.contains(&tx_hash) {
+            let pool = state.mempool.read().await;
+            if pool.contains(&tx_hash) {
                 (
                     StatusCode::OK,
                     Json(json!({ "hash": hash_hex, "status": "pending" })),
                 )
-            } else {
+            } else if pool.expired_recently(&tx_hash) {
+                // Distinguishable from "never seen" (backlog #156). Answering both with the same
+                // "not found" is at its worst exactly when it matters most: while the chain is
+                // stalled, every transaction a user sends expires after the pool's TTL with no
+                // block to go into, and nothing told them. Checked after the pending and in-block
+                // cases, so a resubmitted transaction is reported by what it is doing now.
                 (
                     StatusCode::NOT_FOUND,
-                    Json(json!({ "error": format!("transaction {} not found", hash_hex) })),
+                    Json(json!({
+                        "hash": hash_hex,
+                        "status": "expired",
+                        "error": format!(
+                            "transaction {} expired before it was included in a block — it waited \
+                             in the pool past its time limit and was dropped. Nothing was charged; \
+                             submit it again.",
+                            hash_hex
+                        ),
+                    })),
+                )
+            } else {
+                // Still ambiguous, and now says so: never submitted, mistyped, or expired longer
+                // ago than the pool remembers. Claiming more than that would be a guess.
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": format!(
+                            "transaction {} not found — it was never submitted to this node, or \
+                             it expired long enough ago to have been forgotten",
+                            hash_hex
+                        ),
+                    })),
                 )
             }
         }
@@ -1872,6 +1900,71 @@ mod tests {
             faucet: None,
             tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
         }
+    }
+
+    /// Backlog #156: an expired transaction must be answerable as expired, not as never seen.
+    ///
+    /// The two were the same 404, which is worst precisely when it matters most: while the chain
+    /// is stalled there is no block for anything to enter, so every transaction a user sends ages
+    /// out of the pool and disappears without a word. Still a 404 — it is genuinely not on the
+    /// chain — but one that says what happened and that nothing was charged.
+    #[tokio::test]
+    async fn an_expired_transaction_is_reported_as_expired_not_as_unknown() {
+        let state = fresh_test_state();
+        let kp = KeyPair::generate();
+        let mut t = Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: Address::from_public_key(&kp.public),
+            to: Some(Address::from_public_key(&KeyPair::generate().public)),
+            amount: 10,
+            fee: 100_000,
+            nonce: 0,
+            data: vec![],
+            crypto_version: CryptoVersion::MlDsa,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        t.signature = kp.sign(t.signing_hash().as_bytes()).unwrap();
+        let hash = t.hash();
+
+        {
+            let mut pool = state.mempool.write().await;
+            // A TTL short enough to expire within the test; everything else as in production.
+            *pool = Mempool::with_limits_and_ttl(100, 1_000, std::time::Duration::from_millis(1));
+            pool.add(t).expect("the transaction must be admitted before it can expire");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Expiry is lazy, driven by pool operations — same as in production.
+        let _ = state.mempool.write().await.take(10);
+
+        let response = get_transaction_status(State(state), Path(hash.to_hex()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "it is genuinely not on the chain");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "expired");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("expired"),
+            "the message has to say so too: {parsed}"
+        );
+    }
+
+    /// The control: a hash nobody ever submitted must stay unknown. If everything unknown came
+    /// back as "expired", the answer would carry no information at all.
+    #[tokio::test]
+    async fn an_unknown_transaction_is_still_reported_as_not_found() {
+        let state = fresh_test_state();
+        let hash = helix_crypto::Hash::from_bytes([7u8; 32]);
+
+        let response = get_transaction_status(State(state), Path(hash.to_hex()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.get("status").is_none(), "no claim about what became of it: {parsed}");
     }
 
     /// `/sync/tip-certificate` serves exactly what the node published into the cell — empty until

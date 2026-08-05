@@ -1,6 +1,6 @@
 use helix_core::{transaction::Amount, Transaction, TxType};
 use helix_crypto::{Address, Hash, PublicKey};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -39,6 +39,16 @@ const DEFAULT_MIN_FEE: Amount = 1_000; // 1000 nano-HLX
 /// fee-based eviction.
 const DEFAULT_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// How many recently expired transaction hashes to remember, so a sender can be told their
+/// transaction expired rather than that it was never seen (backlog #156).
+///
+/// A hash is 32 bytes, so this is a few tens of kilobytes for a window that comfortably outlasts
+/// the TTL itself at any realistic rate — during the 2026-08-04 stall the pool turned over about
+/// thirty transactions per half hour. It is deliberately a bounded ring rather than a complete
+/// record: remembering everything forever to answer a question about the past is how a mempool
+/// becomes an archive. What falls out of the ring simply answers as before.
+const EXPIRED_MEMORY: usize = 4096;
+
 /// Tip-prioritized transaction pool.
 /// Higher tip → included in next block first.
 pub struct Mempool {
@@ -56,6 +66,16 @@ pub struct Mempool {
     tip_of: HashMap<String, Amount>,
     /// hash → time of admission, used for TTL-based expiry
     entered_at: HashMap<String, Instant>,
+    /// Hashes recently dropped for exceeding the TTL, newest last (backlog #156).
+    ///
+    /// Without this, a transaction that expired and one that never arrived are the same answer —
+    /// "not found" — and so is a typo in the hash. That is at its worst exactly when it matters
+    /// most: during a stall, every transaction a user sends expires after the TTL with no block to
+    /// go into, and nothing anywhere tells them. Only expiry is recorded here; a transaction that
+    /// made it into a block is answerable from the store, and one replaced or evicted for a low
+    /// tip was never promised anything.
+    expired: VecDeque<String>,
+    expired_set: HashSet<String>,
     max_size: usize,
     min_fee: Amount,
     /// Addresses whose `ProbationHeartbeat` is admitted without a fee — see `is_fee_exempt`.
@@ -84,6 +104,8 @@ impl Mempool {
             by_sender_nonce: HashMap::new(),
             tip_of: HashMap::new(),
             entered_at: HashMap::new(),
+            expired: VecDeque::new(),
+            expired_set: HashSet::new(),
             max_size: DEFAULT_MAX_SIZE,
             min_fee: DEFAULT_MIN_FEE,
             ttl: DEFAULT_TTL,
@@ -101,6 +123,8 @@ impl Mempool {
             by_sender_nonce: HashMap::new(),
             tip_of: HashMap::new(),
             entered_at: HashMap::new(),
+            expired: VecDeque::new(),
+            expired_set: HashSet::new(),
             max_size,
             min_fee,
             ttl: DEFAULT_TTL,
@@ -118,6 +142,8 @@ impl Mempool {
             by_sender_nonce: HashMap::new(),
             tip_of: HashMap::new(),
             entered_at: HashMap::new(),
+            expired: VecDeque::new(),
+            expired_set: HashSet::new(),
             max_size,
             min_fee,
             ttl,
@@ -236,7 +262,32 @@ impl Mempool {
             .collect();
         for hash in expired {
             self.detach(&hash);
+            self.remember_expired(hash);
         }
+    }
+
+    /// Records a hash as recently expired, evicting the oldest once the ring is full (#156).
+    fn remember_expired(&mut self, hash: String) {
+        if !self.expired_set.insert(hash.clone()) {
+            return;
+        }
+        self.expired.push_back(hash);
+        if self.expired.len() > EXPIRED_MEMORY {
+            if let Some(oldest) = self.expired.pop_front() {
+                self.expired_set.remove(&oldest);
+            }
+        }
+    }
+
+    /// Whether this transaction was recently dropped for sitting in the pool past its TTL
+    /// (backlog #156).
+    ///
+    /// `false` is deliberately not "it never expired": beyond the ring's window the answer is
+    /// simply unknown, which is what callers reported before this existed. Everything it does say
+    /// is true — it never turns a transaction that is still pending, or one that made it into a
+    /// block, into an expiry.
+    pub fn expired_recently(&self, hash: &Hash) -> bool {
+        self.expired_set.contains(&hash.to_hex())
     }
 
     pub fn add(&mut self, tx: Transaction) -> MempoolResult<()> {
@@ -428,6 +479,60 @@ mod tests {
     /// actually be spent.
     fn make_tx(keypair: &KeyPair, fee: Amount, nonce: u64) -> Transaction {
         make_tx_with_data(keypair, fee, nonce, 0)
+    }
+
+    /// Backlog #156: a transaction dropped for sitting past its TTL must be answerable as
+    /// *expired*, not as never seen. During a stall this is every transaction a user sends —
+    /// there is no block for it to enter, so it waits out the TTL and vanishes silently.
+    #[test]
+    fn a_transaction_dropped_for_age_is_remembered_as_expired() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::with_ttl(Duration::from_millis(1));
+        let tx = make_tx(&kp, 10_000, 0);
+        let hash = tx.hash();
+        pool.add(tx).unwrap();
+
+        std::thread::sleep(Duration::from_millis(5));
+        // Expiry is lazy — any pool operation drives it, as in production.
+        let _ = pool.take(10);
+
+        assert!(!pool.contains(&hash), "precondition: it really was dropped");
+        assert!(pool.expired_recently(&hash), "and the sender must be able to learn why");
+    }
+
+    /// The control that keeps `expired_recently` honest: a transaction still waiting has not
+    /// expired, and reporting it as such would tell a user to resend something already in flight.
+    #[test]
+    fn a_pending_transaction_is_not_reported_as_expired() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+        let tx = make_tx(&kp, 10_000, 0);
+        let hash = tx.hash();
+        pool.add(tx).unwrap();
+
+        assert!(pool.contains(&hash));
+        assert!(!pool.expired_recently(&hash));
+    }
+
+    /// And one nobody ever submitted must stay unknown — otherwise the answer means nothing.
+    #[test]
+    fn an_unknown_transaction_is_not_reported_as_expired() {
+        let kp = KeyPair::generate();
+        let pool = Mempool::new();
+        assert!(!pool.expired_recently(&make_tx(&kp, 10_000, 0).hash()));
+    }
+
+    /// The memory is a bounded ring, not an archive: past its capacity the oldest entries fall out
+    /// and answer as they did before this existed. Pinned so nobody later assumes it is complete.
+    #[test]
+    fn the_expiry_memory_stays_bounded() {
+        let mut pool = Mempool::new();
+        for i in 0..(EXPIRED_MEMORY + 100) {
+            pool.remember_expired(format!("{i:064x}"));
+        }
+        assert_eq!(pool.expired.len(), EXPIRED_MEMORY, "the ring must not grow without bound");
+        assert_eq!(pool.expired_set.len(), EXPIRED_MEMORY, "and its index must track it exactly");
+        assert!(!pool.expired_set.contains(&format!("{:064x}", 0)), "oldest entries fall out");
     }
 
     /// The gate a probation heartbeat has to clear before it can ever reach a block, and the one
