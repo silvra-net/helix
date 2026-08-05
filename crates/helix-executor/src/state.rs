@@ -1299,6 +1299,103 @@ mod tests {
     /// be aware that doing so requires a chain reset. Nothing is lost by leaving it out —
     /// `missed_blocks`/`jailed_until`, the state this set actually drives, remain hashed, so a
     /// real disagreement still surfaces there within a block or two.
+    /// The state hash must not depend on the order things were inserted.
+    ///
+    /// Every collection in `Canonical` is a `BTreeMap`/`BTreeSet` for exactly this reason, with
+    /// the reasoning written out field by field. Nothing enforced it. A `HashMap` slipping into
+    /// that struct — the natural thing to reach for when adding a field — makes the hash depend
+    /// on iteration order, so two nodes with identical state report different hashes and the
+    /// network looks forked when it is not. It would show up as an intermittent disagreement that
+    /// changes between restarts, which is close to the worst thing to have to debug.
+    #[test]
+    fn the_state_hash_does_not_depend_on_insertion_order() {
+        let mut forwards = ChainState::new(1_000_000);
+        for i in 1..=8u8 {
+            stake(&mut forwards, i, 1_000 + u64::from(i));
+            forwards.names.insert(format!("name{i}"), addr(i).to_string());
+            forwards.jailed_until.insert(addr(i).to_string(), u64::from(i) * 10);
+        }
+
+        let mut backwards = ChainState::new(1_000_000);
+        for i in (1..=8u8).rev() {
+            stake(&mut backwards, i, 1_000 + u64::from(i));
+            backwards.names.insert(format!("name{i}"), addr(i).to_string());
+            backwards.jailed_until.insert(addr(i).to_string(), u64::from(i) * 10);
+        }
+
+        assert_eq!(
+            forwards.state_hash(),
+            backwards.state_hash(),
+            "same state, opposite insertion order — the hash must not be able to tell them apart",
+        );
+    }
+
+    /// Every field that carries value or decides consensus has to reach the hash.
+    ///
+    /// A field left out of `Canonical` is worse than a wrong one: nodes disagree about it in
+    /// silence, because the number they compare says they agree. That is exactly how #142 stayed
+    /// hidden for 26 k blocks — a doubled block reward, identical block hashes, and a supply
+    /// divergence nobody was looking at. `total_issued` and `total_burned` are in the hash today,
+    /// and this pins them there along with the rest.
+    #[test]
+    fn every_value_bearing_field_changes_the_state_hash() {
+        let base = || {
+            let mut s = ChainState::new(1_000_000_000);
+            stake(&mut s, 1, 5_000);
+            s
+        };
+
+        let reference = base().state_hash();
+
+        let mut issued = base();
+        issued.total_issued += 1;
+        assert_ne!(issued.state_hash(), reference, "total_issued must be hashed (#142)");
+
+        let mut burned = base();
+        burned.total_burned += 1;
+        assert_ne!(burned.state_hash(), reference, "total_burned must be hashed");
+
+        let mut balance = base();
+        balance.update_account(&addr(1), |a| a.balance += 1);
+        assert_ne!(balance.state_hash(), reference, "balances must be hashed");
+
+        let mut staked = base();
+        staked.update_account(&addr(1), |a| a.staked += 1);
+        assert_ne!(staked.state_hash(), reference, "stake must be hashed");
+
+        let mut unbonding = base();
+        unbonding.update_account(&addr(1), |a| a.unbonding_stake += 1);
+        assert_ne!(unbonding.state_hash(), reference, "unbonding capital must be hashed");
+
+        let mut nonce = base();
+        nonce.update_account(&addr(1), |a| a.nonce += 1);
+        assert_ne!(nonce.state_hash(), reference, "nonces must be hashed — replay protection");
+
+        let mut jailed = base();
+        jailed.jailed_until.insert(addr(1).to_string(), 999);
+        assert_ne!(jailed.state_hash(), reference, "jailing must be hashed — it gates the set");
+
+        let mut missed = base();
+        missed.missed_blocks.insert(addr(1).to_string(), 7);
+        assert_ne!(missed.state_hash(), reference, "downtime counters must be hashed");
+
+        let mut params = base();
+        params.governance_params.min_validator_stake += 1;
+        assert_ne!(
+            params.state_hash(),
+            reference,
+            "governance parameters must be hashed — they decide who is a validator",
+        );
+
+        let mut pending = base();
+        pending.pending_validators.insert(addr(2));
+        assert_ne!(pending.state_hash(), reference, "the activation queue must be hashed");
+
+        let mut probation = base();
+        probation.probationary_validators.insert(addr(2));
+        assert_ne!(probation.state_hash(), reference, "probation must be hashed");
+    }
+
     #[test]
     fn active_validators_stays_out_of_the_state_hash() {
         let mut state = ChainState::new(1_000_000);
