@@ -1197,7 +1197,15 @@ async fn handle_p2p_event(
             peer_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         P2PEvent::PeerDisconnected(_) => {
-            peer_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // Saturating, not wrapping. The service now pairs these events strictly (#147), but
+            // this counter gates block production via `peers >= needed` — and on an `AtomicUsize`
+            // one unpaired decrement does not read as "-1", it reads as `usize::MAX`, which makes
+            // every quorum-peer check pass forever. Cheap insurance against a future caller.
+            let _ = peer_count.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| Some(n.saturating_sub(1)),
+            );
         }
         P2PEvent::PeerBehind { peer_tip } => {
             serve_catchup_blocks(peer_tip, store, tip_certificate, p2p_tx).await;

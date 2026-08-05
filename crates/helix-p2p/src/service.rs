@@ -326,6 +326,21 @@ impl P2PService {
         // Tip each peer last announced, so the block-sync driver below knows who to ask (#138).
         // Bounded by the connection limit and pruned on disconnect, so it cannot grow unbounded.
         let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
+        // Peers we have announced as connected, so `PeerConnected`/`PeerDisconnected` reach the
+        // node strictly in pairs (backlog #147).
+        //
+        // libp2p reports connections, not peers, and `max_established_per_peer` is 4 — so a peer
+        // both sides dial, or redial, legitimately holds several at once. Announcing every one of
+        // them made a *connection* teardown look like the *peer* leaving: `peer_tips` lost its
+        // entry, and since that map is the block-sync driver's only notion of who is ahead, the
+        // node then never asked anyone for blocks again. That is how a freshly started validator
+        // sat on height 1 for 21 hours with the catch-up path fully intact but never triggered.
+        //
+        // The set also keeps the two events symmetric across the ban path below, which
+        // disconnects *without* announcing — an unpaired `PeerDisconnected` would underflow the
+        // node's `peer_count` (`AtomicUsize`) to `usize::MAX` and make every quorum-peer check
+        // trivially pass.
+        let mut connected_peers: HashSet<PeerId> = HashSet::new();
         // One outstanding request at a time. Without this, every driver tick while a slow batch is
         // in transit would fire another request for the same range — turning our own catch-up into
         // a flood. Cleared on a response and on any failure, so a peer that never answers costs one
@@ -506,6 +521,17 @@ impl P2PService {
                                 continue;
                             }
 
+                            // Only the first connection to a peer makes it a *new* peer. Further
+                            // ones are routine (both sides dialing, a redial racing the existing
+                            // link) and must not be announced again — see `connected_peers`.
+                            if !connected_peers.insert(peer_id) {
+                                debug!(
+                                    peer = %peer_id,
+                                    "Additional connection to an already-connected peer"
+                                );
+                                continue;
+                            }
+
                             info!(peer = %peer_id, "Peer connected");
 
                             // Add every accepted peer to gossipsub's explicit-peer set so it
@@ -533,7 +559,22 @@ impl P2PService {
 
                             let _ = event_tx.send(P2PEvent::PeerConnected(peer_str)).await;
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                            // `num_established` is what is *left* to this peer. Dropping it (the
+                            // `..` this replaces) treated one closing connection as the whole peer
+                            // going away, tearing down state that several still-live connections
+                            // depended on — see `connected_peers` for the outage that caused.
+                            // `contains`, not `remove`: while other connections remain the peer must
+                            // stay in the set, or the next one would be announced as a new peer.
+                            if !peer_departed(num_established, connected_peers.contains(&peer_id)) {
+                                debug!(
+                                    peer = %peer_id,
+                                    remaining = num_established,
+                                    "Connection closed, peer itself has not left"
+                                );
+                                continue;
+                            }
+                            connected_peers.remove(&peer_id);
                             // `info!`, matching "Peer connected" above — the asymmetry this
                             // replaces (connect at `info!`, disconnect at `debug!`) is not
                             // cosmetic. On 2026-07-29 a dropped link to one validator cost 14.5
@@ -894,6 +935,23 @@ fn handle_peer_exchange_message(
 /// to punish.
 const BLOCKSYNC_PEER_COOLDOWN_TICKS: u32 = 5;
 
+/// Whether a closed connection means the *peer* is gone and its state must be torn down.
+///
+/// A named function rather than two inline conditions because getting this wrong is expensive and
+/// invisible (backlog #147): treating any closure as a departure wipes `peer_tips`, which is the
+/// block-sync driver's only record of who is ahead, and a node that has forgotten every peer's tip
+/// never asks anyone for blocks again. That kept a freshly started validator on height 1 for 21
+/// hours with the whole catch-up path intact.
+///
+/// - `remaining_connections`: libp2p's `num_established`, i.e. what is *left* to this peer. Several
+///   connections per peer are routine — `max_established_per_peer` is 4, and a live run reaches it.
+/// - `was_announced`: whether we ever reported this peer as connected. The ban path disconnects
+///   without announcing, and an unpaired `PeerDisconnected` underflows the node's `peer_count`
+///   (`AtomicUsize`) to `usize::MAX`, which makes every quorum-peer check pass.
+fn peer_departed(remaining_connections: u32, was_announced: bool) -> bool {
+    remaining_connections == 0 && was_announced
+}
+
 fn best_blocksync_peer(
     peer_tips: &HashMap<PeerId, u64>,
     our_tip: u64,
@@ -1008,6 +1066,42 @@ async fn handle_app_message(topic: &str, data: &[u8], event_tx: &mpsc::Sender<P2
         }
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod peer_departure_tests {
+    use super::peer_departed;
+
+    /// The production bug (#147), stated directly. A live 2-node run reaches four connections to
+    /// one peer, so this is the ordinary case, not an edge case — and treating it as a departure
+    /// wiped `peer_tips` and left catch-up with nobody to ask.
+    ///
+    /// Unit-level on purpose, and the reason is worth recording: the transport test alongside this
+    /// proves multiple connections per peer really happen, but it cannot produce a *closure* while
+    /// others remain — gossipsub keeps streams on every connection, so the idle timeout never
+    /// reaps one, and surplus dials are refused before they are ever established (both measured,
+    /// not assumed). An earlier version of this file asserted the teardown behaviour over the wire
+    /// and passed just as happily with the fix removed. A vacuous test is worse than none.
+    #[test]
+    fn a_closure_with_connections_remaining_is_not_a_departure() {
+        assert!(!peer_departed(3, true));
+        assert!(!peer_departed(1, true));
+    }
+
+    #[test]
+    fn the_last_connection_closing_is_a_departure() {
+        assert!(peer_departed(0, true));
+    }
+
+    /// The ban path disconnects without ever announcing the peer. Retracting an announcement that
+    /// was never made leaves `PeerConnected`/`PeerDisconnected` unpaired, and the node's
+    /// `peer_count` is an `AtomicUsize` — one unpaired decrement is not `-1`, it is `usize::MAX`,
+    /// after which every "do we have enough peers for quorum" check passes forever.
+    #[test]
+    fn a_peer_we_never_announced_is_never_reported_gone() {
+        assert!(!peer_departed(0, false));
+        assert!(!peer_departed(2, false));
     }
 }
 

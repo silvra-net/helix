@@ -18,7 +18,7 @@ use helix_consensus::Vote;
 use helix_core::{genesis_block, Block};
 use helix_crypto::{Address, KeyPair, Signature};
 use helix_p2p::blocksync::{BlockProvider, BlockSyncResponse};
-use helix_p2p::{P2PConfig, P2PEvent, P2PService};
+use helix_p2p::{P2PCommand, P2PConfig, P2PEvent, P2PService};
 
 /// Blocks that chain from `Hash::ZERO`, signed by `kp` — enough structure for the transport to
 /// carry; this test asserts about delivery, not about validity (the node layer owns that).
@@ -317,5 +317,143 @@ async fn a_peer_that_claims_the_highest_tip_and_serves_nothing_cannot_stall_catc
         batch.blocks.iter().map(|b| b.height()).collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5],
         "and it must be the real range, from the peer that actually had it",
+    );
+}
+
+/// Backlog #147: a peer holding more than one connection is still *one* peer, and closing one of
+/// them must not tear down the state the others still depend on.
+///
+/// This is the production outage of 2026-08-04/05 in miniature. `max_established_per_peer` is 4, so
+/// several connections to the same peer are routine — both sides dialing, or a redial racing the
+/// existing link. The service announced every one of them and, on `ConnectionClosed`, forgot the
+/// peer wholesale: `peer_tips` lost its entry. That map is the block-sync driver's *only* notion of
+/// who is ahead, so the node then never asked anyone for blocks again. A freshly started validator
+/// sat on height 1 for 21 hours with the entire catch-up path intact and never once triggered,
+/// while `peer_count` — which gates block production — counted connections instead of peers.
+///
+/// Deliberately over the real wire: whether a second dial to an already-connected peer produces a
+/// second connection at all is a property of libp2p, not of our code, and it is the premise the
+/// whole bug rests on.
+#[tokio::test]
+async fn a_second_connection_to_the_same_peer_is_not_a_second_peer() {
+    let kp = KeyPair::generate();
+    let blocks = chained_blocks(&kp, 5);
+
+    let ahead_tip = Arc::new(AtomicU64::new(5));
+    let (ahead, _ahead_cmd, mut ahead_events) = P2PService::new(
+        config(19_660, None),
+        ahead_tip,
+        Arc::new(FixedBlocks { blocks, certificate: stand_in_certificate(&kp) }),
+    );
+    tokio::spawn(async move { ahead.run().await });
+    tokio::spawn(async move { while ahead_events.recv().await.is_some() {} });
+
+    let behind_tip = Arc::new(AtomicU64::new(0));
+    let (behind, behind_cmd, mut behind_events) =
+        P2PService::new(config(19_661, Some(19_660)), behind_tip, Arc::new(NoBlocks));
+    tokio::spawn(async move { behind.run().await });
+
+    let mut connects = 0usize;
+    let mut disconnects = 0usize;
+    let mut batch_arrived = false;
+    let mut dialed_again = false;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), behind_events.recv()).await {
+            Ok(Some(P2PEvent::PeerConnected(_))) => {
+                connects += 1;
+                // Dial the peer we are already connected to. `swarm.dial` on a bare multiaddr is
+                // unconditional, so this genuinely opens a second connection rather than being
+                // deduplicated away — that is what makes this deterministic instead of waiting for
+                // a race to happen on its own. Once only: this is about the second connection, not
+                // about how many we can stack up.
+                if !dialed_again {
+                    dialed_again = true;
+                    let _ = behind_cmd
+                        .send(P2PCommand::ConnectPeer(
+                            "/ip4/127.0.0.1/tcp/19660".parse().unwrap(),
+                        ))
+                        .await;
+                }
+            }
+            Ok(Some(P2PEvent::PeerDisconnected(_))) => disconnects += 1,
+            Ok(Some(P2PEvent::BlocksSynced(..))) => batch_arrived = true,
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
+    assert!(dialed_again, "the peers must have connected at all, or this test proves nothing");
+    assert_eq!(
+        connects, 1,
+        "one peer must be announced once, however many connections it holds — counting connections \
+         is what let `peer_count` (which gates block production) drift away from reality",
+    );
+    assert_eq!(
+        disconnects, 0,
+        "the peer never went away, so no disconnect may be reported — this is the event that used \
+         to wipe `peer_tips` and leave catch-up permanently unable to find anyone to ask",
+    );
+    assert!(
+        batch_arrived,
+        "and catch-up must still complete across the extra connection — the accounting fix is only \
+         worth anything if block sync survives it",
+    );
+}
+
+/// The control that keeps the test above from being a tautology (lesson 3): after teaching the
+/// service to ignore *some* closures, a real departure must still be reported. A fix that simply
+/// swallowed every disconnect would pass the assertions above and leave the node believing forever
+/// in peers that are long gone.
+#[tokio::test]
+async fn a_peer_that_really_leaves_is_still_reported_as_gone() {
+    let kp = KeyPair::generate();
+    let blocks = chained_blocks(&kp, 5);
+
+    let ahead_tip = Arc::new(AtomicU64::new(5));
+    let (ahead, _ahead_cmd, mut ahead_events) = P2PService::new(
+        config(19_662, None),
+        ahead_tip,
+        Arc::new(FixedBlocks { blocks, certificate: stand_in_certificate(&kp) }),
+    );
+    let ahead_task = tokio::spawn(async move { ahead.run().await });
+    tokio::spawn(async move { while ahead_events.recv().await.is_some() {} });
+
+    let behind_tip = Arc::new(AtomicU64::new(0));
+    let (behind, _behind_cmd, mut behind_events) =
+        P2PService::new(config(19_663, Some(19_662)), behind_tip, Arc::new(NoBlocks));
+    tokio::spawn(async move { behind.run().await });
+
+    // Wait until they are actually connected before killing anything.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut connected = false;
+    while tokio::time::Instant::now() < deadline && !connected {
+        if let Ok(Some(P2PEvent::PeerConnected(_))) =
+            tokio::time::timeout(Duration::from_secs(2), behind_events.recv()).await
+        {
+            connected = true;
+        }
+    }
+    assert!(connected, "the peers must connect first, or the departure below proves nothing");
+
+    // Dropping the service takes its swarm — and every connection — down with it.
+    ahead_task.abort();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut disconnects = 0usize;
+    while tokio::time::Instant::now() < deadline && disconnects == 0 {
+        if let Ok(Some(P2PEvent::PeerDisconnected(_))) =
+            tokio::time::timeout(Duration::from_secs(2), behind_events.recv()).await
+        {
+            disconnects += 1;
+        }
+    }
+
+    assert_eq!(
+        disconnects, 1,
+        "a peer whose last connection closed must be reported gone exactly once — otherwise the \
+         node keeps counting a peer that no longer exists toward quorum",
     );
 }
