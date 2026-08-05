@@ -2796,6 +2796,11 @@ async fn block_production_loop(
 
     // Logged once rather than every tick — a full catch-up is thousands of ticks long.
     let mut announced_wait = false;
+    // Ticks spent held at the sync gate, so the reason can be repeated at a steady cadence rather
+    // than announced once (#152 made this state long-lived).
+    let mut sync_wait_ticks: u64 = 0;
+    // One minute's worth of production ticks, whatever the configured block time.
+    let ticks_per_minute = (60_000 / block_time_ms).max(1);
     // Ticks spent waiting for peers, for the periodic "this is why nothing is happening" line.
     let mut waited_ticks: u32 = 0;
     // Ticks between probation heartbeats. Not every tick: the transaction is only useful once per
@@ -2827,12 +2832,28 @@ async fn block_production_loop(
         // set nothing else would stop it: `peers_needed_for_quorum` is 0, so the mesh gate
         // below passes straight through.
         if syncing.load(std::sync::atomic::Ordering::Relaxed) {
-            if !announced_wait {
-                info!("Block production held until the initial sync finishes");
+            // Repeated once a minute, not announced once and then silent.
+            //
+            // Saying it once was fine while this state lasted seconds — the initial sync and no
+            // more. Since #152 it can last indefinitely: a node whose startup sync failed with no
+            // chain is held here until it catches up, which needs a peer to answer. An operator
+            // would otherwise see one line at startup and nothing further while their validator
+            // sat out the chain for hours, which is precisely the silence #121 and #150 exist to
+            // remove.
+            if !announced_wait || sync_wait_ticks.is_multiple_of(ticks_per_minute) {
+                let held_at = store.read().await.latest_height();
+                info!(
+                    height = held_at,
+                    "Block production held until this node has caught up — it will not propose or \
+                     vote until then. Waiting for its sync peer or for peers to announce a tip it \
+                     can reach."
+                );
                 announced_wait = true;
             }
+            sync_wait_ticks = sync_wait_ticks.wrapping_add(1);
             continue;
         }
+        sync_wait_ticks = 0;
 
         // Prove liveness while on probation (#132/#141). Placed here, before every gate below,
         // deliberately: a probationer is at its least healthy exactly when it most needs to be
