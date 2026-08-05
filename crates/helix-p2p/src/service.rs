@@ -682,11 +682,25 @@ impl P2PService {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
                                     .publish(block_topic.clone(), data)
                                 {
-                                    // Was `debug!`, i.e. invisible by default. A proposal that
-                                    // does not go out produces a round that cannot finish, and the
-                                    // only other symptom is a climbing round number — the single
-                                    // most expensive thing to diagnose in this codebase's history.
-                                    warn!(error = %e, "Proposal broadcast failed — this round cannot reach a quorum");
+                                    // Was `debug!`, i.e. invisible by default. A proposal that does
+                                    // not go out produces a round that cannot finish, and the only
+                                    // other symptom is a climbing round number — the single most
+                                    // expensive thing to diagnose in this codebase's history.
+                                    //
+                                    // `Duplicate` is not that. The node re-offers its pending
+                                    // proposal every tick so a validator that connects late still
+                                    // sees it, and gossipsub rejecting the repeat is that mechanism
+                                    // working: the message went out the first time. Warning about it
+                                    // fires every two seconds on a perfectly healthy chain, and a
+                                    // line that cries wolf that often is worse than no line at all —
+                                    // it teaches an operator to skip exactly the warning that
+                                    // matters. Measured live on 2026-08-05: 92 of these in 300 log
+                                    // lines while the chain was finalizing blocks normally.
+                                    if matches!(e, gossipsub::PublishError::Duplicate) {
+                                        debug!("Proposal re-offer deduplicated — already published");
+                                    } else {
+                                        warn!(error = %e, "Proposal broadcast failed — this round cannot reach a quorum");
+                                    }
                                 }
                             }
                         }
@@ -717,7 +731,11 @@ impl P2PService {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
                                     .publish(committed_topic.clone(), data)
                                 {
-                                    warn!(error = %e, "Committed block broadcast failed — peers will have to fetch this block instead");
+                                    if matches!(e, gossipsub::PublishError::Duplicate) {
+                                        debug!("Committed-block re-offer deduplicated — already published");
+                                    } else {
+                                        warn!(error = %e, "Committed block broadcast failed — peers will have to fetch this block instead");
+                                    }
                                 }
                             }
                         }
