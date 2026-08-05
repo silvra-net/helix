@@ -341,6 +341,8 @@ impl P2PService {
         // node's `peer_count` (`AtomicUsize`) to `usize::MAX` and make every quorum-peer check
         // trivially pass.
         let mut connected_peers: HashSet<PeerId> = HashSet::new();
+        // Makes a peer that never stays connected visible (backlog #149).
+        let mut flaps = FlapTracker::new(std::time::Instant::now());
         // One outstanding request at a time. Without this, every driver tick while a slow batch is
         // in transit would fire another request for the same range — turning our own catch-up into
         // a flood. Cleared on a response and on any failure, so a peer that never answers costs one
@@ -533,6 +535,20 @@ impl P2PService {
                             }
 
                             info!(peer = %peer_id, "Peer connected");
+
+                            // Counted here, in the branch that treats this as a *new* peer, so
+                            // the extra connections of one healthy peer are not mistaken for
+                            // churn — that distinction only exists since #147.
+                            if flaps.note_reconnect(peer_id, std::time::Instant::now()) {
+                                warn!(
+                                    peer = %peer_id,
+                                    reconnects = FLAP_THRESHOLD,
+                                    "Peer keeps reconnecting — it is not staying connected long \
+                                     enough to be useful (no stable gossip mesh, no block sync). \
+                                     Usually a bad link or a proxy timing the connection out on \
+                                     their side, not misbehaviour."
+                                );
+                            }
 
                             // Add every accepted peer to gossipsub's explicit-peer set so it
                             // always forwards messages to them, not just to whatever subset its
@@ -935,6 +951,56 @@ fn handle_peer_exchange_message(
 /// to punish.
 const BLOCKSYNC_PEER_COOLDOWN_TICKS: u32 = 5;
 
+/// How long a window the flap detector counts reconnects over, and how many it tolerates in one
+/// (backlog #149).
+///
+/// Derived from the real outage rather than picked: the peer that flapped through the 2026-08-04/05
+/// stall produced 434 connect/disconnect lines in 21 hours — 217 cycles, about **10 reconnects an
+/// hour**, sustained. A healthy peer that loses its link occasionally does one or two. Five an hour
+/// sits clear of normal churn and still catches that peer in the first hour instead of after
+/// someone happens to read 868 log lines.
+const FLAP_WINDOW: Duration = Duration::from_secs(3600);
+const FLAP_THRESHOLD: u32 = 5;
+
+/// Counts how often each peer reconnects, so a peer that never stays connected becomes visible.
+///
+/// It went unnoticed for 21 hours that one peer was reconnecting every 30 seconds. Nothing treated
+/// that as remarkable — it is just `info!` lines, indistinguishable from normal churn unless you
+/// already suspect it. A peer in this state is not noise: gossipsub never forms a stable mesh with
+/// it, block sync cannot use it, and before #147 every cycle also tore down our accounting for it.
+///
+/// Warns, never bans. A flapping peer is usually the victim — a bad link, a proxy timing it out —
+/// and disconnecting it would remove a validator whose votes the chain may need. Same reasoning as
+/// the block-sync cooldown (#140): the goal is to make it visible, not to punish it.
+struct FlapTracker {
+    window_start: std::time::Instant,
+    reconnects: HashMap<PeerId, u32>,
+    warned: HashSet<PeerId>,
+}
+
+impl FlapTracker {
+    fn new(now: std::time::Instant) -> Self {
+        FlapTracker { window_start: now, reconnects: HashMap::new(), warned: HashSet::new() }
+    }
+
+    /// Records a reconnect and reports whether this peer has just crossed the threshold — `true`
+    /// exactly once per peer per window, so a peer flapping all day produces one line an hour, not
+    /// one per cycle.
+    ///
+    /// Clearing both maps on the window roll is also what bounds them: without it, a peer churning
+    /// through fresh `PeerId`s would grow this map for the process's lifetime.
+    fn note_reconnect(&mut self, peer: PeerId, now: std::time::Instant) -> bool {
+        if now.duration_since(self.window_start) >= FLAP_WINDOW {
+            self.window_start = now;
+            self.reconnects.clear();
+            self.warned.clear();
+        }
+        let count = self.reconnects.entry(peer).or_insert(0);
+        *count += 1;
+        *count >= FLAP_THRESHOLD && self.warned.insert(peer)
+    }
+}
+
 /// Whether a closed connection means the *peer* is gone and its state must be torn down.
 ///
 /// A named function rather than two inline conditions because getting this wrong is expensive and
@@ -1066,6 +1132,103 @@ async fn handle_app_message(topic: &str, data: &[u8], event_tx: &mpsc::Sender<P2
         }
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod flap_tracker_tests {
+    use super::{FlapTracker, FLAP_THRESHOLD, FLAP_WINDOW};
+    use libp2p::PeerId;
+    use std::time::{Duration, Instant};
+
+    /// The production case, at the rate it actually occurred: ~10 reconnects an hour, sustained
+    /// for 21 hours, and nothing anywhere treated it as remarkable (backlog #149).
+    #[test]
+    fn a_peer_reconnecting_over_and_over_is_reported() {
+        let t0 = Instant::now();
+        let mut tracker = FlapTracker::new(t0);
+        let peer = PeerId::random();
+
+        for i in 1..FLAP_THRESHOLD {
+            assert!(
+                !tracker.note_reconnect(peer, t0 + Duration::from_secs(i as u64 * 60)),
+                "must not fire before the threshold (reconnect {i})"
+            );
+        }
+        assert!(
+            tracker.note_reconnect(peer, t0 + Duration::from_secs(FLAP_THRESHOLD as u64 * 60)),
+            "must fire once the threshold is reached"
+        );
+    }
+
+    /// Once per peer per window. A peer flapping all day is one line an hour, not one per cycle —
+    /// otherwise the warning becomes the noise it exists to cut through.
+    #[test]
+    fn a_peer_already_reported_does_not_warn_again_in_the_same_window() {
+        let t0 = Instant::now();
+        let mut tracker = FlapTracker::new(t0);
+        let peer = PeerId::random();
+
+        let mut fired = 0;
+        for i in 1..=(FLAP_THRESHOLD * 4) {
+            if tracker.note_reconnect(peer, t0 + Duration::from_secs(u64::from(i) * 10)) {
+                fired += 1;
+            }
+        }
+        assert_eq!(fired, 1, "exactly one warning per peer per window");
+    }
+
+    /// The control that keeps the threshold honest: ordinary churn must stay silent. A detector
+    /// that fires on a peer losing its link once or twice an hour would be turned off within a day.
+    #[test]
+    fn ordinary_reconnects_are_not_reported() {
+        let t0 = Instant::now();
+        let mut tracker = FlapTracker::new(t0);
+        let peer = PeerId::random();
+
+        // Two reconnects an hour, over four hours — a peer on a flaky link, not a flapping one.
+        for hour in 0..4u64 {
+            let base = t0 + Duration::from_secs(hour * 3600);
+            assert!(!tracker.note_reconnect(peer, base + Duration::from_secs(60)));
+            assert!(!tracker.note_reconnect(peer, base + Duration::from_secs(1800)));
+        }
+    }
+
+    /// Peers are counted apart: one bad peer must not push an innocent one over the line.
+    #[test]
+    fn peers_are_counted_independently() {
+        let t0 = Instant::now();
+        let mut tracker = FlapTracker::new(t0);
+        let noisy = PeerId::random();
+        let quiet = PeerId::random();
+
+        for i in 1..=(FLAP_THRESHOLD + 2) {
+            tracker.note_reconnect(noisy, t0 + Duration::from_secs(u64::from(i) * 10));
+        }
+        assert!(
+            !tracker.note_reconnect(quiet, t0 + Duration::from_secs(60)),
+            "a peer that reconnected once must not inherit another peer's count"
+        );
+    }
+
+    /// The window rolls, and rolling is also what bounds memory: without the clear, a peer churning
+    /// through fresh PeerIds would grow these maps for the lifetime of the process.
+    #[test]
+    fn the_window_rolls_and_clears_what_it_counted() {
+        let t0 = Instant::now();
+        let mut tracker = FlapTracker::new(t0);
+        let peer = PeerId::random();
+
+        for i in 1..=FLAP_THRESHOLD {
+            tracker.note_reconnect(peer, t0 + Duration::from_secs(u64::from(i)));
+        }
+        assert!(!tracker.reconnects.is_empty());
+
+        // One reconnect in the next window: counted fresh, and the old bookkeeping is gone.
+        let later = t0 + FLAP_WINDOW + Duration::from_secs(1);
+        assert!(!tracker.note_reconnect(peer, later), "a new window starts from zero");
+        assert_eq!(tracker.reconnects.len(), 1, "old counts must not accumulate");
+        assert_eq!(tracker.warned.len(), 0, "and the peer can be reported again if it keeps at it");
     }
 }
 
