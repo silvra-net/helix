@@ -3696,6 +3696,10 @@ async fn sync_blocks_from_peer(
     let client = peer_http_client(Duration::from_secs(30))?;
 
     let mut from = local_tip + 1;
+    // Incremented per block, not per batch (backlog #160). The abort messages below quote this
+    // number, and quoting a per-batch counter meant an abort five blocks into a 200-block batch
+    // reported "0 block(s) already applied" while four were persisted — the one number somebody
+    // reads when deciding whether an interrupted sync left the node clean.
     let mut total_applied = 0u64;
     // Tracks the hash each next block must chain from — starts at our current tip
     // and advances to the just-applied block's own hash after each iteration.
@@ -3707,7 +3711,14 @@ async fn sync_blocks_from_peer(
         if blocks.is_empty() {
             break; // caught up
         }
-        for (idx, block) in blocks.iter().enumerate() {
+        // A full batch means the peer has more: hold its last block back rather than applying it
+        // uncertified, and let the next batch — which begins with it and carries its successor —
+        // prove it (backlog #158). Costs one re-fetched block per batch and closes the gap for
+        // every block except the chain tip itself.
+        let peer_has_more = blocks.len() >= 200;
+        let apply_count = if peer_has_more { blocks.len() - 1 } else { blocks.len() };
+
+        for (idx, block) in blocks.iter().take(apply_count).enumerate() {
             let h = block.height();
             if let Err(e) = block.header.verify_signature() {
                 store.save_chain_state(chain_state)?;
@@ -3786,7 +3797,7 @@ async fn sync_blocks_from_peer(
             // earlier block applied and nothing later, and a rotation happens while executing the
             // block whose height is a multiple of EPOCH_LENGTH — so this is the set that signed
             // the certificate. Deriving it from the batch instead would be self-certifying.
-            if let Some(successor) = blocks.get(idx + 1) {
+            {
                 let set = ValidatorSet::new(validators_from_state(chain_state), h);
                 // Bootstrap, mirroring the `stakers().is_empty()` fallback above: before anyone
                 // has staked there is no set to weigh a certificate against, and every node's own
@@ -3794,12 +3805,32 @@ async fn sync_blocks_from_peer(
                 // make the first blocks of any chain unsyncable, for everyone, forever. As soon as
                 // a set exists this check applies with no exception.
                 if set.total_voting_power() > 0 {
-                let certificate = commit_sigs_to_votes(
-                    successor.header.last_commit.clone(),
-                    h,
-                    block.hash(),
-                );
-                if !set.precommits_reach_quorum(&certificate, h, &block.hash()) {
+                // The successor's `last_commit` where there is one; for the chain tip — the only
+                // block with no successor anywhere — the peer's `/sync/tip-certificate` (#133),
+                // which exists for exactly this and is already used by the other catch-up paths.
+                let certificate = match blocks.get(idx + 1) {
+                    Some(successor) => commit_sigs_to_votes(
+                        successor.header.last_commit.clone(),
+                        h,
+                        block.hash(),
+                    ),
+                    None => fetch_tip_certificate(peer_url, h, block.hash()).await,
+                };
+                if certificate.is_empty() {
+                    // No certificate obtainable — an older peer, or one that just restarted with
+                    // an empty tip-certificate cell. Applied on the pre-#136 terms rather than
+                    // refused: holding the tip back would leave this node one block short, and a
+                    // validator one block short of a small set stops the chain outright (#137).
+                    // That failure has happened and cost 14.5 hours; this one is hypothetical and
+                    // requires the operator's own sync peer to be hostile.
+                    warn!(
+                        height = h,
+                        peer = %peer_url,
+                        "Applying the chain tip without a quorum certificate — this peer served \
+                         none. The block is signed by a set member and chains correctly, but its \
+                         finality is unproven until a successor arrives."
+                    );
+                } else if !set.precommits_reach_quorum(&certificate, h, &block.hash()) {
                     store.save_chain_state(chain_state)?;
                     anyhow::bail!(
                         "block {} from sync peer is not backed by a BFT quorum — its successor's \
@@ -3829,13 +3860,13 @@ async fn sync_blocks_from_peer(
             chain_state.applied_height = h;
             store.put_block(block.clone())?;
             expected_prev_hash = block.hash();
+            total_applied += 1;
             if h % 1000 == 0 {
                 info!("Synced block {}", h);
             }
         }
-        total_applied += blocks.len() as u64;
-        from += blocks.len() as u64;
-        if blocks.len() < 200 {
+        from += apply_count as u64;
+        if !peer_has_more {
             break; // last batch — we're at the peer tip
         }
     }
@@ -4389,6 +4420,127 @@ mod sync_blocks_from_peer_tests {
             "block 1 was already applied by the aborted sync — executing it again mints its reward \
              twice and puts this node on a different state than its peers",
         );
+    }
+
+    /// Like `serve_blocks`, but also serves `/sync/tip-certificate` for the last block — what a
+    /// current peer does. Lets a syncing node prove the chain tip, which has no successor to
+    /// certify it (backlog #158).
+    async fn serve_blocks_with_tip_certificate(blocks: Vec<Block>, certifiers: &[&KeyPair]) -> String {
+        let tip = blocks.last().expect("need at least one block").clone();
+        let cert = TipCertificate {
+            height: tip.height(),
+            block_hash: tip.hash().to_hex(),
+            signatures: certifiers
+                .iter()
+                .map(|c| commit_sig_for(c, tip.height(), &tip.hash()))
+                .collect(),
+        };
+        let blocks = Arc::new(blocks);
+        let app = Router::new()
+            .route(
+                "/sync/blocks",
+                get(move |Query(params): Query<HashMap<String, String>>| {
+                    let blocks = blocks.clone();
+                    async move {
+                        let from: u64 =
+                            params.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let count: usize =
+                            params.get("count").and_then(|s| s.parse().ok()).unwrap_or(200);
+                        let page: Vec<Block> = blocks
+                            .iter()
+                            .filter(|b| b.height() >= from)
+                            .take(count)
+                            .cloned()
+                            .collect();
+                        Json(page)
+                    }
+                }),
+            )
+            .route("/sync/tip-certificate", get(move || {
+                let cert = cert.clone();
+                async move { Json(cert) }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    /// Backlog #160: the number an abort message quotes has to be the number of blocks actually
+    /// persisted. It was incremented once per batch, so an abort partway through reported zero
+    /// while blocks were already on disk — read by whoever decides, after an interrupted sync,
+    /// whether the node needs cleaning up. Same class as #150: a diagnostic that invites the wrong
+    /// action.
+    #[tokio::test]
+    async fn an_aborted_sync_reports_how_many_blocks_it_really_applied() {
+        let kp = KeyPair::generate();
+        let mut blocks = chained_blocks(&kp, &[1, 2, 3, 4]);
+        // Block 4 is signed by nobody in the set — the sync must stop there, having applied 1-3.
+        let stranger = KeyPair::generate();
+        blocks[3] = signed_block(&stranger, 4, blocks[2].hash());
+        blocks[3].header.last_commit = vec![commit_sig_for(&kp, 3, &blocks[2].hash())];
+        blocks[3].header.signature =
+            stranger.sign(blocks[3].header.signing_hash().as_bytes()).unwrap();
+        let peer_url = serve_blocks(blocks).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &kp);
+
+        let err = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+            .await
+            .expect_err("a block from outside the set must abort the sync");
+
+        assert_eq!(store.latest_height(), 3, "precondition: three blocks really were applied");
+        assert!(
+            err.to_string().contains("3 block(s) already applied"),
+            "the message must say how many are on disk, not zero: {err}"
+        );
+    }
+
+    /// Backlog #158: the chain tip is the one block with no successor to certify it, and before
+    /// this it was applied on nothing but a signature. A peer's `/sync/tip-certificate` (#133) is
+    /// exactly that missing proof, and it was already being served — just never consulted here.
+    #[tokio::test]
+    async fn the_chain_tip_is_certified_from_the_peers_tip_certificate() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
+        let peer_url = serve_blocks_with_tip_certificate(blocks, &[&a, &b]).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &a);
+        stake_validator(&mut chain_state, &b);
+
+        let applied = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+            .await
+            .expect("a chain whose tip is certified must sync in full");
+
+        assert_eq!(applied, 3, "including the tip");
+        assert_eq!(store.latest_height(), 3);
+    }
+
+    /// And the tip must be refused when the certificate the peer serves does not carry a quorum —
+    /// otherwise consulting it proves nothing. Here the tip is certified by one of two validators.
+    #[tokio::test]
+    async fn a_tip_whose_certificate_is_short_of_quorum_is_refused() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
+        // Tip certificate signed by A alone — half the power, short of the threshold.
+        let peer_url = serve_blocks_with_tip_certificate(blocks, &[&a]).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &a);
+        stake_validator(&mut chain_state, &b);
+
+        let err = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+            .await
+            .expect_err("a tip certificate short of quorum must not pass");
+        assert!(err.to_string().contains("not backed by a BFT quorum"), "{err}");
+        assert_eq!(store.latest_height(), 2, "the certified blocks below it stay applied");
     }
 
     /// Backlog #136, the hole this path had since it was written: signature + set membership +
