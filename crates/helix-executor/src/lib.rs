@@ -4482,6 +4482,154 @@ mod tests {
         );
     }
 
+    /// Every nano the chain has ever issued is either held by somebody or burned. Nothing else.
+    ///
+    /// This is the accounting identity the whole ledger rests on, and it was asserted nowhere.
+    /// Two production incidents were violations of it, both found sideways rather than by
+    /// checking it: #142 (a block reward minted twice, spotted as a 1 HLX supply divergence
+    /// between nodes) and #145 (a partially applied sync re-executing a block). Neither would
+    /// have survived this test for one block.
+    ///
+    /// Deliberately a whole-state sum rather than a per-operation check: it catches value created
+    /// or destroyed anywhere, by any path, including ones nobody thought to test. That is the
+    /// point — the two incidents came from paths nobody had thought about.
+    fn total_value_held(state: &ChainState) -> u128 {
+        let accounts: u128 = state
+            .accounts
+            .values()
+            .map(|a| {
+                u128::from(a.balance) + u128::from(a.staked) + u128::from(a.unbonding_stake)
+            })
+            .sum();
+        // Delegated capital leaves the delegator's balance and lives in the validator's pool.
+        let pools: u128 = state
+            .validator_pools
+            .values()
+            .map(|p| u128::from(p.total_delegated_stake))
+            .sum();
+        accounts + pools
+    }
+
+    fn assert_ledger_balances(state: &ChainState, after: &str) {
+        let held = total_value_held(state);
+        let accounted = u128::from(state.total_issued) - u128::from(state.total_burned);
+        assert_eq!(
+            held, accounted,
+            "ledger identity broken after {after}: {held} nano held across accounts and pools, \
+             but issued-minus-burned says {accounted} — value was created or destroyed",
+        );
+    }
+
+    #[test]
+    fn the_ledger_never_creates_or_destroys_value() {
+        let alice_kp = KeyPair::generate();
+        let alice = Address::from_public_key(&alice_kp.public);
+        let bob_kp = KeyPair::generate();
+        let bob = Address::from_public_key(&bob_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state =
+            ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        // Seed as genesis does: issued capital, held by somebody.
+        let seed = 1_000_000 * crate::genesis::NANO_PER_HLX;
+        state.update_account(&alice, |a| a.balance = seed);
+        state.total_issued = seed;
+        assert_ledger_balances(&state, "genesis seeding");
+
+        let mut nonce = 0u64;
+        let mut height = 1u64;
+        let next = |txs: Vec<Transaction>, h: u64| {
+            let mut b = empty_block(&validator, h);
+            b.header.base_fee_per_byte = 1; // non-zero: exercises the burn half of every fee
+            b.transactions = txs;
+            b
+        };
+
+        // A plain transfer: fee split between burn and validator, reward minted.
+        let transfer = signed_tx(
+            &alice_kp,
+            &alice,
+            TxType::Transfer,
+            Some(bob.clone()),
+            1_000 * crate::genesis::NANO_PER_HLX,
+            vec![],
+            nonce,
+            100_000_000,
+        );
+        nonce += 1;
+        execute_block(&mut state, &next(vec![transfer], height), None);
+        assert_ledger_balances(&state, "a transfer with a burned base fee");
+        height += 1;
+
+        // Staking moves value between fields of the same account.
+        let stake = signed_tx(
+            &alice_kp,
+            &alice,
+            TxType::Stake,
+            None,
+            200_000 * crate::genesis::NANO_PER_HLX,
+            vec![],
+            nonce,
+            100_000_000,
+        );
+        nonce += 1;
+        execute_block(&mut state, &next(vec![stake], height), None);
+        assert_ledger_balances(&state, "a stake");
+        height += 1;
+
+        // Delegation moves value out of an account and into a pool — the easiest place for a
+        // sum to double-count or lose it.
+        let delegate = signed_tx(
+            &bob_kp,
+            &bob,
+            TxType::Delegate,
+            Some(alice.clone()),
+            500 * crate::genesis::NANO_PER_HLX,
+            vec![],
+            0,
+            100_000_000,
+        );
+        execute_block(&mut state, &next(vec![delegate], height), None);
+        assert_ledger_balances(&state, "a delegation");
+        height += 1;
+
+        // Unstaking moves it again, into the unbonding field.
+        let unstake = signed_tx(
+            &alice_kp,
+            &alice,
+            TxType::Unstake,
+            None,
+            50_000 * crate::genesis::NANO_PER_HLX,
+            vec![],
+            nonce,
+            100_000_000,
+        );
+        execute_block(&mut state, &next(vec![unstake], height), None);
+        assert_ledger_balances(&state, "an unstake into unbonding");
+        height += 1;
+
+        // And a stretch of empty blocks, which mint rewards and nothing else.
+        for _ in 0..5 {
+            execute_block(&mut state, &next(vec![], height), None);
+            assert_ledger_balances(&state, "an empty block minting its reward");
+            height += 1;
+        }
+
+        // Slashing destroys value on purpose — the one legitimate way capital leaves the ledger
+        // besides fee burn, and it reaches stake, delegation pools and unbonding capital at once.
+        // Left out, the identity would go unchecked across the paths most likely to miscount.
+        let burned_before = state.total_burned;
+        state.slash(&alice, 500);
+        assert!(state.total_burned > burned_before, "precondition: the slash really burned stake");
+        assert_ledger_balances(&state, "a slash across stake, pool and unbonding capital");
+
+        assert!(state.total_burned > 0, "the run must actually have burned something");
+        assert!(
+            state.total_issued > seed,
+            "and minted something, or the identity held only because nothing happened",
+        );
+    }
+
     #[test]
     fn execute_block_mints_to_reward_address_override_not_the_block_validator() {
         let validator = Address::from_public_key(&KeyPair::generate().public);
