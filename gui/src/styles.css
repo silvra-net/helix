@@ -111,6 +111,14 @@ nav { display: flex; flex-direction: column; gap: 2px; }
   padding: 4px 10px; font-size: 12px; white-space: nowrap;
 }
 
+/* Catch-up notice. Uses the same warning palette as the testnet badge: it reports that what is
+   on screen may be stale, which is a caution rather than an error — the node is working. */
+.sync-banner {
+  background: var(--warn-bg); color: var(--warn);
+  padding: 8px 18px; font-size: 12px; line-height: 1.4;
+  border-bottom: 1px solid var(--border);
+}
+
 .view { padding: 18px; overflow-y: auto; flex: 1; }
 .statusbar {
   display: flex; justify-content: space-between; padding: 8px 18px;

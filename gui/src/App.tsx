@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, DEFAULT_NODE } from "./api";
+import { api, DEFAULT_NODE, LOCAL_NODE, isLocalNode } from "./api";
 import type { NetworkStatus, WalletMeta } from "./types";
 import { shortAddr } from "./format";
 import Setup from "./views/Setup";
@@ -39,6 +39,32 @@ export default function App() {
     refreshMeta();
   }, [refreshMeta]);
 
+  // Use a node already running on this machine, unless the user has chosen one themselves.
+  //
+  // The wallet only ever switched to the local node when *it* started the bundled one (Validate).
+  // A node started any other way — systemd, pm2, `helix start` in a terminal, or the bundled one
+  // left running from a previous session — went unnoticed, and every balance was read off our
+  // server anyway. Running your own node and still asking a stranger is the wrong way round.
+  //
+  // Deliberately not persisted: an address the user never typed must not outlive the node it
+  // points at. Writing it to localStorage would turn a detection into a stated preference, and a
+  // wallet that kept asking a stopped node forever would be worse than one that never looked.
+  useEffect(() => {
+    if (localStorage.getItem("helix-node")) return; // they answered this already
+    let alive = true;
+    (async () => {
+      try {
+        await api.getNetwork(LOCAL_NODE);
+        if (alive) setNode(LOCAL_NODE);
+      } catch {
+        // No node here — the public endpoint stays, which is what makes a fresh install work.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   // Poll network status while a wallet is open, so the header stays live.
   useEffect(() => {
     if (!meta?.unlocked) return;
@@ -59,9 +85,17 @@ export default function App() {
     };
   }, [meta?.unlocked, node]);
 
-  const onNodeChange = (v: string) => {
+  /// Switch which node the wallet reads from.
+  ///
+  /// `persist` separates a *stated preference* from *housekeeping*. Typing an address in Settings
+  /// is the user answering the question, and must survive a restart and suppress auto-detection.
+  /// The Validate screen switching away from a node it just stopped is not an answer — persisting
+  /// that would record "I want the public endpoint" and permanently disable detection of any node
+  /// started later by other means, which is the very thing this is meant to notice.
+  const onNodeChange = (v: string, persist = true) => {
     setNode(v);
-    localStorage.setItem("helix-node", v);
+    if (persist) localStorage.setItem("helix-node", v);
+    else localStorage.removeItem("helix-node");
   };
 
   const lock = async () => {
@@ -142,6 +176,7 @@ export default function App() {
             />
             {net && (
               <span className="net-meta">
+                {isLocalNode(node) && <span title="Reading from a node on this machine">your node · </span>}
                 height {net.height.toLocaleString()} · base fee {net.base_fee_per_byte}
               </span>
             )}
@@ -150,6 +185,18 @@ export default function App() {
             ⚠ Testnet · test token, no value
           </span>
         </header>
+
+        {net?.is_syncing && (
+          // Progress rather than a blackout. A wallet that shows a balance from thousands of
+          // blocks ago with no indication is lying by omission — the number is real, it is just
+          // not now. `sync_target_height` can be absent when no peer has announced a tip yet, in
+          // which case the height alone still says more than silence.
+          <div className="sync-banner" role="status">
+            {typeof net.sync_target_height === "number" && net.sync_target_height > net.height
+              ? `Your node is catching up — ${net.height.toLocaleString()} of ${net.sync_target_height.toLocaleString()} blocks (${((net.height / net.sync_target_height) * 100).toFixed(1)}%). Balances may be out of date.`
+              : `Your node is catching up (at block ${net.height.toLocaleString()}). Balances may be out of date.`}
+          </div>
+        )}
 
         <section className="view">
           {route === "home" && <Overview node={node} height={net?.height} onSend={() => setRoute("send")} onReceive={() => setRoute("receive")} />}

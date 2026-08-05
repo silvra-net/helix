@@ -15,7 +15,7 @@ import { hlx, shortAddr, shortHash } from "../format";
 
 const MAX_CONSOLE_LINES = 2000;
 
-export default function Validate({ node, net, onNodeChange, walletEncrypted }: { node: string; net: NetworkStatus | null; onNodeChange: (url: string) => void; walletEncrypted: boolean }) {
+export default function Validate({ node, net, onNodeChange, walletEncrypted }: { node: string; net: NetworkStatus | null; onNodeChange: (url: string, persist?: boolean) => void; walletEncrypted: boolean }) {
   const [vs, setVs] = useState<ValidatorStatus | null>(null);
   const [ov, setOv] = useState<Overview | null>(null);
   const [pool, setPool] = useState<ValidatorPool | null>(null);
@@ -74,7 +74,7 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
       // helix-node's run()), so this does not strand the wallet: `Connected node` above shows
       // `syncing` with the height climbing until it has caught up.
       if (!isLocalNode(node)) {
-        onNodeChange(LOCAL_NODE);
+        onNodeChange(LOCAL_NODE, false);
         setProcNotice(`Wallet now reading from your own node (${LOCAL_NODE}). It may show "syncing" until it has caught up.`);
       }
     } catch (e) {
@@ -106,7 +106,9 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
       // Back to the public seed, otherwise the wallet points at a node that is no longer there
       // and every screen goes blank with a connection error.
       if (isLocalNode(node)) {
-        onNodeChange(DEFAULT_NODE);
+        // `false`: automatic housekeeping, not a preference the user stated — see App's
+        // `onNodeChange`. Recording it would switch off detection of any node started later.
+        onNodeChange(DEFAULT_NODE, false);
         setProcNotice(`Local node stopped — wallet reading from ${DEFAULT_NODE} again.`);
       }
     } catch (e) {
