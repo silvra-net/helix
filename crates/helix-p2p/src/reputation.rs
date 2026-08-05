@@ -2,6 +2,19 @@ use std::collections::HashSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
+use tracing::warn;
+
+/// Whether this address belongs to a local reverse proxy rather than to the peer itself, in which
+/// case it is shared by every peer arriving through it and says nothing about who misbehaved.
+/// Mirrors `conn_limits::is_proxy_local` — same deployment fact, two places that must both respect
+/// it (backlog #148).
+fn is_shared_proxy_ip(ip: &str) -> bool {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(addr) => addr.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 /// Number of protocol infractions (malformed gossipsub payloads, failed session
 /// handshakes, etc.) a peer may commit before it is disconnected and refused
 /// reconnection for the lifetime of this process.
@@ -95,7 +108,31 @@ impl PeerReputation {
         if *strikes >= BAN_THRESHOLD {
             insert_bounded(&mut self.banned, &mut self.banned_order, peer.to_string(), MAX_BANNED_ENTRIES);
             if let Some(ip) = self.peer_ip.get(peer) {
-                insert_bounded(&mut self.banned_ips, &mut self.banned_ips_order, ip.clone(), MAX_BANNED_ENTRIES);
+                // Banning the IP alongside the peer assumes the IP identifies *whoever* is
+                // misbehaving — true for a directly reachable listener, false behind a reverse
+                // proxy, where every peer shares the proxy's loopback address (backlog #148,
+                // measured on production: all inbound connections arrive from 127.0.0.1).
+                //
+                // There the IP ban is collective punishment with the whole validator set as the
+                // collective: five infractions from one peer — malicious, or merely running a
+                // broken build — would refuse every honest validator's connections and stall the
+                // chain outright. That is a far worse outcome than the Sybil case the IP ban
+                // exists to raise the cost of, and the Sybil case is one it cannot address here
+                // anyway, since the attacker's address is the same as everyone else's.
+                //
+                // The peer ban above is untouched and does the real work: it is keyed on the
+                // PeerId, which stays meaningful no matter what the connection travelled through.
+                if is_shared_proxy_ip(ip) {
+                    warn!(
+                        peer = %peer,
+                        ip = %ip,
+                        "Banning this peer, but not its address — peers reach this node through a \
+                         local proxy, so the address is shared with every other peer and banning \
+                         it would lock them all out."
+                    );
+                } else {
+                    insert_bounded(&mut self.banned_ips, &mut self.banned_ips_order, ip.clone(), MAX_BANNED_ENTRIES);
+                }
             }
             true
         } else {
@@ -170,6 +207,49 @@ mod tests {
             rep.record_infraction("peer-a");
         }
         assert!(rep.record_infraction("peer-a"));
+    }
+
+    /// Backlog #148: behind the production tunnel every peer connects from `127.0.0.1`, so banning
+    /// the address of one misbehaving peer would refuse *every* validator and stall the chain —
+    /// five malformed messages from one broken build would be enough. The peer ban still has to
+    /// bite; only the collective half is dropped.
+    #[test]
+    fn banning_a_peer_behind_a_proxy_does_not_ban_the_shared_address() {
+        let mut rep = PeerReputation::new();
+        rep.note_connection("peer-bad", "127.0.0.1");
+        rep.note_connection("peer-honest", "127.0.0.1");
+
+        for _ in 0..BAN_THRESHOLD {
+            rep.record_infraction("peer-bad");
+        }
+
+        assert!(rep.is_banned("peer-bad"), "the misbehaving peer must still be banned");
+        assert!(
+            !rep.is_banned("peer-honest"),
+            "an unrelated peer sharing the proxy's address must not be caught by it"
+        );
+        assert!(
+            !rep.note_connection("peer-honest", "127.0.0.1"),
+            "and it must still be able to connect"
+        );
+    }
+
+    /// The control: on a directly reachable node the address really is the peer's, and the IP ban
+    /// is the Sybil cost it was built to impose. An exemption that widened past loopback would
+    /// silently remove that.
+    #[test]
+    fn banning_a_peer_on_a_routable_address_still_bans_the_address() {
+        let mut rep = PeerReputation::new();
+        rep.note_connection("peer-bad", "203.0.113.7");
+        for _ in 0..BAN_THRESHOLD {
+            rep.record_infraction("peer-bad");
+        }
+
+        assert!(rep.is_banned("peer-bad"));
+        assert!(
+            rep.note_connection("peer-fresh-identity", "203.0.113.7"),
+            "a new PeerId from a banned address must still be refused"
+        );
     }
 
     #[test]
