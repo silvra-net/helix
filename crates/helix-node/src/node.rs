@@ -723,13 +723,45 @@ impl HelixNode {
                 let mut cs = self.chain_state.write().await;
                 sync_blocks_from_peer(&peer_url, local_tip, &mut s, &mut cs).await
             };
+            let failed = result.is_err();
             match result {
                 Ok(synced) => info!(applied = synced, "Block sync complete"),
                 // Same tolerance as before this moved out of the constructor: an
                 // unreachable peer must not stop the node, it just starts from what it has.
                 Err(e) => warn!(error = %e, "Block sync failed (continuing anyway)"),
             }
-            self.syncing.store(false, std::sync::atomic::Ordering::Relaxed);
+
+            // Clearing this unconditionally — as this used to — lets a node that failed to sync
+            // start producing and voting on whatever height it happens to hold (backlog #152).
+            //
+            // For a follower "carry on with what you have" is right, and is what the tolerance
+            // above is for. For a validator with no chain it is the worst available outcome: it
+            // votes at height 1, every peer rejects those votes ("vote is for height=1/round=N,
+            // expected …"), and it is simply absent from the quorum. On a small set that stops the
+            // chain — and the node cannot recover through this gate, because `syncing` is never
+            // set back to true anywhere.
+            //
+            // The condition is deliberately *not* "the sync failed". A validator whose chain is
+            // complete and whose peer is briefly unreachable must keep validating; refusing that
+            // would turn every transient network blip into an outage — the opposite mistake, and a
+            // worse one. What actually disqualifies a node is having meant to join an existing
+            // chain and holding none of it: `sync_peer` configured, and nothing above genesis.
+            //
+            // Released again by the periodic RPC catch-up once it has drawn level (see
+            // `rpc_sync_loop`), which is the same peer this just failed against — so a peer that
+            // was merely down for a moment costs one poll interval, not the session.
+            let have_no_chain = self.store.read().await.latest_height() == 0;
+            if hold_production_after_failed_sync(failed, have_no_chain) {
+                warn!(
+                    peer = %peer_url,
+                    "Holding block production: this node has no chain yet and could not sync from \
+                     its peer. It will not propose or vote until it has caught up — a validator \
+                     voting at height 0 is invisible to the network and only removes itself from \
+                     the quorum. Retrying in the background; check that the sync peer is reachable."
+                );
+            } else {
+                self.syncing.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         // Keep the tip height announced to peers (#137) in step with the store.
@@ -899,6 +931,7 @@ impl HelixNode {
             self.mempool.clone(),
             last_applied_height.clone(),
             tip_certificate.clone(),
+            self.syncing.clone(),
         ));
 
         // Validator health heartbeat — logs "am I actually validating?" on its own timer, so an
@@ -2433,6 +2466,26 @@ fn health_verdict(
     }
 }
 
+/// Whether a failed startup sync must hold block production (backlog #152).
+///
+/// `sync_peer` being configured at all means this node set out to join an existing chain. If the
+/// sync then failed *and* it holds nothing above genesis, it has no chain to validate — and a
+/// validator voting at height 0 is not merely useless: every peer rejects those votes as being for
+/// the wrong height, so it is absent from the quorum while appearing to run. On a small set that
+/// stops the chain, and nothing sets `syncing` back to true, so it never recovers on its own.
+///
+/// Note what is deliberately *not* a reason to hold: a sync that failed while this node already
+/// has a chain. That node is very likely current, or close to it, and its peer was merely
+/// unreachable for a moment — holding there would convert every transient network blip into an
+/// outage, which is the same class of harm in the other direction and a good deal more common.
+///
+/// The realistic path into the held state is not an unreachable peer (genesis is fetched from the
+/// same peer moments earlier and fails the startup outright), but a block sync that begins and
+/// then breaks — which, pulling six figures of blocks over RPC, is entirely ordinary.
+fn hold_production_after_failed_sync(sync_failed: bool, no_chain_above_genesis: bool) -> bool {
+    sync_failed && no_chain_above_genesis
+}
+
 /// Consecutive health beats the block production loop may show no progress before it is reported
 /// as dead (backlog #151).
 ///
@@ -3440,6 +3493,9 @@ async fn rpc_sync_loop(
     mempool: Arc<RwLock<Mempool>>,
     last_applied_height: Arc<Mutex<u64>>,
     tip_certificate: Arc<RwLock<TipCertificate>>,
+    // Cleared once this loop finds we have drawn level with the peer. A startup sync that failed
+    // with no chain leaves it set, which holds block production until then (backlog #152).
+    syncing: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let Some(peer_url) = sync_peer else {
         return; // standalone chain (HELIX_NEW_CHAIN) — nothing to catch up from
@@ -3470,6 +3526,15 @@ async fn rpc_sync_loop(
         };
         let our_height = store.read().await.latest_height();
         if peer_height <= our_height {
+            // Level with the peer. If a failed startup sync left production held (#152), this is
+            // the moment it is safe to release: we have what the peer has. Ordinary ticks reach
+            // here constantly and the store is a no-op after the first, so this costs nothing.
+            if syncing.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                info!(
+                    height = our_height,
+                    "Caught up with the sync peer — resuming block production"
+                );
+            }
             continue;
         }
 
@@ -3727,6 +3792,68 @@ mod sync_blocks_from_peer_tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{}", addr)
+    }
+
+    /// A peer that reports a fixed committed height on `/status` — the one field
+    /// `fetch_peer_height` reads.
+    async fn serve_height(height: u64) -> String {
+        let app = Router::new().route(
+            "/status",
+            get(move || async move { Json(serde_json::json!({ "height": height })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    /// Backlog #152, and the half that decides whether the fix is an improvement or a new outage:
+    /// production held after a failed startup sync **must** be released once this node is level
+    /// with its peer. Get this wrong and a node that was briefly unable to sync never validates
+    /// again — worse than the bug it replaces, and silent.
+    ///
+    /// Against a real HTTP peer rather than by calling the predicate: what matters is that the
+    /// running loop reaches the release, and its path there (build a client, probe /status, compare
+    /// heights) is exactly the part a direct call would skip.
+    #[tokio::test]
+    async fn catching_up_with_the_peer_releases_held_block_production() {
+        // Peer reports height 0; our store is a fresh one, also 0 — level, so nothing to fetch.
+        let peer_url = serve_height(0).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        let addr = Address::from_public_key(&KeyPair::generate().public);
+        let vset = ValidatorSet::new(vec![Validator::new(addr.clone(), 1, true)], 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr, 0)));
+        // Held, as a failed startup sync with no chain would leave it.
+        let syncing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let handle = tokio::spawn(rpc_sync_loop(
+            Some(peer_url),
+            store.clone(),
+            chain_state.clone(),
+            engine.clone(),
+            Arc::new(RwLock::new(Mempool::new())),
+            Arc::new(Mutex::new(0u64)),
+            Arc::new(RwLock::new(TipCertificate::default())),
+            syncing.clone(),
+        ));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline
+            && syncing.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        handle.abort();
+
+        assert!(
+            !syncing.load(std::sync::atomic::Ordering::Relaxed),
+            "a node level with its peer must be released to produce again — otherwise a node that \
+             failed one startup sync stays mute for the life of the process"
+        );
     }
 
     fn fresh_store() -> HelixDb {
@@ -4276,6 +4403,33 @@ mod validator_health_tests {
             advice.contains("Do NOT delete"),
             "must warn against wiping the data directory: {advice}"
         );
+    }
+
+    /// Backlog #152, the failure this exists for: a validator that meant to join a chain, could
+    /// not sync it, and holds nothing — it must not vote. Its votes are for height 0/1, every peer
+    /// rejects them as being for the wrong height, and it is simply missing from the quorum while
+    /// looking alive. That is how a node sat at height 1 for 21 hours through the outage of
+    /// 2026-08-04 while the chain it was supposed to be validating stood still.
+    #[test]
+    fn a_validator_that_failed_to_sync_and_has_no_chain_must_not_produce() {
+        assert!(hold_production_after_failed_sync(true, true));
+    }
+
+    /// The control, and the more important half: a node whose chain is already there must keep
+    /// validating when its peer is briefly unreachable. Holding *that* would turn every transient
+    /// network blip into an outage — the same harm in the other direction, and far more frequent.
+    /// A fix that simply held on any failed sync would pass the test above and cause this.
+    #[test]
+    fn a_node_that_already_has_a_chain_keeps_producing_when_a_sync_fails() {
+        assert!(!hold_production_after_failed_sync(true, false));
+    }
+
+    /// And a successful sync never holds, whatever the height — including the legitimate case of
+    /// joining a chain that is genuinely still at genesis.
+    #[test]
+    fn a_successful_sync_never_holds_production() {
+        assert!(!hold_production_after_failed_sync(false, true));
+        assert!(!hold_production_after_failed_sync(false, false));
     }
 
     /// Backlog #151. A production loop that keeps ticking must never be reported dead — a normal
