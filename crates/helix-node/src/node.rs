@@ -63,6 +63,10 @@ const DEFAULT_VALIDATOR_KEY_FILE: &str = "validator-key.json";
 /// P2P port isn't publicly reachable (it runs behind a Cloudflare HTTPS tunnel). Opt out with
 /// `HELIX_NEW_CHAIN=1` to run a standalone chain instead (the production origin node and any
 /// local devnet do this). Override the endpoint itself with `HELIX_SYNC_PEER`.
+/// The chain database's filename, in the working directory. Named because the run record sits
+/// beside it and both paths have to agree.
+const CHAIN_DB_FILE: &str = "helix-data.redb";
+
 pub const DEFAULT_SEED_PEER: &str = "https://helix.silvra.net";
 
 /// The genesis hash of the public Helix chain, compiled in so joining it is verified by default.
@@ -415,8 +419,24 @@ impl HelixNode {
         info!("PK fingerprint    : {}", keypair.public.fingerprint());
 
         // Persistent redb-backed store — blocks + chain state survive restarts.
-        let db_path = PathBuf::from("helix-data.redb");
+        let db_path = PathBuf::from(CHAIN_DB_FILE);
         let mut store = HelixDb::open(&db_path)?;
+
+        // How the last run ended, before anything else can overwrite the evidence.
+        //
+        // A node that stops answering is the most common thing an operator has to diagnose, and
+        // until now nothing distinguished a clean stop from a crash, an OOM kill or a hard
+        // `kill -9` — the log simply ended. That made "why does my node keep dying?" genuinely
+        // unanswerable, including for us when a validator's absence stalls the chain.
+        let run_record_path = crate::run_record::path_beside(&db_path);
+        {
+            let previous = crate::run_record::begin_run(
+                &run_record_path,
+                env!("CARGO_PKG_VERSION"),
+                store.latest_height(),
+            );
+            crate::run_record::report_previous_run(previous.as_ref());
+        }
 
         // Personhood authorities — only takes effect for a fresh chain (see below); an
         // existing chain's authorities (if any) were already persisted at its own genesis.
@@ -1167,9 +1187,45 @@ impl HelixNode {
             production_ticks,
         ));
 
+        // SIGTERM as well as SIGINT. `ctrl_c()` alone catches only SIGINT, which pm2 sends —
+        // but systemd and Docker send SIGTERM, so on those the orderly stop would have looked
+        // exactly like a crash in the run record below. A "your node was killed" warning that
+        // fires on every planned restart is worse than no warning: it is the kind of false alarm
+        // that teaches operators to ignore the line, and this line has to be believed the one
+        // time it is real.
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .ok();
+        let terminate = async {
+            match sigterm.as_mut() {
+                Some(s) => {
+                    s.recv().await;
+                }
+                // No SIGTERM handler (non-Unix, or the handler could not be installed): fall back
+                // to never firing, so SIGINT still works and nothing else changes.
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                info!("Shutdown signal received.");
+                info!("Shutdown signal received (SIGINT).");
+                // Only this path is an orderly stop. A panic in the block loop below is not, and
+                // must stay indistinguishable from a kill in the record — otherwise the next
+                // start would report a crash as a clean shutdown, which is the one lie this
+                // mechanism must not tell.
+                crate::run_record::mark_clean(
+                    &crate::run_record::path_beside(std::path::Path::new(CHAIN_DB_FILE)),
+                    self.store.read().await.latest_height(),
+                );
+            }
+            _ = terminate => {
+                info!("Shutdown signal received (SIGTERM).");
+                crate::run_record::mark_clean(
+                    &crate::run_record::path_beside(std::path::Path::new(CHAIN_DB_FILE)),
+                    self.store.read().await.latest_height(),
+                );
             }
             res = block_loop => {
                 if let Err(e) = res { error!("Block loop panicked: {}", e); }
@@ -2920,6 +2976,15 @@ async fn validator_health_loop(
         // Enough history and past the startup settle before we're allowed to warn.
         let past_grace =
             started.elapsed().as_secs() >= HEALTH_START_GRACE_SECS && height > HEALTH_SIGN_WINDOW;
+
+        // Keep the run record's "last seen" moving, so a run that is killed can still say when
+        // it was last alive — the timestamp that lines up against `dmesg`/journalctl. Written from
+        // here rather than the consensus path because this loop keeps running when that one is
+        // wedged, which is exactly the run whose ending needs explaining.
+        crate::run_record::touch(
+            &crate::run_record::path_beside(std::path::Path::new(CHAIN_DB_FILE)),
+            height,
+        );
 
         let quorum_missing = quorum_peers_missing.load(Ordering::Relaxed);
         let silent_peers = silent_peer_validators.load(Ordering::Relaxed);

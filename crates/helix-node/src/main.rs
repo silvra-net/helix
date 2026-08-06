@@ -5,6 +5,7 @@ use tracing::info;
 mod config;
 mod local_node;
 mod node;
+mod run_record;
 mod signing_guard;
 
 /// Helix — one binary for everything. `helix start` runs the node daemon; every other
