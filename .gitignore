@@ -16,6 +16,11 @@
 # Peers this node has met (helix_p2p::peer_store) — machine-local, like the chain data.
 /helix-peers.txt
 /helix-peers.tmp
+# How the last run ended (helix_node::run_record) — machine-local diagnostics.
+/helix-last-run.json
+/helix-last-run.tmp
+# Binaries pulled from a running process during a deploy (R5).
+/helix-*.bak
 # Scripts (Cron/Dev-Loop — nur lokal)
 /scripts/
 /CLAUDE.md
