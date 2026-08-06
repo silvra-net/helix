@@ -316,6 +316,28 @@ impl BftEngine {
     /// current round instead of advancing (and running ahead of validators that
     /// will join at round 0). Zero for a single-validator set, where this node's
     /// own power already meets quorum and block production never waits on peers.
+    /// How many *other* validators have been silent long enough to be reported as the reason the
+    /// round is not closing — the same threshold that produces the "Validator silent" warnings.
+    ///
+    /// Exists so the health loop can tell two situations apart that look identical from outside
+    /// the consensus path: this node has stopped participating, or this node is fine and waiting
+    /// on somebody else. Those call for opposite actions, and until now the health line gave the
+    /// same advice for both — telling the operator of a perfectly healthy node to restart it.
+    /// Confirmed live on 2026-08-06: peers connected, one validator silent for 86 rounds, and the
+    /// health line recommended a restart that demonstrably changed nothing.
+    ///
+    /// Note carefully what this counts, because the name invites the wrong reading (R2): it is
+    /// validators whose votes *this node is not seeing*. That is not the same as validators that
+    /// are down — on 2026-07-29 a validator was reported silent 596 times while producing blocks
+    /// perfectly well, because the missing piece was the link between them, not the peer. Anything
+    /// phrased on top of this must say "not seeing their votes", never "they are offline".
+    pub fn silent_peer_validators(&self) -> usize {
+        self.missed_rounds
+            .values()
+            .filter(|missed| **missed >= LIVENESS_SILENCE_WARN_ROUNDS)
+            .count()
+    }
+
     pub fn peers_needed_for_quorum(&self) -> usize {
         let quorum = self.validator_set.quorum_threshold();
         let my_power = self
@@ -3416,6 +3438,36 @@ mod tests {
         assert!(
             engine.missed_rounds.get(&peer_addr).copied().unwrap_or(0) >= SILENT_ROUNDS,
             "the silence must still be counted, so the node can name who it is waiting for"
+        );
+    }
+
+    /// What `silent_peer_validators` counts, pinned at the boundary.
+    ///
+    /// The health line acts on this number: above zero it tells the operator that restarting
+    /// *their* node will not help. Counting a single missed round would fire that on ordinary
+    /// gossip delay and teach people to ignore it — the same way the old unconditional "restart"
+    /// advice became noise.
+    #[test]
+    fn a_validator_is_not_counted_as_silent_after_one_missed_round() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+
+        tick_to_timeout_and_advance(&mut engine, &v.self_kp);
+        assert_eq!(
+            engine.silent_peer_validators(),
+            0,
+            "one missed round is gossip delay or a restart, not a reason to tell somebody their \
+             node is fine and someone else's is not"
+        );
+
+        for _ in 0..LIVENESS_SILENCE_WARN_ROUNDS {
+            tick_to_timeout_and_advance(&mut engine, &v.self_kp);
+        }
+        assert_eq!(
+            engine.silent_peer_validators(),
+            1,
+            "sustained silence is exactly what the health line needs to know about"
         );
     }
 
