@@ -279,3 +279,12 @@ button.mini { padding: 4px 9px; font-size: 12px; }
 .picker-row:hover:not(:disabled) { background: var(--surface-2); }
 .picker-row.active { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .picker-row:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* The one-time offer to run your own node (see nodePrompt.ts). Sits above the balance on
+   Overview, using the ordinary card surface rather than the warning palette: this is a choice
+   worth making, not a problem to fix, and dressing it as an alert would be the same
+   attention-grabbing that makes people click past prompts without reading them. */
+.own-node-offer { display: flex; flex-direction: column; gap: 12px; }
+.own-node-offer p { margin: 6px 0 0; line-height: 1.5; }
+.own-node-offer strong { font-size: 15px; }
+.tiny { font-size: 12px; margin: 0; }

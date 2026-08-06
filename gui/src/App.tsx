@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, DEFAULT_NODE, LOCAL_NODE, isLocalNode } from "./api";
 import { nextNode } from "./nodeChoice";
+import { nodeOfferAnswered, shouldOfferOwnNode } from "./nodePrompt";
+import OwnNodeOffer from "./components/OwnNodeOffer";
 import type { NetworkStatus, WalletMeta } from "./types";
 import { shortAddr } from "./format";
 import Setup from "./views/Setup";
@@ -27,6 +29,9 @@ export default function App() {
   const [route, setRoute] = useState<Route>("home");
   const [net, setNet] = useState<NetworkStatus | null>(null);
   const [newMnemonic, setNewMnemonic] = useState<string | null>(null);
+  // Read once at mount: localStorage is not reactive, and re-reading it every render would
+  // make the card flicker back after a click until the next re-render settled.
+  const [nodeOfferOpen, setNodeOfferOpen] = useState(!nodeOfferAnswered());
 
   const refreshMeta = useCallback(async () => {
     try {
@@ -50,10 +55,11 @@ export default function App() {
   // Deliberately not persisted: an address the user never typed must not outlive the node it
   // points at. Writing it to localStorage would turn a detection into a stated preference, and a
   // wallet that kept asking a stopped node forever would be worse than one that never looked.
-  // Runs once, before the wallet is unlocked, so an existing node is already in use by the time
-  // the first balance is drawn. The polling effect below applies the same rule from then on —
-  // through `nextNode` in both places, so there is one definition of when the wallet switches
-  // rather than two that can drift apart.
+  //
+  // This pass runs before the wallet is unlocked, so an existing node is already in use by the
+  // time the first balance is drawn. The polling effect below applies the same rule from then on,
+  // through `nextNode` in both places — one definition of when the wallet switches, not two that
+  // can drift apart.
   useEffect(() => {
     if (localStorage.getItem("helix-node")) return; // they answered this already
     let alive = true;
@@ -244,7 +250,27 @@ export default function App() {
         )}
 
         <section className="view">
-          {route === "home" && <Overview node={node} height={net?.height} onSend={() => setRoute("send")} onReceive={() => setRoute("receive")} />}
+          {route === "home" && (
+            <>
+              {/* Offered above the balance rather than below it: this is a question about where
+                  the number underneath comes from, and after the balance it reads as an
+                  advertisement for a feature rather than a caveat about the figure. */}
+              {shouldOfferOwnNode({
+                answered: !nodeOfferOpen,
+                usingLocalNode: isLocalNode(node),
+                stated: localStorage.getItem("helix-node") !== null,
+              }) && (
+                <OwnNodeOffer
+                  onSetUp={() => {
+                    setNodeOfferOpen(false);
+                    setRoute("validate");
+                  }}
+                  onDismiss={() => setNodeOfferOpen(false)}
+                />
+              )}
+              <Overview node={node} height={net?.height} onSend={() => setRoute("send")} onReceive={() => setRoute("receive")} />
+            </>
+          )}
           {route === "send" && <Send node={node} baseFee={net?.base_fee_per_byte} onDone={() => setRoute("home")} />}
           {route === "receive" && <Receive address={meta.address ?? ""} />}
           {route === "validate" && <Validate node={node} net={net} onNodeChange={onNodeChange} walletEncrypted={meta.encrypted} />}
