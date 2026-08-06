@@ -18,14 +18,13 @@ pub async fn run(cmd: ValidatorCmd, node: &str) -> Result<()> {
 }
 
 async fn show_pool(address: &str, node: &str) -> Result<()> {
-    let res: serde_json::Value = reqwest::get(format!("{}/validators/{}/pool", node, address))
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        anyhow::bail!("Invalid address: {}", err);
-    }
+    let res = super::get_optional(
+        node,
+        &format!("/validators/{}/pool", address),
+        "read the validator's delegation pool",
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("this chain has no record of {}", address))?;
 
     println!("Validator: {}", address);
     println!("─────────────────────────────────────────");

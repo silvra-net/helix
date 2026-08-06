@@ -373,8 +373,19 @@ pub async fn submit_tx(node: &str, tx: &Transaction) -> Result<SubmitResult, Str
         return Err(reason.to_string());
     }
 
+    // Acceptance *is* the node handing back the hash it stored. A 2xx without one did not come
+    // from a node accepting a transaction, and an empty hash on screen reads as "sent" — the
+    // wallet would be showing a receipt for something that was never submitted.
+    let tx_hash = body
+        .get("tx_hash")
+        .and_then(|v| v.as_str())
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| {
+            format!("{node} accepted the request but returned no transaction hash — the transaction was NOT submitted")
+        })?;
+
     Ok(SubmitResult {
-        tx_hash: body.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        tx_hash: tx_hash.to_string(),
         status: body.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string(),
     })
 }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
@@ -74,34 +74,20 @@ async fn attest(address: String, key_path: PathBuf, fee: Option<u64>, node: &str
     println!("  Fee      : {} nano-HLX", tx.fee);
     println!("  Nonce    : {}", nonce);
 
-    let client = reqwest::Client::new();
-    let res: serde_json::Value = client
-        .post(format!("{}/transactions", node))
-        .json(&tx)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("Transaction rejected: {}", err);
-    }
-
+    let res = super::submit_tx(&tx, node).await?;
     println!();
-    println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
-    println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
+    super::report_submitted(&res);
     Ok(())
 }
 
 async fn status(address: String, node: &str) -> Result<()> {
-    let res: serde_json::Value = reqwest::get(format!("{}/accounts/{}/personhood", node, address))
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("{}", err);
-    }
+    let res = super::get_optional(
+        node,
+        &format!("/accounts/{}/personhood", address),
+        "read the personhood status",
+    )
+    .await?
+    .ok_or_else(|| anyhow!("this chain has no record of {}", address))?;
 
     println!("Personhood status for {}:", address);
     println!("  {}", serde_json::to_string_pretty(&res["status"])?);

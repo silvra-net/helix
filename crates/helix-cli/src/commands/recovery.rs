@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
@@ -103,22 +103,9 @@ async fn register_guardians(
     println!("  Fee   : {} nano-HLX", tx.fee);
     println!("  Nonce : {}", nonce);
 
-    let client = reqwest::Client::new();
-    let res: serde_json::Value = client
-        .post(format!("{}/transactions", node))
-        .json(&tx)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("Transaction rejected: {}", err);
-    }
-
+    let res = super::submit_tx(&tx, node).await?;
     println!();
-    println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
-    println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
+    super::report_submitted(&res);
     Ok(())
 }
 
@@ -167,57 +154,51 @@ async fn approve(
     println!("  Fee      : {} nano-HLX", tx.fee);
     println!("  Nonce    : {}", nonce);
 
-    let client = reqwest::Client::new();
-    let res: serde_json::Value = client
-        .post(format!("{}/transactions", node))
-        .json(&tx)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("Transaction rejected: {}", err);
-    }
-
+    let res = super::submit_tx(&tx, node).await?;
     println!();
-    println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
-    println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
+    super::report_submitted(&res);
     Ok(())
 }
 
 async fn status(address: String, node: &str) -> Result<()> {
-    let guardians: serde_json::Value =
-        reqwest::get(format!("{}/accounts/{}/guardians", node, address))
-            .await?
-            .json()
-            .await?;
-    let recovery: serde_json::Value =
-        reqwest::get(format!("{}/accounts/{}/recovery", node, address))
-            .await?
-            .json()
-            .await?;
+    // Both are legitimately absent for an account that never set recovery up, so a 404 here is
+    // an answer rather than a failure — but anything else still has to be reported. Reading a
+    // proxy error page as "no guardians registered" would tell someone their recovery set is
+    // gone at the exact moment they are checking whether they can still get their wallet back.
+    let guardians = super::get_optional(
+        node,
+        &format!("/accounts/{}/guardians", address),
+        "read the guardian set",
+    )
+    .await?;
+    let recovery = super::get_optional(
+        node,
+        &format!("/accounts/{}/recovery", address),
+        "read the recovery status",
+    )
+    .await?;
 
     println!("Recovery status for {}:", address);
-    if guardians.get("error").is_some() {
-        println!("  Guardians: none registered");
-    } else {
-        println!(
+    match &guardians {
+        None => println!("  Guardians: none registered"),
+        Some(g) => println!(
             "  Guardians ({} of {}): {}",
-            guardians["threshold"],
-            guardians["guardians"].as_array().map(|a| a.len()).unwrap_or(0),
-            serde_json::to_string(&guardians["guardians"])?
-        );
+            g["threshold"],
+            g["guardians"].as_array().map(|a| a.len()).unwrap_or(0),
+            serde_json::to_string(&g["guardians"])?
+        ),
     }
-    if let Some(fp) = recovery.get("recovered_key_fingerprint").and_then(|v| v.as_str()) {
-        println!("  Active recovery key fingerprint: {}", fp);
-    }
-    if let Some(approvals) = recovery.get("pending_approvals").and_then(|v| v.as_u64()) {
-        println!(
-            "  Pending recovery vote: {}/{} approvals",
-            approvals,
-            recovery["threshold"].as_u64().unwrap_or(0)
-        );
+    if let Some(recovery) = recovery {
+        if let Some(fp) = recovery.get("recovered_key_fingerprint").and_then(|v| v.as_str()) {
+            println!("  Active recovery key fingerprint: {}", fp);
+        }
+        if let Some(approvals) = recovery.get("pending_approvals").and_then(|v| v.as_u64()) {
+            println!(
+                "  Pending recovery vote: {}/{} approvals",
+                approvals,
+                recovery["threshold"].as_u64().unwrap_or(0)
+            );
+        }
     }
     Ok(())
 }

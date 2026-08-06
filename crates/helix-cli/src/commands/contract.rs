@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
@@ -114,11 +114,10 @@ async fn deploy(
     println!("  Fee   : {} nano-HLX", tx.fee);
     println!("  Nonce : {}", nonce);
 
-    let res = submit(&tx, node).await?;
+    let res = super::submit_tx(&tx, node).await?;
     println!();
     println!("  Contract address : {}", kf.address);
-    println!("  Tx hash          : {}", res["tx_hash"].as_str().unwrap_or("?"));
-    println!("  Status           : {}", res["status"].as_str().unwrap_or("?"));
+    super::report_submitted(&res);
     Ok(())
 }
 
@@ -170,21 +169,22 @@ async fn call(
     println!("  Fee   : {} nano-HLX (execution fuel budget)", tx.fee);
     println!("  Nonce : {}", nonce);
 
-    let res = submit(&tx, node).await?;
+    let res = super::submit_tx(&tx, node).await?;
     println!();
-    println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
-    println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
+    super::report_submitted(&res);
     Ok(())
 }
 
 async fn storage(address: String, key: String, node: &str) -> Result<()> {
     let key_hex = hex::encode(key.as_bytes());
-    let url = format!("{}/accounts/{}/storage/{}", node, address, key_hex);
-    let res: serde_json::Value = reqwest::get(&url).await?.json().await?;
+    let res = super::get_optional(
+        node,
+        &format!("/accounts/{}/storage/{}", address, key_hex),
+        "read the contract's storage",
+    )
+    .await?
+    .ok_or_else(|| anyhow!("contract {} has nothing stored under {}", address, key))?;
 
-    if let Some(err) = res.get("error") {
-        bail!("{}", err);
-    }
     let value_hex = res["value_hex"].as_str().unwrap_or("");
     let value_bytes = hex::decode(value_hex).unwrap_or_default();
     println!("  Key   : {}", key);
@@ -192,18 +192,3 @@ async fn storage(address: String, key: String, node: &str) -> Result<()> {
     Ok(())
 }
 
-async fn submit(tx: &Transaction, node: &str) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-    let res: serde_json::Value = client
-        .post(format!("{}/transactions", node))
-        .json(tx)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("Transaction rejected: {}", err);
-    }
-    Ok(res)
-}

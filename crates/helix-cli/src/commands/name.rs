@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
@@ -71,34 +71,17 @@ async fn register(name: String, key_path: PathBuf, fee: Option<u64>, node: &str)
     println!("  Fee   : {} nano-HLX", tx.fee);
     println!("  Nonce : {}", nonce);
 
-    let client = reqwest::Client::new();
-    let res: serde_json::Value = client
-        .post(format!("{}/transactions", node))
-        .json(&tx)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("Transaction rejected: {}", err);
-    }
-
+    let res = super::submit_tx(&tx, node).await?;
     println!();
-    println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
-    println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
+    super::report_submitted(&res);
     Ok(())
 }
 
 async fn resolve(name: String, node: &str) -> Result<()> {
-    let res: serde_json::Value = reqwest::get(format!("{}/names/{}", node, name))
+    let what = format!("resolve {}.hlx", name);
+    let res = super::get_optional(node, &format!("/names/{}", name), &what)
         .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("{}", err);
-    }
+        .ok_or_else(|| anyhow!("{}.hlx is not registered on this chain", name))?;
 
     println!(
         "{}.hlx -> {}",

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
@@ -163,8 +163,7 @@ async fn propose(
 
     let res = submit(&tx, node).await?;
     println!();
-    println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
-    println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
+    super::report_submitted(&res);
     Ok(())
 }
 
@@ -203,29 +202,25 @@ async fn vote(proposal_id: u64, key_path: PathBuf, fee: Option<u64>, node: &str)
 
     let res = submit(&tx, node).await?;
     println!();
-    println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
-    println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
+    super::report_submitted(&res);
     Ok(())
 }
 
 async fn show(proposal_id: u64, node: &str) -> Result<()> {
-    let res: serde_json::Value =
-        reqwest::get(format!("{}/governance/proposals/{}", node, proposal_id))
-            .await?
-            .json()
-            .await?;
-    if let Some(err) = res.get("error") {
-        bail!("{}", err);
-    }
+    let what = format!("look up proposal #{}", proposal_id);
+    let res = super::get_optional(
+        node,
+        &format!("/governance/proposals/{}", proposal_id),
+        &what,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("there is no proposal #{} on this chain", proposal_id))?;
     print_proposal(&res);
     Ok(())
 }
 
 async fn list(node: &str) -> Result<()> {
-    let res: serde_json::Value = reqwest::get(format!("{}/governance/proposals", node))
-        .await?
-        .json()
-        .await?;
+    let res = super::get_json(node, "/governance/proposals", "list the proposals").await?;
     let empty = Vec::new();
     let proposals = res["proposals"].as_array().unwrap_or(&empty);
     if proposals.is_empty() {
@@ -240,10 +235,7 @@ async fn list(node: &str) -> Result<()> {
 }
 
 async fn params(node: &str) -> Result<()> {
-    let res: serde_json::Value = reqwest::get(format!("{}/governance/params", node))
-        .await?
-        .json()
-        .await?;
+    let res = super::get_json(node, "/governance/params", "governance parameters").await?;
     println!("Current protocol parameters:");
     println!(
         "  min_validator_stake : {} HLX",
@@ -270,19 +262,7 @@ fn print_proposal(p: &serde_json::Value) {
 }
 
 async fn submit(tx: &Transaction, node: &str) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-    let res: serde_json::Value = client
-        .post(format!("{}/transactions", node))
-        .json(tx)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("Transaction rejected: {}", err);
-    }
-    Ok(res)
+    super::submit_tx(tx, node).await
 }
 
 #[cfg(test)]

@@ -461,21 +461,8 @@ async fn set_commission(
 }
 
 async fn submit_tx(tx: &Transaction, node: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    let res: serde_json::Value = client
-        .post(format!("{}/transactions", node))
-        .json(tx)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(err) = res.get("error") {
-        bail!("Transaction rejected: {}", err);
-    }
-
-    println!("  Tx hash : {}", res["tx_hash"].as_str().unwrap_or("?"));
-    println!("  Status  : {}", res["status"].as_str().unwrap_or("?"));
+    let res = super::submit_tx(tx, node).await?;
+    super::report_submitted(&res);
     Ok(())
 }
 
@@ -496,6 +483,10 @@ pub(crate) fn rpassword_read(prompt: &str) -> Result<String> {
     Ok(rpassword::prompt_password(prompt)?.trim().to_string())
 }
 
+/// The one command that talks to a node without going through `super::get_optional`, on purpose:
+/// a 404 here carries information no shared helper can express. "Expired" and "never seen" are
+/// both 404s and mean opposite things to a sender, so this path needs the body *and* the status,
+/// not `Option<Value>`. Left deliberately, not overlooked.
 async fn tx_status(hash: String, node: &str) -> Result<()> {
     let response = reqwest::get(format!("{}/transactions/{}", node, hash)).await?;
     // Whether the transaction exists is the HTTP status code's job, not the body's. Since
