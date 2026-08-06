@@ -5,6 +5,7 @@ pub mod genesis_sync;
 mod conn_limits;
 mod net_addr;
 pub mod reputation;
+pub mod peer_store;
 pub mod service;
 
 pub use blocksync::{

@@ -611,7 +611,17 @@ impl HelixNode {
 
         // P2P setup — `p2p_listen_addr` in helix.toml (or HELIX_P2P_LISTEN) overrides
         // the default listen address; unset means keep P2PConfig::default().
-        let mut p2p_config = P2PConfig::default();
+        let mut p2p_config = P2PConfig {
+            // Remember peers across restarts, beside the chain database rather than inside it.
+            //
+            // Without this a node came back knowing only its configured seeds — in practice the
+            // one built-in endpoint — no matter how much of the network it had met while running.
+            // Beside the database on purpose: deleting chain data is something operators do (and
+            // were told to do, wrongly, by our own health line before #150), and that is exactly
+            // the moment a node most needs to still know who to ask.
+            peer_store_path: Some(db_path.with_file_name("helix-peers.txt")),
+            ..P2PConfig::default()
+        };
         if let Some(addr) = config::resolve("HELIX_P2P_LISTEN", &cfg.p2p_listen_addr) {
             p2p_config.listen_addr = addr
                 .parse()

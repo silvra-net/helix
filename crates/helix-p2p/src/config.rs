@@ -80,6 +80,13 @@ pub struct P2PConfig {
     /// would discover the other's, gossip incompatible-height proposals/votes/committed
     /// blocks at each other, and trigger endless futile catch-up-sync churn.
     pub enable_mdns: bool,
+    /// Where to remember peers this node has met, so a restart does not put it back on its
+    /// first start (`crate::peer_store`).
+    ///
+    /// `None` disables the file entirely — correct for tests and throwaway devnets, where a node
+    /// that remembered a previous run's peers would carry state between runs that are meant to be
+    /// independent.
+    pub peer_store_path: Option<std::path::PathBuf>,
 }
 
 impl Default for P2PConfig {
@@ -96,6 +103,7 @@ impl Default for P2PConfig {
             max_established_per_peer: 2,
             max_connections_per_ip: 8,
             enable_mdns: true,
+            peer_store_path: None,
         }
     }
 }

@@ -96,6 +96,28 @@ database:
   builds/fetches genesis on first run (see above)
 - **Back this file up** alongside `validator-key.json` — losing it loses chain history
 
+### Remembered peers
+
+Alongside the database, the node keeps `helix-peers.txt` — the addresses of peers it has met,
+one multiaddr per line. It is written automatically every 30 seconds and read at startup, and
+its only job is to save the node from starting over.
+
+Without it, every restart put a node back on its first start: it came back knowing only the
+seed you configured, no matter how much of the network it had been talking to. That makes the
+whole network's ability to admit anyone depend on one machine staying reachable. This is the
+same reason Bitcoin Core keeps `peers.dat` next to its DNS seeds — the seeds bootstrap the
+first start, the file carries every one after it.
+
+- **Safe to delete.** The node re-learns the network from its seeds; you only cost it a head
+  start.
+- **Safe to edit.** Adding an address by hand is how you point a node at a peer you know
+  about. Lines that are not valid multiaddrs are ignored, so a typo costs nothing.
+- **Not a substitute for your seed configuration.** Remembered peers are dialed *in addition
+  to* your configured seeds, never instead of them — so an address that has gone stale, or one
+  a hostile peer talked your node into remembering, can never cut it off from the network.
+- Kept deliberately *outside* the chain database, so wiping chain data does not also erase how
+  to find the chain again.
+
 ### Joining the network
 
 **A node joins the public Helix network by default** — no configuration needed. On first
@@ -425,7 +447,8 @@ docker run -d --name helix \
 
 Notes:
 - The container's working directory is `/data` — mount a named volume (or bind mount)
-  there so `validator-key.json` and `helix-data.redb` survive container recreation/upgrades.
+  there so `validator-key.json`, `helix-data.redb` and `helix-peers.txt` survive container
+  recreation/upgrades.
 - `HELIX_RPC_BIND=0.0.0.0:8545` is required for the REST API to be reachable from outside
   the container — the compiled-in default only binds `127.0.0.1`.
 - By default the container joins the public network (fetches genesis from the built-in seed).

@@ -25,6 +25,7 @@ use crate::blocksync::{
 use crate::config::P2PConfig;
 use crate::genesis_sync::{GenesisCodec, GenesisProvider, GenesisResponse, GENESIS_PROTOCOL};
 use crate::conn_limits::IpConnLimiter;
+use crate::peer_store;
 use crate::reputation::PeerReputation;
 use crate::{
     P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_PEER_EXCHANGE,
@@ -264,7 +265,26 @@ impl P2PService {
             .filter_map(|peer_addr| peer_addr.parse::<Multiaddr>().ok())
             .collect();
 
-        for addr in &seed_addrs {
+        // Peers remembered from previous runs (`crate::peer_store`). Dialed *in addition to* the
+        // seeds, never instead of them: these addresses came from the network, so treating them as
+        // a replacement would let a peer that gossiped enough addresses decide who this node talks
+        // to. As an addition they can only widen the ways back onto the network.
+        let remembered: Vec<Multiaddr> = config
+            .peer_store_path
+            .as_deref()
+            .map(peer_store::load)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|addr| addr.parse::<Multiaddr>().ok())
+            .collect();
+        if !remembered.is_empty() {
+            info!(
+                count = remembered.len(),
+                "Dialing peers remembered from a previous run"
+            );
+        }
+
+        for addr in seed_addrs.iter().chain(remembered.iter()) {
             let _ = swarm.dial(addr.clone());
         }
 
@@ -324,6 +344,20 @@ impl P2PService {
         for peer_addr in &config.seed_peers {
             known_addrs.insert(peer_addr.clone());
         }
+        for addr in &remembered {
+            known_addrs.insert(addr.to_string());
+        }
+        // Written whenever the set differs from what is on disk. `known_addrs` never shrinks
+        // (nothing removes from it — the cap in `select_new_addrs` stops it filling instead), so
+        // the length is a sufficient change marker.
+        //
+        // Starts at 0, *not* at the current length, so the first tick always writes even for a
+        // node whose only address is its configured seed. That node has nothing new to learn, but
+        // it does have something to lose: if its configuration is replaced or misplaced, the file
+        // is then the only remaining record of how to reach the network. It also means the file
+        // always exists, so "who does my node know?" has an answer on disk rather than only in a
+        // running process — which is the state this whole mechanism was missing.
+        let mut saved_addr_count = 0;
 
         // Re-announce periodically, not just on connect — a message published right as a
         // connection is established can be lost before gossipsub's mesh for the topic has
@@ -667,6 +701,16 @@ impl P2PService {
                     // that the node is trying, and how often — the silent-wait failure mode from
                     // the peer/liveness windows is exactly what made this class of problem so
                     // hard to tell apart from a hung node.
+                    // Save on this tick rather than at shutdown: a node is far more often killed
+                    // than asked to stop (`pm2 restart`, OOM, power), and a file only written on a
+                    // clean exit is one that is missing exactly when the restart was unplanned.
+                    if let Some(path) = config.peer_store_path.as_deref() {
+                        if known_addrs.len() != saved_addr_count {
+                            peer_store::save(path, &known_addrs);
+                            saved_addr_count = known_addrs.len();
+                        }
+                    }
+
                     if swarm.connected_peers().next().is_none() && !seed_addrs.is_empty() {
                         info!(seeds = seed_addrs.len(), "No peers connected — redialing seed peers");
                         for addr in &seed_addrs {

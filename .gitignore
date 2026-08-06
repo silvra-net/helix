@@ -13,6 +13,9 @@
 # Chain-Datenbank — Laufzeitdaten, kein Quellcode
 /helix-data.redb
 /helix-data.redb.*.bak
+# Peers this node has met (helix_p2p::peer_store) — machine-local, like the chain data.
+/helix-peers.txt
+/helix-peers.tmp
 # Scripts (Cron/Dev-Loop — nur lokal)
 /scripts/
 /CLAUDE.md
