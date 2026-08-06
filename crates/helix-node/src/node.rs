@@ -377,6 +377,10 @@ pub struct HelixNode {
     /// used to certify a block handed to a peer over block sync (#138). Created in the constructor
     /// rather than in `run()` because [`StoreBlockProvider`] needs to share the very same cell.
     tip_certificate: Arc<RwLock<TipCertificate>>,
+    /// How the previous run of this node ended, read once at startup before anything could
+    /// overwrite it. Served at `GET /diagnostics` so the question is answerable remotely once the
+    /// node is back — the startup log line only reaches whoever is watching that machine.
+    previous_run: Option<helix_rpc::PreviousRun>,
     /// Where this node's double-sign high-water mark lives — next to `validator-key.json`. Loaded
     /// into a [`SigningGuard`] in `run()`. See `signing_guard` for why the protection sits on the
     /// broadcast path rather than in the consensus engine.
@@ -429,14 +433,24 @@ impl HelixNode {
         // `kill -9` — the log simply ended. That made "why does my node keep dying?" genuinely
         // unanswerable, including for us when a validator's absence stalls the chain.
         let run_record_path = crate::run_record::path_beside(&db_path);
-        {
+        let previous_run_for_rpc = {
             let previous = crate::run_record::begin_run(
                 &run_record_path,
                 env!("CARGO_PKG_VERSION"),
                 store.latest_height(),
             );
             crate::run_record::report_previous_run(previous.as_ref());
-        }
+            // Also served at `GET /diagnostics`, so "why was that node away?" can be answered
+            // remotely once it is back — the log line only reaches whoever reads that machine.
+            previous.map(|p| helix_rpc::PreviousRun {
+                version: p.version,
+                clean_exit: p.clean_exit,
+                ran_for_secs: p.last_seen_unix.saturating_sub(p.started_at_unix),
+                last_height: p.height,
+                last_seen_unix: p.last_seen_unix,
+                rss_kb: p.rss_kb,
+            })
+        };
 
         // Personhood authorities — only takes effect for a fresh chain (see below); an
         // existing chain's authorities (if any) were already persisted at its own genesis.
@@ -795,6 +809,7 @@ impl HelixNode {
             highest_peer_tip,
             tip_certificate: shared_tip_certificate,
             signing_state_path,
+            previous_run: previous_run_for_rpc,
         })
     }
 
@@ -813,6 +828,13 @@ impl HelixNode {
         // rather than `height: 0` for the block-interval it takes to commit again (#134).
         load_persisted_tip_certificate(&self.store, &tip_certificate).await;
 
+        // Diagnostics cells, shared with the loops that know the answers. Atomics rather than
+        // asking consensus: `/diagnostics` is most useful exactly when the consensus path is
+        // wedged, so it must never wait on a lock that path holds (same reasoning as #150).
+        let silent_peer_validators = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_cosigned = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last_cosigned_at_unix = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let rpc_state = AppState {
             store: self.store.clone(),
             mempool: self.mempool.clone(),
@@ -828,6 +850,11 @@ impl HelixNode {
             // so the faucet can refuse to be the validator key — see `helix_rpc::faucet`.
             faucet: helix_rpc::faucet::Faucet::from_env(&self.address.to_string()),
             tip_certificate: tip_certificate.clone(),
+            started_at_unix: crate::run_record::now_unix(),
+            silent_peer_validators: silent_peer_validators.clone(),
+            last_cosigned: last_cosigned.clone(),
+            last_cosigned_at_unix: last_cosigned_at_unix.clone(),
+            previous_run: self.previous_run.clone(),
         };
 
         // Spawn RPC server — first, before any catch-up, so `GET /status` answers from the
@@ -1150,10 +1177,6 @@ impl HelixNode {
         // One shared truth for "is the chain held up by missing validators?", so the health
         // heartbeat and the production loop cannot contradict each other about it (#150).
         let quorum_peers_missing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // How many other validators' votes are not reaching us, published by
-        // `block_production_loop` for the health loop. Same lock-free reasoning as above:
-        // the health loop must keep talking exactly when the consensus path is wedged.
-        let silent_peer_validators = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // Proof of life for the production loop, watched by the health heartbeat (#151).
         let production_ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -1165,6 +1188,8 @@ impl HelixNode {
             self.syncing.clone(),
             quorum_peers_missing.clone(),
             silent_peer_validators.clone(),
+            last_cosigned,
+            last_cosigned_at_unix,
             production_ticks.clone(),
         ));
 
@@ -2901,6 +2926,10 @@ async fn validator_health_loop(
     // keep talking precisely when the consensus path is stuck (backlog #150).
     quorum_peers_missing: Arc<std::sync::atomic::AtomicBool>,
     silent_peer_validators: Arc<std::sync::atomic::AtomicUsize>,
+    // Height this node last co-signed at, and when — published for `GET /diagnostics`. Filled
+    // here because this loop already scans for it to write its own heartbeat line.
+    last_cosigned: Arc<std::sync::atomic::AtomicU64>,
+    last_cosigned_at_unix: Arc<std::sync::atomic::AtomicU64>,
     // Monotonic tick counter of the block production loop (backlog #151). Its *movement* is the
     // only local evidence that the loop is alive at all; its value means nothing on its own.
     production_ticks: Arc<std::sync::atomic::AtomicU64>,
@@ -2971,6 +3000,12 @@ async fn validator_health_loop(
         } else {
             None
         };
+
+        if let Some((h, age)) = last_signed {
+            last_cosigned.store(h, Ordering::Relaxed);
+            last_cosigned_at_unix
+                .store(crate::run_record::now_unix().saturating_sub(age), Ordering::Relaxed);
+        }
 
         let stalled = stalled_secs >= HEALTH_STALL_WARN_SECS;
         // Enough history and past the startup settle before we're allowed to warn.

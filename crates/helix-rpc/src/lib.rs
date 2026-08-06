@@ -309,6 +309,58 @@ impl From<&helix_executor::GovernanceProposal> for GovernanceProposalResponse {
     }
 }
 
+/// Operational diagnostics — the questions someone actually asks when a node misbehaves.
+///
+/// **Deliberately not the log.** Serving raw log output would be the obvious way to build this and
+/// the wrong one: it makes every future `info!()` line a security decision that whoever writes it
+/// is not making. On a node with a directly reachable listener the log carries peer addresses,
+/// which is the network topology an eclipse attack needs; error paths carry filesystem paths. An
+/// enumerated struct has the opposite property — what is exposed is written down here, and adding
+/// to it is a deliberate act. `diagnostics_expose_no_addresses_keys_or_paths` enforces that.
+///
+/// Everything below is either already public on the chain, or says something about *this* node
+/// that does not help an attacker reach it: no addresses, no paths, no identifiers of peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeDiagnostics {
+    pub version: String,
+    /// Seconds since this process started serving.
+    pub uptime_secs: u64,
+    pub height: u64,
+    pub state_height: u64,
+    pub is_syncing: bool,
+    pub peer_count: usize,
+    /// Validators whose votes this node is not receiving. Note the direction: it is what this
+    /// node observes, not a claim that those validators are down — it cannot tell an absent peer
+    /// from a broken link to a healthy one.
+    pub validators_not_heard_from: usize,
+    /// Height at which this node last co-signed, and how long ago. `None` on a node that has not
+    /// co-signed during this run — including every non-validator.
+    pub last_cosigned_height: Option<u64>,
+    pub last_cosigned_secs_ago: Option<u64>,
+    /// This process's resident memory, and the machine's total, in KB. Zero where unreadable.
+    /// Present because an out-of-memory kill leaves nothing in the node's own log and has cost
+    /// this network a validator before.
+    pub rss_kb: u64,
+    pub machine_total_kb: u64,
+    /// How the *previous* run of this node ended — the one thing that is unanswerable after the
+    /// fact without it, and the reason this endpoint is useful for a node that has been
+    /// restarting. `None` on a first run.
+    pub previous_run: Option<PreviousRun>,
+}
+
+/// How the last run of this node ended. See `helix_node::run_record`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviousRun {
+    pub version: String,
+    /// False means it was killed, crashed, or the machine went down — nothing marked it as an
+    /// orderly stop.
+    pub clean_exit: bool,
+    pub ran_for_secs: u64,
+    pub last_height: u64,
+    pub last_seen_unix: u64,
+    pub rss_kb: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub version: String,

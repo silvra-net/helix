@@ -72,6 +72,18 @@ pub struct AppState {
     /// live engine, never on disk), and served at `GET /sync/tip-certificate` so an RPC-only
     /// follower can obtain the one certificate `/sync/blocks` cannot carry (#133).
     pub tip_certificate: Arc<RwLock<crate::TipCertificate>>,
+    /// Diagnostics the node publishes for `GET /diagnostics` — see [`crate::NodeDiagnostics`].
+    ///
+    /// Atomics and a snapshot rather than asking consensus: this endpoint is most useful exactly
+    /// when the consensus path is wedged, so it must never wait on a lock that path holds. Same
+    /// reasoning as the health loop (backlog #150).
+    pub started_at_unix: u64,
+    pub silent_peer_validators: Arc<std::sync::atomic::AtomicUsize>,
+    /// Height and wall-clock second at which this node last co-signed, both 0 when it has not.
+    pub last_cosigned: Arc<std::sync::atomic::AtomicU64>,
+    pub last_cosigned_at_unix: Arc<std::sync::atomic::AtomicU64>,
+    /// How the previous run ended, read once at startup. Never changes while the node runs.
+    pub previous_run: Option<crate::PreviousRun>,
 }
 
 /// Explicit request-body cap for `POST /transactions`, well above any plausible signed
@@ -124,6 +136,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/genesis", get(get_genesis))
         .route("/sync/blocks", get(get_sync_blocks))
         .route("/sync/tip-certificate", get(get_tip_certificate))
+        .route("/diagnostics", get(get_diagnostics))
         .route(
             "/transactions",
             post(submit_transaction).layer(DefaultBodyLimit::max(TX_SUBMIT_BODY_LIMIT_BYTES)),
@@ -1120,6 +1133,57 @@ async fn get_mempool_info(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// `GET /diagnostics` — operational state, deliberately not the log.
+///
+/// See [`crate::NodeDiagnostics`] for why this enumerates fields instead of streaming log output.
+/// Everything here is either already public on the chain or describes this node in ways that do
+/// not help anyone reach it: no peer addresses, no filesystem paths, no identifiers.
+async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let (height, state_height) = {
+        let store = state.store.read().await;
+        let chain = state.chain_state.read().await;
+        (store.latest_height(), chain.applied_height)
+    };
+
+    let last_height = state.last_cosigned.load(Ordering::Relaxed);
+    let last_at = state.last_cosigned_at_unix.load(Ordering::Relaxed);
+
+    Json(crate::NodeDiagnostics {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_secs: now.saturating_sub(state.started_at_unix),
+        height,
+        state_height,
+        is_syncing: state.syncing.load(Ordering::Relaxed),
+        peer_count: state.peer_count.load(Ordering::Relaxed),
+        validators_not_heard_from: state.silent_peer_validators.load(Ordering::Relaxed),
+        last_cosigned_height: (last_height > 0).then_some(last_height),
+        last_cosigned_secs_ago: (last_at > 0).then(|| now.saturating_sub(last_at)),
+        rss_kb: read_kb_field("/proc/self/status", "VmRSS:"),
+        machine_total_kb: read_kb_field("/proc/meminfo", "MemTotal:"),
+        previous_run: state.previous_run.clone(),
+    })
+}
+
+/// Read one `Key: <n> kB` field from a procfs file, or 0 where that is unavailable (non-Linux,
+/// restricted container). Diagnostics must degrade to "unknown", never to a failed request.
+fn read_kb_field(path: &str, field: &str) -> u64 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    text.lines()
+        .find(|l| l.starts_with(field))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 async fn submit_transaction(
     State(state): State<AppState>,
     Json(tx): Json<Transaction>,
@@ -1374,6 +1438,11 @@ mod tests {
             p2p_command_tx,
             faucet: None,
             tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
+            started_at_unix: 0,
+            silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            previous_run: None,
         };
         (state, path)
     }
@@ -1874,6 +1943,53 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The security property this endpoint rests on, stated as a test.
+    ///
+    /// Serving raw logs was the obvious way to build this, and it fails exactly here: a log
+    /// carries whatever anyone ever put in it, so the guarantee "nothing sensitive is exposed"
+    /// would have to be re-earned by every future `info!()` line, by someone not thinking about
+    /// this endpoint at all. An enumerated struct can be checked once — so it is.
+    ///
+    /// If a field is added that carries a peer address, a filesystem path or a key, this fails.
+    /// That is the point: adding one has to be a deliberate act, not a side effect.
+    #[tokio::test]
+    async fn diagnostics_expose_no_addresses_keys_or_paths() {
+
+        let response = get_diagnostics(State(fresh_test_state())).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // Peer addresses are the network topology an eclipse attack needs; paths describe the
+        // operator's machine; the rest is self-evident.
+        for forbidden in ["/ip4/", "/dns4/", "12D3KooW", "/home/", "/root/", "/var/", "peer_id",
+                          "private", "passphrase", "mnemonic", "secret"] {
+            assert!(
+                !body.contains(forbidden),
+                "diagnostics must not carry {forbidden}: {body}"
+            );
+        }
+
+        // And the control: it does answer, or the assertions above pass on an empty response.
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed.get("uptime_secs").is_some(), "must actually report something: {body}");
+        assert!(parsed.get("height").is_some(), "{body}");
+    }
+
+    /// A node that has never co-signed must say so, rather than claiming height 0 — which reads
+    /// as "co-signed the genesis block" and is the sort of small lie that costs an hour later.
+    #[tokio::test]
+    async fn a_node_that_has_not_co_signed_reports_nothing_rather_than_zero() {
+
+        let response = get_diagnostics(State(fresh_test_state())).await.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(parsed["last_cosigned_height"].is_null(), "{parsed}");
+        assert!(parsed["previous_run"].is_null(), "a first run has no previous run: {parsed}");
+    }
+
     fn fresh_test_state() -> AppState {
         let path = std::env::temp_dir().join(format!(
             "helix-rpc-test-store-{}-{}.redb",
@@ -1899,6 +2015,11 @@ mod tests {
             p2p_command_tx,
             faucet: None,
             tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
+            started_at_unix: 0,
+            silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            previous_run: None,
         }
     }
 
