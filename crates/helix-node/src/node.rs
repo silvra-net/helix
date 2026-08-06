@@ -1218,19 +1218,30 @@ impl HelixNode {
         // fires on every planned restart is worse than no warning: it is the kind of false alarm
         // that teaches operators to ignore the line, and this line has to be believed the one
         // time it is real.
+        //
+        // Unix-only by construction: `tokio::signal::unix` does not exist on Windows, and this
+        // crate ships a Windows release binary. Guarded rather than assumed — the unguarded
+        // version compiled and tested green on Linux and broke the Windows release build, which a
+        // workspace test run cannot catch.
+        #[cfg(unix)]
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
         )
         .ok();
         let terminate = async {
+            #[cfg(unix)]
             match sigterm.as_mut() {
                 Some(s) => {
                     s.recv().await;
                 }
-                // No SIGTERM handler (non-Unix, or the handler could not be installed): fall back
-                // to never firing, so SIGINT still works and nothing else changes.
+                // No SIGTERM handler (the handler could not be installed): fall back to never
+                // firing, so SIGINT still works and nothing else changes.
                 None => std::future::pending::<()>().await,
             }
+            // Windows has no SIGTERM. Ctrl-C still arrives through the SIGINT arm above, so a
+            // clean shutdown is still recorded as clean there.
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await
         };
 
         tokio::select! {
