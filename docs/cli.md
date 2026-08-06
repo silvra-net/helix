@@ -111,7 +111,12 @@ helix chain status               # height, best hash, peer count, mempool size, 
 helix chain latest               # latest block, full transaction list
 helix chain block 142            # block by height
 helix account hlx...             # balance, staked amount, nonce
+helix validator show hlx...      # a validator's pool: delegated stake, commission, effective stake
 ```
+
+Every one of these talks to a node running on this machine if one answers, and the public network
+otherwise. The chosen endpoint is printed to stderr, not stdout, so piping into `jq` is unaffected.
+Override with `--node <url>` or `HELIX_NODE=<url>`.
 
 ### Human-Readable Names
 

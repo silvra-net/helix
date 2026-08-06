@@ -67,6 +67,9 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_DB_CACHE_MB` | `128` | Page cache the embedded database may hold, in MiB. Sized so a node fits comfortably on a 1 GB machine: a full sync of the live chain peaks around 280 MB of RSS in total and stays there. Raise it (e.g. `512`) on a server with memory to spare and RPC read traffic to serve; there is no reason to lower it. |
 | `HELIX_P2P_PUBLIC_ADDR` | (none) | This node's own externally-dialable address, announced to peers via peer exchange (see "Network Resilience" below). Either a bare host (a domain or public IP, no scheme/port — the configured raw-TCP P2P port is appended automatically), or, for a node behind a proxy/tunnel, a full multiaddr starting with `/` (e.g. `/dns4/host/tcp/443/tls/ws`). Overrides `p2p_public_addr` in `helix.toml`. Leave unset for followers with no public/forwarded port — they still relay addresses they learn from others. |
 | `HELIX_P2P_SEED_PEERS` | (none) | Comma-separated libp2p multiaddrs (e.g. `/ip4/1.2.3.4/tcp/8546,/dns4/peer.example/tcp/8546`) to dial directly, in addition to the one derived from `sync_peer`. With no local chain and no `sync_peer`, these are also where the genesis block is fetched from — see "Joining without an HTTP endpoint". Use this to wire a validator set into a full mesh — every validator should peer with every other, not hub-and-spoke through one node. Overrides `p2p_seed_peers` in `helix.toml`. |
+| `HELIX_BLOCK_TIME_MS` | `2000` | Target interval between blocks, in milliseconds. **Consensus-relevant: every validator on a network must use the same value**, or nodes disagree about when a round has timed out. Intended for private devnets, where a shorter interval makes tests finish sooner; do not change it on a running network. |
+| `HELIX_PERSONHOOD_AUTHORITIES` | (none) | Comma-separated hex public keys allowed to issue Proof-of-Personhood attestations. Only takes effect at genesis — an existing chain's authorities were fixed when it was created. Unset means personhood attestations are disabled on this chain. |
+| `HELIX_NODE` | (auto) | Which node the **client** subcommands (`helix wallet`, `helix tx`, `helix chain`) talk to. Unset, they use a node running on this machine if one answers and the public network otherwise. Ignored by `helix start`, which configures itself from the variables above. |
 | `HELIX_P2P_DISABLE_MDNS` | (off) | Set truthy (`1`/`true`) to turn off mDNS LAN auto-discovery, leaving only seed peers + peer exchange. Needed only when two independent Helix networks share a LAN (mDNS would otherwise cross-wire them). Overrides `p2p_disable_mdns` in `helix.toml`. |
 
 ```bash
@@ -213,6 +216,10 @@ Read the node's own health line first — it distinguishes the two cases:
 - **"the chain is waiting for other validators to reconnect"** — your node is fine. Nothing you do
   locally will help; the chain resumes when enough validators are back. Restarting is harmless but
   pointless, and it restarts the internal wait timers.
+- **"votes from at least one other validator are not arriving here"** — your node is healthy and
+  connected, but somebody else's is not voting. Restarting yours will not help; the "Validator
+  silent" lines just above name whose votes are missing. If you run one of those validators, that
+  is the node to look at.
 - **"restarting the node re-establishes its round"** — this node is the stuck one. Restart it
   (`pm2 restart <name>`, `systemctl restart …`, or however you run it). Your chain data and
   validator key stay where they are; that is exactly what makes the restart safe.
@@ -223,6 +230,39 @@ while it waits — it resumes from the same height once quorum is back.
 
 If your node needs to catch up afterwards, it does so on its own (over P2P from any peer, or over
 the RPC sync peer). Nothing needs to be reset for that.
+
+### When your node keeps stopping
+
+A node that vanishes leaves a log that simply ends, and afterwards a clean `systemctl stop`, a
+crash, an out-of-memory kill and a `kill -9` look identical. So the node records how each run
+ended, in `helix-last-run.json` beside the chain database, and reports it on the next start:
+
+```
+Previous run (v0.10.2) did NOT shut down cleanly. It ran 9 min, last seen at height 36119
+(epoch 1786023222), using 1.8 GB of memory. Something ended it without warning — a crash, an
+OOM kill, `kill -9`, or the machine going down. Check the system log around that time
+(`journalctl -k --since` or `dmesg -T`) before assuming the node is at fault.
+```
+
+An orderly stop says so instead, quietly. If you see the warning above:
+
+1. **Check memory first.** An OOM kill leaves nothing in the node's own log — the kernel decides
+   and the process never runs again. If the reported memory is a large share of the machine's, that
+   is your answer: `journalctl -k --since=@<last_seen_unix> | grep -i oom`.
+2. **Then the machine.** A reboot, a hypervisor migration or a full disk all look the same from
+   inside the process.
+3. **Then the node.** A panic is the least likely of these and would normally leave a message.
+
+The same information is available over HTTP at `GET /diagnostics`, so you can check a node without
+reading its log:
+
+```bash
+curl -s localhost:8545/diagnostics | jq
+```
+
+**That output is safe to share.** It contains no addresses, no file paths, no keys and no peer
+identifiers — enumerated on purpose, so you can paste it when asking for help without having to
+audit it first. If you are reporting a problem, this is the single most useful thing to send.
 
 ### Network Resilience (Peer Exchange)
 

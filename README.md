@@ -189,6 +189,11 @@ either the GUI or the [CLI](docs/cli.md#using-the-cli-helix); neither is missing
   `KeyFile` format the CLI uses, and never leaves the app — the wallet signs transactions itself
   and only talks to a node over its public REST API. The 24-word recovery phrase is shown once
   and also works in the Spark mobile app.
+- **It uses your own node if you have one.** The wallet checks whether a node is running on this
+  machine — whether it started it or you did, from a terminal, systemd or pm2 — and reads balances
+  from that instead of a public server, switching back on its own if that node goes away. It also
+  asks once, on first use, whether you want to run one at all, rather than leaving the default
+  unmentioned.
 - **Run a node without a terminal.** The exact `helix` binary the CLI ships is bundled into the
   app as a companion process (a Tauri "sidecar" — same code, not a reimplementation). The
   **Node** tab starts/stops it and streams its output live, so becoming a validator is: stake
@@ -201,8 +206,6 @@ either the GUI or the [CLI](docs/cli.md#using-the-cli-helix); neither is missing
 Source and build steps are in [`gui/`](gui/README.md). There is also a browser **block
 explorer** served by every node at its root URL — open
 [helix.silvra.net](https://helix.silvra.net).
-
----
 
 ---
 
@@ -223,8 +226,9 @@ The README covers what Helix is and how to get started. The full reference lives
 
 **Hardening that's in place:**
 
-- **Persistent validator key** is stored unencrypted in `validator-key.json` by default —
-  protect this file, or encrypt it (`HELIX_VALIDATOR_KEY_PASSPHRASE` / `helix wallet encrypt`)
+- **The validator key can be encrypted at rest** (`helix wallet encrypt` +
+  `HELIX_VALIDATOR_KEY_PASSPHRASE`). Note the default is *un*encrypted, so the file matters:
+  anyone who reads `validator-key.json` can sign blocks as you and get you slashed
 - The P2P transport uses libp2p's classical Noise (X25519) encryption; this is fine because all
   P2P traffic is public ledger data — see [Cryptography](docs/internals.md#cryptography--determinism) for the full
   quantum-safety picture
@@ -235,6 +239,12 @@ The README covers what Helix is and how to get started. The full reference lives
   nonces, and money-path arithmetic is overflow-checked; delegation uses shares-based accounting
   hardened against rounding/inflation loss
 - Double-signing is provable on-chain and slashed; misbehaving peers are scored and banned
+- **A node can be diagnosed without reading its log.** `GET /diagnostics` reports uptime, sync
+  state, how many validators' votes are not arriving, when this node last co-signed, memory
+  against the machine's total, and **how the previous run ended** — so a crash, an OOM kill and an
+  orderly stop are no longer indistinguishable after the fact. The response is enumerated rather
+  than free-form log text, which is what makes it safe to share when asking for help: no
+  addresses, no paths, no keys. See [Reference](docs/reference.md#diagnostics-response)
 - A validator that goes silent is **downtime-jailed** on-chain (`last_commit` +
   `ChainState::jailed_until`) after ~150 blocks of confirmed absence — removed from the active set
   until it submits an explicit `Unjail` transaction, surviving node restarts and carrying no slash

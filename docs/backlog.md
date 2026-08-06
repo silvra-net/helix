@@ -1,5 +1,15 @@
 # Backlog — Validator liveness, onboarding & operator tooling
 
+> **Historical, kept for traceability.** This is the write-up of one investigation, dated
+> 2026-07-26, into a specific failure: a second validator bonding and then going silent after its
+> activation epoch. It describes the code and the reasoning *as they were on that date*.
+>
+> It is **not** a list of currently open problems, and it is not linked from the documentation
+> index for that reason. Several of the mechanisms discussed here have since been built,
+> replaced, or shown to rest on a wrong premise — the probation liveness proof in particular went
+> through five different designs before one worked. For the current state, read the code and the
+> other documents in this directory; where they disagree with this file, they are right.
+
 Consolidated from the 2026-07-26 investigation into the recurring multi-validator
 join stall ("a second validator bonds, then goes silent after its activation epoch
 and the chain halts"). Grouped by priority. Items reference the external CTO backlog

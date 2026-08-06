@@ -33,6 +33,9 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/governance/proposals/:id` | One proposal's status |
 | GET | `/mempool` | Pending transaction count |
 | GET | `/sync/blocks` | Raw block range for peer sync (`?from=&count=`) |
+| GET | `/sync/tip-certificate` | The commit certificate for this node's current tip — the one certificate `/sync/blocks` cannot carry, because a block's proof lives in its *successor* and the tip has none yet |
+| GET | `/validators` | The active validator set with each validator's tier and voting power |
+| GET | `/diagnostics` | Operational state of this node — see below |
 | POST | `/transactions` | Submit a signed transaction — 400 if the signature, nonce slot, fee, or the sender's ability to pay it fails the check |
 | GET | `/transactions/:hash` | Transaction outcome — `applied` / `failed` (with `error`) / `pending` / `unknown`; 404 if no such transaction |
 
@@ -40,18 +43,19 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 
 ```json
 {
-  "version": "0.7.0",
+  "version": "0.10.2",
   "height": 142,
   "best_hash": "a3f8c2...",
-  "peer_count": 0,
+  "peer_count": 2,
   "is_syncing": false,
   "mempool_size": 0,
   "total_accounts": 2,
   "circulating_supply_hlx": 1000141.9995,
   "total_burned_hlx": 0.0005,
   "state_hash": "b3f1a9...",
-  "state_height": 42,
+  "state_height": 142,
   "p2p_port": 8546,
+  "p2p_public_addr": "/dns4/p2p.example.net/tcp/443/tls/ws",
   "base_fee_per_byte": 1
 }
 ```
@@ -66,6 +70,65 @@ libp2p listen port — used by a joining peer to dial it directly, see "Joining 
 Network" above. `base_fee_per_byte` is what the next block will charge per transaction byte;
 price against it rather than hardcoding a fee, since a flat number is only right until the
 network gets busy (see "Fees" above).
+
+### Diagnostics response
+
+`GET /diagnostics` answers the questions that come up when a node is misbehaving. It is
+deliberately **not** the node's log — see the note below on why.
+
+```json
+{
+  "version": "0.10.2",
+  "uptime_secs": 8412,
+  "height": 36377,
+  "state_height": 36377,
+  "is_syncing": false,
+  "peer_count": 2,
+  "validators_not_heard_from": 1,
+  "last_cosigned_height": 36376,
+  "last_cosigned_secs_ago": 5982,
+  "rss_kb": 344328,
+  "machine_total_kb": 32758376,
+  "previous_run": {
+    "version": "0.10.2",
+    "clean_exit": false,
+    "ran_for_secs": 553,
+    "last_height": 36119,
+    "last_seen_unix": 1786023222,
+    "rss_kb": 1835008
+  }
+}
+```
+
+What each field is for:
+
+- **`last_cosigned_height` / `last_cosigned_secs_ago`** — the single most useful pair for a
+  validator. A node whose height is current but whose last co-signature is an hour old is up,
+  connected, and not participating. `null` on a node that has not co-signed during this run,
+  including every non-validator.
+- **`validators_not_heard_from`** — how many validators' votes are not arriving *here*. Read the
+  direction carefully: it is what this node observes, not a claim that those validators are down.
+  This node cannot tell an absent peer from a broken link to a healthy one.
+- **`rss_kb` / `machine_total_kb`** — an out-of-memory kill leaves nothing in the node's own log,
+  because the kernel decides and the process never runs again. These two numbers are how that
+  becomes visible instead of mysterious.
+- **`previous_run`** — how the *last* run ended. `clean_exit: false` means nothing marked it as an
+  orderly stop: a crash, an OOM kill, `kill -9`, or the machine going down. Use `last_seen_unix`
+  with `journalctl --since=@<n>` or `dmesg -T` to find what the system was doing at that moment.
+  `null` on a first run. See "When your node keeps stopping" in
+  [running a node](running-a-node.md).
+
+**Why this is not the log.** Serving raw log output is the obvious way to build a remote debugging
+endpoint and the wrong one: a log carries whatever anyone ever put in it, so the guarantee "nothing
+sensitive is exposed" would have to be re-earned by every future log line — written by somebody not
+thinking about this endpoint at all. On a node with a directly reachable listener the log carries
+peer addresses, which is the network topology an eclipse attack needs. An enumerated response has
+the opposite property: what is exposed is written down in one place and adding to it is a
+deliberate act, which the test `diagnostics_expose_no_addresses_keys_or_paths` enforces.
+
+The practical consequence is the useful one: **this response is safe to paste to anyone.** It
+carries no addresses, no file paths, no keys and no peer identifiers, so an operator can share it
+when asking for help without having to read through it first.
 
 ---
 
