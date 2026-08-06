@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, DEFAULT_NODE, LOCAL_NODE, isLocalNode } from "./api";
+import { nextNode } from "./nodeChoice";
 import type { NetworkStatus, WalletMeta } from "./types";
 import { shortAddr } from "./format";
 import Setup from "./views/Setup";
@@ -49,34 +50,78 @@ export default function App() {
   // Deliberately not persisted: an address the user never typed must not outlive the node it
   // points at. Writing it to localStorage would turn a detection into a stated preference, and a
   // wallet that kept asking a stopped node forever would be worse than one that never looked.
+  // Runs once, before the wallet is unlocked, so an existing node is already in use by the time
+  // the first balance is drawn. The polling effect below applies the same rule from then on —
+  // through `nextNode` in both places, so there is one definition of when the wallet switches
+  // rather than two that can drift apart.
   useEffect(() => {
     if (localStorage.getItem("helix-node")) return; // they answered this already
     let alive = true;
     (async () => {
+      let localIsUp = false;
       try {
         await api.getNetwork(LOCAL_NODE);
-        if (alive) setNode(LOCAL_NODE);
+        localIsUp = true;
       } catch {
         // No node here — the public endpoint stays, which is what makes a fresh install work.
       }
+      if (!alive) return;
+      const target = nextNode({ current: node, stated: false, misses: 0, localIsUp });
+      if (target) setNode(target);
     })();
     return () => {
       alive = false;
     };
   }, []);
 
-  // Poll network status while a wallet is open, so the header stays live.
+  // Poll network status while a wallet is open, so the header stays live — and keep asking which
+  // node we ought to be reading from, rather than deciding that once at startup.
+  //
+  // The startup probe above answers "is there a node right now?". It cannot answer "is there one
+  // *yet*?", which is the ordinary case: people open the wallet and then start their node. Nor
+  // can it notice a detected node going away, which left every screen erroring against an
+  // endpoint that no longer existed. Both rules live in `nextNode`; this only supplies the facts.
   useEffect(() => {
     if (!meta?.unlocked) return;
     let alive = true;
+    let misses = 0;
+
     const tick = async () => {
+      let answered = true;
       try {
         const s = await api.getNetwork(node);
-        if (alive) setNet(s);
+        if (!alive) return;
+        setNet(s);
       } catch {
-        if (alive) setNet(null);
+        if (!alive) return;
+        setNet(null);
+        answered = false;
+      }
+      misses = answered ? 0 : misses + 1;
+
+      const stated = localStorage.getItem("helix-node") !== null;
+      // Only probe when the answer could change something: on a stated preference nothing may
+      // move, and while already reading from the local node there is nothing to discover.
+      const shouldProbeLocal = !stated && !isLocalNode(node);
+      let localIsUp = false;
+      if (shouldProbeLocal) {
+        try {
+          await api.getNetwork(LOCAL_NODE);
+          localIsUp = true;
+        } catch {
+          localIsUp = false;
+        }
+      }
+      if (!alive) return;
+
+      const target = nextNode({ current: node, stated, misses, localIsUp });
+      if (target && target !== node) {
+        // `false` — automatic housekeeping, never a stated preference. Persisting an address the
+        // user never typed would outlive the node it points at and switch off detection for good.
+        onNodeChange(target, false);
       }
     };
+
     tick();
     const id = setInterval(tick, 5000);
     return () => {
