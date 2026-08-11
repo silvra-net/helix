@@ -281,7 +281,7 @@ pub async fn request_funds(
     }
 
     let tx_hash = tx.hash().to_hex();
-    let result = state.mempool.write().await.add(tx.clone());
+    let result = state.mempool.write().await.add(tx.clone(), chain_id);
     match result {
         Ok(()) => {
             *next_nonce = Some(nonce + 1);

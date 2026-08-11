@@ -26,6 +26,8 @@ pub enum MempoolError {
     },
     #[error("Invalid transaction: {0}")]
     Invalid(String),
+    #[error("Signed for a different chain: transaction {theirs}, this chain {ours}")]
+    ForeignChain { theirs: String, ours: String },
 }
 
 pub type MempoolResult<T> = Result<T, MempoolError>;
@@ -290,8 +292,8 @@ impl Mempool {
         self.expired_set.contains(&hash.to_hex())
     }
 
-    pub fn add(&mut self, tx: Transaction) -> MempoolResult<()> {
-        self.add_inner(tx, None)
+    pub fn add(&mut self, tx: Transaction, chain_id: Hash) -> MempoolResult<()> {
+        self.add_inner(tx, None, chain_id)
     }
 
     /// Like `add`, but for a sender whose control was ever rotated by social-recovery
@@ -306,11 +308,17 @@ impl Mempool {
         &mut self,
         tx: Transaction,
         recovery_key: Option<&PublicKey>,
+        chain_id: Hash,
     ) -> MempoolResult<()> {
-        self.add_inner(tx, recovery_key)
+        self.add_inner(tx, recovery_key, chain_id)
     }
 
-    fn add_inner(&mut self, tx: Transaction, recovery_key: Option<&PublicKey>) -> MempoolResult<()> {
+    fn add_inner(
+        &mut self,
+        tx: Transaction,
+        recovery_key: Option<&PublicKey>,
+        chain_id: Hash,
+    ) -> MempoolResult<()> {
         self.evict_expired();
 
         // Both fee gates below have to agree with `execute_transaction`'s, or this pool starts
@@ -371,6 +379,23 @@ impl Mempool {
         // down other users' pending transactions.
         tx.verify_signature_with_recovery_key(recovery_key)
             .map_err(|e| MempoolError::Invalid(e.to_string()))?;
+
+        // Another chain's transaction cannot execute here, so holding it wastes a pool slot and,
+        // once a proposer packs it, block space — for free, since a transaction that fails this
+        // check burns no fee. Found live: with only the executor's check in place, a transaction
+        // carrying a foreign chain id was accepted, gossiped, included in a block and *then*
+        // rejected. `chain_id` is passed in rather than stored because the caller already holds
+        // chain state and a stored copy is one more thing that can be stale.
+        //
+        // Placed with the signature check and before the eviction branch below, for the reason
+        // spelled out there: anything rejected here must never be able to evict an admitted
+        // transaction first.
+        if tx.chain_id != chain_id {
+            return Err(MempoolError::ForeignChain {
+                theirs: tx.chain_id.to_hex(),
+                ours: chain_id.to_hex(),
+            });
+        }
 
         let tip = self.tip(&tx);
 
@@ -507,6 +532,47 @@ mod tests {
         make_tx_with_data(keypair, fee, nonce, 0)
     }
 
+    /// Found live on 2026-08-11, minutes after 0.11.0 went out, and not by any test here.
+    ///
+    /// The executor refuses a foreign chain's transaction (#174), so nothing unsafe could happen —
+    /// but with only that check in place, one submitted with `HELIX_CHAIN_ID` set to a dead chain's
+    /// hash was accepted by the pool, gossiped to peers, packed into block 351 and *then* rejected.
+    /// A transaction that fails that check burns no fee, so the whole round trip was free: pool
+    /// slot, bandwidth and block space, for nothing. The pool is where it has to stop.
+    #[test]
+    fn a_transaction_for_another_chain_never_enters_the_pool() {
+        let kp = KeyPair::generate();
+        let ours = Hash::digest(b"this chain");
+        let mut pool = Mempool::new();
+
+        let mut tx = make_tx(&kp, 10_000, 0);
+        tx.chain_id = Hash::digest(b"some other chain");
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+
+        let err = pool.add(tx, ours).expect_err("a foreign chain's tx must not be admitted");
+        assert!(
+            matches!(err, MempoolError::ForeignChain { .. }),
+            "and it must say so rather than blaming the signature: {err}",
+        );
+        assert_eq!(pool.len(), 0, "nothing may be held");
+    }
+
+    /// The positive control. Without it the test above passes just as well if `add` had started
+    /// refusing everything.
+    #[test]
+    fn a_transaction_for_this_chain_still_enters_the_pool() {
+        let kp = KeyPair::generate();
+        let ours = Hash::digest(b"this chain");
+        let mut pool = Mempool::new();
+
+        let mut tx = make_tx(&kp, 10_000, 0);
+        tx.chain_id = ours;
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+
+        pool.add(tx, ours).expect("our own chain's transaction belongs in the pool");
+        assert_eq!(pool.len(), 1);
+    }
+
     /// Packing must stop at a byte budget, not only at a transaction count.
     ///
     /// The count cap bounded nothing that matters: at ~5.4 KB per transfer, 1000 transactions is a
@@ -518,7 +584,7 @@ mod tests {
         let kp = KeyPair::generate();
         let mut pool = Mempool::with_limits(1_000, 1_000);
         for nonce in 0..20 {
-            pool.add(make_tx(&kp, 10_000 + nonce, nonce)).unwrap();
+            pool.add(make_tx(&kp, 10_000 + nonce, nonce), Hash::ZERO).unwrap();
         }
 
         let one = make_tx(&kp, 10_000, 0).size_bytes();
@@ -537,7 +603,7 @@ mod tests {
     fn a_transaction_larger_than_the_whole_budget_is_still_taken() {
         let kp = KeyPair::generate();
         let mut pool = Mempool::with_limits(1_000, 1_000);
-        pool.add(make_tx(&kp, 10_000, 0)).unwrap();
+        pool.add(make_tx(&kp, 10_000, 0), Hash::ZERO).unwrap();
 
         let taken = pool.take_within(1_000, 1);
         assert_eq!(taken.len(), 1, "the first transaction always goes in, budget or not");
@@ -550,7 +616,7 @@ mod tests {
         let kp = KeyPair::generate();
         let mut pool = Mempool::with_limits(1_000, 1_000);
         for nonce in 0..20 {
-            pool.add(make_tx(&kp, 10_000 + nonce, nonce)).unwrap();
+            pool.add(make_tx(&kp, 10_000 + nonce, nonce), Hash::ZERO).unwrap();
         }
 
         assert_eq!(pool.take_within(7, u64::MAX).len(), 7);
@@ -562,7 +628,7 @@ mod tests {
         let kp = KeyPair::generate();
         let mut pool = Mempool::with_limits(1_000, 1_000);
         for nonce in 0..6 {
-            pool.add(make_tx(&kp, 10_000 + nonce, nonce)).unwrap();
+            pool.add(make_tx(&kp, 10_000 + nonce, nonce), Hash::ZERO).unwrap();
         }
         let plain: Vec<_> = pool.take(4).iter().map(|t| t.hash()).collect();
         let budgeted: Vec<_> = pool.take_within(4, u64::MAX).iter().map(|t| t.hash()).collect();
@@ -578,7 +644,7 @@ mod tests {
         let mut pool = Mempool::with_ttl(Duration::from_millis(1));
         let tx = make_tx(&kp, 10_000, 0);
         let hash = tx.hash();
-        pool.add(tx).unwrap();
+        pool.add(tx, Hash::ZERO).unwrap();
 
         std::thread::sleep(Duration::from_millis(5));
         // Expiry is lazy — any pool operation drives it, as in production.
@@ -596,7 +662,7 @@ mod tests {
         let mut pool = Mempool::new();
         let tx = make_tx(&kp, 10_000, 0);
         let hash = tx.hash();
-        pool.add(tx).unwrap();
+        pool.add(tx, Hash::ZERO).unwrap();
 
         assert!(pool.contains(&hash));
         assert!(!pool.expired_recently(&hash));
@@ -638,12 +704,12 @@ mod tests {
         );
 
         assert!(
-            pool.add(make_heartbeat(&probationer, 0, 0)).is_ok(),
+            pool.add(make_heartbeat(&probationer, 0, 0), Hash::ZERO).is_ok(),
             "a probationer with nothing liquid must still get its proof into the pool",
         );
 
         assert!(
-            pool.add(make_heartbeat(&stranger, 0, 0)).is_err(),
+            pool.add(make_heartbeat(&stranger, 0, 0), Hash::ZERO).is_err(),
             "but the exemption must not be a free lane for everyone else",
         );
     }
@@ -739,12 +805,12 @@ mod tests {
         // Two TXs from same sender — must come out in nonce order (not fee order)
         let tx_lo = make_tx(&kp1, 10_000, 0);
         let tx_hi = make_tx(&kp1, 20_000, 1);
-        pool.add(tx_lo).unwrap();
-        pool.add(tx_hi).unwrap();
+        pool.add(tx_lo, Hash::ZERO).unwrap();
+        pool.add(tx_hi, Hash::ZERO).unwrap();
 
         // TX from a second sender (higher fee) also in pool
         let tx_other = make_tx(&kp2, 40_000, 0);
-        pool.add(tx_other).unwrap();
+        pool.add(tx_other, Hash::ZERO).unwrap();
 
         assert_eq!(pool.len(), 3);
 
@@ -763,7 +829,7 @@ mod tests {
         let kp = KeyPair::generate();
         let mut pool = Mempool::new();
         let tx = make_tx(&kp, 500, 0); // below 1000 min
-        assert!(matches!(pool.add(tx), Err(MempoolError::FeeTooLow { .. })));
+        assert!(matches!(pool.add(tx, Hash::ZERO), Err(MempoolError::FeeTooLow { .. })));
     }
 
     /// The gap this whole field closes: a fee comfortably above the flat `min_fee` but below
@@ -781,7 +847,7 @@ mod tests {
         // already costs more than this.
         assert!(5_000 < size, "premise: the floor alone outprices this fee");
 
-        let err = pool.add(tx).unwrap_err();
+        let err = pool.add(tx, Hash::ZERO).unwrap_err();
         assert!(
             matches!(err, MempoolError::BelowBaseFee { need, .. } if need == size),
             "{err:?}"
@@ -809,7 +875,7 @@ mod tests {
             tx.fee < tx.size_bytes(),
             "premise: the reporter fee is below what the base fee would charge for this size"
         );
-        assert!(pool.add(tx).is_ok(), "a slashing report must never be priced out of the pool");
+        assert!(pool.add(tx, Hash::ZERO).is_ok(), "a slashing report must never be priced out of the pool");
     }
 
     /// A rising base fee has to actually bite: the pool mirrors consensus, so what it accepts
@@ -821,11 +887,11 @@ mod tests {
         let tx = make_tx(&kp, 10_000, 0);
         let size = tx.size_bytes();
 
-        assert!(pool.add(tx.clone()).is_ok(), "affordable at the floor");
+        assert!(pool.add(tx.clone(), Hash::ZERO).is_ok(), "affordable at the floor");
 
         pool.remove_committed(&[tx.hash()]);
         pool.set_base_fee_per_byte(2);
-        let err = pool.add(tx).unwrap_err();
+        let err = pool.add(tx, Hash::ZERO).unwrap_err();
         assert!(
             matches!(err, MempoolError::BelowBaseFee { need, .. } if need == size * 2),
             "the same fee must stop clearing once the byte price doubles: {err:?}"
@@ -850,8 +916,8 @@ mod tests {
         );
         let small_hash = small.hash();
 
-        pool.add(big).unwrap();
-        pool.add(small).unwrap();
+        pool.add(big, Hash::ZERO).unwrap();
+        pool.add(small, Hash::ZERO).unwrap();
 
         let taken = pool.take(1);
         assert_eq!(taken.len(), 1);
@@ -872,11 +938,11 @@ mod tests {
 
         let big = make_zero_tip_tx(&big_kp, 0, 20_000);
         let big_hash = big.hash();
-        pool.add(big).unwrap();
+        pool.add(big, Hash::ZERO).unwrap();
 
         let small = make_tipping_tx(&small_kp, 0, 5_000);
         let small_hash = small.hash();
-        pool.add(small).expect("a real tip must outbid a zero tip, whatever the totals say");
+        pool.add(small, Hash::ZERO).expect("a real tip must outbid a zero tip, whatever the totals say");
 
         assert!(!pool.contains(&big_hash), "the zero-tip tx should have been evicted");
         assert!(pool.contains(&small_hash));
@@ -902,8 +968,8 @@ mod tests {
         );
         let evidence_hash = evidence.hash();
 
-        pool.add(evidence).unwrap();
-        pool.add(make_tipping_tx(&other, 0, 5_000)).unwrap();
+        pool.add(evidence, Hash::ZERO).unwrap();
+        pool.add(make_tipping_tx(&other, 0, 5_000), Hash::ZERO).unwrap();
 
         let taken = pool.take(1);
         assert_eq!(
@@ -923,7 +989,7 @@ mod tests {
 
         let tx = make_tx(&kp, 20_000, 0);
         let hash = tx.hash();
-        pool.add(tx).unwrap();
+        pool.add(tx, Hash::ZERO).unwrap();
 
         pool.set_base_fee_per_byte(2);
         pool.remove_committed(&[hash]);
@@ -943,7 +1009,7 @@ mod tests {
 
         // Insert nonce 2 first, then 0, then 1 — all same fee
         for nonce in [2u64, 0, 1] {
-            pool.add(make_tx(&kp, 10_000, nonce)).unwrap();
+            pool.add(make_tx(&kp, 10_000, nonce), Hash::ZERO).unwrap();
         }
         let taken = pool.take(10);
         assert_eq!(taken.iter().map(|t| t.nonce).collect::<Vec<_>>(), vec![0, 1, 2]);
@@ -955,7 +1021,7 @@ mod tests {
         let mut pool = Mempool::new();
         let tx = make_tx(&kp, 10_000, 0);
         let hash = tx.hash();
-        pool.add(tx).unwrap();
+        pool.add(tx, Hash::ZERO).unwrap();
         assert_eq!(pool.len(), 1);
         pool.remove_committed(&[hash]);
         assert_eq!(pool.len(), 0);
@@ -971,9 +1037,9 @@ mod tests {
         let tx1 = make_tx(&kp, 10_000, 0);
         let tx2 = make_tx(&kp, 12_000, 0); // same sender, same nonce, higher fee
 
-        pool.add(tx1).unwrap();
+        pool.add(tx1, Hash::ZERO).unwrap();
         assert!(matches!(
-            pool.add(tx2),
+            pool.add(tx2, Hash::ZERO),
             Err(MempoolError::NoncePending { .. })
         ));
         assert_eq!(pool.len(), 1);
@@ -988,11 +1054,11 @@ mod tests {
 
         let tx = make_tx(&kp, 10_000, 0);
         let hash = tx.hash();
-        pool.add(tx).unwrap();
+        pool.add(tx, Hash::ZERO).unwrap();
         pool.remove_committed(&[hash]);
 
         let tx2 = make_tx(&kp, 12_000, 0);
-        assert!(pool.add(tx2).is_ok(), "slot should be free after commit");
+        assert!(pool.add(tx2, Hash::ZERO).is_ok(), "slot should be free after commit");
     }
 
     #[test]
@@ -1005,20 +1071,20 @@ mod tests {
         let cheap = make_tx(&kp1, 10_000, 0);
         let cheap_hash = cheap.hash();
         let mid = make_tx(&kp2, 12_000, 0);
-        pool.add(cheap).unwrap();
-        pool.add(mid).unwrap();
+        pool.add(cheap, Hash::ZERO).unwrap();
+        pool.add(mid, Hash::ZERO).unwrap();
         assert_eq!(pool.len(), 2);
 
         // Pool is full, but this tx outbids the cheapest (5_000) — must evict it.
         let expensive = make_tx(&kp3, 14_000, 0);
-        pool.add(expensive).unwrap();
+        pool.add(expensive, Hash::ZERO).unwrap();
 
         assert_eq!(pool.len(), 2);
         assert!(!pool.contains(&cheap_hash), "cheapest tx should have been evicted");
 
         // Evicted sender's nonce slot must be freed too.
         let resubmit = make_tx(&kp1, 16_000, 0);
-        assert!(pool.add(resubmit).is_ok());
+        assert!(pool.add(resubmit, Hash::ZERO).is_ok());
     }
 
     #[test]
@@ -1028,12 +1094,12 @@ mod tests {
         let kp3 = KeyPair::generate();
         let mut pool = Mempool::with_limits(2, 1_000);
 
-        pool.add(make_tx(&kp1, 10_000, 0)).unwrap();
-        pool.add(make_tx(&kp2, 12_000, 0)).unwrap();
+        pool.add(make_tx(&kp1, 10_000, 0), Hash::ZERO).unwrap();
+        pool.add(make_tx(&kp2, 12_000, 0), Hash::ZERO).unwrap();
 
         // Equal to the cheapest fee — must not evict, must reject as Full.
         let tx = make_tx(&kp3, 10_000, 0);
-        assert!(matches!(pool.add(tx), Err(MempoolError::Full(2))));
+        assert!(matches!(pool.add(tx, Hash::ZERO), Err(MempoolError::Full(2))));
         assert_eq!(pool.len(), 2);
     }
 
@@ -1046,15 +1112,15 @@ mod tests {
 
         let cheap = make_tx(&kp1, 10_000, 0);
         let cheap_hash = cheap.hash();
-        pool.add(cheap).unwrap();
-        pool.add(make_tx(&kp2, 12_000, 0)).unwrap();
+        pool.add(cheap, Hash::ZERO).unwrap();
+        pool.add(make_tx(&kp2, 12_000, 0), Hash::ZERO).unwrap();
         assert_eq!(pool.len(), 2);
 
         // Would outbid the cheapest tx (5_000) on fee alone, but the signature is
         // garbage — must be rejected as Invalid without evicting anything.
         let mut forged = make_tx(&attacker_kp, 100_000, 0);
         forged.signature = Signature::from_bytes(vec![0u8; 32]);
-        assert!(matches!(pool.add(forged), Err(MempoolError::Invalid(_))));
+        assert!(matches!(pool.add(forged, Hash::ZERO), Err(MempoolError::Invalid(_))));
 
         assert_eq!(pool.len(), 2);
         assert!(pool.contains(&cheap_hash), "cheapest tx must survive a forged eviction attempt");
@@ -1066,7 +1132,7 @@ mod tests {
         let mut pool = Mempool::with_limits_and_ttl(100, 1_000, Duration::from_millis(1));
 
         let stuck = make_tx(&kp, 10_000, 0);
-        pool.add(stuck).unwrap();
+        pool.add(stuck, Hash::ZERO).unwrap();
         assert_eq!(pool.len(), 1);
 
         std::thread::sleep(Duration::from_millis(10));
@@ -1075,7 +1141,7 @@ mod tests {
         // with NoncePending — but the stuck tx is past its TTL, so add() must
         // evict it first and admit the new one.
         let resubmit = make_tx(&kp, 12_000, 0);
-        pool.add(resubmit).unwrap();
+        pool.add(resubmit, Hash::ZERO).unwrap();
         assert_eq!(pool.len(), 1);
     }
 
@@ -1083,7 +1149,7 @@ mod tests {
     fn test_take_also_evicts_expired() {
         let kp = KeyPair::generate();
         let mut pool = Mempool::with_limits_and_ttl(100, 1_000, Duration::from_millis(1));
-        pool.add(make_tx(&kp, 10_000, 0)).unwrap();
+        pool.add(make_tx(&kp, 10_000, 0), Hash::ZERO).unwrap();
 
         std::thread::sleep(Duration::from_millis(10));
 

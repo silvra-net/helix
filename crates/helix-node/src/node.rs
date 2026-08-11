@@ -1333,11 +1333,12 @@ async fn handle_p2p_event(
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
-            let (recovery_key, can_pay) = {
+            let (recovery_key, can_pay, chain_id) = {
                 let chain = chain_state.read().await;
                 (
                     chain.recovery_key(&tx.from).cloned(),
                     helix_executor::can_pay_fee(&chain, &tx),
+                    chain.chain_id,
                 )
             };
             // The same gate the RPC submit path applies. Without it here, the RPC's rate limiter
@@ -1348,7 +1349,7 @@ async fn handle_p2p_event(
                 return;
             }
             let mut pool = mempool.write().await;
-            match pool.add_with_recovery_key(tx, recovery_key.as_ref()) {
+            match pool.add_with_recovery_key(tx, recovery_key.as_ref(), chain_id) {
                 Ok(()) => {}
                 Err(e) => warn!("Rejected peer tx: {}", e),
             }
@@ -2110,7 +2111,7 @@ async fn report_double_sign_evidence(
         "Double-sign evidence detected — reporting on-chain"
     );
 
-    if let Err(e) = mempool.write().await.add(tx.clone()) {
+    if let Err(e) = mempool.write().await.add(tx.clone(), chain_id) {
         // Most likely a peer's report of the same incident already made it into our
         // mempool first (same evidence, different reporter) — not an error.
         debug!(err = %e, "Local mempool rejected our own evidence tx");
@@ -2188,7 +2189,7 @@ async fn send_probation_heartbeat_if_due(
     // The pool rejects every attempt after the first (same nonce still pending) — expected, and
     // not a reason to skip the broadcast: it is the *peers'* pools that decide whether this ever
     // reaches a block, and each retry is a distinct message to them.
-    let first_attempt = mempool.write().await.add(tx.clone()).is_ok();
+    let first_attempt = mempool.write().await.add(tx.clone(), chain_id).is_ok();
     if first_attempt {
         info!(height = applied_height, "Proving this node is live so the validator can leave probation");
     } else {
