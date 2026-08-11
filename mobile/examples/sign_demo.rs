@@ -18,6 +18,9 @@ fn main() {
     let signed = helix_mobile::sign_transaction(
         seed,
         helix_mobile::UnsignedTx {
+            // Empty = the public Helix chain, whose genesis hash is compiled in. A wallet talking
+            // to a devnet has to pass that chain's hash here instead.
+            chain_id: String::new(),
             version: 1,
             tx_type: "Transfer".to_string(),
             from: from.clone(),

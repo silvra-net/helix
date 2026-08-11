@@ -6,7 +6,7 @@
 //! kept short enough to eyeball against the original.
 
 use helix_core::{Transaction, TxType};
-use helix_crypto::{Address, KeyPair, Signature};
+use helix_crypto::{Address, Hash, KeyPair, Signature};
 
 pub const NANO_PER_HLX: u64 = 1_000_000_000;
 
@@ -41,7 +41,8 @@ pub fn hlx_to_nano(amount_hlx: f64) -> Result<u64, String> {
 }
 
 /// Assemble a transaction skeleton. The caller then hands it to [`finalize_and_sign`].
-pub fn build_tx(tx_type: TxType, from: Address, to: Option<Address>, amount: u64, nonce: u64, data: Vec<u8>, kp: &KeyPair) -> Transaction {
+#[allow(clippy::too_many_arguments)]
+pub fn build_tx(tx_type: TxType, from: Address, to: Option<Address>, amount: u64, nonce: u64, data: Vec<u8>, chain_id: Hash, kp: &KeyPair) -> Transaction {
     Transaction {
         version: 1,
         tx_type,
@@ -52,6 +53,10 @@ pub fn build_tx(tx_type: TxType, from: Address, to: Option<Address>, amount: u64
         nonce,
         data,
         crypto_version: kp.scheme,
+        // Which chain this is for — see `Transaction::chain_id`. Passed in rather than taken from
+        // the compiled-in default here, because a wallet pointed at a devnet must sign for that
+        // devnet; `rpc::fetch_chain_id` is where the decision of whom to believe lives.
+        chain_id,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     }
@@ -102,7 +107,7 @@ mod tests {
         let kp = KeyPair::generate();
         let from = Address::from_public_key(&kp.public);
         let to = Address::from_public_key(&KeyPair::generate().public);
-        let mut tx = build_tx(TxType::Transfer, from, Some(to), 5 * NANO_PER_HLX, 0, vec![], &kp);
+        let mut tx = build_tx(TxType::Transfer, from, Some(to), 5 * NANO_PER_HLX, 0, vec![], Hash::ZERO, &kp);
         finalize_and_sign(&mut tx, None, 1, &kp).unwrap();
         assert!(tx.fee > 0, "an unpinned fee must be priced above zero");
         assert!(tx.verify_signature().is_ok(), "the node would reject this signature");

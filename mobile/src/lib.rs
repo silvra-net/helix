@@ -15,7 +15,7 @@
 //! caller's responsibility exactly as before (opaque bytes, not signature-critical structure).
 
 use helix_core::{Transaction, TxType};
-use helix_crypto::{Address, KeyPair, Signature};
+use helix_crypto::{Address, Hash, KeyPair, Signature};
 
 #[derive(uniffi::Record)]
 pub struct UnsignedTx {
@@ -33,6 +33,16 @@ pub struct UnsignedTx {
     pub fee: u64,
     pub nonce: u64,
     pub data: Vec<u8>,
+    /// Genesis hash (hex) of the chain this transaction is for — see
+    /// `helix_core::Transaction::chain_id`. Signed over, so it cannot be swapped afterwards.
+    ///
+    /// Empty means "the public Helix chain", whose hash is compiled into this build. That default
+    /// exists so an app that only ever talks to the public network needs no extra plumbing — but a
+    /// wallet pointed anywhere else **must** pass the hash of that chain, or the transactions it
+    /// produces will be refused by name. Never take it from the endpoint you are about to submit
+    /// to: an endpoint that gets to say which chain it is also gets to decide what the signature
+    /// authorises.
+    pub chain_id: String,
 }
 
 #[derive(uniffi::Record)]
@@ -56,6 +66,11 @@ pub enum MobileError {
     UnknownTxType(String),
     #[error("signing failed: {0}")]
     Signing(String),
+    #[error(
+        "invalid chain_id {0:?} — it is a chain's genesis hash in hex (64 characters), or empty \
+         for the public Helix chain"
+    )]
+    InvalidChainId(String),
 }
 
 /// Every `TxType` variant, spelled exactly as `UnsignedTx::tx_type` must spell it. A `match`
@@ -85,6 +100,7 @@ fn tx_type_from_str(s: &str) -> Result<TxType, MobileError> {
         "Redelegate" => TxType::Redelegate,
         "SetCommission" => TxType::SetCommission,
         "Unjail" => TxType::Unjail,
+        "ProbationHeartbeat" => TxType::ProbationHeartbeat,
         other => return Err(MobileError::UnknownTxType(other.to_string())),
     })
 }
@@ -119,6 +135,11 @@ pub fn sign_transaction(seed: Vec<u8>, tx: UnsignedTx) -> Result<SignedTx, Mobil
         .map(|s| Address::from_str(&s).map_err(|e| MobileError::InvalidAddress(s, e.to_string())))
         .transpose()?;
     let tx_type = tx_type_from_str(&tx.tx_type)?;
+    let chain_id = match tx.chain_id.trim() {
+        "" => helix_core::default_chain_id(),
+        hex => Hash::from_hex(hex)
+            .map_err(|_| MobileError::InvalidChainId(tx.chain_id.clone()))?,
+    };
 
     let mut signed = Transaction {
         version: tx.version,
@@ -130,6 +151,7 @@ pub fn sign_transaction(seed: Vec<u8>, tx: UnsignedTx) -> Result<SignedTx, Mobil
         nonce: tx.nonce,
         data: tx.data,
         crypto_version: keypair.scheme,
+        chain_id,
         signature: Signature::from_bytes(vec![]),
         public_key: keypair.public.clone(),
     };
@@ -169,6 +191,7 @@ mod tests {
         let signed = sign_transaction(
             seed,
             UnsignedTx {
+                chain_id: String::new(),
                 version: 1,
                 tx_type: "Transfer".to_string(),
                 from: from.clone(),
@@ -197,6 +220,7 @@ mod tests {
             TxType::VoteProposal, TxType::ProvePersonhood, TxType::ClaimUnbonded,
             TxType::CancelRecoveryRequest, TxType::SubmitDoubleSignEvidence, TxType::Delegate,
             TxType::Undelegate, TxType::Redelegate, TxType::SetCommission, TxType::Unjail,
+            TxType::ProbationHeartbeat,
         ];
         for variant in all {
             let name = match &variant {
@@ -220,6 +244,7 @@ mod tests {
                 TxType::Redelegate => "Redelegate",
                 TxType::SetCommission => "SetCommission",
                 TxType::Unjail => "Unjail",
+                TxType::ProbationHeartbeat => "ProbationHeartbeat",
             };
             assert_eq!(tx_type_from_str(name).unwrap(), variant);
         }

@@ -173,6 +173,9 @@ async fn build_sign_submit(
         Some(_) => 0,
         None => rpc::fetch_base_fee(node).await?,
     };
+    // Before the wallet lock is taken: this may go over the network, and the lock must never be
+    // held across an await (see `finalize_and_sign`).
+    let chain_id = rpc::fetch_chain_id(node).await?;
 
     // Captured before `tx_type` moves into `build_tx` below — just for the log line, so it
     // doesn't need `TxType: Copy`/an extra clone of anything bigger.
@@ -181,7 +184,7 @@ async fn build_sign_submit(
     let signed = {
         let guard = state.inner.lock().unwrap();
         let wallet = guard.as_ref().ok_or("wallet is locked")?;
-        let mut tx = pricing::build_tx(tx_type, from, to, amount, nonce, data, &wallet.keypair);
+        let mut tx = pricing::build_tx(tx_type, from, to, amount, nonce, data, chain_id, &wallet.keypair);
         pricing::finalize_and_sign(&mut tx, fee, base_fee, &wallet.keypair)?;
         tx
     };

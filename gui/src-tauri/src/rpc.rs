@@ -5,7 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use helix_core::Transaction;
+use helix_core::{ChainIdSource, Transaction};
+use helix_crypto::Hash;
 
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -262,6 +263,35 @@ pub async fn fetch_nonce(node: &str, address: &str) -> u64 {
 
 pub async fn fetch_base_fee(node: &str) -> Result<u64, String> {
     Ok(get_status(node).await?.base_fee_per_byte)
+}
+
+/// Which chain to sign for (backlog #174, `Transaction::chain_id`).
+///
+/// Same boundary as the CLI's `resolve_chain_id`, and for the same reason: asking the endpoint you
+/// are about to submit to which chain it is on lets that endpoint decide what your signature
+/// authorises. Point a user at a "testnet" RPC, answer with mainnet's id, and the transaction they
+/// thought was worthless is spendable. So the public endpoint is never asked — its id is compiled
+/// in — while a node the user named may be, because trusting it is a choice they already made.
+pub async fn fetch_chain_id(node: &str) -> Result<Hash, String> {
+    match helix_core::chain_id_source(node) {
+        ChainIdSource::CompiledIn => Ok(helix_core::default_chain_id()),
+        ChainIdSource::AskEndpoint => {
+            let value: serde_json::Value = client()
+                .get(format!("{node}/blocks/height/0"))
+                .send()
+                .await
+                .map_err(err)?
+                .json()
+                .await
+                .map_err(err)?;
+            let hex = value
+                .get("hash")
+                .and_then(|h| h.as_str())
+                .ok_or_else(|| format!("the node at {node} returned a genesis block with no hash"))?;
+            Hash::from_hex(hex)
+                .map_err(|_| format!("the node at {node} reported a malformed genesis hash: {hex}"))
+        }
+    }
 }
 
 pub async fn get_delegations(node: &str, address: &str) -> Result<Vec<Delegation>, String> {
