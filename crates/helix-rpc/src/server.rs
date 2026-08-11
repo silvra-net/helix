@@ -1350,6 +1350,7 @@ mod tests {
             nonce,
             data: vec![],
             crypto_version: Default::default(),
+            chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
             public_key: PublicKey::from_bytes(vec![]),
@@ -1471,6 +1472,7 @@ mod tests {
             nonce: 0,
             data: vec![],
             crypto_version: CryptoVersion::MlDsa,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -1513,6 +1515,7 @@ mod tests {
             nonce: 0,
             data: vec![],
             crypto_version: CryptoVersion::MlDsa,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -2043,6 +2046,7 @@ mod tests {
             nonce: 0,
             data: vec![],
             crypto_version: CryptoVersion::MlDsa,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };

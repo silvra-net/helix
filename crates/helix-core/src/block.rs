@@ -312,6 +312,7 @@ mod tests {
             nonce,
             data: vec![],
             crypto_version: Default::default(),
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Sig::from_bytes(vec![]),
             public_key: PublicKey::from_bytes(vec![]),
         }

@@ -180,8 +180,31 @@ pub struct Redelegation {
 }
 
 /// Full world state of the chain
+/// The `chain_id` a state carries before anyone sets one.
+///
+/// Not `impl Default for Hash`: a blanket default on a hash type invites `Hash::default()` at call
+/// sites where "no hash yet" is not a meaningful value, and a zero hash that silently stands in for
+/// a real one is how a check turns into a formality. Named here so the one place that wants it says
+/// what it means.
+fn unset_chain_id() -> Hash {
+    Hash::ZERO
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainState {
+    /// Which chain this state belongs to: the genesis block's hash. Set by whoever builds or loads
+    /// the state, checked against every transaction's `chain_id` (backlog #174).
+    ///
+    /// Deliberately **not** part of `state_hash`'s `Canonical` view. It is context, not consensus
+    /// state — the genesis block already proves which chain this is, and folding it in would buy no
+    /// safety while giving the genesis rebuild another way to disagree with a peer.
+    ///
+    /// Defaults to the zero hash, which matches no real genesis, so a node that forgot to set it
+    /// rejects every transaction loudly instead of accepting foreign ones quietly. That direction
+    /// is chosen: a stuck faucet is a bug report, a chain that honours another chain's signatures
+    /// is a theft.
+    #[serde(default = "unset_chain_id")]
+    pub chain_id: Hash,
     /// address string → account state
     pub accounts: HashMap<String, AccountState>,
     /// Absolute HLX supply ceiling in nano-HLX (`genesis::TOTAL_SUPPLY_HLX`, fixed at
@@ -436,8 +459,12 @@ pub struct ChainState {
 }
 
 impl ChainState {
+    /// A state with no chain identity yet — `chain_id` stays [`Hash::ZERO`] until the caller who
+    /// knows the genesis block sets it (see `ChainState::chain_id`). Callers that skip that step
+    /// get a state which rejects every transaction, which is the loud direction to fail in.
     pub fn new(total_supply: u64) -> Self {
         ChainState {
+            chain_id: unset_chain_id(),
             accounts: HashMap::new(),
             total_supply,
             total_issued: 0,

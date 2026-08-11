@@ -104,6 +104,7 @@ async fn deploy(
         nonce,
         data: bytecode,
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
@@ -158,6 +159,7 @@ async fn call(
         nonce,
         data: data.map(|d| d.into_bytes()).unwrap_or_default(),
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),

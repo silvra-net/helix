@@ -212,6 +212,26 @@ pub struct Transaction {
     /// Defaults to `CryptoScheme::MlDsa` for backward-compatible deserialization.
     #[serde(default)]
     pub crypto_version: CryptoScheme,
+    /// Genesis hash of the chain this transaction is valid on — Helix's answer to EIP-155.
+    ///
+    /// Without it a signature commits to an intent ("send 110,000 to X, nonce 0") and to nothing
+    /// about *where*, so the same signed bytes spend on every Helix chain that ever existed. That
+    /// is not theoretical: the three validator fundings of 2026-08-07 came out byte-identical to
+    /// those of the 2026-08-05 reset, same hashes, because the intent was the same and ML-DSA signs
+    /// deterministically. On a devnet that is folklore. With a testnet beside a mainnet it is a
+    /// theft vector, and it cannot be fixed retroactively — a chain cannot start honouring a field
+    /// its history never signed.
+    ///
+    /// The genesis hash rather than a configured number, and deliberately: a separate parameter is
+    /// something you forget to change during a reset, which is exactly the mistake that locked
+    /// three operators out on 2026-08-08 with `DEFAULT_GENESIS_HASH`. This one cannot go stale
+    /// without the chain itself changing, because it *is* the chain's identity.
+    ///
+    /// Carried on the wire instead of folded silently into the preimage, so a mismatch can be
+    /// reported as what it is. The alternative fails as "invalid signature", which is the same
+    /// class of unreadable diagnosis as #166 and the stale-genesis lockout — true, useless, and
+    /// pointing at the wrong repair.
+    pub chain_id: Hash,
     /// Detached signature over the canonical hash of this tx
     pub signature: Signature,
     /// Full public key (needed for sig verification + address derivation)
@@ -232,6 +252,7 @@ impl Transaction {
             nonce: self.nonce,
             data: &self.data,
             crypto_version: self.crypto_version,
+            chain_id: &self.chain_id,
         })
         .expect("serialization is infallible for fixed types");
         // Domain tag separates a transaction signature from a block-header or vote
@@ -311,6 +332,7 @@ struct TxPayload<'a> {
     nonce: u64,
     data: &'a [u8],
     crypto_version: CryptoScheme,
+    chain_id: &'a Hash,
 }
 
 #[cfg(test)]
@@ -329,11 +351,64 @@ mod tests {
             nonce: 0,
             data: vec![],
             crypto_version: keypair.scheme,
+            chain_id: Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: keypair.public.clone(),
         };
         tx.signature = keypair.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
+    }
+
+    /// The measurement that produced backlog #174, turned into a test.
+    ///
+    /// On 2026-08-07 the three validator fundings came out with hashes byte-identical to the ones
+    /// from the 2026-08-05 reset — same amounts, same nonces, same keys, and ML-DSA signs
+    /// deterministically, so the same intent produced the same bytes. Nothing distinguished the
+    /// two chains, which is what made every one of those signatures replayable on the other.
+    #[test]
+    fn the_same_intent_signed_for_two_chains_produces_two_different_signatures() {
+        let keypair = KeyPair::generate();
+        let address = Address::from_public_key(&keypair.public);
+
+        let mut on_chain_a = build_tx(address.clone(), &keypair);
+        on_chain_a.chain_id = Hash::digest(b"chain A genesis");
+        on_chain_a.signature = keypair.sign(on_chain_a.signing_hash().as_bytes()).unwrap();
+
+        let mut on_chain_b = on_chain_a.clone();
+        on_chain_b.chain_id = Hash::digest(b"chain B genesis");
+        on_chain_b.signature = keypair.sign(on_chain_b.signing_hash().as_bytes()).unwrap();
+
+        assert_ne!(
+            on_chain_a.signing_hash(),
+            on_chain_b.signing_hash(),
+            "identical intent on two chains must not sign to the same bytes — that was #174",
+        );
+        assert_ne!(on_chain_a.hash(), on_chain_b.hash(), "and the tx ids must differ too");
+
+        // Both are individually valid. The chain id does not make a signature good or bad; it makes
+        // it *belong somewhere*, and refusing the foreign one is the executor's job.
+        assert!(on_chain_a.verify_signature().is_ok());
+        assert!(on_chain_b.verify_signature().is_ok());
+    }
+
+    /// The field has to be inside the signature, not merely beside it. If it were not, an attacker
+    /// could take a transaction signed for a worthless chain, rewrite the id, and submit it to a
+    /// valuable one — which is the whole attack restated.
+    #[test]
+    fn rewriting_the_chain_id_after_signing_invalidates_the_signature() {
+        let keypair = KeyPair::generate();
+        let address = Address::from_public_key(&keypair.public);
+
+        let mut tx = build_tx(address, &keypair);
+        tx.chain_id = Hash::digest(b"the chain it was signed for");
+        tx.signature = keypair.sign(tx.signing_hash().as_bytes()).unwrap();
+        assert!(tx.verify_signature().is_ok(), "premise: it is valid where it was signed");
+
+        tx.chain_id = Hash::digest(b"a chain worth stealing on");
+        assert!(
+            tx.verify_signature().is_err(),
+            "the chain id must be covered by the signature, or it is decoration",
+        );
     }
 
     #[test]

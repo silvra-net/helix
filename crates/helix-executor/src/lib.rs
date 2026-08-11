@@ -194,6 +194,25 @@ pub fn execute_transaction_metered(
 ) -> Receipt {
     let tx_hash = tx.hash();
 
+    // Which chain was this signed for (backlog #174)? Before the signature, for two reasons. It is
+    // a 32-byte comparison in front of an ML-DSA verification, so a flood of foreign transactions
+    // costs a memcmp rather than a signature check. And the diagnosis is the point: a transaction
+    // signed for another chain has a *perfectly valid* signature, so without this it would be
+    // accepted outright — and once the check exists, reporting it as "invalid signature" would send
+    // whoever reads the receipt hunting for a key problem that does not exist.
+    if tx.chain_id != state.chain_id {
+        return Receipt::failure(
+            tx_hash,
+            &format!(
+                "signed for a different chain (transaction: {}, this chain: {})",
+                tx.chain_id.to_hex(),
+                state.chain_id.to_hex()
+            ),
+            0,
+            0,
+        );
+    }
+
     // Signature first: an unsigned transaction is nobody's, so there is no one to charge.
     if !verify_tx_signature(state, tx) {
         return Receipt::failure(tx_hash, "invalid signature", 0, 0);
@@ -2022,6 +2041,7 @@ mod tests {
             nonce,
             data: name.as_bytes().to_vec(),
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -2127,6 +2147,7 @@ mod tests {
             nonce,
             data: vec![],
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -2185,6 +2206,7 @@ mod tests {
             nonce,
             data,
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -2211,6 +2233,7 @@ mod tests {
             nonce,
             data: new_public_key.as_bytes().to_vec(),
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -2325,6 +2348,7 @@ mod tests {
             nonce: 1,
             data: vec![],
             crypto_version: Default::default(),
+            chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
             public_key: new_kp.public.clone(),
@@ -2371,6 +2395,7 @@ mod tests {
             nonce,
             data: vec![],
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -2475,6 +2500,7 @@ mod tests {
             nonce,
             data,
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -3298,6 +3324,7 @@ mod tests {
             nonce,
             data,
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
@@ -3781,6 +3808,7 @@ mod tests {
             nonce,
             data: vec![],
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -3892,6 +3920,7 @@ mod tests {
             nonce,
             data: vec![],
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -4212,6 +4241,7 @@ mod tests {
             nonce,
             data: bincode::serialize(payload).unwrap(),
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -4433,6 +4463,7 @@ mod tests {
             nonce,
             data: bincode::serialize(evidence).unwrap(),
             crypto_version: reporter_kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: reporter_kp.public.clone(),
         };
@@ -5289,6 +5320,73 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Backlog #174 at the executor: a transaction carrying another chain's id is refused before
+    /// anything else happens, and the refusal names both ids.
+    ///
+    /// The signature on such a transaction is *valid* — that is what makes this the dangerous case
+    /// and why the check cannot be left to `verify_tx_signature`. Without it, a signed transfer
+    /// from any other Helix chain would execute here exactly as its sender meant it on the chain
+    /// they meant it for.
+    #[test]
+    fn a_transaction_signed_for_another_chain_is_refused_and_says_so() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let to = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let ours = Hash::digest(b"this chain's genesis");
+        let theirs = Hash::digest(b"another chain's genesis");
+
+        let mut state = ChainState::new(0);
+        state.chain_id = ours;
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let mut tx =
+            signed_tx(&kp, &addr, TxType::Transfer, Some(to.clone()), 1, vec![], 0, 100_000);
+        tx.chain_id = theirs;
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        assert!(tx.verify_signature().is_ok(), "premise: the signature itself is perfectly good");
+
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 1);
+        assert!(!receipt.success, "a foreign chain's transaction must not execute here");
+
+        let err = receipt.error.as_deref().unwrap_or_default();
+        assert!(err.contains("different chain"), "must name the reason, not just fail: {err}");
+        assert!(err.contains(&theirs.to_hex()), "must name what the tx was signed for: {err}");
+        assert!(err.contains(&ours.to_hex()), "must name which chain this is: {err}");
+        assert!(
+            !err.contains("invalid signature"),
+            "must not send the reader after a key problem that does not exist: {err}",
+        );
+
+        // Nothing moved and nothing was charged — a foreign transaction is not this chain's
+        // business at all, so it must not even burn the sender's nonce.
+        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000);
+        assert_eq!(state.get(&addr).unwrap().nonce, 0);
+    }
+
+    /// The same transaction, on the chain it was actually signed for. Without this, the test above
+    /// would pass just as happily if the executor had started refusing everything.
+    #[test]
+    fn the_same_transaction_executes_on_the_chain_it_was_signed_for() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let to = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let ours = Hash::digest(b"this chain's genesis");
+        let mut state = ChainState::new(0);
+        state.chain_id = ours;
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+
+        let mut tx = signed_tx(&kp, &addr, TxType::Transfer, Some(to), 1, vec![], 0, 100_000);
+        tx.chain_id = ours;
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 1);
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+    }
+
     fn signed_tx(
         kp: &KeyPair,
         from: &Address,
@@ -5309,6 +5407,7 @@ mod tests {
             nonce,
             data,
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };

@@ -215,6 +215,7 @@ async fn send(
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
@@ -263,6 +264,7 @@ async fn simple_amount_tx(
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
@@ -302,6 +304,7 @@ async fn zero_amount_tx(
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
@@ -347,6 +350,7 @@ async fn targeted_amount_tx(
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
@@ -401,6 +405,7 @@ async fn redelegate(
         // names two validators.
         data: src.to_string().into_bytes(),
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };
@@ -447,6 +452,7 @@ async fn set_commission(
         nonce,
         data: bps.to_le_bytes().to_vec(),
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
     };

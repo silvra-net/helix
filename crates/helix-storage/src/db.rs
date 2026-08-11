@@ -788,7 +788,14 @@ impl HelixDb {
                     * helix_executor::genesis::NANO_PER_HLX,
             );
 
+        // Which chain this state belongs to (backlog #174). Read from the genesis block rather
+        // than stored beside the accounts: it is derived data, and a second copy is a second thing
+        // that can disagree. An empty database has no genesis yet and correctly yields the unset
+        // value — the node writes genesis moments later and reloads.
+        let chain_id = self.get_block_by_height(0).map(|b| b.hash()).unwrap_or(Hash::ZERO);
+
         Ok(ChainState {
+            chain_id,
             accounts,
             applied_height,
             total_supply,
@@ -1096,6 +1103,7 @@ mod tests {
             nonce,
             data: vec![],
             crypto_version: Default::default(),
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: PublicKey::from_bytes(vec![]),
         }

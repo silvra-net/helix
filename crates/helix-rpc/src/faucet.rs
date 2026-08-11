@@ -37,7 +37,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use helix_core::{Transaction, TxType};
-use helix_crypto::{Address, KeyFile, KeyPair, Signature};
+use helix_crypto::{Address, Hash, KeyFile, KeyPair, Signature};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -161,6 +161,7 @@ impl Faucet {
         amount: u64,
         nonce: u64,
         base_fee_per_byte: u64,
+        chain_id: Hash,
     ) -> Result<Transaction, String> {
         let mut tx = Transaction {
             version: 1,
@@ -172,6 +173,7 @@ impl Faucet {
             nonce,
             data: Vec::new(),
             crypto_version: self.keypair.scheme,
+            chain_id,
             signature: Signature::from_bytes(Vec::new()),
             public_key: self.keypair.public.clone(),
         };
@@ -227,12 +229,16 @@ pub async fn request_funds(
     // nothing can interleave between choosing the nonce and spending it.
     let mut next_nonce = faucet.next_nonce.lock().await;
 
-    let (recipient_balance, faucet_balance, state_nonce) = {
+    let (recipient_balance, faucet_balance, state_nonce, chain_id) = {
         let chain = state.chain_state.read().await;
         (
             chain.get(&to).map(|a| a.balance).unwrap_or(0),
             chain.get(&faucet.address).map(|a| a.balance).unwrap_or(0),
             chain.get(&faucet.address).map(|a| a.nonce).unwrap_or(0),
+            // Taken from the state this grant will be executed against, never from a constant:
+            // the faucet must sign for the chain it is actually paying out on, which after a reset
+            // is a different one than the binary was published for.
+            chain.chain_id,
         )
     };
 
@@ -249,7 +255,7 @@ pub async fn request_funds(
 
     let base_fee_per_byte = state.mempool.read().await.base_fee_per_byte();
     let nonce = next_nonce.unwrap_or(state_nonce);
-    let tx = match faucet.signed_transfer(&to, grant, nonce, base_fee_per_byte) {
+    let tx = match faucet.signed_transfer(&to, grant, nonce, base_fee_per_byte, chain_id) {
         Ok(tx) => tx,
         Err(e) => {
             *next_nonce = None;
@@ -356,8 +362,8 @@ mod tests {
         let faucet = faucet_with(10);
         let to = Address::from_public_key(&KeyPair::generate().public);
 
-        let cheap = faucet.signed_transfer(&to, NANO_PER_HLX, 0, 1).unwrap();
-        let dear = faucet.signed_transfer(&to, NANO_PER_HLX, 0, 1_000_000).unwrap();
+        let cheap = faucet.signed_transfer(&to, NANO_PER_HLX, 0, 1, helix_core::default_chain_id()).unwrap();
+        let dear = faucet.signed_transfer(&to, NANO_PER_HLX, 0, 1_000_000, helix_core::default_chain_id()).unwrap();
 
         assert_ne!(cheap.fee, dear.fee, "precondition: the two must differ in fee");
         assert_eq!(
@@ -374,7 +380,7 @@ mod tests {
     fn a_grant_is_priced_above_the_bare_minimum() {
         let faucet = faucet_with(10);
         let to = Address::from_public_key(&KeyPair::generate().public);
-        let tx = faucet.signed_transfer(&to, NANO_PER_HLX, 0, 1).unwrap();
+        let tx = faucet.signed_transfer(&to, NANO_PER_HLX, 0, 1, helix_core::default_chain_id()).unwrap();
 
         let bare_minimum = tx.size_bytes();
         assert!(
@@ -395,7 +401,7 @@ mod tests {
     fn the_shipped_signature_covers_the_final_fee() {
         let faucet = faucet_with(10);
         let to = Address::from_public_key(&KeyPair::generate().public);
-        let tx = faucet.signed_transfer(&to, NANO_PER_HLX, 7, 1).unwrap();
+        let tx = faucet.signed_transfer(&to, NANO_PER_HLX, 7, 1, helix_core::default_chain_id()).unwrap();
 
         assert!(tx.verify_signature().is_ok());
         assert_eq!(tx.nonce, 7, "the nonce the caller chose must be the one signed");

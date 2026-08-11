@@ -67,30 +67,14 @@ const DEFAULT_VALIDATOR_KEY_FILE: &str = "validator-key.json";
 /// beside it and both paths have to agree.
 const CHAIN_DB_FILE: &str = "helix-data.redb";
 
-pub const DEFAULT_SEED_PEER: &str = "https://helix.silvra.net";
+pub use helix_core::DEFAULT_SEED_PEER;
 
-/// The genesis hash of the public Helix chain, compiled in so joining it is verified by default.
-///
-/// Bitcoin puts its genesis block in the source and asserts the hash (`chainparams.cpp`), so a node
-/// cannot be talked onto another chain and nobody configures anything. This is the same idea with
-/// one deliberate softening: it is the *default* value of the checkpoint, not a law. A Helix devnet
-/// reset produces a new genesis, and a hard-coded hash that outlived a reset would lock every
-/// operator out of the network until a release shipped — trading a real outage for a hypothetical
-/// impersonation. `HELIX_GENESIS_HASH` still overrides it, so after a reset an operator is told
-/// clearly what happened and has a way through rather than being stranded.
-///
-/// Only applies when joining the default seed. An operator who named their own `sync_peer` is
-/// joining a network this constant knows nothing about, and silently checking ours against theirs
-/// would refuse a perfectly good join.
-///
-/// **Update this together with any chain reset**, in the release that accompanies it. That
-/// instruction stood here and was missed on 2026-08-07: the chain was reset, this constant kept the
-/// dead chain's hash, and every operator running the published binary was refused at the join — by
-/// a message that read as though *they* had configured the stale value. Hence
-/// [`GenesisCheckpoint`]: the constant will go stale again, so the refusal has to say whose claim
-/// it is.
-pub const DEFAULT_GENESIS_HASH: &str =
-    "6860abdad560f163f22aad1c8d3b7e2ef8b4a4c2b442402e7b19ddefa771169e";
+/// Re-exported from `helix_core::chain`, which is where it has to live: the wallet needs this
+/// value as badly as the node does, and a second copy beside this one is a second thing that can
+/// be updated alone. See `GenesisCheckpoint` below for what a stale value does to a joining node,
+/// and `scripts/check-genesis-pin.sh` for the check that catches it.
+pub use helix_core::DEFAULT_GENESIS_HASH;
+
 
 /// Where a genesis checkpoint came from, kept alongside the hash because the refusal message has to
 /// distinguish them.
@@ -594,7 +578,7 @@ impl HelixNode {
             store.put_block(genesis.clone())?;
             info!(validator = %genesis.header.validator, "Adopted peer's genesis block (height 0)");
             store.save_chain_state(&state)?;
-            state
+            with_chain_id(state, &genesis)
         } else if joins_over_p2p(new_chain, &configured_seed_peers(&cfg)) {
             // No local chain and no RPC `sync_peer`, but the operator named P2P peers — join from
             // those alone (#139). Until this branch existed, adopting a genesis was possible only
@@ -656,7 +640,7 @@ impl HelixNode {
             store.put_block(genesis.clone())?;
             info!(validator = %genesis.header.validator, "Adopted genesis received over P2P (height 0)");
             store.save_chain_state(&state)?;
-            state
+            with_chain_id(state, &genesis)
         } else {
             let sig = keypair.sign(b"helix-genesis-v1")?;
             // Wall-clock timestamp, not the historical hardcoded 0: it makes this genesis hash
@@ -672,14 +656,27 @@ impl HelixNode {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let genesis = genesis_block(address.clone(), keypair.public.clone(), sig, genesis_ts);
+            let state = with_chain_id(genesis_cfg.build_state(), &genesis);
             store.put_block(genesis)?;
             info!("Genesis block created (height 0)");
 
-            let state = genesis_cfg.build_state();
             store.save_chain_state(&state)?;
             info!("Genesis: no liquid pre-mine — validator earns via 50/50 fee split plus the halving block reward");
             state
         };
+
+        // Every path above must have stamped the chain identity (backlog #174). A node that
+        // reaches here without one rejects every transaction it is ever offered, and does it in
+        // the receipt rather than in the log — the operator would see a chain producing empty
+        // blocks and nothing saying why. Cheaper to refuse to start: this is a wiring mistake in
+        // our own constructor, not a condition an operator can be in.
+        anyhow::ensure!(
+            chain_state.chain_id != helix_crypto::Hash::ZERO,
+            "internal error: chain state has no chain_id after startup — every transaction would \
+             be rejected as belonging to another chain. This is a bug in HelixNode::new, not a \
+             configuration problem."
+        );
+        info!(chain_id = %chain_state.chain_id.to_hex(), "Chain identity established");
 
         // NOTE: the historical catch-up does NOT happen here any more — it runs in `run`,
         // after the RPC server is listening. Downloading it from inside the constructor meant
@@ -2071,9 +2068,9 @@ async fn report_double_sign_evidence(
     p2p_tx: &mpsc::Sender<P2PCommand>,
 ) {
     let self_address = Address::from_public_key(&keypair.public);
-    let nonce = {
+    let (nonce, chain_id) = {
         let state = chain_state.read().await;
-        state.get(&self_address).map(|acc| acc.nonce).unwrap_or(0)
+        (state.get(&self_address).map(|acc| acc.nonce).unwrap_or(0), state.chain_id)
     };
 
     let data = match bincode::serialize(&evidence) {
@@ -2094,6 +2091,7 @@ async fn report_double_sign_evidence(
         nonce,
         data,
         crypto_version: keypair.scheme,
+        chain_id,
         signature: Signature::from_bytes(vec![]),
         public_key: keypair.public.clone(),
     };
@@ -2140,7 +2138,7 @@ async fn send_probation_heartbeat_if_due(
     p2p_tx: &mpsc::Sender<P2PCommand>,
 ) {
     let self_address = Address::from_public_key(&keypair.public);
-    let (nonce, applied_height) = {
+    let (nonce, applied_height, chain_id) = {
         let state = chain_state.read().await;
         if !state.probation_proof_outstanding(&self_address) {
             return;
@@ -2148,6 +2146,7 @@ async fn send_probation_heartbeat_if_due(
         (
             state.get(&self_address).map(|acc| acc.nonce).unwrap_or(0),
             state.applied_height,
+            state.chain_id,
         )
     };
 
@@ -2174,6 +2173,7 @@ async fn send_probation_heartbeat_if_due(
         // proof, not this.
         data: applied_height.to_le_bytes().to_vec(),
         crypto_version: keypair.scheme,
+        chain_id,
         signature: Signature::from_bytes(vec![]),
         public_key: keypair.public.clone(),
     };
@@ -3899,6 +3899,19 @@ fn verify_genesis_reconstruction(peer_genesis: &PeerGenesis, local: &ChainState)
          disagrees with the chain about something genesis depends on — most likely it is older \
          than the chain's format. Use a build matching the network."
     )
+}
+
+/// Stamps a freshly built genesis state with the chain it belongs to (backlog #174).
+///
+/// Every path that *builds* a state instead of loading one has to pass through here: a state loaded
+/// from the database reads its `chain_id` back off the stored genesis block, but a state that was
+/// just rebuilt or self-signed has no chain identity yet, and a node running with the unset value
+/// rejects every transaction it is offered. There are three such paths (join over RPC, join over
+/// P2P, start a standalone chain) and they are far apart in `HelixNode::new` — which is exactly why
+/// this is a named function rather than three assignments nobody would notice going missing.
+fn with_chain_id(mut state: ChainState, genesis: &Block) -> ChainState {
+    state.chain_id = genesis.hash();
+    state
 }
 
 /// Resolves a `sync_peer` HTTP URL (e.g. `http://seed:8545`) to a dialable libp2p multiaddr
@@ -6388,6 +6401,7 @@ mod handle_p2p_event_tests {
             nonce: 0,
             data: vec![0u8; helix_core::fee::MAX_BLOCK_BYTES as usize + 1],
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Sig::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };
@@ -6743,6 +6757,7 @@ mod handle_p2p_event_tests {
             nonce: 0,
             data: bincode::serialize(&evidence).unwrap(),
             crypto_version: reporter_kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Sig::from_bytes(vec![]),
             public_key: reporter_kp.public.clone(),
         };
@@ -6798,6 +6813,7 @@ mod handle_p2p_event_tests {
             nonce: 0,
             data: vec![],
             crypto_version: sender_kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Sig::from_bytes(vec![]),
             public_key: sender_kp.public.clone(),
         };

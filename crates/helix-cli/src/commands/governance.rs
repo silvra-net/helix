@@ -147,6 +147,7 @@ async fn propose(
         nonce,
         data: encode_proposal(param.into(), new_value),
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
@@ -190,6 +191,7 @@ async fn vote(proposal_id: u64, key_path: PathBuf, fee: Option<u64>, node: &str)
         nonce,
         data: encode_vote(proposal_id),
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),

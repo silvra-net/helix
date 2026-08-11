@@ -150,6 +150,7 @@ Transactions are signed ML-DSA (or SPHINCS+) objects. The signing hash is
   "fee": 1000000,
   "nonce": 0,
   "data": [],
+  "chain_id": "<hex>",
   "signature": "<hex>",
   "public_key": "<hex>"
 }
@@ -158,8 +159,18 @@ Transactions are signed ML-DSA (or SPHINCS+) objects. The signing hash is
 - `amount` and `fee` are in **nano-HLX** (1 HLX = 1,000,000,000 nano-HLX)
 - `nonce` is per-sender, strictly monotonic, starts at 0 — multiple sequential-nonce
   transactions from one sender can be submitted and included in the same block
+- `chain_id` is the **genesis hash of the chain the transaction is valid on**, and it is covered
+  by the signature. A node refuses any transaction whose `chain_id` is not its own, naming both
+  values. Without it the same signed bytes would spend on every Helix chain that shares the
+  sender's key and nonce — Ethereum's EIP-155 problem, and not a hypothetical one: the validator
+  fundings of 2026-08-07 came out byte-identical to those of the 2026-08-05 reset
 - Minimum fee: 1,000 nano-HLX
 - The mempool validates the signature before accepting
+
+Wallets take the chain id from a compiled-in constant when talking to the public endpoint, and
+from the endpoint itself only when you named it (your own node, a devnet). That asymmetry is
+deliberate: an endpoint that gets to answer "which chain are you on?" gets to decide what your
+signature authorises. `HELIX_CHAIN_ID` overrides both, for offline signing and fresh devnets.
 
 ### Address Format
 

@@ -92,6 +92,7 @@ async fn register_guardians(
         nonce,
         data: guardians.join("\n").into_bytes(),
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
@@ -142,6 +143,7 @@ async fn approve(
         nonce,
         data: new_key_bytes,
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),

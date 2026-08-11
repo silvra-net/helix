@@ -9,7 +9,8 @@ pub mod validator;
 pub mod wallet;
 
 use anyhow::{anyhow, bail, Context, Result};
-use helix_core::Transaction;
+use helix_core::{ChainIdSource, Transaction};
+use helix_crypto::Hash;
 use reqwest::StatusCode;
 use serde_json::Value;
 
@@ -99,6 +100,54 @@ pub(crate) async fn fetch_nonce(node: &str, address: &str) -> Result<u64> {
         }),
         None => Ok(0),
     }
+}
+
+/// Which chain to sign for — the value that stops a transaction signed here from being spendable
+/// on a different Helix chain (backlog #174, `Transaction::chain_id`).
+///
+/// **Where the answer comes from is the security property, not a detail.** Asking the endpoint you
+/// are about to submit to hands it the power to decide what your signature authorises: point a user
+/// at a "testnet" RPC, answer with mainnet's id, and the transaction they believed was worthless is
+/// spendable. So the public endpoint is never asked — its id is compiled in. An endpoint the user
+/// named, or their own node, may be asked, because choosing to trust it is a choice they already
+/// made. `HELIX_CHAIN_ID` overrides both, which is what makes offline signing and a fresh devnet
+/// possible without a release.
+///
+/// Cached for the process: a `tx send` makes one of these, and paying for a round trip per
+/// transaction would be a regression nobody asked for.
+pub(crate) async fn resolve_chain_id(node: &str) -> Result<Hash> {
+    static CACHED: tokio::sync::OnceCell<Hash> = tokio::sync::OnceCell::const_new();
+    CACHED
+        .get_or_try_init(|| async {
+            if let Some(explicit) = std::env::var("HELIX_CHAIN_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                return Hash::from_hex(&explicit).map_err(|_| {
+                    anyhow!(
+                        "HELIX_CHAIN_ID is not a 32-byte hex hash: {explicit:?}. It is a chain's \
+                         genesis hash — read one with: curl -s <node>/blocks/height/0"
+                    )
+                });
+            }
+
+            match helix_core::chain_id_source(node) {
+                ChainIdSource::CompiledIn => Ok(helix_core::default_chain_id()),
+                ChainIdSource::AskEndpoint => {
+                    let genesis = get_json(node, "/blocks/height/0", "learn which chain it is on")
+                        .await?;
+                    let hex = genesis["hash"].as_str().ok_or_else(|| {
+                        anyhow!("the node at {node} returned a genesis block with no hash field")
+                    })?;
+                    Hash::from_hex(hex).map_err(|_| {
+                        anyhow!("the node at {node} reported a malformed genesis hash: {hex:?}")
+                    })
+                }
+            }
+        })
+        .await
+        .copied()
 }
 
 /// Submit a signed transaction. The one implementation for the whole CLI — import it, do not
@@ -238,6 +287,7 @@ mod node_reply_tests {
             nonce: 0,
             data: vec![],
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         };

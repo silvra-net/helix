@@ -683,6 +683,7 @@ mod tests {
             nonce,
             data: vec![0u8; data_len],
             crypto_version: keypair.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![0u8; 32]),
             public_key: keypair.public.clone(),
         };
@@ -705,6 +706,7 @@ mod tests {
             nonce,
             data: vec![],
             crypto_version: keypair.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![0u8; 32]),
             public_key: keypair.public.clone(),
         };

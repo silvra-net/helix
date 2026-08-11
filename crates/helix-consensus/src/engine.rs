@@ -2983,6 +2983,7 @@ mod tests {
             nonce: 0,
             data: vec![],
             crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
             signature: helix_crypto::Signature::from_bytes(vec![]),
             public_key: kp.public.clone(),
         }

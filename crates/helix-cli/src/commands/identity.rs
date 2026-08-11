@@ -62,6 +62,7 @@ async fn attest(address: String, key_path: PathBuf, fee: Option<u64>, node: &str
         nonce,
         data: vec![],
         crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
         public_key: kp.public.clone(),
