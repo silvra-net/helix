@@ -56,7 +56,7 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_P2P_WS_LISTEN` | (none) | Extra P2P listen address that carries libp2p inside a **WebSocket** (e.g. `127.0.0.1:8547`), on top of the raw TCP above. Set this when the node's only route in from outside is an HTTPS reverse proxy or a Cloudflare tunnel, which forward WebSockets but not raw TCP — see "Validating from behind a reverse proxy / Cloudflare tunnel" below. Overrides `p2p_ws_listen_addr` in `helix.toml`. |
 | `HELIX_SYNC_PEER` | `https://helix.silvra.net` | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks, and is the target of the periodic RPC catch-up that keeps a follower current when the peer's raw P2P port isn't reachable. Defaults to the public network's seed; override to point at a different network, or set `HELIX_NEW_CHAIN=1` to disable seeding entirely. Overrides `sync_peer` in `helix.toml`. |
 | `HELIX_NEW_CHAIN` | (off) | Set truthy (`1`/`true`) to run a **standalone chain** — the node self-signs its own genesis instead of joining the public network via the default seed. Set this for a private devnet, or for the origin node of a brand-new network. Ignored if a sync peer is explicitly configured. Overrides `new_chain` in `helix.toml`. |
-| `HELIX_GENESIS_HASH` | (none) | Hex hash of the genesis block you expect to join, checked against whatever the sync peer serves **before** anything is written — a mismatch aborts startup instead of adopting the wrong chain. Strongly recommended: without it a node has no way to tell a genuine peer from an impersonated one (see "Verifying which chain you joined"). Ignored with `HELIX_NEW_CHAIN`. Overrides `genesis_hash` in `helix.toml`. |
+| `HELIX_GENESIS_HASH` | the public chain's genesis, compiled in | Hex hash of the genesis block you expect to join, checked against whatever the sync peer serves **before** anything is written — a mismatch aborts startup instead of adopting the wrong chain. **Joining the public seed is already checked without setting anything**, against a hash built into the binary. Set this to join a different network, or to get past a build whose compiled-in hash predates a chain reset (see "Verifying which chain you joined"). Ignored with `HELIX_NEW_CHAIN`, and not applied when the genesis arrives over P2P from seed peers rather than from a named sync peer. Overrides `genesis_hash` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY` | `validator-key.json` | Path to the validator key file (unified `KeyFile` JSON, same format as `helix wallet`). Overrides `validator_key_path` in `helix.toml`. |
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Signature scheme for a newly generated validator key (`ml-dsa` or `sphincs-plus`). Only applies the first time a key is generated — ignored once `validator-key.json` exists. Overrides `validator_crypto_scheme` in `helix.toml`. |
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase to decrypt `validator-key.json` if it was encrypted (e.g. via `helix wallet encrypt`). Not needed for the default plaintext key file. |
@@ -169,7 +169,15 @@ whichever peer replied first, not from an address you named. Joining the wrong o
 every later block applies perfectly on top of the wrong ledger, and every balance the node reports
 is quietly wrong.
 
-Pin the genesis hash so that decision is yours rather than the endpoint's:
+**Joining the public network is already pinned.** The hash of its genesis is compiled into the
+binary and checked automatically — Bitcoin's model, where the genesis is in the source and nobody
+configures anything. You do not need to set it, and a mismatch will stop the node before it writes.
+
+Two things follow from the hash living in the binary. Joining *another* network — anything you
+reach through your own `HELIX_SYNC_PEER` — is not covered by it, because this build knows nothing
+about that chain; pin it yourself. And a **chain reset publishes a new genesis**, which a binary
+released before the reset cannot know: it will refuse to join and say so, naming its own version.
+The repair is to upgrade to the release that followed the reset, or to set the hash by hand:
 
 ```toml
 # helix.toml
@@ -188,10 +196,11 @@ Take it from a source you trust — release notes or a node you already run — 
 are about to sync from, which would be circular. A hash costs nothing to publish and needs no
 infrastructure to stay reachable, which is exactly what makes it a better anchor than the endpoint.
 
-Leaving it unset keeps the previous behaviour (trust the sync peer); the node logs a warning at
-startup so the choice is visible. **Note that a chain reset produces a new genesis hash** — if the
-node refuses to start after one, check for a newly published value rather than removing the
-setting.
+Leaving it unset falls back to the compiled-in hash when you are joining the public seed, and to
+trusting the peer otherwise — the node logs a warning in the second case, so the choice is visible.
+**A chain reset produces a new genesis hash**: if the node refuses to start after one, take the
+newly published value rather than removing the setting. Removing it does not help anyway when the
+public seed is involved, since the compiled-in hash then applies instead.
 
 **Staying current.** A joined node stays up to date two ways: live P2P gossip (the primary
 path), plus a periodic RPC catch-up that polls the sync peer for any new blocks every few

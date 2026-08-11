@@ -83,21 +83,63 @@ pub const DEFAULT_SEED_PEER: &str = "https://helix.silvra.net";
 /// joining a network this constant knows nothing about, and silently checking ours against theirs
 /// would refuse a perfectly good join.
 ///
-/// **Update this together with any chain reset**, in the release that accompanies it.
+/// **Update this together with any chain reset**, in the release that accompanies it. That
+/// instruction stood here and was missed on 2026-08-07: the chain was reset, this constant kept the
+/// dead chain's hash, and every operator running the published binary was refused at the join — by
+/// a message that read as though *they* had configured the stale value. Hence
+/// [`GenesisCheckpoint`]: the constant will go stale again, so the refusal has to say whose claim
+/// it is.
 pub const DEFAULT_GENESIS_HASH: &str =
-    "ff271e4a9e4d61f769a8d7dc543facca7dc17a3968398a730c5863a93f2d030b";
+    "6860abdad560f163f22aad1c8d3b7e2ef8b4a4c2b442402e7b19ddefa771169e";
+
+/// Where a genesis checkpoint came from, kept alongside the hash because the refusal message has to
+/// distinguish them.
+///
+/// A hash the operator set is a statement of intent — "this exact chain, nothing else". A hash we
+/// compiled in is *our* claim about which chain is public, and ours is the one that goes stale the
+/// moment the chain is reset. An `Option<String>` cannot tell those apart, and that is precisely how
+/// the 2026-08-07 reset produced a message blaming operators for a value they had never seen or
+/// typed. Same class as the health line that recommended the wrong restart (#150): the text was
+/// accurate about the mismatch and pointed every reader at the wrong cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GenesisCheckpoint {
+    /// Set by the operator, via `HELIX_GENESIS_HASH` or `genesis_hash` in `helix.toml`.
+    Configured(String),
+    /// [`DEFAULT_GENESIS_HASH`], applied because this node is joining the public chain.
+    CompiledIn(String),
+}
+
+impl GenesisCheckpoint {
+    fn hash(&self) -> &str {
+        match self {
+            Self::Configured(h) | Self::CompiledIn(h) => h,
+        }
+    }
+
+    /// An operator-supplied value, or `None` if they supplied nothing usable. Blank is unset: an
+    /// exported-but-empty `HELIX_GENESIS_HASH` is a variable someone cleared, and treating it as a
+    /// hash would abort every start against the empty string.
+    fn configured(value: Option<String>) -> Option<Self> {
+        value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).map(Self::Configured)
+    }
+}
 
 /// The genesis hash this node should insist on: the operator's if they set one, otherwise the
 /// compiled-in default — but only when joining the public chain the default describes.
 ///
 /// Split out as a pure function because the "only for the default seed" condition is the whole
 /// safety argument, and it is one `&&` away from silently refusing every private network.
-fn expected_genesis_hash(configured: Option<String>, sync_peer: Option<&str>) -> Option<String> {
-    if let Some(explicit) = configured.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+fn expected_genesis_hash(
+    configured: Option<String>,
+    sync_peer: Option<&str>,
+) -> Option<GenesisCheckpoint> {
+    if let Some(explicit) = GenesisCheckpoint::configured(configured) {
         return Some(explicit);
     }
     match sync_peer {
-        Some(peer) if peer == DEFAULT_SEED_PEER => Some(DEFAULT_GENESIS_HASH.to_string()),
+        Some(peer) if peer == DEFAULT_SEED_PEER => {
+            Some(GenesisCheckpoint::CompiledIn(DEFAULT_GENESIS_HASH.to_string()))
+        }
         _ => None,
     }
 }
@@ -531,7 +573,7 @@ impl HelixNode {
                 config::resolve("HELIX_GENESIS_HASH", &cfg.genesis_hash),
                 Some(peer_url.as_str()),
             );
-            verify_genesis_checkpoint(expected_genesis.as_deref(), &genesis)?;
+            verify_genesis_checkpoint(expected_genesis.as_ref(), &genesis)?;
 
             // Rebuild through the same function the peer hashed, taking every field from the
             // peer rather than from this binary's own defaults — they describe a chain this node
@@ -577,12 +619,16 @@ impl HelixNode {
                 helix_p2p::fetch_genesis_over_p2p(&peers, helix_p2p::GENESIS_FETCH_TIMEOUT).await?;
             let genesis = payload.block.clone();
 
-            // The same checkpoint the RPC path applies, and for a stronger reason here: over P2P
-            // the answer comes from whichever peer replied first, not from a source the operator
-            // named. Compared against a locally recomputed `Block::hash()` — never against anything
-            // the peer says about the block — and before anything is rebuilt or written.
-            let expected_genesis = config::resolve("HELIX_GENESIS_HASH", &cfg.genesis_hash);
-            verify_genesis_checkpoint(expected_genesis.as_deref(), &genesis)?;
+            // The operator's checkpoint only — deliberately *not* `expected_genesis_hash`, whose
+            // compiled-in fallback is scoped to the one public sync peer it describes. Here the
+            // genesis arrives from whichever seed replied first, and those seeds are as often a
+            // private devnet as the public chain; insisting on our own hash would refuse every one
+            // of them. The check that matters most is weakest exactly where the peer is least
+            // chosen — an honest gap, not an oversight, and the reason the unconfigured branch
+            // warns rather than staying silent.
+            let expected_genesis =
+                GenesisCheckpoint::configured(config::resolve("HELIX_GENESIS_HASH", &cfg.genesis_hash));
+            verify_genesis_checkpoint(expected_genesis.as_ref(), &genesis)?;
 
             let state = helix_executor::genesis::rebuild_genesis_state(
                 genesis.header.validator.clone(),
@@ -3783,10 +3829,13 @@ async fn fetch_genesis_from_peer(peer_url: &str) -> Result<PeerGenesis> {
 /// Unconfigured stays permitted: it is what every existing deployment does, and refusing would
 /// lock operators out on upgrade. It warns, because "I trust this endpoint completely" should be a
 /// visible choice rather than a default nobody noticed making.
-fn verify_genesis_checkpoint(expected_hex: Option<&str>, genesis: &Block) -> Result<()> {
+fn verify_genesis_checkpoint(
+    checkpoint: Option<&GenesisCheckpoint>,
+    genesis: &Block,
+) -> Result<()> {
     let actual = genesis.hash().to_hex();
 
-    let Some(expected) = expected_hex.map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(checkpoint) = checkpoint else {
         warn!(
             genesis_hash = %actual,
             "No expected genesis hash configured — adopting whatever this sync peer serves. A \
@@ -3797,6 +3846,8 @@ fn verify_genesis_checkpoint(expected_hex: Option<&str>, genesis: &Block) -> Res
         return Ok(());
     };
 
+    let expected = checkpoint.hash().trim();
+
     // Case-insensitive: operators copy this out of logs, release notes and block explorers, which
     // do not agree on casing. Nothing else about the comparison is lenient.
     if actual.eq_ignore_ascii_case(expected) {
@@ -3804,12 +3855,28 @@ fn verify_genesis_checkpoint(expected_hex: Option<&str>, genesis: &Block) -> Res
         return Ok(());
     }
 
-    bail!(
-        "refusing to join: this sync peer serves genesis {actual}, but this node is configured to \
-         join the chain whose genesis is {expected}. Either the peer is on a different chain (a \
-         reset creates a new genesis — check for a published new hash), or it is not the peer it \
-         claims to be. Nothing has been written."
-    )
+    // Both branches describe the same mismatch and differ only in whose claim the expected value
+    // is — which is the one thing the reader needs, because it decides whether they go and fix
+    // their own configuration or go and get a newer binary.
+    match checkpoint {
+        GenesisCheckpoint::Configured(_) => bail!(
+            "refusing to join: this sync peer serves genesis {actual}, but this node is \
+             configured to join the chain whose genesis is {expected}. Either the peer is on a \
+             different chain (a reset creates a new genesis — check for a published new hash), or \
+             it is not the peer it claims to be. Nothing has been written."
+        ),
+        GenesisCheckpoint::CompiledIn(_) => bail!(
+            "refusing to join: this sync peer serves genesis {actual}, but Helix {version} has \
+             {expected} compiled in as the public chain's genesis. Nothing on this machine was \
+             configured to expect that — it ships inside the binary. Most likely the chain was \
+             reset after this version was published, and a newer release carries the new hash; the \
+             other possibility is that this peer is not the peer it claims to be. Confirm the \
+             network's current genesis hash from somewhere other than this peer (release notes, a \
+             block explorer, or a node you already run), then either upgrade or set \
+             HELIX_GENESIS_HASH to it. Nothing has been written.",
+            version = env!("CARGO_PKG_VERSION"),
+        ),
+    }
 }
 
 fn verify_genesis_reconstruction(peer_genesis: &PeerGenesis, local: &ChainState) -> Result<()> {
@@ -4301,7 +4368,10 @@ async fn sync_blocks_from_peer(
 
 #[cfg(test)]
 mod genesis_join_tests {
-    use super::{expected_genesis_hash, joins_over_p2p, DEFAULT_GENESIS_HASH, DEFAULT_SEED_PEER};
+    use super::{
+        expected_genesis_hash, joins_over_p2p, GenesisCheckpoint, DEFAULT_GENESIS_HASH,
+        DEFAULT_SEED_PEER,
+    };
 
     /// Joining the public chain is verified without the operator configuring anything — Bitcoin's
     /// model, where the genesis is compiled in and nobody is asked. Before this, the default was to
@@ -4309,8 +4379,22 @@ mod genesis_join_tests {
     #[test]
     fn joining_the_public_chain_checks_the_compiled_in_genesis_by_default() {
         assert_eq!(
-            expected_genesis_hash(None, Some(DEFAULT_SEED_PEER)).as_deref(),
-            Some(DEFAULT_GENESIS_HASH),
+            expected_genesis_hash(None, Some(DEFAULT_SEED_PEER)),
+            Some(GenesisCheckpoint::CompiledIn(DEFAULT_GENESIS_HASH.to_string())),
+        );
+    }
+
+    /// Shape only — and worth saying what that does *not* cover, because the tempting claim here is
+    /// false: no unit test can tell whether this constant still names the live chain. The stale
+    /// value that locked out three operators on 2026-08-07 was perfectly well-formed. Catching that
+    /// needs the running network, so it lives in `scripts/check-genesis-pin.sh` and in the reset
+    /// ritual, not here.
+    #[test]
+    fn the_compiled_in_genesis_is_a_well_formed_hash() {
+        assert_eq!(DEFAULT_GENESIS_HASH.len(), 64, "a BLAKE3 hash is 32 bytes of hex");
+        assert!(
+            DEFAULT_GENESIS_HASH.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "lowercase hex only — that is the form every node prints",
         );
     }
 
@@ -4328,8 +4412,8 @@ mod genesis_join_tests {
     #[test]
     fn an_explicit_setting_overrides_the_compiled_in_default() {
         assert_eq!(
-            expected_genesis_hash(Some("abc123".into()), Some(DEFAULT_SEED_PEER)).as_deref(),
-            Some("abc123"),
+            expected_genesis_hash(Some("abc123".into()), Some(DEFAULT_SEED_PEER)),
+            Some(GenesisCheckpoint::Configured("abc123".into())),
         );
     }
 
@@ -4338,8 +4422,8 @@ mod genesis_join_tests {
     #[test]
     fn a_blank_setting_falls_through_to_the_default() {
         assert_eq!(
-            expected_genesis_hash(Some("   ".into()), Some(DEFAULT_SEED_PEER)).as_deref(),
-            Some(DEFAULT_GENESIS_HASH),
+            expected_genesis_hash(Some("   ".into()), Some(DEFAULT_SEED_PEER)),
+            Some(GenesisCheckpoint::CompiledIn(DEFAULT_GENESIS_HASH.to_string())),
         );
     }
 
@@ -7662,18 +7746,84 @@ mod genesis_verification_tests {
         let other = some_genesis(2);
         assert_ne!(genesis.hash(), other.hash(), "the two must actually differ");
 
-        let err = verify_genesis_checkpoint(Some(&other.hash().to_hex()), &genesis)
-            .expect_err("a genesis that is not the configured one must be refused");
+        let err = verify_genesis_checkpoint(
+            Some(&GenesisCheckpoint::Configured(other.hash().to_hex())),
+            &genesis,
+        )
+        .expect_err("a genesis that is not the configured one must be refused");
         // The operator has to be able to tell the two apart from the message alone.
         let msg = err.to_string();
         assert!(msg.contains(&genesis.hash().to_hex()), "must name what was served");
         assert!(msg.contains(&other.hash().to_hex()), "must name what was expected");
     }
 
+    /// The 2026-08-07 regression, as a test. The chain was reset, `DEFAULT_GENESIS_HASH` kept the
+    /// dead chain's value, and three operators who had configured *nothing* were refused by a
+    /// message telling them what "this node is configured to" expect. Each of them went looking
+    /// for a setting that did not exist; so did I. A mismatch against a value that ships in the
+    /// binary has to read as what it is — the binary being out of date — because that is a
+    /// different repair than fixing your own config.
+    #[test]
+    fn a_stale_compiled_in_genesis_blames_the_build_and_not_the_operator() {
+        let genesis = some_genesis(1);
+        let stale = some_genesis(2);
+
+        let err = verify_genesis_checkpoint(
+            Some(&GenesisCheckpoint::CompiledIn(stale.hash().to_hex())),
+            &genesis,
+        )
+        .expect_err("premise: the two genesis blocks differ");
+        let msg = err.to_string();
+
+        assert!(msg.contains(&genesis.hash().to_hex()), "must name what was served");
+        assert!(msg.contains(&stale.hash().to_hex()), "must name what was expected");
+        assert!(
+            msg.contains(env!("CARGO_PKG_VERSION")),
+            "must name the version the stale hash came from, since upgrading is the repair: {msg}"
+        );
+        assert!(
+            msg.contains("ships inside the binary"),
+            "must say the value was not configured here, or the reader hunts for a setting that \
+             does not exist: {msg}"
+        );
+        // The wording that sent everyone to the wrong place. Not a style preference: "configured"
+        // is a claim about this machine, and it was false.
+        assert!(
+            !msg.contains("this node is configured to"),
+            "must not attribute a compiled-in value to the operator: {msg}"
+        );
+    }
+
+    /// Both branches must survive a reset-shaped mismatch without leaving the reader guessing which
+    /// hash is which — the pair is checked together because the failure mode was that they read
+    /// identically.
+    #[test]
+    fn the_two_checkpoint_sources_produce_distinguishable_refusals() {
+        let genesis = some_genesis(1);
+        let other = some_genesis(2).hash().to_hex();
+
+        let configured =
+            verify_genesis_checkpoint(Some(&GenesisCheckpoint::Configured(other.clone())), &genesis)
+                .unwrap_err()
+                .to_string();
+        let compiled =
+            verify_genesis_checkpoint(Some(&GenesisCheckpoint::CompiledIn(other)), &genesis)
+                .unwrap_err()
+                .to_string();
+
+        assert_ne!(configured, compiled, "the whole point is that they differ");
+        assert!(configured.contains("this node is configured to"), "{configured}");
+        assert!(compiled.contains("compiled in"), "{compiled}");
+    }
+
     #[test]
     fn the_configured_genesis_is_accepted() {
         let genesis = some_genesis(1);
-        assert!(verify_genesis_checkpoint(Some(&genesis.hash().to_hex()), &genesis).is_ok());
+        assert!(verify_genesis_checkpoint(
+            Some(&GenesisCheckpoint::Configured(genesis.hash().to_hex())),
+            &genesis
+        )
+        .is_ok());
     }
 
     /// Operators copy this hash out of logs, release notes and explorers, which disagree on casing.
@@ -7681,8 +7831,16 @@ mod genesis_verification_tests {
     fn the_checkpoint_comparison_ignores_hex_casing_and_whitespace() {
         let genesis = some_genesis(1);
         let hex = genesis.hash().to_hex();
-        assert!(verify_genesis_checkpoint(Some(&hex.to_uppercase()), &genesis).is_ok());
-        assert!(verify_genesis_checkpoint(Some(&format!("  {hex}  ")), &genesis).is_ok());
+        assert!(verify_genesis_checkpoint(
+            Some(&GenesisCheckpoint::Configured(hex.to_uppercase())),
+            &genesis
+        )
+        .is_ok());
+        assert!(verify_genesis_checkpoint(
+            Some(&GenesisCheckpoint::Configured(format!("  {hex}  "))),
+            &genesis
+        )
+        .is_ok());
     }
 
     /// No regression for existing deployments: unconfigured must still join, or every operator is
@@ -7693,8 +7851,9 @@ mod genesis_verification_tests {
     fn an_unconfigured_checkpoint_still_joins() {
         let genesis = some_genesis(1);
         assert!(verify_genesis_checkpoint(None, &genesis).is_ok());
-        assert!(verify_genesis_checkpoint(Some(""), &genesis).is_ok());
-        assert!(verify_genesis_checkpoint(Some("   "), &genesis).is_ok());
+        assert!(GenesisCheckpoint::configured(Some(String::new())).is_none());
+        assert!(GenesisCheckpoint::configured(Some("   ".into())).is_none());
+        assert!(GenesisCheckpoint::configured(None).is_none());
     }
 
     fn peer_genesis_with(validator_stake: u64, state_hash: Option<String>) -> PeerGenesis {
