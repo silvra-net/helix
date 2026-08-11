@@ -307,6 +307,10 @@ impl P2PService {
         // Tip each peer last announced, so the block-sync driver below knows who to ask (#138).
         // Bounded by the connection limit and pruned on disconnect, so it cannot grow unbounded.
         let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
+        // Unreadable peer-exchange messages per peer (backlog #166). Lives beside `peer_tips`
+        // because it is the same kind of thing: per-peer state the loop owns and the pure helpers
+        // must not.
+        let mut unreadable_peer_exchange_counts: HashMap<PeerId, u32> = HashMap::new();
         // Peers we have announced as connected, so `PeerConnected`/`PeerDisconnected` reach the
         // node strictly in pairs (backlog #147).
         //
@@ -406,7 +410,23 @@ impl P2PService {
                                         .send(P2PEvent::PeerBehind { peer_tip })
                                         .await;
                                 }
-                                outcome.malformed
+                                // An unreadable peer-exchange message is an old build far more often
+                                // than it is an attack (#166), so it is counted per peer rather
+                                // than charged on sight — see `unreadable_peer_exchange`.
+                                if outcome.malformed {
+                                    let seen = unreadable_peer_exchange_counts
+                                        .entry(propagation_source)
+                                        .and_modify(|n| *n += 1)
+                                        .or_insert(1);
+                                    let (message, strike) =
+                                        unreadable_peer_exchange(&peer_str, *seen);
+                                    if let Some(message) = message {
+                                        warn!("{message}");
+                                    }
+                                    strike
+                                } else {
+                                    false
+                                }
                             } else {
                                 handle_app_message(topic, &message.data, &event_tx).await
                             };
@@ -953,9 +973,37 @@ fn foreign_version_warning(their: &str, ours: &str, warned: &mut HashSet<String>
 /// the enforcement. A comparison bug that disconnected instead would partition the network, and a
 /// foreign-chain peer already costs nothing — every message it sends is rejected on its own merits,
 /// and the block-sync cooldown (#140) stops us asking it twice.
+/// Which chain a peer says it is on, from its announced genesis hash.
+///
+/// The three-way answer is the whole point (backlog #175). Collapsing `Unknown` into `Foreign`
+/// would be the tempting simplification and it is wrong in the most common case there is: the very
+/// first message from a peer running a build older than 0.10.1 carries no hash, and a node that
+/// refuses to learn tips from anyone who has not identified their chain stops asking anybody
+/// anything. Collapsing it into `Same` is the bug this exists to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerChain {
+    /// Same genesis as ours — trust its tip as far as any unauthenticated claim can be trusted.
+    Same,
+    /// A different genesis. Its blocks can never apply here and its tip means nothing to us.
+    Foreign,
+    /// It did not say (older build, or no genesis of its own yet). Treated as `Same` would be,
+    /// because refusing the unknown costs more than it saves.
+    Unknown,
+}
+
+fn peer_chain(theirs: &str, ours: &str) -> PeerChain {
+    if theirs.is_empty() || ours.is_empty() {
+        PeerChain::Unknown
+    } else if theirs == ours {
+        PeerChain::Same
+    } else {
+        PeerChain::Foreign
+    }
+}
+
 fn foreign_chain_warning(theirs: &str, ours: &str, warned: &mut HashSet<String>) -> Option<String> {
     // An empty hash is a node that has no genesis yet, not a node on another chain.
-    if theirs.is_empty() || ours.is_empty() || theirs == ours {
+    if peer_chain(theirs, ours) != PeerChain::Foreign {
         return None;
     }
     if !warned.insert(theirs.to_string()) {
@@ -1031,11 +1079,46 @@ fn decode_peer_exchange(data: &[u8]) -> Option<PeerExchangeMsg> {
             // and stays quiet, which is right: an older peer's chain is not knowable from here.
             genesis_hash: String::new(),
         }),
-        Err(e) => {
-            warn!("Malformed peer-exchange message: {}", e);
-            None
-        }
+        Err(_) => None,
     }
+}
+
+/// How many unreadable peer-exchange messages from one peer count as misbehaviour rather than as an
+/// old build (backlog #166).
+///
+/// Peer exchange runs every 30 s, so a genuinely outdated node crosses this in about a minute and
+/// a half and is then treated like any other misbehaving peer — five strikes and it is banned,
+/// which is the correct end state: it cannot participate in this chain anyway. What the threshold
+/// buys is the *first* minute, in which the log says something true about what is happening instead
+/// of accusing a peer of sending garbage.
+///
+/// Not zero, and that is the part worth defending: an attacker who could send unlimited junk
+/// without ever earning a strike would have a free channel. Repetition is what separates the two,
+/// so repetition is what is counted.
+const UNREADABLE_PEER_EXCHANGE_TOLERANCE: u32 = 3;
+
+/// What to do about a peer whose peer-exchange message this build cannot read.
+///
+/// The message that made this necessary: `Malformed peer-exchange message: io error: unexpected end
+/// of file`, seen right after the 0.10.1 deploy. It reads like an attack or a broken network, and
+/// it means neither — a node running 0.8.x sends a payload with one field where this build expects
+/// four, so both decoder shapes reject it. Whoever reads that line goes looking in the wrong place,
+/// which is the same failure as #150's restart advice and the stale-genesis lockout: accurate about
+/// the symptom, wrong about the cause, and therefore worse than silence.
+fn unreadable_peer_exchange(peer: &str, seen: u32) -> (Option<String>, bool) {
+    let strike = seen >= UNREADABLE_PEER_EXCHANGE_TOLERANCE;
+    // Once, on the first occurrence — the same once-per-peer dedup `foreign_version_warning` uses.
+    // This arrives every 30 s per peer and repeating it says nothing new.
+    let message = (seen == 1).then(|| {
+        format!(
+            "A peer ({peer}) is sending peer-exchange messages this build cannot read. Almost \
+             always this means it runs a Helix older than 0.9.0, whose message format this version \
+             no longer understands — not that it is sending garbage. It cannot take part in this \
+             chain until its operator upgrades it. If it keeps this up it will be treated as \
+             misbehaving and disconnected."
+        )
+    });
+    (message, strike)
 }
 
 /// Returns what the caller must act on: whether the sender misbehaved, and whether it is behind us
@@ -1081,6 +1164,31 @@ fn handle_peer_exchange_message(
                 debug!(addr = %addr, err = %e, "Peer exchange gave an unparseable address — skipping");
             }
         }
+    }
+
+    tip_outcome(&msg, our_tip, our_genesis)
+}
+
+/// What a decoded peer-exchange message means for syncing: whose tip we record, and whom we serve.
+///
+/// Split out from `handle_peer_exchange_message` because that one needs a live `Swarm` to dial the
+/// addresses it learns, which is exactly the kind of dependency that leaves the interesting decision
+/// untested. This half is pure.
+fn tip_outcome(msg: &PeerExchangeMsg, our_tip: u64, our_genesis: &str) -> PeerExchangeOutcome {
+    // A peer on another chain gets no say in what we sync (backlog #175). Its height is a real
+    // number about a chain we are not on, and letting it through made a freshly reset node chase
+    // its own dead history: right after the 2026-08-07 reset, V1 sat at height 70 while operator
+    // nodes still on the old chain claimed 36378, so it declared itself behind, block-synced from
+    // them every second, and discarded every batch — two WARN lines a second, forever. Harmless to
+    // the chain and corrosive to the log, which is how operators learn to skim warnings.
+    //
+    // `Unknown` deliberately behaves like `Same`: see `PeerChain`.
+    if peer_chain(&msg.genesis_hash, our_genesis) == PeerChain::Foreign {
+        return PeerExchangeOutcome {
+            malformed: false,
+            announced_tip: None,
+            serve_from_tip: None,
+        };
     }
 
     // The other direction of the same comparison: a peer ahead of us means *we* are missing blocks.
@@ -1532,9 +1640,10 @@ mod multiaddr_ip_tests {
 #[cfg(test)]
 mod peer_exchange_tests {
     use super::{
-        decode_peer_exchange, foreign_chain_warning, foreign_version_warning, select_new_addrs,
-        should_serve_catchup, PeerExchangeMsg, PeerExchangeMsgV1, MAX_CATCHUP_SERVE_BLOCKS,
-        MAX_KNOWN_PEER_ADDRS, OUR_VERSION,
+        decode_peer_exchange, foreign_chain_warning, foreign_version_warning, peer_chain,
+        select_new_addrs, should_serve_catchup, tip_outcome, unreadable_peer_exchange, PeerChain,
+        PeerExchangeMsg, PeerExchangeMsgV1, MAX_CATCHUP_SERVE_BLOCKS, MAX_KNOWN_PEER_ADDRS,
+        OUR_VERSION, UNREADABLE_PEER_EXCHANGE_TOLERANCE,
     };
     use std::collections::HashSet;
 
@@ -1755,6 +1864,88 @@ mod peer_exchange_tests {
         let mut warned = HashSet::new();
         assert!(foreign_chain_warning("", "bbbb", &mut warned).is_none());
         assert!(foreign_chain_warning("aaaa", "", &mut warned).is_none());
+    }
+
+    /// A peer-exchange message announcing a tip on a given chain, with nothing else in it.
+    fn msg_announcing(tip_height: u64, genesis_hash: &str) -> PeerExchangeMsg {
+        PeerExchangeMsg {
+            peers: vec![],
+            version: OUR_VERSION.to_string(),
+            tip_height,
+            genesis_hash: genesis_hash.to_string(),
+        }
+    }
+
+    /// Backlog #175, as the three-way decision it has to be.
+    ///
+    /// Reversing the `Unknown` arm is invisible in review — both versions compile, both "work" — and
+    /// only one of them lets a node keep talking to peers that predate the genesis field.
+    #[test]
+    fn a_peer_that_did_not_say_which_chain_it_is_on_is_not_treated_as_foreign() {
+        assert_eq!(peer_chain("aaaa", "aaaa"), PeerChain::Same);
+        assert_eq!(peer_chain("aaaa", "bbbb"), PeerChain::Foreign);
+        assert_eq!(peer_chain("", "bbbb"), PeerChain::Unknown, "did not say ≠ different");
+        assert_eq!(peer_chain("aaaa", ""), PeerChain::Unknown, "we have no genesis yet");
+    }
+
+    /// The behaviour that cost 12 hours of log noise after the 2026-08-07 reset: a node at height 70
+    /// took the 36378 claimed by peers still on the *old* chain as evidence it was behind, and
+    /// block-synced from them once a second forever, discarding every batch.
+    #[test]
+    fn a_foreign_chains_tip_is_not_recorded_or_served() {
+        let ours = "6860abda";
+        let foreign = msg_announcing(36378, "ff271e4a");
+        let outcome = tip_outcome(&foreign, 70, ours);
+        assert_eq!(outcome.announced_tip, None, "a foreign tip must not drive our sync");
+        assert_eq!(outcome.serve_from_tip, None, "nor make us serve blocks it cannot use");
+        assert!(!outcome.malformed, "it is a well-formed message from a peer on another chain");
+
+        // Positive control: the identical message from a peer on our chain still counts. Without
+        // this, the test above would pass just as well if tips had stopped working altogether.
+        let outcome = tip_outcome(&msg_announcing(36378, ours), 70, ours);
+        assert_eq!(outcome.announced_tip, Some(36378));
+    }
+
+    /// A peer that did not announce a genesis must still be listened to — the case that makes the
+    /// `Unknown` arm load-bearing rather than decorative.
+    #[test]
+    fn a_peer_that_announced_no_genesis_is_still_worth_asking_for_blocks() {
+        let outcome = tip_outcome(&msg_announcing(500, ""), 70, "6860abda");
+        assert_eq!(outcome.announced_tip, Some(500));
+    }
+
+    /// Backlog #166: the first unreadable message explains itself, and does not cost a strike.
+    ///
+    /// The line it replaces — "Malformed peer-exchange message: io error: unexpected end of file" —
+    /// was accurate and sent every reader hunting for an attack or a broken network, when the cause
+    /// is someone running a Helix older than 0.9.0.
+    #[test]
+    fn an_unreadable_peer_exchange_reads_as_an_old_build_before_it_reads_as_abuse() {
+        let (message, strike) = unreadable_peer_exchange("12D3KooWpeer", 1);
+        let message = message.expect("the first one has to say something");
+        assert!(message.contains("older than 0.9.0"), "must name the likely cause: {message}");
+        assert!(message.contains("cannot read"), "{message}");
+        assert!(
+            !message.contains("Malformed"),
+            "the word that sent everyone to the wrong place: {message}",
+        );
+        assert!(!strike, "one unreadable message is not misbehaviour");
+
+        // Silent afterwards — it arrives every 30 s and repeating it says nothing new.
+        assert_eq!(unreadable_peer_exchange("12D3KooWpeer", 2).0, None);
+    }
+
+    /// And the other half: repetition *is* misbehaviour, or an attacker gets a free channel for
+    /// unlimited junk. The tolerance buys diagnosis, it does not buy immunity.
+    #[test]
+    fn a_peer_that_keeps_sending_unreadable_messages_is_eventually_charged() {
+        assert!(!unreadable_peer_exchange("p", 1).1);
+        assert!(!unreadable_peer_exchange("p", 2).1);
+        assert!(
+            unreadable_peer_exchange("p", UNREADABLE_PEER_EXCHANGE_TOLERANCE).1,
+            "past the tolerance it is treated as any other misbehaving peer",
+        );
+        assert!(unreadable_peer_exchange("p", 50).1);
     }
 
     /// The one that matters most, and the reason this crate now carries two message shapes.
