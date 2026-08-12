@@ -1,21 +1,37 @@
-/* Helix shared design system — cool graphite neutrals + a single iris accent, identical hexes to
-   the explorer (crates/helix-rpc/src/explorer.html). Default :root is dark; the media query and the
-   manual data-theme override below carry light. */
+/* Helix shared design system — a truly achromatic grey scale, black (light) or white (dark) as
+   the only accent, and colour reserved for state. Identical hexes to the node's status board
+   (crates/helix-rpc/src/status.html) and the network explorer, so the three surfaces read as one
+   product. Aligned with silvra.net, which uses the same monochrome vocabulary.
+
+   The greys are neutral, not slate: a palette described as "black and white" should not have a
+   hue in its largest surface, and the graphite this replaced was noticeably blue.
+
+   Two deliberate exceptions to "pure": surfaces sit above the background rather than on the same
+   black, so panels are separable without a border doing all the work; and body text is #f5f5f5
+   rather than #fff, because pure white on pure black haloes at small sizes. `--accent` stays a
+   true #fff so emphasis is still distinguishable from ordinary text.
+
+   `color-scheme` tells the browser which way round the page is, so it draws scrollbars, focus
+   rings and native form controls to match — without it a dark window gets a white scrollbar,
+   which is the one piece of the design a stylesheet cannot otherwise reach.
+
+   Default :root is dark; the media query and the manual data-theme override below carry light. */
 :root {
-  --bg: #0c0f15;
-  --surface: #141a23;
-  --surface-2: #1b212d;
-  --border: #272f3d;
-  --text: #e7eaf1;
-  --muted: #8992a4;
-  --accent: #8092f4;
-  --accent-ink: #0c0f15;
-  --ok: #34cea0;
-  --ok-bg: #0f2620;
-  --bad: #f2718a;
-  --bad-bg: #2c1620;
+  color-scheme: dark;
+  --bg: #000000;
+  --surface: #0c0c0c;
+  --surface-2: #171717;
+  --border: #262626;
+  --text: #f5f5f5;
+  --muted: #a3a3a3;
+  --accent: #ffffff;
+  --accent-ink: #000000;
+  --ok: #22c55e;
+  --ok-bg: #0d2114;
+  --bad: #ef4444;
+  --bad-bg: #241113;
   --warn: #e0a44a;
-  --warn-bg: #281f11;
+  --warn-bg: #241c0d;
   --radius: 10px;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
@@ -24,34 +40,46 @@
 /* Light palette, applied when the OS prefers light AND no manual theme is set. */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
-    --bg: #f5f6f9;
+    color-scheme: light;
+    --bg: #fafafa;
     --surface: #ffffff;
-    --surface-2: #eceef4;
-    --border: #e1e4ec;
-    --text: #14171f;
-    --muted: #5a6172;
-    --accent: #3f57df;
+    --surface-2: #f5f5f5;
+    --border: #e5e5e5;
+    --text: #0a0a0a;
+    --muted: #737373;
+    --accent: #000000;
     --accent-ink: #ffffff;
-    --ok: #0c9c6b;
-    --ok-bg: #e2f4ec;
-    --bad: #d23a56;
-    --bad-bg: #fbe6ea;
-    --warn: #a86c07;
-    --warn-bg: #f7eeda;
+    --ok: #15803d;
+    --ok-bg: #e9f7ee;
+    --bad: #c81e1e;
+    --bad-bg: #fceaea;
+    --warn: #8a5a06;
+    --warn-bg: #fdf4e3;
   }
 }
 
 /* Manual theme toggle (Settings) — data-theme on <html> wins over the OS preference both ways. */
 :root[data-theme="dark"] {
-  --bg: #0c0f15; --surface: #141a23; --surface-2: #1b212d; --border: #272f3d; --text: #e7eaf1;
-  --muted: #8992a4; --accent: #8092f4; --accent-ink: #0c0f15;
-  --ok: #34cea0; --ok-bg: #0f2620; --bad: #f2718a; --bad-bg: #2c1620; --warn: #e0a44a; --warn-bg: #281f11;
+  color-scheme: dark;
+  --bg: #000000; --surface: #0c0c0c; --surface-2: #171717; --border: #262626; --text: #f5f5f5;
+  --muted: #a3a3a3; --accent: #ffffff; --accent-ink: #000000;
+  --ok: #22c55e; --ok-bg: #0d2114; --bad: #ef4444; --bad-bg: #241113; --warn: #e0a44a; --warn-bg: #241c0d;
 }
 :root[data-theme="light"] {
-  --bg: #f5f6f9; --surface: #ffffff; --surface-2: #eceef4; --border: #e1e4ec; --text: #14171f;
-  --muted: #5a6172; --accent: #3f57df; --accent-ink: #ffffff;
-  --ok: #0c9c6b; --ok-bg: #e2f4ec; --bad: #d23a56; --bad-bg: #fbe6ea; --warn: #a86c07; --warn-bg: #f7eeda;
+  color-scheme: light;
+  --bg: #fafafa; --surface: #ffffff; --surface-2: #f5f5f5; --border: #e5e5e5; --text: #0a0a0a;
+  --muted: #737373; --accent: #000000; --accent-ink: #ffffff;
+  --ok: #15803d; --ok-bg: #e9f7ee; --bad: #c81e1e; --bad-bg: #fceaea; --warn: #8a5a06; --warn-bg: #fdf4e3;
 }
+
+/* Thin, monochrome scrollbars — the same treatment as the status board, so a wallet pane that
+   overflows does not grow a heavy grey chrome bar down its edge. */
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+::-webkit-scrollbar-corner { background: transparent; }
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }

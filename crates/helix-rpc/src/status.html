@@ -1,0 +1,823 @@
+<!--
+  Served by the node itself at `/` to browsers (see `root`). Deliberately ONE self-contained
+  file with no external requests: a node has to work on a machine that cannot reach a CDN, and a
+  page that quietly depends on someone else's font server is not one you can run air-gapped.
+
+  This page is about **this node**, not about the chain. It answers the question its operator
+  actually has — is my node healthy, is it keeping up, is it co-signing? — from `/status` and
+  `/diagnostics`, both of which describe this process and no other. Browsing the chain moved to
+  the network explorer (explorer.silvra.net), a separate project on its own release cycle.
+
+  It is laid out as a board rather than a document: fixed viewport, six regions, nothing to
+  scroll past. An operator glances at it, so the answer has to be in the first second — the big
+  word top-left is the whole verdict, and everything else explains it. Lists scroll inside their
+  own panel; the page itself does not. Below 1100px (or on a short viewport) that inverts and it
+  becomes an ordinary scrolling page, because a board that does not fit is worse than a document.
+
+  The bar row is the one thing here that is genuinely new: the seconds between consecutive
+  blocks, drawn. This chain produces a block every ~2s, so a missed consensus round shows up as
+  a single tall bar at 30 or 60 seconds. A stall you would otherwise find by reading timestamps
+  in a log is visible from across the room.
+
+  What is deliberately NOT here:
+  - Block/transaction/validator *browsing* — the explorer does that better and paginates.
+  - A faucet. It signs transactions on request from the open internet, which is the one thing a
+    machine holding a validator key should not also do. It moved off the node entirely.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Helix node status</title>
+<meta name="description" content="Live status of this Helix node: height, sync state, peers, memory and whether it is co-signing blocks.">
+<link rel="icon" type="image/png" href="/logo.png">
+<style>
+  /* Helix design system, aligned with silvra.net: a truly achromatic grey scale, black (light)
+     or white (dark) as the only accent, and colour reserved for state — red for a fault, green
+     for health, amber for a warning. Nothing is coloured merely to look designed.
+
+     The greys are neutral, not slate. Slate reads as dark *blue*, which is a colour, and a
+     palette described as "black and white" should not have a hue in its largest surface. Dark
+     mode grounds on true #000: on an OLED panel those pixels are simply off, which is the right
+     look for something meant to be glanced at in a dim room, and it matches silvra.net's own
+     use of #000 for its chrome.
+
+     Two deliberate exceptions to "pure": panels sit at #0c0c0c rather than #000 so the 1px grid
+     lines have something to separate, and body text is #f5f5f5 rather than #fff — pure white on
+     pure black haloes badly at small sizes. The accent stays a true #fff so emphasis is still
+     distinguishable from ordinary text.
+
+     Consequence worth stating: with a monochrome accent, colour can no longer distinguish a link
+     from body text, so links carry an underline instead. That is not a compromise — a link told
+     apart by hue alone fails for anyone who cannot separate those hues.
+
+     Three theme states, so an explicit choice wins over the OS preference in both directions. */
+  :root {
+    /* Tells the browser which way round this page is, so it draws scrollbars, focus rings and
+       form controls to match. Without it a dark page gets a white native scrollbar — the one
+       piece of the design the stylesheet cannot reach any other way. */
+    color-scheme: light;
+    --ground: #fafafa; --panel: #ffffff; --panel-2: #f5f5f5; --line: #e5e5e5;
+    --ink: #0a0a0a; --dim: #737373; --accent: #000000; --accent-soft: #f5f5f5;
+    --warn-bg: #fdf4e3; --warn-line: #ecd7a4; --warn-ink: #8a5a06;
+    --ok: #15803d; --ok-bg: #e9f7ee; --bad: #c81e1e; --bad-bg: #fceaea;
+    --bar: #d4d4d4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --ground: #000000; --panel: #0c0c0c; --panel-2: #171717; --line: #262626;
+      --ink: #f5f5f5; --dim: #a3a3a3; --accent: #ffffff; --accent-soft: #171717;
+      --warn-bg: #241c0d; --warn-line: #4d3c17; --warn-ink: #e0a44a;
+      --ok: #22c55e; --ok-bg: #0d2114; --bad: #ef4444; --bad-bg: #241113;
+      --bar: #404040;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground: #000000; --panel: #0c0c0c; --panel-2: #171717; --line: #262626;
+    --ink: #f5f5f5; --dim: #a3a3a3; --accent: #ffffff; --accent-soft: #171717;
+    --warn-bg: #241c0d; --warn-line: #4d3c17; --warn-ink: #e0a44a;
+    --ok: #22c55e; --ok-bg: #0d2114; --bad: #ef4444; --bad-bg: #241113;
+    --bar: #404040;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--line); color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  .mono, .num { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; }
+  .num { font-variant-numeric: tabular-nums; }
+  .dim { color: var(--dim); }
+  a { color: var(--ink); text-decoration: underline; text-decoration-thickness: 1px;
+      text-underline-offset: 3px; text-decoration-color: var(--dim); }
+  a:hover { text-decoration-color: var(--ink); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* ---------- the board ---------- */
+
+  /* 1px gaps over a --line background: the grid draws its own hairlines, so no panel needs a
+     border and none of them can disagree about one. */
+  .app {
+    height: 100%;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    gap: 1px;
+  }
+
+  .board {
+    display: grid;
+    grid-template-columns: minmax(250px, 340px) minmax(0, 1fr) minmax(280px, 380px);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "verdict rhythm validators"
+      "metrics blocks inspector";
+    gap: 1px;
+    min-height: 0;
+  }
+  .verdict-cell { grid-area: verdict; }
+  .rhythm-cell  { grid-area: rhythm; }
+  .vals-cell    { grid-area: validators; }
+  .metrics-cell { grid-area: metrics; }
+  .blocks-cell  { grid-area: blocks; }
+  .inspect-cell { grid-area: inspector; }
+
+  .cell {
+    background: var(--panel);
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .cell > header {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+    padding: 9px 14px 7px;
+    flex: none;
+  }
+  .cell > header h2 {
+    margin: 0; font-size: 10.5px; font-weight: 700; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--dim);
+  }
+  .cell > header .aside { font-size: 11.5px; color: var(--dim); }
+  .cell .body { flex: 1; min-height: 0; overflow: auto; }
+
+  /* Scrollbars, made part of the design rather than a hole in it. `color-scheme` above already
+     gets the browser to draw them dark; these two rules make them thin and monochrome so a
+     panel that happens to overflow does not grow a heavy grey chrome bar down its edge.
+     Overlay-style (no track, no buttons) because the board is dense and every pixel of width in
+     a panel is content. */
+  * { scrollbar-width: thin; scrollbar-color: var(--bar) transparent; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--bar); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  .cell .body.pad { padding: 0 14px 12px; }
+
+  /* ---------- top bar ---------- */
+
+  .topbar {
+    background: var(--panel);
+    display: flex; align-items: center; gap: 12px;
+    padding: 9px 14px;
+    flex: none;
+  }
+  .topbar img { width: 22px; height: 22px; border-radius: 5px; display: block; }
+  .topbar .name { font-weight: 700; letter-spacing: .1em; font-size: 12px; text-transform: uppercase; }
+  .topbar .ver { font-size: 11.5px; color: var(--dim); font-family: ui-monospace, monospace; }
+  .topbar .spacer { margin-left: auto; }
+  .topbar .clock { font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .tbtn {
+    background: transparent; border: 1px solid var(--line); color: var(--dim);
+    border-radius: 6px; padding: 4px 9px; font: inherit; font-size: 11.5px; cursor: pointer;
+  }
+  .tbtn:hover { color: var(--ink); border-color: var(--dim); }
+
+  /* ---------- the verdict ---------- */
+
+  .verdict-cell .body { display: flex; flex-direction: column; justify-content: center; padding: 0 16px 14px; }
+  .state {
+    font-size: clamp(24px, 3.2vw, 40px); font-weight: 800; letter-spacing: -.03em;
+    line-height: 1; margin: 0 0 2px; display: flex; align-items: center; gap: 11px;
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot.ok  { background: var(--ok); }
+  .dot.bad { background: var(--bad); animation: blink 1.4s steps(1, end) infinite; }
+  .dot.warn{ background: var(--warn-ink); }
+  @keyframes blink { 50% { opacity: .25; } }
+  .state-why { font-size: 12.5px; color: var(--dim); margin: 6px 0 0; max-width: 34ch; }
+  .height {
+    font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums;
+    font-size: clamp(28px, 4vw, 52px); font-weight: 700; letter-spacing: -.04em; line-height: 1.05;
+    margin-top: 14px;
+  }
+  .height small { display: block; font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase;
+                  color: var(--dim); font-weight: 700; font-family: system-ui, sans-serif; margin-bottom: 2px; }
+  .since { margin-top: 10px; font-size: 12.5px; color: var(--dim); }
+  .since b { color: var(--ink); font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  /* The heartbeat: fills over the interval this chain has actually been keeping, and empties the
+     moment a block lands. On a healthy chain it is a slow sweep you stop noticing; during a stall
+     it sits full and red, which is the point — a stall should look wrong before it is read. */
+  .beat { height: 3px; background: var(--panel-2); border-radius: 2px; margin-top: 12px; overflow: hidden; }
+  .beat i {
+    display: block; height: 100%; width: 0; background: var(--ink);
+    transition: width .18s linear;
+  }
+  .beat i.over { background: var(--bad); }
+
+  /* One block landing lights the whole board briefly — see `onNewBlock`. */
+  @keyframes land { from { background: var(--accent-soft); } to { background: transparent; } }
+  .landed { animation: land .7s ease-out; }
+  @keyframes grow-in { from { transform: scaleY(.05); opacity: .3; } to { transform: scaleY(1); opacity: 1; } }
+  .rhythm .b.fresh { animation: grow-in .35s cubic-bezier(.16, 1, .3, 1); transform-origin: bottom; }
+  @keyframes beat-pulse { 0%,100% { box-shadow: 0 0 0 0 transparent; } 35% { box-shadow: 0 0 0 5px var(--accent-soft); } }
+  .dot.ok.pulse { animation: beat-pulse .8s ease-out; }
+
+  /* ---------- metric tiles ---------- */
+
+  .metrics-cell .body { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); overflow: hidden; }
+  .tile { background: var(--panel); padding: 10px 14px; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+  .tile .k { font-size: 9.5px; letter-spacing: .13em; text-transform: uppercase; color: var(--dim); font-weight: 700; }
+  .tile .v { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums;
+             font-size: clamp(15px, 1.5vw, 21px); font-weight: 700; letter-spacing: -.02em; margin-top: 1px; }
+  .tile .v small { font-size: 11px; font-weight: 500; color: var(--dim); letter-spacing: 0; }
+  .meter { height: 3px; background: var(--panel-2); border-radius: 2px; margin-top: 5px; overflow: hidden; }
+  .meter i { display: block; height: 100%; background: var(--ink); }
+  .meter i.warn { background: var(--warn-ink); }
+  .meter i.bad { background: var(--bad); }
+
+  /* ---------- block rhythm ---------- */
+
+  /* Bars, not a line: each block is a discrete event and the question is "was this one late",
+     not "what is the trend". A missed round is one tall bar, which is exactly how it feels. */
+  .rhythm { display: flex; align-items: flex-end; gap: 2px; height: 100%; min-height: 60px; padding: 0 14px 6px; }
+  .rhythm .b {
+    flex: 1 1 0; min-width: 2px; background: var(--bar); border-radius: 1px 1px 0 0;
+    transition: height .25s ease, background-color .15s ease;
+    cursor: crosshair;
+  }
+  .rhythm .b.warn { background: var(--warn-ink); }
+  .rhythm .b.bad { background: var(--bad); }
+  .rhythm:hover .b { opacity: .45; }
+  .rhythm .b:hover { opacity: 1; background: var(--accent); }
+  .rhythm .b.warn:hover { background: var(--warn-ink); }
+  .rhythm .b.bad:hover { background: var(--bad); }
+
+  /* A validator selected in the set panel dims every block it did not propose, which turns the
+     recent-blocks list into "show me this validator's turns". Cheap, and it answers a question
+     an operator genuinely asks: is my node actually taking its slots? */
+  tbody tr.faded td { opacity: .32; }
+  tbody tr.pick td { background: var(--accent-soft); }
+  tbody tr { cursor: pointer; }
+
+  /* ---------- inspector ---------- */
+
+  /* The board answers "is it healthy" at a glance; this answers "what exactly is that" without
+     leaving the page. Bottom right because it is the last thing you look at, and because a
+     detail pane that pushes the live panels around would defeat the point of a fixed board. */
+  .inspect-cell .body { padding: 0 14px 12px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12px; align-items: baseline; }
+  .kv dt { color: var(--dim); font-size: 9.5px; letter-spacing: .11em; text-transform: uppercase; font-weight: 700; white-space: nowrap; }
+  .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .inspect-empty { color: var(--dim); font-size: 12.5px; padding-top: 4px; }
+  .inspect-empty kbd {
+    font: inherit; font-family: ui-monospace, monospace; background: var(--panel-2);
+    border-radius: 4px; padding: 1px 5px; color: var(--ink);
+  }
+  .clear-btn {
+    background: transparent; border: 1px solid var(--line); color: var(--dim);
+    border-radius: 5px; padding: 2px 7px; font: inherit; font-size: 10.5px; cursor: pointer;
+  }
+  .clear-btn:hover { color: var(--ink); border-color: var(--dim); }
+  .rhythm-axis { display: flex; justify-content: space-between; padding: 4px 14px 10px; font-size: 10.5px; color: var(--dim); }
+
+  /* ---------- tables ---------- */
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  thead th {
+    position: sticky; top: 0; background: var(--panel); z-index: 1;
+    text-align: left; font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--dim); font-weight: 700; padding: 4px 14px 6px; white-space: nowrap;
+  }
+  td { padding: 5px 14px; white-space: nowrap; border-top: 1px solid var(--line); }
+  tbody tr:hover td { background: var(--panel-2); }
+  td.r, th.r { text-align: right; }
+
+  .pill {
+    display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+    background: var(--panel-2); color: var(--dim); letter-spacing: .04em; text-transform: uppercase;
+  }
+  .pill.ok { background: var(--ok-bg); color: var(--ok); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn-ink); }
+
+  /* ---------- alerts ---------- */
+
+  .alerts { display: flex; flex-direction: column; gap: 1px; }
+  .alert { padding: 7px 14px; font-size: 12px; background: var(--warn-bg); color: var(--warn-ink); }
+  .alert.bad { background: var(--bad-bg); color: var(--bad); }
+  .alert b { font-weight: 700; }
+
+  /* ---------- footer identity strip ---------- */
+
+  .strip {
+    background: var(--panel); display: flex; flex-wrap: wrap; gap: 0 22px;
+    padding: 7px 14px; font-size: 11px; color: var(--dim); flex: none; align-items: center;
+  }
+  .strip span b { color: var(--dim); font-weight: 700; letter-spacing: .1em; text-transform: uppercase; font-size: 9.5px; margin-right: 5px; }
+  .strip span i { font-style: normal; color: var(--ink); font-family: ui-monospace, monospace; }
+  .strip .spacer { margin-left: auto; }
+
+  /* ---------- fallback: a board that does not fit is worse than a document ---------- */
+
+  @media (max-width: 1100px), (max-height: 620px) {
+    body { overflow: auto; }
+    html, body { height: auto; }
+    .app { height: auto; }
+    .board {
+      grid-template-columns: 1fr;
+      grid-template-areas: "verdict" "metrics" "rhythm" "blocks" "validators";
+      grid-template-rows: none;
+    }
+    .cell { overflow: visible; }
+    .cell .body { overflow: visible; }
+    .vals-cell .body, .blocks-cell .body { max-height: 320px; overflow: auto; }
+    .rhythm { min-height: 90px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: .001ms !important; animation-iteration-count: 1 !important;
+        transition-duration: .001ms !important; }
+  }
+</style>
+
+<div class="app">
+  <div class="topbar">
+    <img src="/logo.png" alt="">
+    <span class="name">Helix node</span>
+    <span class="ver" id="version">—</span>
+    <span class="spacer"></span>
+    <span class="clock" id="clock">—</span>
+    <a href="https://explorer.silvra.net">Explorer</a>
+    <button class="tbtn" id="theme" type="button">System</button>
+  </div>
+
+  <div class="board">
+    <section class="cell verdict-cell">
+      <header><h2>This node</h2><span class="aside" id="uptime">—</span></header>
+      <div class="body">
+        <p class="state"><span class="dot" id="dot"></span><span id="state">…</span></p>
+        <p class="state-why" id="why">Reading this node.</p>
+        <div class="height"><small>Height</small><span id="height">—</span></div>
+        <p class="since">Last block <b id="since">—</b> ago · last co-signed <b id="cosign">—</b></p>
+        <div class="beat" title="Time since the last block, against the interval this chain has been keeping"><i id="beat"></i></div>
+      </div>
+    </section>
+
+    <section class="cell metrics-cell">
+      <header><h2>Resources &amp; network</h2></header>
+      <div class="body">
+        <div class="tile"><span class="k">Peers</span><span class="v" id="peers">—</span></div>
+        <div class="tile"><span class="k">Mempool</span><span class="v" id="mempool">—</span></div>
+        <div class="tile">
+          <span class="k">Memory</span><span class="v" id="rss">—</span>
+          <span class="meter"><i id="rss-bar" style="width:0"></i></span>
+        </div>
+        <div class="tile"><span class="k">State height</span><span class="v" id="stateh">—</span></div>
+      </div>
+    </section>
+
+    <section class="cell rhythm-cell">
+      <header><h2>Block rhythm</h2><span class="aside" id="rhythm-note">seconds between blocks</span></header>
+      <div class="body" style="display:flex;flex-direction:column">
+        <div class="rhythm" id="rhythm"></div>
+        <div class="rhythm-axis"><span id="rhythm-old">—</span><span id="rhythm-max">—</span><span id="rhythm-new">newest</span></div>
+      </div>
+    </section>
+
+    <section class="cell blocks-cell">
+      <header><h2>Recent blocks</h2><span class="aside">full history in the explorer</span></header>
+      <div class="body">
+        <table>
+          <thead><tr><th>Height</th><th>Age</th><th class="r">Gap</th><th>Proposer</th><th class="r">Txs</th><th>Version</th></tr></thead>
+          <tbody id="blocks"><tr><td colspan="6" class="dim">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="cell vals-cell">
+      <header><h2>Validator set</h2><span class="aside" id="quorum">—</span></header>
+      <div class="alerts" id="alerts"></div>
+      <div class="body">
+        <table>
+          <thead><tr><th>Address</th><th>State</th><th class="r">Stake</th><th class="r">Power</th></tr></thead>
+          <tbody id="validators"><tr><td colspan="4" class="dim">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="cell inspect-cell">
+      <header>
+        <h2 id="inspect-title">Inspector</h2>
+        <button class="clear-btn" id="inspect-clear" type="button" hidden>Clear</button>
+      </header>
+      <div class="body">
+        <div id="inspect">
+          <p class="inspect-empty">Select a block or a validator to see its detail here.
+            <kbd>Esc</kbd> clears.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="strip">
+    <span><b>Genesis</b><i id="genesis">—</i></span>
+    <span><b>State</b><i id="statehash">—</i></span>
+    <span><b>P2P</b><i id="p2p">—</i></span>
+    <span class="spacer"></span>
+    <span><b>Previous run</b><i id="prevrun">—</i></span>
+  </div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  // Same three-state model and the same localStorage key as the wallet and the explorer: an
+  // explicit choice wins over the OS preference in both directions, "system" removes it.
+  const THEMES = ["system", "light", "dark"];
+  function applyTheme(t) {
+    if (t === "system") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", t);
+    $("theme").textContent = t[0].toUpperCase() + t.slice(1);
+  }
+  let theme = localStorage.getItem("helix-theme") || "system";
+  if (!THEMES.includes(theme)) theme = "system";
+  applyTheme(theme);
+  $("theme").addEventListener("click", () => {
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    if (theme === "system") localStorage.removeItem("helix-theme");
+    else localStorage.setItem("helix-theme", theme);
+    applyTheme(theme);
+  });
+
+  // Everything is read from this node, at its own origin. No base URL to configure, and no way
+  // for this page to end up describing a node other than the one that served it.
+  async function get(path) {
+    const r = await fetch(path, { headers: { Accept: "application/json" } });
+    if (!r.ok) throw new Error(path + " → HTTP " + r.status);
+    return r.json();
+  }
+
+  const nf = (n) => Number(n).toLocaleString();
+  const hlx = (n) => Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+  const short = (s) => (s && s.length > 16 ? s.slice(0, 8) + "…" + s.slice(-5) : s || "—");
+
+  function duration(secs) {
+    if (secs == null) return "—";
+    if (secs < 60) return secs + "s";
+    const m = Math.floor(secs / 60);
+    if (m < 60) return m + "m " + (secs % 60) + "s";
+    const h = Math.floor(m / 60);
+    if (h < 48) return h + "h " + (m % 60) + "m";
+    return Math.floor(h / 24) + "d";
+  }
+
+  // Block timestamps are milliseconds.
+  const ageSecs = (ms) => Math.max(0, Math.floor((Date.now() - ms) / 1000));
+
+  let tipTs = null;          // timestamp of the newest block, for the live "last block" counter
+  let lastCosignedSecs = null, lastCosignedAt = null;
+  let lastHeight = null;     // to notice a block landing between refreshes
+  let expectedGap = 2;       // seconds, learned from the chain rather than assumed
+  let selected = null;       // {kind: "block"|"validator", id} — what the inspector is showing
+  let lastBlocks = [];       // newest-first, as last rendered
+  let lastValidators = [];
+
+  const CALM = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /**
+   * A block landed. One orchestrated moment rather than four scattered effects: the height
+   * flashes, the newest bar grows in, the status dot pulses once. Scattered motion on a board
+   * teaches people to ignore it; a single recognisable event does the opposite.
+   */
+  function onNewBlock() {
+    if (CALM) return;
+    for (const el of [$("height"), $("stateh")]) {
+      el.classList.remove("landed");
+      void el.offsetWidth;                       // restart the animation on a repeat
+      el.classList.add("landed");
+    }
+    const dot = $("dot");
+    if (dot.classList.contains("ok")) {
+      dot.classList.remove("pulse");
+      void dot.offsetWidth;
+      dot.classList.add("pulse");
+    }
+  }
+
+  // Ticks once a second so the two numbers that matter during a stall keep moving even though
+  // the data behind them is refreshed every five. A frozen counter during a stall reads as a
+  // broken page, which is the opposite of what it should convey.
+  setInterval(() => {
+    const now = new Date();
+    $("clock").textContent = now.toTimeString().slice(0, 8) + " " +
+      (now.getTimezoneOffset() === 0 ? "UTC" : "local");
+    if (tipTs !== null) $("since").textContent = duration(ageSecs(tipTs));
+    if (lastCosignedSecs !== null) {
+      $("cosign").textContent = duration(lastCosignedSecs + Math.floor((Date.now() - lastCosignedAt) / 1000));
+    }
+  }, 1000);
+
+  // The heartbeat sweeps at 150ms so it reads as motion rather than as a stepping counter. It is
+  // the only thing on the board that moves continuously, which is what makes a frozen one mean
+  // something.
+  setInterval(() => {
+    if (tipTs === null) return;
+    const elapsed = (Date.now() - tipTs) / 1000;
+    const frac = Math.min(1, elapsed / Math.max(1, expectedGap));
+    const bar = $("beat");
+    bar.style.width = (frac * 100).toFixed(1) + "%";
+    // "Over" means this block is later than the chain's own recent rhythm, not later than some
+    // number picked in advance — a chain configured for slower blocks should not look sick.
+    bar.classList.toggle("over", elapsed > expectedGap * 3);
+  }, 150);
+
+  /** The whole verdict in one word, plus the sentence that justifies it. */
+  function verdict(status, diag, gapSecs) {
+    const isValidator = diag && diag.last_cosigned_height != null;
+    if (status.is_syncing) {
+      const target = status.sync_target_height || status.height;
+      return ["warn", "SYNCING",
+        `Holding ${nf(status.state_height)} of ${nf(target)} blocks. This node cannot propose or vote until it is level.`];
+    }
+    if (status.peer_count === 0) {
+      return ["bad", "ISOLATED",
+        "No peers. This node cannot learn about new blocks or broadcast transactions."];
+    }
+    if (gapSecs !== null && gapSecs > 20) {
+      return ["bad", "STALLED",
+        isValidator
+          ? "No block for a while. This node is connected and healthy — the round cannot close without votes from other validators."
+          : "No block for a while. The chain is not advancing; this node is only watching."];
+    }
+    if (isValidator && diag.last_cosigned_secs_ago != null && diag.last_cosigned_secs_ago > 300) {
+      return ["warn", "NOT SIGNING",
+        "The chain is moving but this node's signature is not in recent blocks."];
+    }
+    if (isValidator) return ["ok", "VALIDATING", "Producing and co-signing blocks with the rest of the set."];
+    return ["ok", "IN SYNC", "Following the chain. This node holds no stake, so it does not vote."];
+  }
+
+  function alerts(diag) {
+    const out = [];
+    // Reported as an observation about this node, never as a verdict about someone else's: not
+    // seeing a validator's votes here says something about this edge of the network, not that
+    // the validator is down.
+    if (diag && diag.validators_not_heard_from > 0) {
+      out.push(["", `<b>${diag.validators_not_heard_from} validator(s) whose votes are not arriving here.</b> ` +
+        "That describes what this node can see, not proof they are offline."]);
+    }
+    $("alerts").innerHTML = out.map(([k, h]) => `<div class="alert ${k}">${h}</div>`).join("");
+  }
+
+  function previousRun(diag) {
+    const p = diag && diag.previous_run;
+    if (!p) { $("prevrun").textContent = "none recorded"; return; }
+    // The point of this record (#172): an out-of-memory kill leaves nothing in the killed
+    // process's own log, so the only place it can ever be reported is the *next* start.
+    $("prevrun").innerHTML = (p.clean_exit ? "clean exit" : "<b>UNCLEAN EXIT</b>") +
+      ` · ${p.version} · ran ${duration(p.ran_for_secs)} · to #${nf(p.last_height)}`;
+    $("prevrun").style.color = p.clean_exit ? "" : "var(--bad)";
+  }
+
+  /** Seconds between consecutive blocks, drawn. See the file header for why bars. */
+  function rhythm(blocks) {
+    if (blocks.length < 2) { $("rhythm").innerHTML = ""; return null; }
+    const gaps = [];
+    for (let i = 1; i < blocks.length; i++) {
+      gaps.push((blocks[i].timestamp - blocks[i - 1].timestamp) / 1000);
+    }
+    // Scale to the tallest bar but never below 8s, so a healthy 2s chain does not render as
+    // dramatic peaks of noise.
+    const max = Math.max(8, ...gaps);
+    const fresh = gaps.length - 1;
+    $("rhythm").innerHTML = gaps.map((g, i) => {
+      const cls = g > 25 ? "bad" : g > 10 ? "warn" : "";
+      const h = Math.max(2, Math.round((g / max) * 100));
+      const height = blocks[i + 1].height;
+      return `<span class="b ${cls}${i === fresh && !CALM ? " fresh" : ""}" style="height:${h}%" ` +
+             `data-g="${g.toFixed(1)}" data-h="${height}"></span>`;
+    }).join("");
+    $("rhythm-max").textContent = "peak " + max.toFixed(0) + "s";
+    $("rhythm-old").textContent = "#" + nf(blocks[0].height);
+
+    // The median, not the mean, drives the heartbeat: one 30s stall in the window would drag a
+    // mean far enough that a healthy chain afterwards looks early forever.
+    const sorted = gaps.slice().sort((a, b) => a - b);
+    expectedGap = Math.max(1, sorted[Math.floor(sorted.length / 2)]);
+    const mean = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+    $("rhythm-note").dataset.idle = `${gaps.length} intervals · median ${expectedGap.toFixed(1)}s · mean ${mean.toFixed(1)}s`;
+    $("rhythm-note").textContent = $("rhythm-note").dataset.idle;
+    return gaps;
+  }
+
+  // Hovering a bar reads it out in the panel header — instant, styleable, and it puts the answer
+  // where the eye already is instead of waiting a second for a native tooltip somewhere else.
+  $("rhythm").addEventListener("mouseover", (e) => {
+    const b = e.target.closest(".b");
+    if (!b) return;
+    $("rhythm-note").textContent = `block #${nf(Number(b.dataset.h))} · ${b.dataset.g}s after the one before`;
+  });
+  $("rhythm").addEventListener("mouseleave", () => {
+    $("rhythm-note").textContent = $("rhythm-note").dataset.idle || "seconds between blocks";
+  });
+
+  // ---------- inspector ----------
+
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const row = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+
+  function select(kind, id) {
+    // Clicking the same thing again clears it — no separate "deselect" to discover.
+    selected = selected && selected.kind === kind && selected.id === id ? null : { kind, id };
+    renderInspector();
+    paintSelection();
+  }
+
+  function renderInspector() {
+    const box = $("inspect"), title = $("inspect-title"), clear = $("inspect-clear");
+    clear.hidden = !selected;
+
+    if (!selected) {
+      title.textContent = "Inspector";
+      box.innerHTML = '<p class="inspect-empty">Select a block or a validator to see its detail ' +
+        'here. <kbd>Esc</kbd> clears.</p>';
+      return;
+    }
+
+    if (selected.kind === "block") {
+      const b = lastBlocks.find((x) => x.height === selected.id);
+      if (!b) {
+        // The window scrolled past it. Say so rather than silently showing nothing.
+        title.textContent = "Block " + nf(selected.id);
+        box.innerHTML = '<p class="inspect-empty">This block has scrolled out of the window this ' +
+          'page keeps. Open it in the <a href="https://explorer.silvra.net">explorer</a>.</p>';
+        return;
+      }
+      const i = lastBlocks.indexOf(b), prev = lastBlocks[i + 1];
+      title.textContent = "Block " + nf(b.height);
+      box.innerHTML = `<dl class="kv">
+        ${row("Hash", esc(b.hash))}
+        ${row("Previous", esc(b.prev_hash))}
+        ${row("Proposer", esc(b.validator))}
+        ${row("Time", esc(new Date(b.timestamp).toLocaleString()) + ` <span class="dim">(${duration(ageSecs(b.timestamp))} ago)</span>`)}
+        ${prev ? row("Gap", ((b.timestamp - prev.timestamp) / 1000).toFixed(1) + "s <span class='dim'>after #" + nf(prev.height) + "</span>") : ""}
+        ${row("Transactions", b.tx_count)}
+        ${row("Merkle root", esc(b.merkle_root))}
+        ${row("Built by", "Helix " + esc(b.node_version))}
+        ${row("Base fee", b.base_fee_per_byte + " <span class='dim'>per byte</span>")}
+      </dl>`;
+      return;
+    }
+
+    const v = lastValidators.find((x) => x.address === selected.id);
+    title.textContent = "Validator";
+    if (!v) { box.innerHTML = '<p class="inspect-empty">No longer in the set.</p>'; return; }
+    // How many of the blocks on screen this validator proposed — the question an operator has
+    // about their own node, answerable from what is already loaded.
+    const mine = lastBlocks.filter((b) => b.validator === v.address).length;
+    box.innerHTML = `<dl class="kv">
+      ${row("Address", esc(v.address))}
+      ${row("Tier", esc(v.tier) + (v.active ? "" : " <span class='dim'>(not active)</span>"))}
+      ${row("Self-staked", hlx(v.self_staked_hlx) + " HLX")}
+      ${row("Delegated", hlx(v.delegated_stake_hlx) + " HLX")}
+      ${row("Effective", hlx(v.effective_stake_hlx) + " HLX")}
+      ${v.voting_power != null ? row("Voting power", nf(v.voting_power)) : ""}
+      ${v.jailed_until != null ? row("Jailed until", "#" + nf(v.jailed_until)) : ""}
+      ${v.missed_blocks != null ? row("Missed blocks", nf(v.missed_blocks)) : ""}
+      ${v.tier === "probationary" ? row("Liveness seen", v.probation_liveness_seen ? "yes" : "<b>not yet</b>") : ""}
+      ${row("Proposed here", `${mine} of the last ${lastBlocks.length} blocks`)}
+    </dl>`;
+  }
+
+  /** Highlight the selected row, and dim blocks a selected validator did not propose. */
+  function paintSelection() {
+    for (const tr of document.querySelectorAll("#blocks tr")) {
+      const h = Number(tr.dataset.h);
+      tr.classList.toggle("pick", !!selected && selected.kind === "block" && h === selected.id);
+      tr.classList.toggle("faded",
+        !!selected && selected.kind === "validator" && tr.dataset.v !== selected.id);
+    }
+    for (const tr of document.querySelectorAll("#validators tr")) {
+      tr.classList.toggle("pick", !!selected && selected.kind === "validator" && tr.dataset.v === selected.id);
+    }
+  }
+
+  $("inspect-clear").addEventListener("click", () => { selected = null; renderInspector(); paintSelection(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && selected) { selected = null; renderInspector(); paintSelection(); }
+  });
+  $("blocks").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr[data-h]");
+    if (tr) select("block", Number(tr.dataset.h));
+  });
+  $("validators").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr[data-v]");
+    if (tr) select("validator", tr.dataset.v);
+  });
+
+  function renderValidators(v) {
+    const rows = (v.validators || []).map((x) => {
+      const state = x.jailed_until != null
+        ? '<span class="pill bad">jailed</span>'
+        : x.active ? `<span class="pill ok">${x.tier}</span>` : `<span class="pill">${x.tier}</span>`;
+      // `null` power means "not in the set at all", which is not the same as being in it with no
+      // weight — a probationer shows a real 0.
+      const power = x.voting_power == null ? '<span class="dim">—</span>' : nf(x.voting_power);
+      return `<tr data-v="${esc(x.address)}"><td class="mono">${short(x.address)}</td><td>${state}</td>` +
+             `<td class="r num">${hlx(x.effective_stake_hlx)}</td><td class="r num">${power}</td></tr>`;
+    });
+    lastValidators = v.validators || [];
+    $("validators").innerHTML = rows.length ? rows.join("")
+      : '<tr><td colspan="4" class="dim">This node reports no validators.</td></tr>';
+
+    if (v.total_voting_power != null && v.quorum_threshold != null) {
+      // How many can go quiet: strip the weakest members while the rest still carry quorum.
+      // That is the decision an operator actually makes — whether it is safe to restart.
+      const powers = (v.validators || []).map((x) => x.voting_power || 0).filter((p) => p > 0).sort((a, b) => a - b);
+      let remaining = v.total_voting_power, spare = 0;
+      for (const p of powers) { if (remaining - p < v.quorum_threshold) break; remaining -= p; spare++; }
+      $("quorum").textContent = spare === 0
+        ? "no validator can drop out"
+        : `survives ${spare} offline`;
+    } else {
+      $("quorum").textContent = `${(v.validators || []).length} in set`;
+    }
+  }
+
+  async function refresh() {
+    let height = null;
+    try {
+      const [status, diag] = await Promise.all([get("/status"), get("/diagnostics").catch(() => null)]);
+      height = status.height;
+
+      $("version").textContent = "v" + status.version;
+      $("height").textContent = nf(status.height);
+      $("stateh").innerHTML = nf(status.state_height) +
+        (status.state_height === status.height ? '<small> level</small>' : '<small> behind</small>');
+      $("peers").textContent = nf(status.peer_count);
+      $("mempool").textContent = nf(status.mempool_size);
+      $("uptime").textContent = diag ? "up " + duration(diag.uptime_secs) : "";
+
+      if (diag) {
+        const mb = Math.round(diag.rss_kb / 1024);
+        $("rss").innerHTML = nf(mb) + "<small> MB</small>";
+        const pct = diag.machine_total_kb ? (diag.rss_kb / diag.machine_total_kb) * 100 : 0;
+        const bar = $("rss-bar");
+        bar.style.width = Math.min(100, pct).toFixed(1) + "%";
+        bar.className = pct > 80 ? "bad" : pct > 50 ? "warn" : "";
+        lastCosignedSecs = diag.last_cosigned_secs_ago;
+        lastCosignedAt = Date.now();
+      }
+
+      $("statehash").textContent = short(status.state_hash);
+      $("p2p").textContent = status.p2p_public_addr || "not advertised";
+
+      alerts(diag);
+      previousRun(diag);
+
+      // Blocks: one request serves both the rhythm bars and the table below them.
+      let gapSecs = null;
+      if (height !== null) {
+        const from = Math.max(0, height - 39);
+        const blocks = await get(`/blocks/range?from=${from}&count=40`);
+        const asc = blocks.slice().sort((a, b) => a.height - b.height);
+        rhythm(asc);
+        const desc = asc.slice().reverse();
+        lastBlocks = desc;
+        if (desc.length) { tipTs = desc[0].timestamp; gapSecs = ageSecs(tipTs); }
+        $("blocks").innerHTML = desc.map((b, i) => {
+          const prev = desc[i + 1];
+          const gap = prev ? ((b.timestamp - prev.timestamp) / 1000).toFixed(1) + "s" : "—";
+          return `<tr data-h="${b.height}" data-v="${esc(b.validator)}">` +
+                 `<td class="num">${nf(b.height)}</td><td class="dim num">${duration(ageSecs(b.timestamp))}</td>` +
+                 `<td class="r num dim">${gap}</td><td class="mono">${short(b.validator)}</td>` +
+                 `<td class="r num">${b.tx_count}</td><td class="dim num">${b.node_version}</td></tr>`;
+        }).join("");
+      }
+
+      if (lastHeight !== null && height !== null && height > lastHeight) onNewBlock();
+      lastHeight = height;
+
+      const [cls, word, why] = verdict(status, diag, gapSecs);
+      $("dot").className = "dot " + cls;
+      $("state").textContent = word;
+      $("why").textContent = why;
+    } catch (e) {
+      $("dot").className = "dot bad";
+      $("state").textContent = "NO DATA";
+      $("why").textContent = "Cannot read this node: " + e.message;
+    }
+
+    try { renderValidators(await get("/validators")); }
+    catch (e) { $("validators").innerHTML = `<tr><td colspan="4" class="dim">unavailable: ${e.message}</td></tr>`; }
+
+    // Both tables were just rebuilt, so the selection has to be repainted onto the new rows —
+    // and the inspector refreshed, since a selected block's age and a validator's tier move.
+    renderInspector();
+    paintSelection();
+  }
+
+  // Genesis is fetched once — it is the one value on this page that cannot change while the node
+  // runs, and re-fetching it every five seconds would be pure noise.
+  get("/blocks/height/0")
+    .then((g) => ($("genesis").textContent = short(g.hash)))
+    .catch(() => ($("genesis").textContent = "unavailable"));
+
+  refresh();
+  setInterval(refresh, 5000);
+</script>

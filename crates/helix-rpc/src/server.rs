@@ -63,10 +63,6 @@ pub struct AppState {
     /// any single-node unit/integration test, since a lone node is always its own
     /// proposer and never needed this path.
     pub p2p_command_tx: mpsc::Sender<P2PCommand>,
-    /// The testnet faucet, when this operator deliberately configured one — see
-    /// `crate::faucet`. `None` on every node that did not, which is the default and must stay
-    /// the default: this binary ships to strangers.
-    pub faucet: Option<Arc<crate::faucet::Faucet>>,
     /// The commit certificate for this node's current tip — see [`crate::TipCertificate`]. Held in
     /// a cell the node updates on every committed block (the tip's certificate lives only in the
     /// live engine, never on disk), and served at `GET /sync/tip-certificate` so an RPC-only
@@ -96,13 +92,6 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
     // for normal wallet/explorer use, tight enough to blunt a single-source flood
     // against the publicly reachable RPC endpoint.
     let limiter = Arc::new(RateLimiter::new(30.0, 10.0));
-
-    // The faucet gets its own, far tighter bucket on top of the shared one: 3 up front, then
-    // one every five minutes. It spends real balance and writes to the mempool, so the cost of
-    // a request is nothing like that of a read. This only shapes the traffic — what actually
-    // bounds the damage is that a grant tops an address up rather than paying it out, and that
-    // the faucet account holds only what it was funded with.
-    let faucet_limiter = Arc::new(RateLimiter::new(3.0, 1.0 / 300.0));
 
     let app = Router::new()
         .route("/", get(root))
@@ -142,13 +131,6 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
             post(submit_transaction).layer(DefaultBodyLimit::max(TX_SUBMIT_BODY_LIMIT_BYTES)),
         )
         .route("/transactions/:hash", get(get_transaction_status))
-        .route(
-            "/faucet",
-            post(crate::faucet::request_funds).layer(middleware::from_fn_with_state(
-                faucet_limiter,
-                rate_limit_middleware,
-            )),
-        )
         .layer(CorsLayer::permissive())
         // Compress responses for any client that asks (`Accept-Encoding: gzip`). The chain's
         // bulk payloads are dominated by ML-DSA signatures and public keys, which serde renders
@@ -176,10 +158,16 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
     .unwrap();
 }
 
-/// The explorer, compiled into the binary. Not read from disk and not fetched from anywhere:
-/// a node must work on a machine that cannot reach a CDN, and shipping it as a file would mean
-/// a node whose explorer silently disappears if the file isn't deployed alongside it.
-const EXPLORER_HTML: &str = include_str!("explorer.html");
+/// This node's own status page, compiled into the binary. Not read from disk and not fetched
+/// from anywhere: a node must work on a machine that cannot reach a CDN, and shipping it as a
+/// file would mean a node whose status page silently disappears if the file isn't deployed
+/// alongside it.
+///
+/// It describes **this process** — height, sync state, peers, memory, whether it is co-signing.
+/// Browsing the chain belongs to the network explorer, a separate project on its own release
+/// cycle: an operator should not need a new node binary to get a better block list, and a node
+/// that shipped a whole explorer was answering a question nobody asked it.
+const STATUS_HTML: &str = include_str!("status.html");
 
 /// The Helix logo (512×512 PNG), compiled into the binary and served at a stable URL.
 ///
@@ -223,12 +211,12 @@ async fn chainquiry_logo() -> impl IntoResponse {
     )
 }
 
-/// `GET /` answers a browser with the explorer and everything else with the API index.
+/// `GET /` answers a browser with this node's status page and everything else with the API index.
 ///
 /// Same URL, because it is the one people are handed: `helix.silvra.net` in a browser used to
 /// return raw JSON, which is a poor way to meet a project. Content negotiation rather than a
-/// separate `/explorer` path keeps the link that gets shared and the link that gets curl'd the
-/// same one. Anything that doesn't ask for HTML — curl, a wallet, another node — is unaffected.
+/// separate path keeps the link that gets shared and the link that gets curl'd the same one.
+/// Anything that doesn't ask for HTML — curl, a wallet, another node — is unaffected.
 async fn root(headers: axum::http::HeaderMap) -> axum::response::Response {
     let wants_html = headers
         .get(axum::http::header::ACCEPT)
@@ -237,7 +225,7 @@ async fn root(headers: axum::http::HeaderMap) -> axum::response::Response {
     if wants_html {
         return (
             [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            EXPLORER_HTML,
+            STATUS_HTML,
         )
             .into_response();
     }
@@ -294,17 +282,6 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
             0 => None,
             h => Some(h),
         },
-        // Advertised only while the faucet can actually pay a grant. An offer that answers
-        // "out of funds" is worse than no offer, and gating it on the balance rather than on
-        // configuration means it appears the moment someone tops the account up and disappears
-        // when it runs dry — both without a restart, and without anyone having to notice.
-        faucet_topup_hlx: state.faucet.as_ref().and_then(|f| {
-            let funded = chain
-                .get(&f.address)
-                .map(|a| a.balance >= f.topup_nano())
-                .unwrap_or(false);
-            funded.then(|| f.topup_hlx())
-        }),
         mempool_size: mempool.len(),
         total_accounts: chain.account_count(),
         circulating_supply_hlx: chain.circulating_supply() as f64 / 1_000_000_000.0,
@@ -835,6 +812,18 @@ async fn get_validator_pool(
 async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
     let chain = state.chain_state.read().await;
 
+    // The set exactly as consensus builds it, so the power figures below are the ones the chain
+    // is actually voting with rather than a second implementation of the rule. Without this a
+    // client wanting to answer "can this set survive one validator going quiet?" has to
+    // re-derive `min(has_personhood ? stake : stake/2, total_stake/100)` from fields that do not
+    // include `has_personhood` — which means guessing an input and publishing the guess as fact.
+    let set = chain.consensus_validator_set();
+    let power: std::collections::HashMap<String, u64> = set
+        .validators
+        .iter()
+        .map(|v| (v.address.to_string(), v.voting_power))
+        .collect();
+
     let mut out: Vec<_> = chain
         .stakers()
         .into_iter()
@@ -884,6 +873,11 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                 // nothing happening. It is also how the two earlier, unsatisfiable versions of
                 // this gate were caught. Only meaningful while `tier` is `probationary`.
                 "probation_liveness_seen": chain.probation_seen.contains(&addr),
+                // What this validator actually weighs in a vote, after the 1 % cap and the
+                // halving for validators without personhood. `0` for a probationer (in the set
+                // to sign, but carrying no power) and absent for anyone not in the set at all —
+                // the two are different situations and must not both render as zero.
+                "voting_power": power.get(&key),
                 "jailed_until": chain.jailed_until.get(&key),
                 "missed_blocks": chain.missed_blocks.get(&key),
             })
@@ -904,6 +898,9 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                 "commission_bps": pool.map(|p| p.commission_bps),
                 "accepts_delegation": pool.is_some(),
                 "active": false,
+                // Absent rather than zero: a jailed validator is not in the set at all, which is
+                // a different thing from being in it with no weight.
+                "voting_power": power.get(key),
                 "jailed_until": Some(until),
                 "missed_blocks": chain.missed_blocks.get(key),
             }));
@@ -921,6 +918,18 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
         Json(json!({
             "validators": out,
             "min_validator_stake_hlx": chain.governance_params.min_validator_stake as f64 / 1_000_000_000.0,
+            // The two numbers that decide whether this chain keeps producing blocks. A block is
+            // final once the precommits behind it carry at least `quorum_threshold` of
+            // `total_voting_power`; anything less and the round times out.
+            //
+            // Published because the answer to "how many validators can go quiet before the chain
+            // stops?" is not derivable from stake alone — the 1 % cap makes two validators with
+            // very different stakes weigh exactly the same, so a set that looks lopsided can be
+            // perfectly balanced and a set of three can have less tolerance than a set of two
+            // looks like it should. Every client that tried to work this out from stake got it
+            // wrong, including ours.
+            "total_voting_power": set.total_voting_power(),
+            "quorum_threshold": set.quorum_threshold(),
         })),
     )
 }
@@ -1438,7 +1447,6 @@ mod tests {
             p2p_port: 0,
             p2p_public_addr: None,
             p2p_command_tx,
-            faucet: None,
             tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
             started_at_unix: 0,
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2017,7 +2025,6 @@ mod tests {
             p2p_port: 0,
             p2p_public_addr: None,
             p2p_command_tx,
-            faucet: None,
             tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
             started_at_unix: 0,
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2187,7 +2194,7 @@ mod tests {
     /// node reads `/` expecting the JSON index, and quietly handing them HTML would break them
     /// all at once.
     #[tokio::test]
-    async fn root_serves_the_explorer_to_browsers_and_json_to_everything_else() {
+    async fn root_serves_the_status_page_to_browsers_and_json_to_everything_else() {
         use axum::http::{header, HeaderMap, HeaderValue};
 
         let mut browser = HeaderMap::new();
@@ -2202,11 +2209,12 @@ mod tests {
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("<title>Helix Explorer — the post-quantum blockchain</title>"));
-        assert!(
-            html.contains("test token"),
-            "the hub is the first thing most people see — it has to say honestly what this chain is"
-        );
+        assert!(html.contains("<title>Helix node status</title>"));
+        // There is deliberately no "this is a devnet / valueless test token" assertion here any
+        // more. The page carried that sentence until 2026-08-12; it was removed on Vistos' call
+        // because this page is an operator's own dashboard and whoever runs a node already knows
+        // what they joined. The statement still stands where strangers actually arrive — the
+        // network explorer and the README. Recorded so nobody restores it as a "missing" test.
 
         // curl, wallets, other nodes: no Accept header at all, or a JSON one.
         for headers in [HeaderMap::new(), {
@@ -2238,32 +2246,51 @@ mod tests {
         assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "must be a real PNG");
     }
 
-    /// The explorer must not reach for anything off the node. A node has to work where there is
-    /// no CDN to reach, and an explorer that fetches a font from someone else's server is both a
+    /// The status page must not reach for anything off the node. A node has to work where there
+    /// is no CDN to reach, and a page that fetches a font from someone else's server is both a
     /// dependency and a tracker.
     #[test]
-    fn the_explorer_makes_no_external_requests() {
+    fn the_status_page_makes_no_external_requests() {
         for needle in ["//fonts.", "cdn.", "https://unpkg", "https://cdn", "<script src=", "@import"] {
             assert!(
-                !EXPLORER_HTML.contains(needle),
-                "explorer must be self-contained, found {needle:?}"
+                !STATUS_HTML.contains(needle),
+                "status page must be self-contained, found {needle:?}"
             );
         }
 
         // The list above only catches sources someone thought of in advance — it would happily
         // pass an `<img src="https://…">`, which is exactly the mistake waiting to be made when
         // adding a badge or an icon. Any *loaded* resource must be same-origin; `href` links are
-        // fine, since a link fetches nothing until the reader chooses to follow it.
+        // fine, since a link fetches nothing until the reader chooses to follow it. The page
+        // links to the network explorer, and that link must stay a link.
         assert!(
-            !EXPLORER_HTML.contains("src=\"http"),
-            "every image/script the explorer loads must come from the node itself — the footer \
-             promises no external requests, and a hotlinked asset hands every visitor's IP and \
-             referrer to a third party"
+            !STATUS_HTML.contains("src=\"http"),
+            "every image/script the status page loads must come from the node itself — a \
+             hotlinked asset hands every visitor's IP and referrer to a third party"
         );
     }
 
-    /// The directory badge is served by the node like every other asset, for the reason the test
-    /// above pins down.
+    /// The status page describes this node, so it must read from this node — relative paths only.
+    ///
+    /// A page that had an absolute API base could be pointed elsewhere by an edit or a proxy, and
+    /// would then report a *different* node's health under this node's URL. That is the specific
+    /// failure this page exists to prevent, so it is worth a test rather than a comment.
+    #[test]
+    fn the_status_page_reads_only_from_its_own_origin() {
+        for call in ["fetch(\"http", "fetch('http", "API_BASE"] {
+            assert!(
+                !STATUS_HTML.contains(call),
+                "the status page must fetch from its own origin, found {call:?}"
+            );
+        }
+        assert!(
+            STATUS_HTML.contains("get(\"/status\")"),
+            "precondition: the page is expected to read /status relatively"
+        );
+    }
+
+    /// The directory badge is still served for anyone linking it, even though the status page no
+    /// longer displays it — that is the network explorer's job now.
     #[tokio::test]
     async fn the_chainquiry_badge_is_served_locally_as_a_png() {
         use axum::http::header;
@@ -2275,9 +2302,45 @@ mod tests {
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "must be a real PNG");
+    }
+
+    /// The faucet is gone from the node, and `/status` must not advertise one.
+    ///
+    /// Pinned as a test because the removal is the kind that half-happens: a leftover field
+    /// deserializing as `null` would keep every client's faucet button rendering, pointed at a
+    /// route that no longer exists.
+    #[test]
+    fn the_node_no_longer_offers_a_faucet() {
+        // Checks for an actual offer — the route and the advertised field — rather than the
+        // word. The page's own header comment explains *why* there is no faucet, and a test
+        // that forbade the word would forbid the explanation along with the thing.
+        for offer in ["/faucet", "faucet_topup_hlx", "id=\"faucet"] {
+            assert!(
+                !STATUS_HTML.contains(offer),
+                "the status page must not offer a faucet, found {offer:?}"
+            );
+        }
+        let status = serde_json::to_value(crate::NodeStatus {
+            version: "0.11.1".into(),
+            height: 1,
+            best_hash: String::new(),
+            peer_count: 0,
+            is_syncing: false,
+            sync_target_height: None,
+            mempool_size: 0,
+            total_accounts: 0,
+            circulating_supply_hlx: 0.0,
+            total_burned_hlx: 0.0,
+            state_hash: String::new(),
+            state_height: 1,
+            p2p_port: 0,
+            p2p_public_addr: None,
+            base_fee_per_byte: 1,
+        })
+        .unwrap();
         assert!(
-            EXPLORER_HTML.contains("src=\"/chainquiry.png\""),
-            "the explorer must reference the locally served copy, not the origin"
+            status.get("faucet_topup_hlx").is_none(),
+            "/status must carry no faucet field at all"
         );
     }
 

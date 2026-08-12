@@ -843,6 +843,19 @@ impl HelixDb {
     /// touched `address` (as sender or recipient), newest first, after applying
     /// `offset`/`limit` — backed by `ADDRESS_TX_INDEX` instead of scanning every
     /// block in the chain on every call.
+    ///
+    /// Values are stored with the height big-endian first, so redb keeps them sorted
+    /// ascending and `rev()` walks the newest end without a seek. That is the whole
+    /// reason this reads backwards rather than collecting and reversing: the previous
+    /// version pulled *every* entry for the address into a `Vec` before paginating, so
+    /// the cost of one page grew with an account's total history rather than with the
+    /// page size. Irrelevant for a wallet with twenty transfers; not irrelevant for a
+    /// faucet or a validator with tens of thousands, which is exactly the account a
+    /// public explorer opens most often.
+    ///
+    /// `offset` is still walked entry by entry — a b-tree multimap cannot jump to the
+    /// n-th value — so deep paging remains linear in `offset`. That is a real limit and
+    /// the reason this is a paging API rather than a "give me everything" one.
     pub fn address_transactions(
         &self,
         address: &str,
@@ -851,19 +864,17 @@ impl HelixDb {
     ) -> StorageResult<Vec<(u64, u32)>> {
         let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
         let table = tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
-        let mut entries = Vec::new();
-        let mut iter = table.get(address).map_err(|e| StorageError::Db(e.to_string()))?;
-        while let Some(v) = iter.next() {
+        let iter = table.get(address).map_err(|e| StorageError::Db(e.to_string()))?;
+
+        let mut entries = Vec::with_capacity(limit.min(1024));
+        for v in iter.rev().skip(offset).take(limit) {
             let v = v.map_err(|e| StorageError::Db(e.to_string()))?;
             let bytes = v.value();
             let height = u64::from_be_bytes(bytes[..8].try_into().unwrap());
             let tx_index = u32::from_be_bytes(bytes[8..].try_into().unwrap());
             entries.push((height, tx_index));
         }
-        // Stored ascending (big-endian height sorts numerically) — reverse for
-        // newest-first before paginating.
-        entries.reverse();
-        Ok(entries.into_iter().skip(offset).take(limit).collect())
+        Ok(entries)
     }
 
     /// `(block_height, tx_index_within_block)` for the transaction with this hash,

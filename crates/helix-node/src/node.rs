@@ -889,9 +889,6 @@ impl HelixNode {
             p2p_port: self.p2p_port,
             p2p_public_addr: self.p2p_public_addr.clone(),
             p2p_command_tx: self.p2p_command_tx.clone(),
-            // `None` unless this operator set HELIX_FAUCET_KEY. The node's own address goes in
-            // so the faucet can refuse to be the validator key — see `helix_rpc::faucet`.
-            faucet: helix_rpc::faucet::Faucet::from_env(&self.address.to_string()),
             tip_certificate: tip_certificate.clone(),
             started_at_unix: crate::run_record::now_unix(),
             silent_peer_validators: silent_peer_validators.clone(),
@@ -905,6 +902,23 @@ impl HelixNode {
         // black box until it finishes.
         let rpc_bind: SocketAddr = self.rpc_bind;
         info!("RPC bind address  : {}", rpc_bind);
+        // Point the operator at their own status board. It answers in one screen what this log
+        // answers in a thousand lines — height, sync state, peers, memory, whether this node is
+        // co-signing, and how the previous run ended — and until this line existed there was no
+        // way to find out it was there at all. A feature nobody knows about is not a feature.
+        //
+        // The URL is built from the bind address the operator actually chose, so it is
+        // copy-pasteable rather than an example. `0.0.0.0` is a bind wildcard and not something a
+        // browser can open, so it is rewritten to localhost — which is where an operator sitting
+        // on that machine would reach it.
+        {
+            let shown = if rpc_bind.ip().is_unspecified() {
+                format!("127.0.0.1:{}", rpc_bind.port())
+            } else {
+                rpc_bind.to_string()
+            };
+            info!("Status board      : http://{shown}/ (open in a browser)");
+        }
         tokio::spawn(async move {
             start_rpc_server(rpc_state, rpc_bind).await;
         });
@@ -2271,20 +2285,10 @@ async fn publish_fee_exempt_probationers(
 /// voting-power cap is applied. Shared by the startup engine build and both catch-up paths, so a
 /// synced validator can never construct a different set from the same state than a live one does.
 fn validators_from_state(state: &ChainState) -> Vec<Validator> {
-    state
-        .engine_validator_set()
-        .into_iter()
-        .map(|(addr, stake, probationary)| {
-            let has_personhood = state.has_personhood(&addr);
-            if probationary {
-                // In the set to sign (so its liveness is provable via `last_commit`) but with no
-                // voting power and no proposer turn — see `Validator::probationary` / backlog #132.
-                Validator::new_probationary(addr, stake, has_personhood)
-            } else {
-                Validator::new(addr, stake, has_personhood)
-            }
-        })
-        .collect()
+    // Delegates to `ChainState::consensus_validator_set` so this and the `/validators` RPC route
+    // cannot disagree about voting power. Probationers keep zero power and no proposer turn there
+    // exactly as they did here — see `Validator::probationary` / backlog #132.
+    state.consensus_validator_set().validators
 }
 
 /// Mirror a just-synced chain-state validator rotation into the live BFT engine.

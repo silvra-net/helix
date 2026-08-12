@@ -5,7 +5,8 @@
 | I want to… | Download |
 |---|---|
 | **Run a node or validator** (server, headless, no desktop) | `helix-cli-…` for your platform — unpack it and run `helix start`. No installer, no dependencies. |
-| **Use the wallet on my desktop** (send, stake, explorer, run a node from the UI) | `helix-gui-…` for your platform. **The wallet already contains the node** — you do not need the CLI as well. |
+| **Use the wallet on my desktop** (send, stake, see your history, run a node from the UI) | `helix-gui-…` for your platform. **The wallet already contains the node** — you do not need the CLI as well. |
+| **Browse the chain** (blocks, transactions, any address) | Nothing to download — [explorer.silvra.net](https://explorer.silvra.net). Every node also serves its own status page at its root URL. |
 
 ### Which wallet installer?
 

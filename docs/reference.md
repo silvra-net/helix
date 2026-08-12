@@ -34,7 +34,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/mempool` | Pending transaction count |
 | GET | `/sync/blocks` | Raw block range for peer sync (`?from=&count=`) |
 | GET | `/sync/tip-certificate` | The commit certificate for this node's current tip — the one certificate `/sync/blocks` cannot carry, because a block's proof lives in its *successor* and the tip has none yet |
-| GET | `/validators` | The active validator set with each validator's tier and voting power |
+| GET | `/validators` | The active validator set: each validator's tier, stake and `voting_power`, plus the set's `total_voting_power` and `quorum_threshold` |
 | GET | `/diagnostics` | Operational state of this node — see below |
 | POST | `/transactions` | Submit a signed transaction — 400 if the signature, nonce slot, fee, or the sender's ability to pay it fails the check |
 | GET | `/transactions/:hash` | Transaction outcome — `applied` / `failed` (with `error`) / `pending` / `unknown`; 404 if no such transaction |

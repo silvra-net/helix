@@ -2,7 +2,9 @@
 
 A desktop wallet for the Helix blockchain — see your balance and transaction history, receive,
 send HLX, and run your own node or validator, all without touching a shell. Backlog #83, stage
-2+ (stage 1, the read-only block explorer, is served by the node itself at `GET /`).
+2+ (stage 1, the read-only explorer, is now its own project at
+[silvra-net/helix-explorer](https://github.com/silvra-net/helix-explorer); a node serves only
+its own status page at `GET /`).
 
 **CLI/GUI parity:** `helix-cli` and `helix-gui` are two front ends over the same node/wallet
 core — neither is a subset of the other. The GUI bundles the real `helix` binary as a sidecar
@@ -147,7 +149,7 @@ Tauri prerequisites installed to check that by eye.
 
 ## Roadmap (stages of backlog #83)
 
-- **SA1** ✅ read-only explorer — served by the node (`GET /`)
+- **SA1** ✅ read-only explorer — now [its own project](https://github.com/silvra-net/helix-explorer); the node serves its own status page at `GET /`
 - **SA2/SA3** ✅ local wallet + balance/history + signed send
 - **SA4** ✅ staking / delegation UI — stake, unstake, claim, delegate, redelegate, commission
 - **Identity** ✅ `.hlx` names (register, resolve) + social recovery (guardians, approve/cancel a

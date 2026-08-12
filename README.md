@@ -203,9 +203,17 @@ either the GUI or the [CLI](docs/cli.md#using-the-cli-helix); neither is missing
 - Same honest caveat as everywhere: it points at the public **testnet** by default, and HLX
   there is a valueless test token that does not survive a chain reset.
 
-Source and build steps are in [`gui/`](gui/README.md). There is also a browser **block
-explorer** served by every node at its root URL — open
-[helix.silvra.net](https://helix.silvra.net).
+Source and build steps are in [`gui/`](gui/README.md).
+
+There is also a browser **block explorer** at
+[explorer.silvra.net](https://explorer.silvra.net) — blocks, transactions, accounts, validators
+and search, including who co-signed each block. It talks to a node's public RPC from your own
+browser and can be pointed at your own node instead of the public one; source in
+[silvra-net/helix-explorer](https://github.com/silvra-net/helix-explorer).
+
+Every node separately serves a **status page for itself** at its own root URL: height, sync
+state, peers, memory, and whether it is co-signing. That page is compiled into the binary and
+works with no internet at all.
 
 ---
 

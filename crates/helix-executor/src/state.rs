@@ -937,6 +937,33 @@ impl ChainState {
         self.tagged_engine_set()
     }
 
+    /// The current set as a real [`helix_consensus::ValidatorSet`] — same membership, the same
+    /// 1 % cap, the same `quorum_threshold`.
+    ///
+    /// The single place that turns chain state into a set, so voting power cannot be computed
+    /// two ways and drift. `validators_from_state` in the node and the `/validators` RPC route
+    /// both go through here: one builds the engine's live set, the other only reports it, and
+    /// the point is that a reader is told exactly the numbers consensus is using rather than a
+    /// second implementation of the rule that happens to agree today.
+    ///
+    /// The epoch is `0` because callers that care set their own — this exists for the power
+    /// figures, which do not depend on it.
+    pub fn consensus_validator_set(&self) -> helix_consensus::ValidatorSet {
+        let validators = self
+            .engine_validator_set()
+            .into_iter()
+            .map(|(addr, stake, probationary)| {
+                let has_personhood = self.has_personhood(&addr);
+                if probationary {
+                    helix_consensus::Validator::new_probationary(addr, stake, has_personhood)
+                } else {
+                    helix_consensus::Validator::new(addr, stake, has_personhood)
+                }
+            })
+            .collect();
+        helix_consensus::ValidatorSet::new(validators, 0)
+    }
+
     /// The signing set from the rotation's own truth: `active_validators` as full members
     /// (`probationary = false`) followed by `probationary_validators` (`true`, zero voting power —
     /// see `helix_consensus::Validator::probationary`), each group address-sorted so every node
@@ -1686,6 +1713,138 @@ mod tests {
             !state.engine_validator_set().iter().any(|(a, _, _)| a == &addr(2)),
             "the pending staker must never reach the live engine set"
         );
+    }
+
+    /// The arithmetic the `/validators` route now publishes, pinned here rather than trusted.
+    ///
+    /// Two validators whose stakes differ by 20x end up with **identical** voting power, because
+    /// both sit above the 1 % cap. This is the result that has been miscalculated twice from
+    /// stake alone, and the reason the RPC reports power instead of leaving clients to derive it:
+    /// "who has more stake" and "who has more say" are not the same question here.
+    #[test]
+    fn consensus_validator_set_caps_power_and_reports_quorum() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 100_000);
+        stake(&mut state, 2, 2_000_000); // 20x the stake of validator 1
+        state.active_validators = [addr(1), addr(2)].into_iter().collect();
+
+        let set = state.consensus_validator_set();
+        let power = |a: Address| {
+            set.validators.iter().find(|v| v.address == a).unwrap().voting_power
+        };
+
+        // total_stake = 2,100,000 ⇒ cap = 21,000. Without personhood raw power is stake/2, so
+        // validator 1 offers 50,000 and validator 2 offers 1,000,000 — both are cut to the cap.
+        assert_eq!(power(addr(1)), 21_000);
+        assert_eq!(power(addr(2)), 21_000);
+        assert_eq!(
+            power(addr(1)),
+            power(addr(2)),
+            "above the cap, twenty times the stake buys exactly no extra say"
+        );
+
+        assert_eq!(set.total_voting_power(), 42_000);
+        assert_eq!(set.quorum_threshold(), 42_000 * 2 / 3 + 1);
+
+        // The consequence that matters operationally: with two equal validators the threshold is
+        // above what either one carries alone, so both must sign every block.
+        assert!(
+            power(addr(1)) < set.quorum_threshold(),
+            "a two-validator set has no tolerance for one going quiet"
+        );
+    }
+
+    /// Routing the node's engine set through `consensus_validator_set` must not change the set
+    /// the engine ends up with — otherwise an upgraded validator would compute a different
+    /// quorum from identical state than one still on the previous release, and the two would
+    /// stop agreeing on blocks.
+    ///
+    /// This is the whole compatibility argument for that refactor, so it is a test rather than a
+    /// comment. It rebuilds the set **the old way** (raw `Validator::new` straight from
+    /// `engine_validator_set`) and the new way, installs both exactly as every call site does —
+    /// through `ValidatorSet::new(…, epoch)` — and compares the results field by field.
+    ///
+    /// The reason they agree: `ValidatorSet::new` recomputes `voting_power` from `stake`,
+    /// `has_personhood` and `probationary` unconditionally, and touches nothing else. So the
+    /// power the new path computes early is overwritten by the identical value, and passing
+    /// through it twice is the same as passing through it once.
+    #[test]
+    fn routing_the_engine_set_through_the_shared_builder_changes_nothing() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 100_000);
+        stake(&mut state, 2, 2_000_000);
+        stake(&mut state, 3, 150_000);
+        state.active_validators = [addr(1), addr(2)].into_iter().collect();
+        state.probationary_validators = [addr(3)].into_iter().collect();
+
+        // Exactly what `validators_from_state` did before the refactor.
+        let the_old_way: Vec<helix_consensus::Validator> = state
+            .engine_validator_set()
+            .into_iter()
+            .map(|(a, s, probationary)| {
+                let hp = state.has_personhood(&a);
+                if probationary {
+                    helix_consensus::Validator::new_probationary(a, s, hp)
+                } else {
+                    helix_consensus::Validator::new(a, s, hp)
+                }
+            })
+            .collect();
+        let the_new_way = state.consensus_validator_set().validators;
+
+        // Every call site installs the result this way, so compare what the engine actually gets.
+        const EPOCH: u64 = 7;
+        let old = helix_consensus::ValidatorSet::new(the_old_way, EPOCH);
+        let new = helix_consensus::ValidatorSet::new(the_new_way, EPOCH);
+
+        assert_eq!(
+            old.validators.len(),
+            new.validators.len(),
+            "membership must be identical"
+        );
+        for (o, n) in old.validators.iter().zip(new.validators.iter()) {
+            // Order matters as much as content: the proposer schedule is derived from it, and
+            // two nodes disagreeing about whose turn it is stall exactly like a fork.
+            assert_eq!(o.address, n.address, "order and membership must match");
+            assert_eq!(o.stake, n.stake);
+            assert_eq!(o.voting_power, n.voting_power);
+            assert_eq!(o.probationary, n.probationary);
+            assert_eq!(o.has_personhood, n.has_personhood);
+        }
+        assert_eq!(old.total_voting_power(), new.total_voting_power());
+        assert_eq!(old.quorum_threshold(), new.quorum_threshold());
+
+        // Prove the fixture is not trivially equal: a set where everything is zero would pass
+        // the loop above while testing nothing.
+        assert!(new.total_voting_power() > 0, "precondition: the set carries real power");
+        assert!(
+            new.validators.iter().any(|v| v.probationary),
+            "precondition: a probationer is present, since that is the branch most likely to differ"
+        );
+    }
+
+    /// A probationer is in the set so its precommits are gathered, but weighs nothing — and the
+    /// RPC must be able to tell that apart from "not in the set", which is why power is reported
+    /// as an explicit zero here rather than by omitting the validator.
+    #[test]
+    fn consensus_validator_set_gives_probationers_zero_power() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        stake(&mut state, 1, 100_000);
+        stake(&mut state, 2, 100_000);
+        state.active_validators = [addr(1)].into_iter().collect();
+        state.probationary_validators = [addr(2)].into_iter().collect();
+
+        let set = state.consensus_validator_set();
+        let prob = set.validators.iter().find(|v| v.address == addr(2)).unwrap();
+        assert!(prob.probationary, "still in the set, so its signatures are collected");
+        assert_eq!(prob.voting_power, 0, "but it carries no weight toward quorum");
+
+        // Its stake must also stay out of the total that sets everyone else's cap.
+        let full = set.validators.iter().find(|v| v.address == addr(1)).unwrap();
+        assert_eq!(set.total_voting_power(), full.voting_power);
     }
 
     /// A probationary validator (backlog #132) is in the engine set so its precommits are gathered,
