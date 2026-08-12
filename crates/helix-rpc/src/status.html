@@ -452,12 +452,21 @@
     return r.json();
   }
 
-  const nf = (n) => Number(n).toLocaleString();
-  const hlx = (n) => Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+  // Every formatter answers "—" for anything that is not a finite number. A board exists to be
+  // believed at a glance, and "NaN" in a slot where a number belongs reads as a broken page
+  // rather than as missing data — which is the wrong alarm to raise about a healthy node that
+  // simply does not report that field. `Number(undefined)` is NaN, so the guard has to be
+  // explicit rather than a `== null` check.
+  // Only a real number counts. Coercing first is the trap: `Number(null)` and `Number("")` are
+  // both 0, so a guard built on `Number.isFinite(Number(x))` lets missing data through and
+  // renders it as a confident zero — worse than NaN, because a zero looks like an answer.
+  const fin = (n) => typeof n === "number" && Number.isFinite(n);
+  const nf = (n) => (fin(n) ? n.toLocaleString() : "—");
+  const hlx = (n) => (fin(n) ? n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : "—");
   const short = (s) => (s && s.length > 16 ? s.slice(0, 8) + "…" + s.slice(-5) : s || "—");
 
   function duration(secs) {
-    if (secs == null) return "—";
+    if (!fin(secs)) return "—";
     if (secs < 60) return secs + "s";
     const m = Math.floor(secs / 60);
     if (m < 60) return m + "m " + (secs % 60) + "s";
