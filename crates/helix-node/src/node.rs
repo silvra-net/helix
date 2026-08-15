@@ -895,6 +895,9 @@ impl HelixNode {
             last_cosigned: last_cosigned.clone(),
             last_cosigned_at_unix: last_cosigned_at_unix.clone(),
             previous_run: self.previous_run.clone(),
+            // Measured, never reported: `GET /diagnostics` serves the database's size and the
+            // free space on its volume, and no part of this path.
+            data_path: Some(PathBuf::from(CHAIN_DB_FILE)),
         };
 
         // Spawn RPC server — first, before any catch-up, so `GET /status` answers from the

@@ -67,6 +67,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
 
+# Filesystem stats for `GET /diagnostics` (free space on the chain volume). Deliberately rustix
+# rather than `libc`: `statvfs` is the one thing a node operator's dashboard needs that std does
+# not expose, and rustix wraps it in a *safe* function. This crate has no `unsafe` anywhere in
+# its own code, and getting a disk figure was not worth being the first exception. rustix was
+# already in the lock file as a transitive dependency, so this adds no new supply-chain surface.
+rustix = { version = "1.1", features = ["fs"] }
+
 # P2P networking
 libp2p = { version = "0.54", features = [
     "tcp", "noise", "yamux",

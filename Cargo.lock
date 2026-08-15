@@ -1390,6 +1390,7 @@ dependencies = [
  "helix-p2p",
  "helix-storage",
  "hex",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

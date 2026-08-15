@@ -341,6 +341,30 @@ pub struct NodeDiagnostics {
     /// this network a validator before.
     pub rss_kb: u64,
     pub machine_total_kb: u64,
+    /// What the machine could still hand out, in KB — `MemAvailable`, not "free". Free memory on
+    /// a healthy Linux box is near zero because the page cache uses the rest; the number that
+    /// actually predicts an out-of-memory kill is this one.
+    pub mem_available_kb: u64,
+    /// Size of this node's chain database, in KB. **The path is deliberately absent** — the size
+    /// says how much a chain costs to hold, the path describes the operator's machine. See the
+    /// note on this struct.
+    pub chain_db_kb: u64,
+    /// Free and total space on the volume holding that database, in KB. Zero where unreadable.
+    ///
+    /// The pair that answers the question a chain database raises and cannot answer alone: it
+    /// only ever grows, so "4 GB" means nothing without "of 370 GB, 308 free". A node that fills
+    /// its disk stops, and stops in a way that leaves nothing useful in its own log.
+    pub disk_free_kb: u64,
+    pub disk_total_kb: u64,
+    /// One-minute load average, and the cores it is spread across — a load of 8 means idle on
+    /// this machine and desperate on a single-core VPS, so neither number is worth reporting
+    /// without the other.
+    pub load_avg_1: f64,
+    pub cpu_count: usize,
+    /// Threads and open file descriptors in this process. Both climb slowly when something
+    /// leaks, and a descriptor limit hit at 3am reads as an unexplained refusal to accept peers.
+    pub threads: u64,
+    pub open_fds: u64,
     /// How the *previous* run of this node ended — the one thing that is unanswerable after the
     /// fact without it, and the reason this endpoint is useful for a node that has been
     /// restarting. `None` on a first run.

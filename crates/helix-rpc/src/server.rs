@@ -75,6 +75,14 @@ pub struct AppState {
     /// reasoning as the health loop (backlog #150).
     pub started_at_unix: u64,
     pub silent_peer_validators: Arc<std::sync::atomic::AtomicUsize>,
+    /// Path of the chain database, used only to measure it and the volume it sits on.
+    ///
+    /// **Never serialised.** `GET /diagnostics` reports the size and the free space, not where
+    /// they are — a path describes the operator's machine, and
+    /// `diagnostics_expose_no_addresses_keys_or_paths` fails the build if one ever leaks into the
+    /// response. `None` in tests and anywhere the node did not supply it, which reports zeros
+    /// rather than failing the request.
+    pub data_path: Option<std::path::PathBuf>,
     /// Height and wall-clock second at which this node last co-signed, both 0 when it has not.
     pub last_cosigned: Arc<std::sync::atomic::AtomicU64>,
     pub last_cosigned_at_unix: Arc<std::sync::atomic::AtomicU64>,
@@ -1163,6 +1171,7 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
 
     let last_height = state.last_cosigned.load(Ordering::Relaxed);
     let last_at = state.last_cosigned_at_unix.load(Ordering::Relaxed);
+    let (disk_free_kb, disk_total_kb) = disk_stats(state.data_path.as_deref());
 
     Json(crate::NodeDiagnostics {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1176,8 +1185,77 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
         last_cosigned_secs_ago: (last_at > 0).then(|| now.saturating_sub(last_at)),
         rss_kb: read_kb_field("/proc/self/status", "VmRSS:"),
         machine_total_kb: read_kb_field("/proc/meminfo", "MemTotal:"),
+        mem_available_kb: read_kb_field("/proc/meminfo", "MemAvailable:"),
+        chain_db_kb: chain_db_kb(state.data_path.as_deref()),
+        disk_free_kb,
+        disk_total_kb,
+        load_avg_1: read_load_avg_1(),
+        cpu_count: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        threads: read_plain_field("/proc/self/status", "Threads:"),
+        open_fds: count_open_fds(),
         previous_run: state.previous_run.clone(),
     })
+}
+
+/// Size of the chain database in KB, or 0 when the path is unknown or unreadable.
+///
+/// `redb` keeps the whole chain in one file, so this is a `metadata` call rather than a directory
+/// walk — which also keeps it cheap enough to serve on every poll of a public endpoint.
+fn chain_db_kb(path: Option<&std::path::Path>) -> u64 {
+    path.and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len() / 1024)
+        .unwrap_or(0)
+}
+
+/// Free and total space on the volume holding `path`, in KB. `(0, 0)` where unreadable.
+///
+/// `f_bavail` rather than `f_bfree`: the kernel reserves a slice of every filesystem for root,
+/// and reporting space this process cannot actually use would promise headroom that is not
+/// there. Blocks are counted in `f_frsize` units, not `f_bsize` — the two differ on some
+/// filesystems, and using the wrong one is a silent factor-of-something error.
+fn disk_stats(path: Option<&std::path::Path>) -> (u64, u64) {
+    let Some(path) = path else { return (0, 0) };
+    // The volume, not the file: on a missing database file the parent directory still answers,
+    // which is the case during a fresh start before anything has been written.
+    let target = if path.exists() { path } else { path.parent().unwrap_or(path) };
+    match rustix::fs::statvfs(target) {
+        Ok(s) => {
+            let unit = if s.f_frsize > 0 { s.f_frsize } else { s.f_bsize };
+            (
+                s.f_bavail.saturating_mul(unit) / 1024,
+                s.f_blocks.saturating_mul(unit) / 1024,
+            )
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+/// The one-minute load average, or 0.0 where `/proc` is unavailable.
+fn read_load_avg_1() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+        .unwrap_or(0.0)
+}
+
+/// Open file descriptors held by this process, or 0 where `/proc` is unavailable.
+fn count_open_fds() -> u64 {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count() as u64)
+        .unwrap_or(0)
+}
+
+/// Read one `Key: <n>` field from a procfs file — the same shape as [`read_kb_field`] but for
+/// values that carry no unit.
+fn read_plain_field(path: &str, field: &str) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with(field))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
+        })
+        .unwrap_or(0)
 }
 
 /// Read one `Key: <n> kB` field from a procfs file, or 0 where that is unavailable (non-Linux,
@@ -1453,6 +1531,10 @@ mod tests {
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             previous_run: None,
+            // The real database this test opened, so the diagnostics fields that measure it
+            // are exercised rather than skipped — including by the test that checks no path
+            // ever reaches the response.
+            data_path: Some(path.clone()),
         };
         (state, path)
     }
@@ -1989,6 +2071,35 @@ mod tests {
         assert!(parsed.get("height").is_some(), "{body}");
     }
 
+    /// The machine figures an operator opens this endpoint for: how big the chain has grown and
+    /// how much room is left for it to keep growing.
+    ///
+    /// Asserted as a *relationship*, not against fixed numbers, because the only thing that can
+    /// be known here is that free space cannot exceed the volume and the database cannot be
+    /// larger than the volume holding it. A test that hardcoded sizes would pass on this machine
+    /// and fail on every other one.
+    #[tokio::test]
+    async fn diagnostics_report_the_size_of_the_chain_and_the_room_left_for_it() {
+        let response = get_diagnostics(State(fresh_test_state())).await.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let d: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let free = d["disk_free_kb"].as_u64().expect("disk_free_kb: {d}");
+        let total = d["disk_total_kb"].as_u64().expect("disk_total_kb: {d}");
+        let db = d["chain_db_kb"].as_u64().expect("chain_db_kb: {d}");
+
+        assert!(total > 0, "a volume the test just wrote to has a size: {d}");
+        assert!(free <= total, "free cannot exceed the volume: {free} of {total}");
+        assert!(db <= total, "the database cannot be larger than its volume: {db} of {total}");
+
+        // The rest only has to be present and readable — their values belong to the machine.
+        assert!(d["mem_available_kb"].as_u64().is_some(), "{d}");
+        assert!(d["load_avg_1"].as_f64().is_some(), "{d}");
+        assert!(d["cpu_count"].as_u64().unwrap_or(0) > 0, "{d}");
+        assert!(d["threads"].as_u64().unwrap_or(0) > 0, "a running process has threads: {d}");
+        assert!(d["open_fds"].as_u64().unwrap_or(0) > 0, "it also has the file it opened: {d}");
+    }
+
     /// A node that has never co-signed must say so, rather than claiming height 0 — which reads
     /// as "co-signed the genesis block" and is the sort of small lie that costs an hour later.
     #[tokio::test]
@@ -2031,6 +2142,10 @@ mod tests {
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             previous_run: None,
+            // The real database this test opened, so the diagnostics fields that measure it
+            // are exercised rather than skipped — including by the test that checks no path
+            // ever reaches the response.
+            data_path: Some(path.clone()),
         }
     }
 
