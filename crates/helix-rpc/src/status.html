@@ -103,6 +103,10 @@
   .app {
     height: 100%;
     display: grid;
+    /* Named explicitly so the single column may be narrower than its content. A grid with no
+       declared columns gets an implicit `auto` one, whose minimum is the widest thing inside —
+       one nowrap table then pushes the whole page, top bar included, past the viewport. */
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto 1fr auto;
     gap: 1px;
   }
@@ -318,15 +322,32 @@
     body { overflow: auto; }
     html, body { height: auto; }
     .app { height: auto; }
+    /* Every area the board names has to be named here too. `inspector` was missing, and a
+       `grid-area` pointing at a name the template does not define does not fall back to the
+       flow — it gets auto-placed into an *implicit* column beside the explicit one. The result
+       was the whole board crushed into the left half of the screen with the inspector alone on
+       the right, from 1100px down to a phone. Nothing about it looked like a missing word.
+
+       `minmax(0, 1fr)`, not `1fr`: a bare `1fr` track carries an automatic *minimum* of its
+       content's min-content width, so one nowrap table wider than the screen silently stretches
+       the entire grid. The cells scroll their own overflow. */
     .board {
-      grid-template-columns: 1fr;
-      grid-template-areas: "verdict" "metrics" "rhythm" "blocks" "validators";
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas: "verdict" "metrics" "rhythm" "blocks" "validators" "inspector";
       grid-template-rows: none;
     }
     .cell { overflow: visible; }
     .cell .body { overflow: visible; }
     .vals-cell .body, .blocks-cell .body { max-height: 320px; overflow: auto; }
     .rhythm { min-height: 90px; }
+  }
+
+  /* On a phone these tables are wider than the screen. Rather than let them drag the page
+     sideways, the columns that answer the least are dropped — a column somebody has to scroll to
+     find is a column that is not there. The remaining gutters give back the last few pixels. */
+  @media (max-width: 620px) {
+    .opt { display: none; }
+    td, thead th { padding-left: 9px; padding-right: 9px; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -383,7 +404,10 @@
       <header><h2>Recent blocks</h2><span class="aside">full history in the explorer</span></header>
       <div class="body">
         <table>
-          <thead><tr><th>Height</th><th>Age</th><th class="r">Gap</th><th>Proposer</th><th class="r">Txs</th><th>Version</th></tr></thead>
+          <!-- `opt` columns are dropped on a phone. What survives answers what the panel is for:
+               which block, how old, who proposed it. The gap is drawn above as the rhythm chart,
+               and the version is identical on every row until the day it is not. -->
+          <thead><tr><th>Height</th><th>Age</th><th class="r opt">Gap</th><th>Proposer</th><th class="r">Txs</th><th class="opt">Version</th></tr></thead>
           <tbody id="blocks"><tr><td colspan="6" class="dim">Loading…</td></tr></tbody>
         </table>
       </div>
@@ -394,7 +418,9 @@
       <div class="alerts" id="alerts"></div>
       <div class="body">
         <table>
-          <thead><tr><th>Address</th><th>State</th><th class="r">Stake</th><th class="r">Power</th></tr></thead>
+          <!-- Stake goes first on a narrow screen: above the 1 % cap it buys no extra say, so
+               power is the column that answers what a validator actually weighs. -->
+          <thead><tr><th>Address</th><th>State</th><th class="r opt">Stake</th><th class="r">Power</th></tr></thead>
           <tbody id="validators"><tr><td colspan="4" class="dim">Loading…</td></tr></tbody>
         </table>
       </div>
@@ -728,7 +754,7 @@
       // weight — a probationer shows a real 0.
       const power = x.voting_power == null ? '<span class="dim">—</span>' : nf(x.voting_power);
       return `<tr data-v="${esc(x.address)}"><td class="mono">${short(x.address)}</td><td>${state}</td>` +
-             `<td class="r num">${hlx(x.effective_stake_hlx)}</td><td class="r num">${power}</td></tr>`;
+             `<td class="r num opt">${hlx(x.effective_stake_hlx)}</td><td class="r num">${power}</td></tr>`;
     });
     lastValidators = v.validators || [];
     $("validators").innerHTML = rows.length ? rows.join("")
@@ -794,8 +820,8 @@
           const gap = prev ? ((b.timestamp - prev.timestamp) / 1000).toFixed(1) + "s" : "—";
           return `<tr data-h="${b.height}" data-v="${esc(b.validator)}">` +
                  `<td class="num">${nf(b.height)}</td><td class="dim num">${duration(ageSecs(b.timestamp))}</td>` +
-                 `<td class="r num dim">${gap}</td><td class="mono">${short(b.validator)}</td>` +
-                 `<td class="r num">${b.tx_count}</td><td class="dim num">${b.node_version}</td></tr>`;
+                 `<td class="r num dim opt">${gap}</td><td class="mono">${short(b.validator)}</td>` +
+                 `<td class="r num">${b.tx_count}</td><td class="dim num opt">${b.node_version}</td></tr>`;
         }).join("");
       }
 
