@@ -326,11 +326,11 @@
        `grid-area` pointing at a name the template does not define does not fall back to the
        flow — it gets auto-placed into an *implicit* column beside the explicit one. The result
        was the whole board crushed into the left half of the screen with the inspector alone on
-       the right, from 1100px down to a phone. Nothing about it looked like a missing word.
-
-       `minmax(0, 1fr)`, not `1fr`: a bare `1fr` track carries an automatic *minimum* of its
+       the right, from 1100px down to a phone. Nothing about it looked like a missing word. */
+    /* `minmax(0, 1fr)`, not `1fr`: a bare `1fr` track carries an automatic *minimum* of its
        content's min-content width, so one nowrap table wider than the screen silently stretches
-       the entire grid. The cells scroll their own overflow. */
+       the entire grid — and with it the top bar and every panel — past the viewport. The cells
+       scroll their own overflow, so the track is allowed to be narrower than what is inside it. */
     .board {
       grid-template-columns: minmax(0, 1fr);
       grid-template-areas: "verdict" "metrics" "rhythm" "blocks" "validators" "inspector";
@@ -348,6 +348,7 @@
   @media (max-width: 620px) {
     .opt { display: none; }
     td, thead th { padding-left: 9px; padding-right: 9px; }
+    .metrics-cell .body { grid-template-columns: 1fr 1fr; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -384,10 +385,30 @@
       <div class="body">
         <div class="tile"><span class="k">Peers</span><span class="v" id="peers">—</span></div>
         <div class="tile"><span class="k">Mempool</span><span class="v" id="mempool">—</span></div>
+        <!--
+          The chain's size and the room left for it, side by side on purpose. A database that only
+          ever grows says nothing on its own — "4.2 GB" is either comfortable or nearly fatal
+          depending on the volume under it, and a node that fills its disk stops in a way that
+          leaves nothing useful in its own log.
+        -->
+        <div class="tile">
+          <span class="k">Chain on disk</span><span class="v" id="chainsize">—</span>
+        </div>
+        <div class="tile">
+          <span class="k">Disk free</span><span class="v" id="diskfree">—</span>
+          <span class="meter"><i id="disk-bar" style="width:0"></i></span>
+        </div>
         <div class="tile">
           <span class="k">Memory</span><span class="v" id="rss">—</span>
           <span class="meter"><i id="rss-bar" style="width:0"></i></span>
         </div>
+        <!-- What the machine could still hand out, not what is "free": free memory on a healthy
+             Linux box is near zero because the page cache holds the rest, and it is this number
+             that predicts the out-of-memory kill that has cost this network a validator. -->
+        <div class="tile"><span class="k">RAM available</span><span class="v" id="memavail">—</span></div>
+        <!-- A load of 8 is idle on eight cores and desperate on one, so the cores travel with
+             it rather than being left for the reader to remember. -->
+        <div class="tile"><span class="k">Load</span><span class="v" id="load">—</span></div>
         <div class="tile"><span class="k">State height</span><span class="v" id="stateh">—</span></div>
       </div>
     </section>
@@ -444,6 +465,7 @@
     <span><b>Genesis</b><i id="genesis">—</i></span>
     <span><b>State</b><i id="statehash">—</i></span>
     <span><b>P2P</b><i id="p2p">—</i></span>
+    <span><b>Process</b><i id="procstat">—</i></span>
     <span class="spacer"></span>
     <span><b>Previous run</b><i id="prevrun">—</i></span>
   </div>
@@ -490,6 +512,27 @@
   const nf = (n) => (fin(n) ? n.toLocaleString() : "—");
   const hlx = (n) => (fin(n) ? n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : "—");
   const short = (s) => (s && s.length > 16 ? s.slice(0, 8) + "…" + s.slice(-5) : s || "—");
+
+  /**
+   * Kilobytes as the unit a person would have said out loud.
+   *
+   * A chain database and a volume differ by two orders of magnitude and both belong in the same
+   * row of tiles, so a fixed unit makes one of them unreadable — "4457552 MB" or "0.004 TB".
+   * The unit travels with the number in a `<small>`, the way every other tile here writes one.
+   */
+  function gbParts(kb) {
+    if (!fin(kb) || kb <= 0) return ["—", ""];
+    const mb = kb / 1024;
+    if (mb < 1024) return [mb.toFixed(mb < 10 ? 1 : 0), "MB"];
+    const g = mb / 1024;
+    if (g < 1024) return [g.toFixed(g < 10 ? 2 : 1), "GB"];
+    return [(g / 1024).toFixed(2), "TB"];
+  }
+  const gb = (kb) => {
+    const [n, u] = gbParts(kb);
+    return u ? `${n}<small> ${u}</small>` : n;
+  };
+  const gbText = (kb) => gbParts(kb).join(" ").trim();
 
   function duration(secs) {
     if (!fin(secs)) return "—";
@@ -750,9 +793,22 @@
       const state = x.jailed_until != null
         ? '<span class="pill bad">jailed</span>'
         : x.active ? `<span class="pill ok">${x.tier}</span>` : `<span class="pill">${x.tier}</span>`;
+      // Power as a share, not as the figure the node reports.
+      //
+      // `3000000000000` of `9000000000000` is thirteen digits that overflow the column and hide
+      // the one fact that matters: above the 1 % cap every validator weighs exactly the same, so
+      // more stake buys no more say. That is invisible until it is a percentage, and it is the
+      // single most misunderstood thing about this chain's quorum. The raw value stays in the
+      // tooltip, and the inspector still prints it in full.
+      //
       // `null` power means "not in the set at all", which is not the same as being in it with no
-      // weight — a probationer shows a real 0.
-      const power = x.voting_power == null ? '<span class="dim">—</span>' : nf(x.voting_power);
+      // weight — a probationer shows a real 0 %.
+      const total = v.total_voting_power;
+      const power = x.voting_power == null
+        ? '<span class="dim">—</span>'
+        : fin(total) && total > 0
+          ? `<span title="${nf(x.voting_power)} of ${nf(total)}">${((x.voting_power / total) * 100).toFixed(1)} %</span>`
+          : nf(x.voting_power);
       return `<tr data-v="${esc(x.address)}"><td class="mono">${short(x.address)}</td><td>${state}</td>` +
              `<td class="r num opt">${hlx(x.effective_stake_hlx)}</td><td class="r num">${power}</td></tr>`;
     });
@@ -795,6 +851,36 @@
         const bar = $("rss-bar");
         bar.style.width = Math.min(100, pct).toFixed(1) + "%";
         bar.className = pct > 80 ? "bad" : pct > 50 ? "warn" : "";
+
+        $("memavail").innerHTML = gb(diag.mem_available_kb);
+        $("chainsize").innerHTML = gb(diag.chain_db_kb);
+
+        // The bar fills with what is *used*, so a nearly full disk is a nearly full bar — the
+        // direction every other meter on this board already reads in. The figure beside it is
+        // what is left, because that is the number an operator acts on.
+        $("diskfree").innerHTML = gb(diag.disk_free_kb);
+        const usedPct = diag.disk_total_kb
+          ? ((diag.disk_total_kb - diag.disk_free_kb) / diag.disk_total_kb) * 100
+          : 0;
+        const dbar = $("disk-bar");
+        dbar.style.width = Math.min(100, usedPct).toFixed(1) + "%";
+        dbar.className = usedPct > 90 ? "bad" : usedPct > 75 ? "warn" : "";
+        $("diskfree").title = fin(diag.disk_total_kb)
+          ? `${gbText(diag.disk_free_kb)} free of ${gbText(diag.disk_total_kb)} — ${usedPct.toFixed(0)} % used`
+          : "";
+
+        // Load against cores: the same number means idle here and desperate on a single-core
+        // box, so neither is shown without the other.
+        if (fin(diag.load_avg_1)) {
+          const perCore = diag.cpu_count ? diag.load_avg_1 / diag.cpu_count : 0;
+          $("load").innerHTML = diag.load_avg_1.toFixed(2) +
+            `<small> of ${nf(diag.cpu_count)} core${diag.cpu_count === 1 ? "" : "s"}</small>`;
+          $("load").style.color = perCore > 1 ? "var(--bad)" : perCore > 0.7 ? "var(--warn-ink)" : "";
+        }
+
+        $("procstat").textContent =
+          `${nf(diag.threads)} threads · ${nf(diag.open_fds)} open files`;
+
         lastCosignedSecs = diag.last_cosigned_secs_ago;
         lastCosignedAt = Date.now();
       }
