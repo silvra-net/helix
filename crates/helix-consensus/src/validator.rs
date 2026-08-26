@@ -96,7 +96,11 @@ impl ValidatorSet {
 
     /// The validators that count toward quorum and take proposer turns — everyone except those
     /// serving their probation epoch (see `Validator::probationary`).
-    fn full_members(&self) -> impl Iterator<Item = &Validator> {
+    ///
+    /// Public because liveness *reporting* has to draw the same line consensus does: a node that
+    /// names a probationer as the reason a round timed out is naming someone who holds no voting
+    /// power and takes no proposer turn (`BftEngine::record_round_liveness`).
+    pub fn full_members(&self) -> impl Iterator<Item = &Validator> {
         self.validators.iter().filter(|v| !v.probationary)
     }
 

@@ -155,7 +155,7 @@ export const api = {
 /// works out of the box. A convenience, not the destination: every balance you read and every
 /// transaction you send passes through someone else's machine, which can misreport the former
 /// and observe the latter.
-export const DEFAULT_NODE = "https://helix.silvra.net";
+export const DEFAULT_NODE = "https://node.silvra.net";
 
 /// Where the bundled node's RPC lands. `node_process.rs` starts it without `HELIX_RPC_BIND`, so
 /// it takes the compiled-in default.

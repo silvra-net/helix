@@ -69,13 +69,31 @@ struct SignedState {
 }
 
 /// Outcome of checking a candidate vote against the high-water mark.
+///
+/// The two refusals are kept apart because they mean opposite things to whoever reads the log.
+/// They were one variant with one message until 2026-08-26, and that message asserted the wrong
+/// one: every withheld vote was reported as "already signed a different value … (most likely a
+/// restart)" — including the 30-odd per four-validator test run where nothing had restarted at
+/// all. An operator who reads that goes looking for a second node holding a copy of their key.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Safe to broadcast this vote.
     Allow,
-    /// Broadcasting this vote would equivocate (a different value at, or a regression below, a
-    /// position already signed) — drop it.
-    Refuse,
+    /// A *different value* at a position this key has already signed. This is the real
+    /// equivocation case, and the one that means "a second node may be running with this key".
+    RefuseConflict,
+    /// A position *below* the high-water mark: this key has already signed further ahead than the
+    /// vote being offered. Not equivocation in itself — the engine is behind where the key has
+    /// been, which is what a restart, a round that was left, or a catch-up looks like. Refused
+    /// anyway, because signing backwards is exactly how a fork gets two signatures.
+    RefuseRegression,
+}
+
+impl Decision {
+    /// Whether this decision withholds the vote.
+    pub fn is_refusal(&self) -> bool {
+        !matches!(self, Decision::Allow)
+    }
 }
 
 pub struct SigningGuard {
@@ -165,6 +183,20 @@ impl SigningGuard {
     ///
     /// Read at startup so the engine can resume above it rather than below — see
     /// `BftEngine::resume_at_round` for why coming back *under* this mark gags the node.
+    /// The position and value this key last signed — for the one log line that has to name both
+    /// sides of a conflict. Without it "already signed a different value" is a claim the reader
+    /// cannot check, and the two real conflicts per four-validator run (measured 2026-08-26) are
+    /// indistinguishable from the 26 harmless stale ones.
+    pub fn last_signed_detail(&self) -> Option<(u64, u32, u8, Hash)> {
+        self.path.as_ref()?;
+        Some((
+            self.last.position.height,
+            self.last.position.round,
+            self.last.position.step,
+            self.last.block_hash,
+        ))
+    }
+
     pub fn last_signed(&self) -> Option<(u64, u32)> {
         self.path.as_ref()?;
         Some((self.last.position.height, self.last.position.round))
@@ -181,14 +213,14 @@ impl SigningGuard {
         };
 
         if pos < self.last.position {
-            return Decision::Refuse; // regression, e.g. a restart resuming on an older height
+            return Decision::RefuseRegression; // e.g. a restart resuming on an older height
         }
         if pos == self.last.position {
             // Same slot: only a byte-identical re-send is safe.
             return if vote.block_hash == self.last.block_hash {
                 Decision::Allow
             } else {
-                Decision::Refuse
+                Decision::RefuseConflict
             };
         }
 
@@ -196,7 +228,9 @@ impl SigningGuard {
         let state = SignedState { position: pos, block_hash: vote.block_hash, chain_id: self.chain_id };
         if let Err(e) = Self::persist(&path, &state) {
             error!(err = %e, "could not persist signing state — refusing the vote to stay safe");
-            return Decision::Refuse;
+            // A regression, in the sense that matters here: the mark did not move, so nothing may
+            // go out on top of it.
+            return Decision::RefuseRegression;
         }
         self.last = state;
         Decision::Allow
@@ -259,7 +293,7 @@ mod tests {
         let (mut g, _d) = guard(100);
         assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(1))), Decision::Allow);
         // Same height/round/step, different value — the double-sign we exist to stop.
-        assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(2))), Decision::Refuse);
+        assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(2))), Decision::RefuseConflict);
     }
 
     /// Why `BftEngine::resume_at_round` exists, stated as the guard sees it.
@@ -276,8 +310,8 @@ mod tests {
         assert_eq!(g.check(&vote(101, 10, VoteType::Prevote, hash(1))), Decision::Allow);
 
         // Rejoining at round 7 after a restart: refused, and rightly so.
-        assert_eq!(g.check(&vote(101, 7, VoteType::Prevote, hash(2))), Decision::Refuse);
-        assert_eq!(g.check(&vote(101, 9, VoteType::Prevote, hash(2))), Decision::Refuse);
+        assert_eq!(g.check(&vote(101, 7, VoteType::Prevote, hash(2))), Decision::RefuseRegression);
+        assert_eq!(g.check(&vote(101, 9, VoteType::Prevote, hash(2))), Decision::RefuseRegression);
 
         // Resuming above the mark instead: allowed immediately.
         assert_eq!(g.check(&vote(101, 11, VoteType::Prevote, hash(2))), Decision::Allow);
@@ -317,22 +351,22 @@ mod tests {
         assert_eq!(g.check(&vote(101, 0, VoteType::Precommit, hash(1))), Decision::Allow);
         // A prevote (step 1) after a precommit (step 2) at the same height/round is a step
         // regression — refuse it.
-        assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(1))), Decision::Refuse);
+        assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(1))), Decision::RefuseRegression);
     }
 
     #[test]
     fn refuses_everything_at_or_below_the_chain_height_floor() {
         let (mut g, _d) = guard(100);
         // The tip (height 100) is already committed — the node must never vote there again.
-        assert_eq!(g.check(&vote(100, 0, VoteType::Prevote, hash(1))), Decision::Refuse);
-        assert_eq!(g.check(&vote(50, 5, VoteType::Precommit, hash(1))), Decision::Refuse);
+        assert_eq!(g.check(&vote(100, 0, VoteType::Prevote, hash(1))), Decision::RefuseRegression);
+        assert_eq!(g.check(&vote(50, 5, VoteType::Precommit, hash(1))), Decision::RefuseRegression);
     }
 
     #[test]
     fn a_later_round_after_a_conflict_still_advances() {
         let (mut g, _d) = guard(100);
         assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(1))), Decision::Allow);
-        assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(2))), Decision::Refuse);
+        assert_eq!(g.check(&vote(101, 0, VoteType::Prevote, hash(2))), Decision::RefuseConflict);
         // Round 1 is a strictly higher position — a fresh, legitimate vote.
         assert_eq!(g.check(&vote(101, 1, VoteType::Prevote, hash(2))), Decision::Allow);
     }
@@ -347,7 +381,7 @@ mod tests {
         // A "restart" on the SAME chain (same chain_id): a new guard over the same file must
         // refuse a conflicting re-sign at 101/2.
         let mut g = SigningGuard::load(dir.path(), 100, hash(0xAA));
-        assert_eq!(g.check(&vote(101, 2, VoteType::Precommit, hash(9))), Decision::Refuse);
+        assert_eq!(g.check(&vote(101, 2, VoteType::Precommit, hash(9))), Decision::RefuseConflict);
         // …and the identical value is still fine.
         assert_eq!(g.check(&vote(101, 2, VoteType::Precommit, hash(7))), Decision::Allow);
     }
@@ -372,7 +406,7 @@ mod tests {
         assert_eq!(g.check(&vote(1501, 0, VoteType::Prevote, hash(2))), Decision::Allow);
         // …and within chain B, double-sign protection is fully back: a conflicting re-sign at the
         // same slot is still refused.
-        assert_eq!(g.check(&vote(1501, 0, VoteType::Prevote, hash(3))), Decision::Refuse);
+        assert_eq!(g.check(&vote(1501, 0, VoteType::Prevote, hash(3))), Decision::RefuseConflict);
     }
 
     /// Minimal self-cleaning temp path helper — avoids a dev-dependency just for these tests.

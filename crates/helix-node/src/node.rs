@@ -1055,14 +1055,6 @@ impl HelixNode {
             }
         });
 
-        // Spawn P2P service
-        let p2p_service = self.p2p_service.take().unwrap();
-        tokio::spawn(async move {
-            if let Err(e) = p2p_service.run().await {
-                error!("P2P service error: {}", e);
-            }
-        });
-
         // BFT engine, shared between the block production loop (which drives
         // its own proposals) and the P2P event handler (which folds in votes
         // arriving from other validators against that same active round).
@@ -1094,6 +1086,22 @@ impl HelixNode {
             self.address.clone(),
             genesis_height,
         )));
+
+        // Spawn P2P service — deliberately *after* the engine exists, because the service serves
+        // inbound round-sync requests straight out of it (`EngineRoundProvider`). Starting the
+        // swarm a few microseconds later costs nothing; handing it a provider that has no engine
+        // yet would mean answering "nothing" to every peer that asks during startup, which is the
+        // window in which a joining validator needs the answer most.
+        let p2p_service = self
+            .p2p_service
+            .take()
+            .unwrap()
+            .with_round_provider(Arc::new(EngineRoundProvider { engine: engine.clone() }));
+        tokio::spawn(async move {
+            if let Err(e) = p2p_service.run().await {
+                error!("P2P service error: {}", e);
+            }
+        });
         // Double-sign protection: every outbound vote is checked against a durable high-water
         // mark before it is gossiped, so a restart or a stray second instance can't equivocate
         // and get this validator slashed. Seeded with the persisted tip so it never re-signs an
@@ -1333,6 +1341,122 @@ impl HelixNode {
     }
 }
 
+/// Ask a peer for the proposal this node is waiting on, if it has waited long enough that the
+/// proposal is not simply still in flight (`BftEngine::missing_proposal`).
+///
+/// This is the half of round synchronization that gossip cannot provide. A proposal is published
+/// once; gossipsub identifies a message by a hash of its bytes and refuses to publish the same
+/// bytes again for a minute, so the proposer's per-tick re-offer never reaches a validator that
+/// was not listening during that one broadcast — while catching up, for instance, which is exactly
+/// when a validator misses proposals. Before this, such a node could only wait out the round.
+///
+/// Cheap by construction: it fires only while a proposal is actually missing, the service holds at
+/// most one request in flight, and the answer is verified like any gossiped message.
+async fn request_round_sync_if_waiting(
+    engine: &Arc<RwLock<BftEngine>>,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
+) {
+    let missing = { engine.read().await.missing_proposal() };
+    if let Some((height, round)) = missing {
+        let _ = p2p_tx.try_send(P2PCommand::RequestRoundSync { height, round });
+    }
+}
+
+/// Fold a proposal from a peer into the engine and act on the outcome.
+///
+/// Extracted so the gossip path and the round-sync pull cannot drift apart: both must cast this
+/// node's prevote, broadcast it, surface double-sign evidence and apply a block that finalizes on
+/// the spot. Two copies of that sequence is exactly the shape that has gone wrong here before
+/// (a fix applied to one copy looking like a fix).
+#[allow(clippy::too_many_arguments)]
+async fn apply_peer_proposal(
+    proposal: Proposal,
+    mempool: &Arc<RwLock<Mempool>>,
+    store: &Arc<RwLock<HelixDb>>,
+    chain_state: &Arc<RwLock<ChainState>>,
+    engine: &Arc<RwLock<BftEngine>>,
+    keypair: &KeyPair,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
+    last_applied_height: &Arc<Mutex<u64>>,
+    signing_guard: &Arc<std::sync::Mutex<SigningGuard>>,
+    tip_certificate: &Arc<RwLock<TipCertificate>>,
+) {
+    let result = { engine.write().await.receive_proposal(keypair, proposal) };
+
+    // receive_proposal() may have cast our prevote (and possibly a
+    // follow-up precommit) for the received proposal — broadcast
+    // those regardless of outcome, same as the vote path below.
+    broadcast_outbound_votes(engine, p2p_tx, signing_guard).await;
+    // Report any double-sign evidence this vote processing turned up — see
+    // report_double_sign_evidence's doc comment for why this can't just slash
+    // directly here.
+    let evidence = { engine.write().await.take_evidence() };
+    for ev in evidence {
+        report_double_sign_evidence(ev, keypair, chain_state, mempool, p2p_tx).await;
+    }
+
+    match result {
+        Ok(Some(block)) => {
+            info!(height = block.height(), "Block finalized via peer proposal");
+            // `None`, not our own configured reward_address: this block was
+            // proposed by whichever validator's turn it was (see receive_proposal),
+            // not necessarily us. Passing our local override here would redirect
+            // that validator's reward to our own address, and — since reward_address
+            // is a per-node config, not part of the block — make every node compute
+            // a different balance for the same block. `None` lets execute_block fall
+            // back to `block.header.validator`, which is identical on every node.
+            apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
+        }
+        Ok(None) => {}
+        Err(ConsensusError::UnknownValidator(_)) => {
+            // We're not a validator in the current set — nothing to vote with.
+        }
+        Err(e) => warn!("Rejected peer proposal: {}", e),
+    }
+}
+
+/// Fold a vote from a peer into the engine and act on the outcome. Counterpart to
+/// `apply_peer_proposal`, shared by the gossip path and the round-sync pull for the same reason.
+#[allow(clippy::too_many_arguments)]
+async fn apply_peer_vote(
+    vote: Vote,
+    mempool: &Arc<RwLock<Mempool>>,
+    store: &Arc<RwLock<HelixDb>>,
+    chain_state: &Arc<RwLock<ChainState>>,
+    engine: &Arc<RwLock<BftEngine>>,
+    keypair: &KeyPair,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
+    last_applied_height: &Arc<Mutex<u64>>,
+    signing_guard: &Arc<std::sync::Mutex<SigningGuard>>,
+    tip_certificate: &Arc<RwLock<TipCertificate>>,
+) {
+    let result = { engine.write().await.add_vote(keypair, vote) };
+
+    // add_vote() may itself have cast our own follow-up precommit
+    // (see its doc comment) — broadcast that regardless of outcome.
+    broadcast_outbound_votes(engine, p2p_tx, signing_guard).await;
+    let evidence = { engine.write().await.take_evidence() };
+    for ev in evidence {
+        report_double_sign_evidence(ev, keypair, chain_state, mempool, p2p_tx).await;
+    }
+
+    match result {
+        Ok(Some(block)) => {
+            info!(height = block.height(), "Block finalized via peer votes");
+            // Same reasoning as the proposal path above: this block's proposer
+            // isn't necessarily us, so `None` — not our local reward_address.
+            apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
+        }
+        Ok(None) => {}
+        Err(ConsensusError::NoActiveRound) => {
+            // We're not currently proposing/awaiting votes for any round —
+            // expected whenever this node isn't the proposer this height.
+            debug!("Vote received with no active round — ignored");
+        }
+        Err(e) => warn!("Rejected peer vote: {}", e),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_p2p_event(
     event: P2PEvent,
@@ -1372,64 +1496,27 @@ async fn handle_p2p_event(
             }
         }
         P2PEvent::NewProposal(proposal) => {
-            let result = { engine.write().await.receive_proposal(keypair, proposal) };
-
-            // receive_proposal() may have cast our prevote (and possibly a
-            // follow-up precommit) for the received proposal — broadcast
-            // those regardless of outcome, same as the NewVote arm below.
-            broadcast_outbound_votes(engine, p2p_tx, signing_guard).await;
-            // Report any double-sign evidence this vote processing turned up — see
-            // report_double_sign_evidence's doc comment for why this can't just slash
-            // directly here.
-            let evidence = { engine.write().await.take_evidence() };
-            for ev in evidence {
-                report_double_sign_evidence(ev, keypair, chain_state, mempool, p2p_tx).await;
-            }
-
-            match result {
-                Ok(Some(block)) => {
-                    info!(height = block.height(), "Block finalized via peer proposal");
-                    // `None`, not our own configured reward_address: this block was
-                    // proposed by whichever validator's turn it was (see receive_proposal),
-                    // not necessarily us. Passing our local override here would redirect
-                    // that validator's reward to our own address, and — since reward_address
-                    // is a per-node config, not part of the block — make every node compute
-                    // a different balance for the same block. `None` lets execute_block fall
-                    // back to `block.header.validator`, which is identical on every node.
-                    apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
-                }
-                Ok(None) => {}
-                Err(ConsensusError::UnknownValidator(_)) => {
-                    // We're not a validator in the current set — nothing to vote with.
-                }
-                Err(e) => warn!("Rejected peer proposal: {}", e),
-            }
+            apply_peer_proposal(proposal, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
         }
         P2PEvent::NewVote(vote) => {
-            let result = { engine.write().await.add_vote(keypair, vote) };
-
-            // add_vote() may itself have cast our own follow-up precommit
-            // (see its doc comment) — broadcast that regardless of outcome.
-            broadcast_outbound_votes(engine, p2p_tx, signing_guard).await;
-            let evidence = { engine.write().await.take_evidence() };
-            for ev in evidence {
-                report_double_sign_evidence(ev, keypair, chain_state, mempool, p2p_tx).await;
+            apply_peer_vote(vote, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
+        }
+        P2PEvent::RoundSynced(state, peer) => {
+            // A peer answered what it holds for the height we are deciding. Fed through exactly
+            // the paths a gossiped proposal and gossiped votes take — nothing here is trusted
+            // because it came from an answer rather than a broadcast, and the pull exists only
+            // because gossip cannot re-deliver (see the `roundsync` module).
+            debug!(
+                peer = %peer,
+                proposal = state.proposal.is_some(),
+                votes = state.votes.len(),
+                "Applying the round state a peer served"
+            );
+            if let Some(proposal) = state.proposal {
+                apply_peer_proposal(proposal, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
             }
-
-            match result {
-                Ok(Some(block)) => {
-                    info!(height = block.height(), "Block finalized via peer votes");
-                    // Same reasoning as the NewProposal arm above: this block's proposer
-                    // isn't necessarily us, so `None` — not our local reward_address.
-                    apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
-                }
-                Ok(None) => {}
-                Err(ConsensusError::NoActiveRound) => {
-                    // We're not currently proposing/awaiting votes for any round —
-                    // expected whenever this node isn't the proposer this height.
-                    debug!("Vote received with no active round — ignored");
-                }
-                Err(e) => warn!("Rejected peer vote: {}", e),
+            for vote in state.votes {
+                apply_peer_vote(vote, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
             }
         }
         P2PEvent::NewCommittedBlock(block, commit_certificate) => {
@@ -1749,6 +1836,16 @@ async fn apply_synced_batch(
         applied = new_height - base,
         new_height, "Caught up over P2P block sync"
     );
+    // Ask for the next batch now. Sent last, once the blocks are on disk and every derived piece
+    // of state above has been brought in step, so the height we report is one we can actually
+    // serve and build on.
+    //
+    // `try_send`, not `send`: this is an optimisation, and a full command queue is precisely the
+    // moment not to block the event loop waiting to add more work to it. A dropped nudge costs
+    // one `blocksync_interval` tick, which is what used to drive every request anyway.
+    if let Err(e) = p2p_tx.try_send(P2PCommand::BlocksyncAdvance(new_height)) {
+        debug!(err = %e, "Could not ask for the next block-sync batch immediately — the interval will pick it up");
+    }
 }
 
 /// Re-broadcast the committed blocks a peer that announced `peer_tip` is missing, each with the
@@ -1988,6 +2085,34 @@ impl helix_p2p::GenesisProvider for StoreGenesisProvider {
                     state_hash: Some(state_hash),
                 }),
             }
+        })
+    }
+}
+
+/// Serves the round this node is currently deciding to peers that ask for it (round sync).
+///
+/// The counterpart to `StoreBlockProvider`: that one answers for heights already committed, this
+/// one for the height still being agreed on. A validator that missed the single gossip broadcast
+/// of a proposal — because it was catching up, or its mesh was not formed yet — has no other way
+/// to obtain it: gossipsub identifies messages by a hash of their bytes and refuses to publish the
+/// same proposal twice within a minute, so the proposer's per-tick re-offer never leaves the node.
+struct EngineRoundProvider {
+    engine: Arc<RwLock<BftEngine>>,
+}
+
+impl helix_p2p::RoundProvider for EngineRoundProvider {
+    fn round_state<'a>(
+        &'a self,
+        height: u64,
+        _round: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = helix_p2p::RoundSyncResponse> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // The asker's round is deliberately ignored: we answer with the round *we* are in.
+            // Being told that is the point — a peer that is behind learns where the network is and
+            // skips ahead to it, and a peer that is ahead simply finds nothing it can use.
+            let (proposal, votes) = self.engine.read().await.round_evidence(height);
+            helix_p2p::RoundSyncResponse { proposal, votes }
         })
     }
 }
@@ -3254,6 +3379,28 @@ async fn block_production_loop(
         // would build its own fork of the network it is trying to join. On a single-validator
         // set nothing else would stop it: `peers_needed_for_quorum` is 0, so the mesh gate
         // below passes straight through.
+        // Prove liveness while on probation (#132/#141). Ahead of the sync gate and every gate
+        // below, deliberately: a probationer is at its least healthy exactly when it most needs
+        // to be counted — catching up, below quorum, waiting on peers — and none of those states
+        // may silence the one signal that gets it out of probation.
+        //
+        // It used to sit *after* the sync gate, whose `continue` skips the rest of the iteration.
+        // The comment claimed this placement and the code did not have it, so a validator that
+        // was catching up — the state every joiner starts in, and one that #152 made open-ended —
+        // sent no heartbeat at all. `probation_seen` therefore stayed empty, `rotate_active_
+        // validators` promoted nobody, and the joiner sat at `voting_power = 0` for good. Three
+        // of the four multi-node tests fail on this ("B staked but never entered the active
+        // validator set"), and `hlxSpsWWU…` has been stuck exactly there on the live chain since
+        // it staked, which is why the set is three validators and not four.
+        //
+        // Safe to send while behind: `probation_proof_outstanding` reads local committed state,
+        // so a node that has not yet synced far enough to know it is on probation sends nothing.
+        // Cheap when it does not apply — an active validator's check is a single state read.
+        heartbeat_ticks = heartbeat_ticks.saturating_add(1);
+        if heartbeat_ticks % HEARTBEAT_TICK_INTERVAL == 1 {
+            send_probation_heartbeat_if_due(&keypair, &chain_state, &mempool, &p2p_tx).await;
+        }
+
         if syncing.load(std::sync::atomic::Ordering::Relaxed) {
             // Repeated once a minute, not announced once and then silent.
             //
@@ -3278,15 +3425,6 @@ async fn block_production_loop(
         }
         sync_wait_ticks = 0;
 
-        // Prove liveness while on probation (#132/#141). Placed here, before every gate below,
-        // deliberately: a probationer is at its least healthy exactly when it most needs to be
-        // counted — catching up, below quorum, waiting on peers — and none of those states should
-        // silence the one signal that gets it out of probation. Cheap when it does not apply: an
-        // active validator's check is a single read of the chain state.
-        heartbeat_ticks = heartbeat_ticks.saturating_add(1);
-        if heartbeat_ticks % HEARTBEAT_TICK_INTERVAL == 1 {
-            send_probation_heartbeat_if_due(&keypair, &chain_state, &mempool, &p2p_tx).await;
-        }
 
         // Publish, for the health heartbeat, whether the chain is held up by missing validators
         // rather than by anything wrong with this node (backlog #150).
@@ -3427,11 +3565,14 @@ async fn block_production_loop(
             }
 
             let timed_out = { engine.write().await.note_round_tick(&keypair) };
-            // This tick may have cast a nil prevote (`PROPOSAL_TIMEOUT_TICKS`). Send it now:
+            // This tick may have cast a nil prevote (`proposal_timeout_ticks`). Send it now:
             // the drain at the end of the loop body is unreachable from the `continue` below,
             // and a nil prevote that never leaves this node can't be tallied by anyone, so
             // nil quorum — the whole point of casting it — could never form.
             broadcast_outbound_votes(&engine, &p2p_tx, &signing_guard).await;
+            // A round can be open without a proposal — `prevote_nil` creates one. Ask for what
+            // we are missing instead of only voting that we are missing it.
+            request_round_sync_if_waiting(&engine, &p2p_tx).await;
             if !timed_out {
                 continue;
             }
@@ -3490,6 +3631,9 @@ async fn block_production_loop(
                 // out this tick. (This branch falls through to the end-of-body drain rather
                 // than `continue`ing, but draining twice is free — the second is empty.)
                 broadcast_outbound_votes(&engine, &p2p_tx, &signing_guard).await;
+                // The waiting-for-a-proposal case this branch exists for is exactly the one a
+                // round-sync pull answers.
+                request_round_sync_if_waiting(&engine, &p2p_tx).await;
                 timed_out
             }
         };
@@ -3566,23 +3710,45 @@ async fn broadcast_outbound_votes(
 ) {
     let outbound = { engine.write().await.take_outbound_votes() };
     for vote in outbound {
-        let decision = {
+        let (decision, mark) = {
             // Short, synchronous critical section (a small fsync on advance) — no await held.
-            signing_guard.lock().unwrap().check(&vote)
+            let mut guard = signing_guard.lock().unwrap();
+            let mark = guard.last_signed_detail();
+            (guard.check(&vote), mark)
         };
         match decision {
             Decision::Allow => {
                 let _ = p2p_tx.try_send(P2PCommand::BroadcastVote(vote));
             }
-            Decision::Refuse => {
+            Decision::RefuseConflict => {
                 warn!(
                     height = vote.height,
                     round = vote.round,
                     vote_type = ?vote.vote_type,
-                    "Double-sign guard withheld a vote: this key already signed a different value \
-                     at this height/round (most likely a restart). Not equivocating — this node \
-                     will resync instead. If this repeats, a second node may be running with a \
-                     copy of this validator key."
+                    offered = %vote.block_hash,
+                    already_signed = ?mark.map(|(h, r, s, hash)| format!("{h}/{r}/step{s} = {hash}")),
+                    "Double-sign guard withheld a vote: this key has already signed a DIFFERENT \
+                     value at exactly this height/round/step. Not equivocating — the vote was \
+                     dropped. If this repeats, a second node is very likely running with a copy \
+                     of this validator key; find it before it finds a round where the guard \
+                     cannot help."
+                );
+            }
+            Decision::RefuseRegression => {
+                // Deliberately not a warning, and deliberately not the sentence above. This is the
+                // engine offering a vote for a position the key has already signed *past* — after
+                // a restart, or after a round this node left while a slow path was still holding
+                // the vote. Nothing conflicting was signed and nobody is running a copy of the
+                // key; the vote is simply too late to be useful. Reported as one warning per
+                // height so a genuinely stuck validator is still visible, but the alarming
+                // sentence is reserved for the case that actually deserves it — until 2026-08-26
+                // both cases shared it, and a four-validator test run produced 30 of these with
+                // nothing restarted at all (backlog #176).
+                debug!(
+                    height = vote.height,
+                    round = vote.round,
+                    vote_type = ?vote.vote_type,
+                    "Signing guard: vote is behind this key's high-water mark — dropped as stale"
                 );
             }
         }
@@ -3985,7 +4151,7 @@ fn peer_version_warning(status: &serde_json::Value, ours: &str) -> Option<String
 /// Prefers the peer's *announced* public multiaddr (`p2p_public_addr`) if it has one. A node
 /// behind an HTTPS proxy / Cloudflare tunnel is reachable only over a WebSocket on a different
 /// host+port than its raw TCP `p2p_port` (e.g. `/dns4/p2p.silvra.net/tcp/443/tls/ws` while its
-/// RPC host is `helix.silvra.net`) — a fact the raw-TCP derivation below cannot reconstruct,
+/// RPC host is `node.silvra.net`) — a fact the raw-TCP derivation below cannot reconstruct,
 /// since it reuses the RPC host and the raw port. Dialing the derived raw-TCP address for such
 /// a peer just burns a ~20 s connection timeout on every (re)connect before the WebSocket seed
 /// is tried. Using the announced address avoids that and needs no separate seed config. Trust
@@ -5321,7 +5487,7 @@ mod multiaddr_kind_tests {
     #[test]
     fn falls_back_to_dns4_for_hostnames() {
         assert_eq!(multiaddr_kind("localhost"), "dns4");
-        assert_eq!(multiaddr_kind("helix.silvra.net"), "dns4");
+        assert_eq!(multiaddr_kind("node.silvra.net"), "dns4");
     }
 }
 
@@ -8054,5 +8220,184 @@ mod catchup_tests {
                 "a follower must never defer — nothing else will bring it the blocks"
             );
         }
+    }
+}
+
+/// Round sync (2026-08-26): asking a peer for the proposal gossip will not re-send.
+#[cfg(test)]
+mod round_sync_tests {
+    use super::*;
+    use helix_consensus::{proposal_timeout_ticks, Validator, ValidatorSet, PROPOSAL_PULL_TICKS};
+    use helix_crypto::{Address, KeyPair};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::{mpsc, Mutex, RwLock};
+
+    fn fresh_store() -> HelixDb {
+        let path = std::env::temp_dir().join(format!(
+            "helix-test-roundsync-store-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        HelixDb::open(&path).unwrap()
+    }
+
+    /// Two equal validators, and the keypair whose turn it is to propose height 1 round 0 first.
+    fn two_validators() -> (KeyPair, KeyPair, ValidatorSet) {
+        let one = KeyPair::generate();
+        let two = KeyPair::generate();
+        let set = ValidatorSet::new(
+            vec![
+                Validator::new(Address::from_public_key(&one.public), 1_000, true),
+                Validator::new(Address::from_public_key(&two.public), 1_000, true),
+            ],
+            0,
+        );
+        let proposer = set.proposer_for_round(1, 0).expect("a set of two has a proposer").address.clone();
+        if proposer == Address::from_public_key(&one.public) {
+            (one, two, set)
+        } else {
+            (two, one, set)
+        }
+    }
+
+    /// **The rescue this whole mechanism exists for.** A validator that was catching up while the
+    /// proposal was broadcast cannot get it from gossip — the proposer's per-tick re-offer is
+    /// refused by gossipsub as a duplicate for a full minute. Handed the same proposal as an
+    /// *answer* instead, it must join the round and vote exactly as if it had heard the broadcast.
+    #[tokio::test]
+    async fn a_proposal_pulled_from_a_peer_is_adopted_exactly_like_a_gossiped_one() {
+        let (proposer_kp, waiting_kp, set) = two_validators();
+        let waiting_addr = Address::from_public_key(&waiting_kp.public);
+
+        // The proposer builds a real round-0 proposal for height 1.
+        let mut proposer_engine = BftEngine::new(set.clone(), Address::from_public_key(&proposer_kp.public), 0);
+        let _ = proposer_engine.produce_block(&proposer_kp, Hash::ZERO, vec![]);
+        let (proposal, votes) = proposer_engine.round_evidence(1);
+        let proposal = proposal.expect("the proposer holds its own proposal");
+
+        // The waiting node never saw any of it.
+        let engine = Arc::new(RwLock::new(BftEngine::new(set, waiting_addr.clone(), 0)));
+        assert!(
+            engine.read().await.pending_proposal().is_none(),
+            "precondition: this node holds nothing for the round"
+        );
+
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(16);
+        handle_p2p_event(
+            P2PEvent::RoundSynced(
+                helix_p2p::RoundSyncResponse { proposal: Some(proposal), votes },
+                "12D3KooWtest".to_string(),
+            ),
+            &Arc::new(RwLock::new(Mempool::new())),
+            &Arc::new(AtomicUsize::new(1)),
+            &Arc::new(RwLock::new(fresh_store())),
+            &Arc::new(RwLock::new(ChainState::new(0))),
+            &engine,
+            &waiting_kp,
+            &p2p_tx,
+            &None,
+            &Arc::new(Mutex::new(0)),
+            &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            &Arc::new(RwLock::new(TipCertificate::default())),
+        )
+        .await;
+
+        assert!(
+            engine.read().await.pending_proposal().is_some(),
+            "the pulled proposal must open the round — without it this node can only wait out \
+             the round and the height stops (measured live, 2026-08-26)"
+        );
+        let broadcast_a_vote = std::iter::from_fn(|| p2p_rx.try_recv().ok())
+            .any(|cmd| matches!(cmd, P2PCommand::BroadcastVote(_)));
+        assert!(
+            broadcast_a_vote,
+            "and it must vote on it — a proposal adopted in silence helps no quorum"
+        );
+    }
+
+    /// The ask fires exactly when it can help: the proposal is not ours to make, and it has been
+    /// missing longer than this round's window.
+    #[tokio::test]
+    async fn a_node_waiting_on_a_proposal_asks_a_peer_for_it() {
+        let (_proposer_kp, waiting_kp, set) = two_validators();
+        let waiting_addr = Address::from_public_key(&waiting_kp.public);
+        let engine = Arc::new(RwLock::new(BftEngine::new(set, waiting_addr, 0)));
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(16);
+
+        // Not waited yet: whatever is coming may still be in flight.
+        request_round_sync_if_waiting(&engine, &p2p_tx).await;
+        assert!(p2p_rx.try_recv().is_err(), "asking immediately just wastes a request");
+
+        // Deliberately `PROPOSAL_PULL_TICKS`, not the nil window: asking has to happen while the
+        // round can still accept an answer. One tick later and `open_for_nil_prevote` has closed
+        // it (that ordering has its own assertion in the engine's tests).
+        for _ in 0..PROPOSAL_PULL_TICKS {
+            engine.write().await.note_round_tick(&waiting_kp);
+        }
+        engine.write().await.take_outbound_votes();
+        request_round_sync_if_waiting(&engine, &p2p_tx).await;
+
+        let asked = std::iter::from_fn(|| p2p_rx.try_recv().ok()).find_map(|cmd| match cmd {
+            P2PCommand::RequestRoundSync { height, round } => Some((height, round)),
+            _ => None,
+        });
+        assert_eq!(
+            asked,
+            Some((1, 0)),
+            "past its window the proposal is not coming by itself — gossip publishes once"
+        );
+    }
+
+    /// A node that already holds the proposal has nothing to ask for, and asking anyway would put
+    /// a request on the wire for every tick of every healthy round.
+    #[tokio::test]
+    async fn a_node_that_holds_the_proposal_asks_nobody() {
+        let (proposer_kp, _waiting_kp, set) = two_validators();
+        let engine = Arc::new(RwLock::new(BftEngine::new(
+            set,
+            Address::from_public_key(&proposer_kp.public),
+            0,
+        )));
+        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, vec![]);
+        engine.write().await.take_outbound_votes();
+
+        for _ in 0..proposal_timeout_ticks(0) + 5 {
+            engine.write().await.note_round_tick(&proposer_kp);
+        }
+        engine.write().await.take_outbound_votes();
+
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(16);
+        request_round_sync_if_waiting(&engine, &p2p_tx).await;
+
+        let asked = std::iter::from_fn(|| p2p_rx.try_recv().ok())
+            .any(|cmd| matches!(cmd, P2PCommand::RequestRoundSync { .. }));
+        assert!(!asked, "we are the one who makes this proposal");
+    }
+
+    /// The serving side: what a peer is handed is what the engine actually holds, and nothing at
+    /// all for a height this node is not deciding — that one is block sync's job, and it carries a
+    /// quorum certificate this answer could not.
+    #[tokio::test]
+    async fn the_round_provider_serves_the_engine_and_only_the_pending_height() {
+        use helix_p2p::RoundProvider;
+
+        let (proposer_kp, _other, set) = two_validators();
+        let engine = Arc::new(RwLock::new(BftEngine::new(
+            set,
+            Address::from_public_key(&proposer_kp.public),
+            0,
+        )));
+        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, vec![]);
+        engine.write().await.take_outbound_votes();
+
+        let provider = EngineRoundProvider { engine: engine.clone() };
+
+        let served = provider.round_state(1, 0).await;
+        assert!(served.proposal.is_some(), "the height being decided is servable");
+        assert!(!served.votes.is_empty(), "including the votes we have cast on it");
+
+        let nothing = provider.round_state(2, 0).await;
+        assert!(nothing.is_empty(), "we hold no round for a height we are not deciding");
     }
 }

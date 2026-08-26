@@ -1,7 +1,7 @@
 //! Choosing which node the client subcommands talk to (Masterplan Stufe 2).
 //!
 //! Every `helix wallet`, `helix tx` and `helix chain` invocation used to go to
-//! `https://helix.silvra.net` unless the operator knew to set `--node` or `HELIX_NODE`. So the
+//! `https://node.silvra.net` unless the operator knew to set `--node` or `HELIX_NODE`. So the
 //! people most likely to be running their own node — validators — were still having every balance
 //! and every transaction answered by our server, and the whole point of running one was lost to a
 //! default. Bitcoin Core has no such setting: `bitcoin-cli` talks to your node, and that is the
@@ -15,7 +15,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 /// The public network, used when nothing else answers.
-pub const PUBLIC_NODE: &str = "https://helix.silvra.net";
+pub const PUBLIC_NODE: &str = "https://node.silvra.net";
 
 /// How long to wait for a local node to answer before deciding there isn't one.
 ///

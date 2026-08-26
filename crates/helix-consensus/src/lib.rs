@@ -6,7 +6,10 @@ pub mod validator;
 pub mod vote;
 pub mod vote_set;
 
-pub use engine::{BftEngine, PROPOSAL_TIMEOUT_TICKS, ROUND_TIMEOUT_TICKS};
+pub use engine::{
+    proposal_timeout_ticks, round_timeout_ticks, BftEngine, PROPOSAL_PULL_TICKS,
+    PROPOSAL_TIMEOUT_TICKS, ROUND_TIMEOUT_TICKS,
+};
 pub use evidence::DoubleSignEvidence;
 pub use proposal::Proposal;
 pub use round::{RoundPhase, RoundState};

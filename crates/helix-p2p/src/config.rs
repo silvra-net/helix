@@ -25,7 +25,7 @@ pub struct P2PConfig {
     /// Optional seed peers to connect to on startup
     pub seed_peers: Vec<String>,
     /// This node's own externally-dialable multiaddr (e.g.
-    /// `/dns4/helix.silvra.net/tcp/8546`), if known — announced to peers via peer
+    /// `/dns4/node.silvra.net/tcp/8546`), if known — announced to peers via peer
     /// exchange (`crate::service`'s `TOPIC_PEER_EXCHANGE`) so a node connecting only to
     /// this one can still be told about, and directly dial, every other peer this node
     /// knows about. `None` when this node has no known-public address (e.g. behind NAT

@@ -6,7 +6,7 @@
 
 ### System Requirements
 
-These are measured against the live `helix.silvra.net` deployment (a small validator set and
+These are measured against the live `node.silvra.net` deployment (a small validator set and
 light but real testnet traffic — blocks are small, no longer empty), not synthetic benchmarks.
 Treat them as a starting point, not a ceiling: they will need revisiting once the network carries
 sustained transaction volume.

@@ -221,7 +221,7 @@ async fn chainquiry_logo() -> impl IntoResponse {
 
 /// `GET /` answers a browser with this node's status page and everything else with the API index.
 ///
-/// Same URL, because it is the one people are handed: `helix.silvra.net` in a browser used to
+/// Same URL, because it is the one people are handed: `node.silvra.net` in a browser used to
 /// return raw JSON, which is a poor way to meet a project. Content negotiation rather than a
 /// separate path keeps the link that gets shared and the link that gets curl'd the same one.
 /// Anything that doesn't ask for HTML — curl, a wallet, another node — is unaffected.

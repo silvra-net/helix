@@ -11,7 +11,7 @@
 On first start, the node:
 - Loads or generates a persistent ML-DSA keypair (`validator-key.json`)
 - **Joins the public Helix network by default** — fetches the real genesis from the built-in
-  seed (`https://helix.silvra.net`), downloads and verifies the chain history, then follows
+  seed (`https://node.silvra.net`), downloads and verifies the chain history, then follows
   the live chain. No peer to configure. (Override the seed with `HELIX_SYNC_PEER`, or set
   `HELIX_NEW_CHAIN=1` to start a standalone chain instead — see "Joining the network" below.)
 - Follows/produces blocks every 2 seconds
@@ -54,7 +54,7 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). Overrides `rpc_bind` in `helix.toml`. |
 | `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address (raw TCP). Overrides `p2p_listen_addr` in `helix.toml`. |
 | `HELIX_P2P_WS_LISTEN` | (none) | Extra P2P listen address that carries libp2p inside a **WebSocket** (e.g. `127.0.0.1:8547`), on top of the raw TCP above. Set this when the node's only route in from outside is an HTTPS reverse proxy or a Cloudflare tunnel, which forward WebSockets but not raw TCP — see "Validating from behind a reverse proxy / Cloudflare tunnel" below. Overrides `p2p_ws_listen_addr` in `helix.toml`. |
-| `HELIX_SYNC_PEER` | `https://helix.silvra.net` | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks, and is the target of the periodic RPC catch-up that keeps a follower current when the peer's raw P2P port isn't reachable. Defaults to the public network's seed; override to point at a different network, or set `HELIX_NEW_CHAIN=1` to disable seeding entirely. Overrides `sync_peer` in `helix.toml`. |
+| `HELIX_SYNC_PEER` | `https://node.silvra.net` | `http://host:8545` of a trusted peer — fetches this chain's genesis from it (if you have no local chain yet) and any missing historical blocks, and is the target of the periodic RPC catch-up that keeps a follower current when the peer's raw P2P port isn't reachable. Defaults to the public network's seed; override to point at a different network, or set `HELIX_NEW_CHAIN=1` to disable seeding entirely. Overrides `sync_peer` in `helix.toml`. |
 | `HELIX_NEW_CHAIN` | (off) | Set truthy (`1`/`true`) to run a **standalone chain** — the node self-signs its own genesis instead of joining the public network via the default seed. Set this for a private devnet, or for the origin node of a brand-new network. Ignored if a sync peer is explicitly configured. Overrides `new_chain` in `helix.toml`. |
 | `HELIX_GENESIS_HASH` | the public chain's genesis, compiled in | Hex hash of the genesis block you expect to join, checked against whatever the sync peer serves **before** anything is written — a mismatch aborts startup instead of adopting the wrong chain. **Joining the public seed is already checked without setting anything**, against a hash built into the binary. Set this to join a different network, or to get past a build whose compiled-in hash predates a chain reset (see "Verifying which chain you joined"). Ignored with `HELIX_NEW_CHAIN`, and not applied when the genesis arrives over P2P from seed peers rather than from a named sync peer. Overrides `genesis_hash` in `helix.toml`. |
 | `HELIX_CHAIN_ID` | the chain the endpoint you named is on; the public chain's genesis otherwise | Genesis hash of the chain that **wallet commands** sign transactions for (`Transaction.chain_id`). Rarely needed: pointed at the public endpoint the wallet uses its compiled-in value, and pointed at a node you named it asks that node. Set it to sign offline, or for a devnet whose genesis this build predates. A wrong value produces transactions the chain refuses by name, never silently. |
@@ -187,7 +187,7 @@ or `HELIX_GENESIS_HASH=7bc4… helix start`. The node compares it against the bl
 value is printed by any node on this chain:
 
 ```bash
-curl -s https://helix.silvra.net/blocks/height/0 | jq -r .hash
+curl -s https://node.silvra.net/blocks/height/0 | jq -r .hash
 ```
 
 Take it from a source you trust — release notes or a node you already run — not from the peer you
@@ -449,7 +449,7 @@ server / firewall, so this assumes the WebSocket-tunnel setup:
    each of the other validators as seeds (in addition to the one `sync_peer` that bootstraps
    your history):
    ```bash
-   HELIX_SYNC_PEER="https://helix.silvra.net"                 # history + auto WS discovery
+   HELIX_SYNC_PEER="https://node.silvra.net"                 # history + auto WS discovery
    HELIX_P2P_SEED_PEERS="/dns4/p2p.bob.net/tcp/443/tls/ws,/dns4/p2p.carol.net/tcp/443/tls/ws"
    ```
 6. **Start and verify:** `helix start`, then confirm `peer_count` climbs above zero and your

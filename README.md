@@ -80,7 +80,7 @@ short and concrete. Nothing here is hidden behind a "coming soon."
 | Phase | Status | What it means |
 |---|---|---|
 | **Core protocol** | ✅ Done | PoS + BFT finality, ML-DSA-65 signatures, WASM VM, ZK-STARK proofs, names, social recovery — all implemented and running. |
-| **Public testnet** | ✅ Live | `helix.silvra.net` produces finalized blocks continuously; anyone can run a node or use the CLI against it today. |
+| **Public testnet** | ✅ Live | `node.silvra.net` produces finalized blocks continuously; anyone can run a node or use the CLI against it today. |
 | **Remote validation** | ✅ Verified | A node behind any HTTPS proxy / firewall can validate over the WebSocket transport — proven end-to-end with independent validators reaching BFT quorum through a Cloudflare tunnel. |
 | **Independent validators** | 🔄 Underway | The first external operators are already co-signing the live chain from their own hardware. The set is small and still hardening toward surviving a fault — four is where `3f+1` first tolerates losing one. This is the main gate to mainnet. [Become one →](docs/running-a-node.md#bootstrapping-a-multi-validator-network) |
 | **External security audit** | ⏳ Planned | Independent review of consensus and cryptography before value is ever at stake. |
@@ -94,7 +94,7 @@ infrastructure is ready today — see
 
 ## Quick Start
 
-> **This is the public testnet, not mainnet.** `helix.silvra.net` is live and stable, but it
+> **This is the public testnet, not mainnet.** `node.silvra.net` is live and stable, but it
 > is still reset from genesis when the chain format changes. **HLX on the testnet is a
 > valueless test token** — it is for trying the network, not for holding value, and it will
 > not carry over to mainnet.
@@ -126,7 +126,7 @@ helix tx status <hash>                        # check it landed
 ```
 
 Every client command uses a node running on this machine if one answers, and
-`https://helix.silvra.net` (the public testnet) otherwise — so a fresh download works with no
+`https://node.silvra.net` (the public testnet) otherwise — so a fresh download works with no
 setup, and running your own node is enough for the client to use it. Override either with
 `--node <url>` or `HELIX_NODE=<url>`.
 

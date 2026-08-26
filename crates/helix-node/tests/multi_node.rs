@@ -506,15 +506,29 @@ async fn a_validator_funded_and_staked_at_runtime_activates_and_co_signs() {
     let staked = wait_for_account(JOIN_A_RPC, &addr_b, |a| a["staked_hlx"].as_f64().unwrap_or(0.0) >= 100_000.0, Duration::from_secs(30)).await;
     assert!(staked, "B's stake never took effect on chain");
 
-    // B must cross both activation epochs and show up as active. `EPOCH_LENGTH` is 100, so this is
-    // up to ~200 blocks; generous timeout for the accelerated cadence on a loaded machine.
-    let active = wait_for_validator_active(JOIN_A_RPC, &addr_b, Duration::from_secs(180)).await;
+    // B must cross **three** rotations before it is active: a new staker waits one epoch in
+    // `pending_validators`, one in `probationary_validators`, and is promoted at the rotation
+    // after that (`ChainState::rotate_active_validators`). `EPOCH_LENGTH` is 100, so the wait is
+    // ~300 blocks, not the ~200 this comment used to claim.
+    //
+    // The window is generous because the cadence is not ours to set: `JOIN_BLOCK_TIME_MS` is the
+    // *sleep* between ticks, and a debug build on a loaded machine spends far longer than that
+    // building and signing each block — measured 2026-08-26 at 0.91 s per block against a
+    // configured 300 ms. At 180 s this timed out mid-activation and reported "the activation
+    // stalled", which sent a whole session looking for a bug in probation that was not there.
+    let active = wait_for_validator_active(JOIN_A_RPC, &addr_b, Duration::from_secs(420)).await;
     assert!(active, "B staked but never entered the active validator set — the activation stalled");
 
     // THE anti-stall assertion: A alone cannot finalize in a 2-of-2 set, so height advancing past
     // B's activation proves B is co-signing, not sitting bonded-but-silent.
     let height_at_activation = status(JOIN_A_RPC).await.unwrap()["height"].as_u64().unwrap();
-    wait_for_height(JOIN_A_RPC, height_at_activation + 10, Duration::from_secs(60)).await;
+    // 180 s rather than 60: the assertion is about the chain *advancing*, not about how fast. The
+    // moment a set grows from one validator to two is also the moment the two have to find the
+    // same round for the first time, and on a loaded machine that reconciliation can cost a round
+    // or two before the cadence settles. Sixty seconds made a green run depend on the machine
+    // being idle — measured 2026-08-26, this test passing alone and failing in the same serial run
+    // as the other four.
+    wait_for_height(JOIN_A_RPC, height_at_activation + 10, Duration::from_secs(180)).await;
 
     // And both nodes agree on the result — no fork or execution divergence across the join.
     // Third port is A again: this is a 2-node test, so "all three agree" is just "A and B agree".
@@ -706,12 +720,19 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
     let (_kd_c, key_c) = temp_keyfile(&kp_c);
     fund_and_stake(VAL_A_RPC, &key_a, &kp_b, &key_b).await;
     fund_and_stake(VAL_A_RPC, &key_a, &kp_c, &key_c).await;
+    // 420 s, for the same measured reason as the runtime-join test above: activation is a fixed
+    // ~300 blocks (pending → probation → active), and the *cadence* is not ours to set —
+    // `VAL_BLOCK_TIME_MS` is the sleep between ticks, while a debug build on a loaded machine
+    // spends far longer than that building and signing each block (0.91 s against a configured
+    // 300 ms, measured 2026-08-26). Too short a window here does not report "slow", it reports
+    // "activation stalled", which reads as a bug in probation and cost a session finding out it
+    // was not one.
     assert!(
-        wait_for_validator_active(VAL_A_RPC, &addr_b.to_string(), Duration::from_secs(180)).await,
+        wait_for_validator_active(VAL_A_RPC, &addr_b.to_string(), Duration::from_secs(420)).await,
         "B staked but never entered the active validator set — activation stalled"
     );
     assert!(
-        wait_for_validator_active(VAL_A_RPC, &addr_c.to_string(), Duration::from_secs(180)).await,
+        wait_for_validator_active(VAL_A_RPC, &addr_c.to_string(), Duration::from_secs(420)).await,
         "C staked but never entered the active validator set — activation stalled"
     );
 
@@ -794,9 +815,11 @@ async fn four_validators_survive_one_going_offline() {
     fund_and_stake(FT_A_RPC, &key_a, &kp_b, &key_b).await;
     fund_and_stake(FT_A_RPC, &key_a, &kp_c, &key_c).await;
     fund_and_stake(FT_A_RPC, &key_a, &kp_d, &key_d).await;
+    // 420 s each — see the comment on the three-validator test above; all three cross their
+    // activation epochs together, so this is one wait, not three consecutive ones.
     for (addr, label) in [(&addr_b, "B"), (&addr_c, "C"), (&addr_d, "D")] {
         assert!(
-            wait_for_validator_active(FT_A_RPC, &addr.to_string(), Duration::from_secs(240)).await,
+            wait_for_validator_active(FT_A_RPC, &addr.to_string(), Duration::from_secs(420)).await,
             "{label} staked but never entered the active validator set — activation stalled"
         );
     }

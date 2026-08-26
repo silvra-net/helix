@@ -104,7 +104,7 @@ Prerequisites: [Rust](https://rustup.rs), [Node 18+](https://nodejs.org), and th
 ```bash
 cd gui
 npm install
-npm run tauri dev      # launches the app against https://helix.silvra.net by default
+npm run tauri dev      # launches the app against https://node.silvra.net by default
 ```
 
 The node URL is editable in the top bar (defaults to the public testnet; point it at

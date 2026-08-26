@@ -62,7 +62,7 @@ pub struct NodeConfig {
     pub personhood_authorities: Option<String>,
     /// The address this node announces to peers via peer exchange (`P2PConfig::public_addr`,
     /// see its doc comment for why). Either a bare externally-dialable host (e.g.
-    /// `helix.silvra.net` or a public IP, no scheme/port — this node's raw TCP P2P port is
+    /// `node.silvra.net` or a public IP, no scheme/port — this node's raw TCP P2P port is
     /// appended), or a full multiaddr starting with `/` (e.g. `/dns4/host/tcp/443/tls/ws`) for
     /// a node reachable only over a WebSocket behind an HTTPS proxy / Cloudflare tunnel, which
     /// the bare-host form cannot express. Absent for pure followers / nodes behind NAT with no

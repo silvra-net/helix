@@ -24,6 +24,9 @@ use crate::blocksync::{
 };
 use crate::config::P2PConfig;
 use crate::genesis_sync::{GenesisCodec, GenesisProvider, GenesisResponse, GENESIS_PROTOCOL};
+use crate::roundsync::{
+    RoundProvider, RoundSyncCodec, RoundSyncRequest, RoundSyncResponse, ROUNDSYNC_PROTOCOL,
+};
 use crate::conn_limits::IpConnLimiter;
 use crate::peer_store;
 use crate::reputation::PeerReputation;
@@ -68,6 +71,10 @@ pub enum P2PEvent {
     /// A block-sync batch, and the peer that served it — the node reports back via
     /// `P2PCommand::BlocksyncBatchRejected` if it does not verify (backlog #140).
     BlocksSynced(BlockSyncResponse, String),
+    /// A peer answered our round-sync request with what it holds for the height being decided:
+    /// its pending proposal and the votes it has seen. Entirely untrusted — the node feeds both
+    /// through `receive_proposal`/`add_vote`, the same paths a gossiped message takes.
+    RoundSynced(RoundSyncResponse, String),
 }
 
 /// Commands sent TO the P2P network FROM the node
@@ -80,11 +87,36 @@ pub enum P2PCommand {
     /// to help lagging peers catch up and carry finality with the block (#114).
     BroadcastBlock(Block, Vec<Vote>),
     ConnectPeer(Multiaddr),
+    /// Ask a connected peer what it holds for the height this node is deciding — the proposal it
+    /// is voting on, and the votes it has collected.
+    ///
+    /// Sent when this node is waiting on a proposal that has not arrived. It cannot arrive by
+    /// itself: gossipsub publishes each message once and refuses to re-publish the same bytes for
+    /// a minute, so the proposer's per-tick re-offer never reaches a node that was not listening
+    /// during the one broadcast that counted. See the `roundsync` module.
+    RequestRoundSync { height: u64, round: u32 },
     /// The node could not verify the block-sync batch this peer served (backlog #140). The service
     /// cannot tell that by itself: from here a batch that fails verification and one that applies
     /// cleanly are both just a non-empty response. Without this the peer keeps being picked — it
     /// is by definition the one claiming the highest tip — and catch-up never moves.
     BlocksyncBatchRejected(String),
+    /// A synced batch is on disk and `tip_height` has moved — ask for the next one now instead of
+    /// waiting out the rest of `blocksync_interval`.
+    ///
+    /// The service cannot detect this for itself either: it hands the batch off and never learns
+    /// whether or when it was applied. Requesting only on the 2s interval made that period the
+    /// floor on the gap between consecutive batches, holding catch-up to `MAX_BLOCKSYNC_BATCH`
+    /// blocks per tick — 50 blocks/s — with the link idle in between. See
+    /// `request_blocks_if_behind`.
+    ///
+    /// Carries the height the node just reached. That height is not merely a convenience: the
+    /// `tip_height` this service requests against is a **5-second sample** of the store
+    /// (`node.rs`, the announce loop), sized for the 30s peer-exchange announcement and far too
+    /// coarse for this. Between a batch landing and the next sample, catch-up re-requested the
+    /// range it had just applied; the node dropped it as `<= base` without a word, and — the
+    /// answer being non-empty and verifying fine — nothing charged a cooldown or logged a
+    /// retry. That capped catch-up at one batch per *sample*, 20 blocks/s, not per tick.
+    BlocksyncAdvance(u64),
 }
 
 #[derive(NetworkBehaviour)]
@@ -111,6 +143,11 @@ pub(crate) struct HelixBehaviour {
     /// misparse. This is what lets a node with no chain at all join from a peer address alone,
     /// instead of needing somebody to run a reachable HTTP endpoint.
     pub(crate) genesis_sync: request_response::Behaviour<GenesisCodec>,
+    /// Asking a peer for the proposal and votes of the height being decided right now. Block sync
+    /// covers what is already committed; this covers the block that is still being agreed on, and
+    /// exists because gossip refuses to re-publish a message it has already sent (see the
+    /// `roundsync` module).
+    roundsync: request_response::Behaviour<RoundSyncCodec>,
 }
 
 pub struct P2PService {
@@ -133,6 +170,9 @@ pub struct P2PService {
     /// Answers inbound genesis requests (#139). `None` on a node with nothing to serve — every
     /// test in this crate, and any endpoint that is itself still bootstrapping.
     genesis_provider: Option<Arc<dyn GenesisProvider>>,
+    /// Answers inbound round-sync requests. `None` on a service with no consensus engine behind
+    /// it — every test in this crate — which then answers honestly that it holds nothing.
+    round_provider: Option<Arc<dyn RoundProvider>>,
     /// Answers inbound block-sync requests (#138). Supplied by the node, which owns the store —
     /// see [`BlockProvider`] for why the dependency points this way.
     block_provider: Arc<dyn BlockProvider>,
@@ -164,6 +204,7 @@ impl P2PService {
                 block_provider,
                 genesis_hash: String::new(),
                 genesis_provider: None,
+                round_provider: None,
                 highest_peer_tip: None,
             },
             command_tx,
@@ -200,6 +241,15 @@ impl P2PService {
         self
     }
 
+    /// Serve the round this node is deciding to peers that ask for it.
+    ///
+    /// Opt-in like the others: a service without one answers "nothing for that height", which is
+    /// the truthful answer for a node that runs no consensus engine.
+    pub fn with_round_provider(mut self, provider: Arc<dyn RoundProvider>) -> Self {
+        self.round_provider = Some(provider);
+        self
+    }
+
     pub async fn run(self) -> P2PResult<()> {
         // Destructure so we can move fields into the loop without borrowing `self`
         let event_tx = self.event_tx;
@@ -208,6 +258,7 @@ impl P2PService {
         let tip_height = self.tip_height;
         let block_provider = self.block_provider;
         let genesis_provider = self.genesis_provider;
+        let round_provider = self.round_provider;
         let our_genesis = self.genesis_hash;
         let highest_peer_tip = self.highest_peer_tip;
 
@@ -333,6 +384,10 @@ impl P2PService {
         // a flood. Cleared on a response and on any failure, so a peer that never answers costs one
         // request and one timeout, not a wedged sync.
         let mut blocksync_in_flight = false;
+        // One outstanding round-sync request at a time, and the peer to ask next (round-robin
+        // over whoever is connected).
+        let mut roundsync_in_flight = false;
+        let mut roundsync_next_peer: usize = 0;
         // Driver ticks left before each peer may be asked for blocks again (backlog #140).
         //
         // `best_blocksync_peer` picks the highest claimed tip, which is deterministic — so a peer
@@ -402,7 +457,27 @@ impl P2PService {
                                     &our_genesis,
                                 );
                                 if let Some(tip) = outcome.announced_tip {
-                                    peer_tips.insert(propagation_source, tip);
+                                    // Credit the tip to whoever *wrote* the announcement, not to
+                                    // whoever handed it to us. gossipsub floods, so
+                                    // `propagation_source` is merely the last hop, and
+                                    // `PeerExchangeMsg` carries no sender field of its own — so
+                                    // this used to file every relayed announcement under the
+                                    // relaying peer. For a node with a single connection (a fresh
+                                    // one behind the tunnel, which is exactly the node that needs
+                                    // catch-up) *every* announcement arrives that way, so its seed
+                                    // inherited the highest tip anyone in the network claimed.
+                                    // `best_blocksync_peer` picks by highest claim, so catch-up
+                                    // then asked that one peer for blocks it does not have, got a
+                                    // short or empty answer, and put its only usable peer on a 10s
+                                    // cooldown — on repeat.
+                                    //
+                                    // The set runs gossipsub with `MessageAuthenticity::Signed`
+                                    // and `ValidationMode::Strict`, so `message.source` is a
+                                    // signature-checked origin, not a self-declared one. Falling
+                                    // back to the relay keeps the old behaviour for the case the
+                                    // types allow but Strict rejects before it reaches us.
+                                    let origin = message.source.unwrap_or(propagation_source);
+                                    peer_tips.insert(origin, tip);
                                     publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
                                 }
                                 if let Some(peer_tip) = outcome.serve_from_tip {
@@ -428,7 +503,36 @@ impl P2PService {
                                     false
                                 }
                             } else {
-                                handle_app_message(topic, &message.data, &event_tx).await
+                                let outcome =
+                                    handle_app_message(topic, &message.data, &event_tx).await;
+                                // A gossiped block is a live statement about its sender's height,
+                                // and it arrives with every block rather than once per
+                                // `peer_exchange_interval`. Without it `peer_tips` has exactly one
+                                // source, 30s apart, so a node that just started knows no tip at
+                                // all for up to half a minute and does not sync while it waits —
+                                // connected, behind, and idle.
+                                //
+                                // Raise-only, deliberately. Peer exchange is the authority on what
+                                // a peer holds and must stay able to *lower* a tip (a peer that
+                                // reset now claims less, #175); an old block replayed through the
+                                // mesh must never push a tip back up.
+                                if let Some(height) = outcome.observed_height {
+                                    let origin = message.source.unwrap_or(propagation_source);
+                                    let entry = peer_tips.entry(origin).or_insert(height);
+                                    if *entry < height {
+                                        *entry = height;
+                                    }
+                                    publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
+                                    // Learning the tip is the fix; requesting against it here is
+                                    // deliberately left to `blocksync_interval`. `tip_height` is a
+                                    // 5-second sample of our own store, so during ordinary
+                                    // operation — where blocks arrive by consensus, not by sync —
+                                    // our sampled tip trails the block we just committed, and
+                                    // firing a request per gossiped block would ask peers for
+                                    // blocks we already hold, on every block. The interval picks
+                                    // the tip up within 2s, which is the entire latency saved.
+                                }
+                                outcome.malformed
                             };
 
                             if malformed && reputation.record_infraction(&peer_str) {
@@ -539,6 +643,75 @@ impl P2PService {
                             request_response::Event::InboundFailure { peer, error, .. }
                         )) => {
                             debug!(peer = %peer, err = %error, "Failed to answer a block-sync request");
+                        }
+
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Roundsync(
+                            request_response::Event::Message { peer, message, .. }
+                        )) => {
+                            match message {
+                                request_response::Message::Request { request, channel, .. } => {
+                                    // Answered inside the swarm loop like the other two, and
+                                    // read-only in the same way: the requester names a height and
+                                    // a round and gets what this node already holds for it.
+                                    let response = match &round_provider {
+                                        Some(provider) => provider
+                                            .round_state(request.height, request.round)
+                                            .await
+                                            .clamped(),
+                                        // A service with no engine behind it says so honestly
+                                        // rather than letting the request time out, which is
+                                        // indistinguishable from an unreachable peer.
+                                        None => RoundSyncResponse::empty(),
+                                    };
+                                    debug!(
+                                        peer = %peer,
+                                        height = request.height,
+                                        round = request.round,
+                                        proposal = response.proposal.is_some(),
+                                        votes = response.votes.len(),
+                                        "Answering a round-sync request"
+                                    );
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .roundsync
+                                        .send_response(channel, response);
+                                }
+                                request_response::Message::Response { response, .. } => {
+                                    roundsync_in_flight = false;
+                                    if response.is_empty() {
+                                        // Not a fault: a peer that is behind us, or one that has
+                                        // already committed the height, genuinely holds nothing.
+                                        // No cooldown either — unlike block sync, we did not pick
+                                        // this peer because it claimed to have something.
+                                        debug!(peer = %peer, "Round-sync peer holds nothing for this height");
+                                    } else {
+                                        debug!(
+                                            peer = %peer,
+                                            proposal = response.proposal.is_some(),
+                                            votes = response.votes.len(),
+                                            "Received round-sync state"
+                                        );
+                                        let _ = event_tx
+                                            .send(P2PEvent::RoundSynced(response, peer.to_string()))
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Roundsync(
+                            request_response::Event::OutboundFailure { peer, error, .. }
+                        )) => {
+                            // Only the in-flight slot is freed. There is deliberately no cooldown
+                            // and no strike: the next request goes to the next peer in rotation
+                            // anyway, and a round-sync request is asked at most once per round —
+                            // far too little traffic for a peer's failure to be worth remembering.
+                            roundsync_in_flight = false;
+                            debug!(peer = %peer, err = %error, "Round-sync request failed");
+                        }
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Roundsync(
+                            request_response::Event::InboundFailure { peer, error, .. }
+                        )) => {
+                            debug!(peer = %peer, err = %error, "Failed to answer a round-sync request");
                         }
 
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Mdns(
@@ -669,28 +842,13 @@ impl P2PService {
                         *ticks -= 1;
                         *ticks > 0
                     });
-                    if !blocksync_in_flight {
-                        let our_tip = tip_height.load(Ordering::Relaxed);
-                        if let Some((peer, peer_tip)) =
-                            best_blocksync_peer(&peer_tips, our_tip, &blocksync_cooldown)
-                        {
-                            let count = blocksync_request_count(our_tip, peer_tip);
-                            if count > 0 {
-                                debug!(
-                                    peer = %peer,
-                                    from = our_tip + 1,
-                                    count,
-                                    peer_tip,
-                                    "Requesting missing blocks from a peer that is ahead"
-                                );
-                                swarm.behaviour_mut().blocksync.send_request(
-                                    &peer,
-                                    BlockSyncRequest { from_height: our_tip + 1, count },
-                                );
-                                blocksync_in_flight = true;
-                            }
-                        }
-                    }
+                    request_blocks_if_behind(
+                        &mut swarm,
+                        &peer_tips,
+                        &blocksync_cooldown,
+                        tip_height.load(Ordering::Relaxed),
+                        &mut blocksync_in_flight,
+                    );
                 }
 
                 _ = peer_exchange_interval.tick() => {
@@ -768,6 +926,31 @@ impl P2PService {
                                 }
                             }
                         }
+                        P2PCommand::RequestRoundSync { height, round } => {
+                            if roundsync_in_flight {
+                                // One at a time. The answer is only useful inside the round that
+                                // asked for it, so queueing more would just deliver stale rounds.
+                                debug!(height, round, "Round-sync request already in flight");
+                            } else {
+                                let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+                                if peers.is_empty() {
+                                    debug!(height, round, "No peer to ask for the round");
+                                } else {
+                                    // Rotate rather than always asking the same peer: the one that
+                                    // cannot answer is often exactly the one whose silence put us
+                                    // here, and a deterministic pick would ask it forever (the
+                                    // mistake #140 fixed for block sync).
+                                    let peer = peers[roundsync_next_peer % peers.len()];
+                                    roundsync_next_peer = roundsync_next_peer.wrapping_add(1);
+                                    debug!(peer = %peer, height, round, "Asking a peer for the round we are missing");
+                                    swarm.behaviour_mut().roundsync.send_request(
+                                        &peer,
+                                        RoundSyncRequest { height, round },
+                                    );
+                                    roundsync_in_flight = true;
+                                }
+                            }
+                        }
                         P2PCommand::BroadcastTransaction(tx) => {
                             if let Ok(data) = bincode::serialize(&tx) {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
@@ -822,6 +1005,19 @@ impl P2PService {
                                 }
                                 Err(e) => debug!(peer = %peer, err = %e, "Unparseable peer id in block-sync rejection"),
                             }
+                        }
+                        P2PCommand::BlocksyncAdvance(new_tip) => {
+                            // Pull the sampled tip forward to what the node actually holds. Raise
+                            // only: this races the 5s announce loop, and a command that waited in
+                            // the queue must never walk the tip backwards.
+                            let our_tip = tip_height.fetch_max(new_tip, Ordering::Relaxed).max(new_tip);
+                            request_blocks_if_behind(
+                                &mut swarm,
+                                &peer_tips,
+                                &blocksync_cooldown,
+                                our_tip,
+                                &mut blocksync_in_flight,
+                            );
                         }
                     }
                 }
@@ -1302,16 +1498,79 @@ fn peer_departed(remaining_connections: u32, was_announced: bool) -> bool {
     remaining_connections == 0 && was_announced
 }
 
-fn best_blocksync_peer(
+/// Pick the peer to ask for blocks: the highest claimed tip above ours, skipping anyone
+/// serving a cooldown and anyone we are **not currently connected to**.
+///
+/// The connection filter exists because `peer_tips` is now keyed by the validator that
+/// *originated* the announcement rather than the one that relayed it to us (see the
+/// `TOPIC_PEER_EXCHANGE` arm). That is the honest attribution, but it means the map can name a
+/// peer we have no connection to — and `send_request` to one of those buys a dial attempt and
+/// an `OutboundFailure`, which costs the *responding* peer a cooldown it did not earn. Asking
+/// only reachable peers keeps the higher-quality tip data without paying for it in failures.
+fn best_blocksync_peer<F: Fn(&PeerId) -> bool>(
     peer_tips: &HashMap<PeerId, u64>,
     our_tip: u64,
     cooldown: &HashMap<PeerId, u32>,
+    is_connected: F,
 ) -> Option<(PeerId, u64)> {
     peer_tips
         .iter()
-        .filter(|(peer, &tip)| tip > our_tip && !cooldown.contains_key(*peer))
+        .filter(|(peer, &tip)| {
+            tip > our_tip && !cooldown.contains_key(*peer) && is_connected(peer)
+        })
         .max_by_key(|(_, &tip)| tip)
         .map(|(peer, &tip)| (*peer, tip))
+}
+
+/// Send one block-sync request if we are behind and a usable peer is available. Returns whether
+/// a request went out. No-op while one is already in flight.
+///
+/// Extracted so catch-up can be driven by **progress** and not only by the clock. Requests used
+/// to be issued exclusively from `blocksync_interval`, which made that 2s period a floor on the
+/// time between one batch and the next: catch-up was capped at `MAX_BLOCKSYNC_BATCH` blocks per
+/// tick — 50 blocks/s — however fast the link, the peer and the local apply actually were. At
+/// the 2026-08-25 tip of ~477k blocks that is 2.7 hours of syncing with the connection idle
+/// ~99% of the time. The node now reports each applied batch (`P2PCommand::BlocksyncAdvance`)
+/// and this runs again immediately, so the next request leaves as soon as the previous batch is
+/// on disk.
+///
+/// The interval stays, as the backstop: it covers every case where no progress report arrives —
+/// a rejected batch, a dropped event, a peer that only just announced a higher tip, or a tip we
+/// learned from a gossiped block while nothing was in flight.
+fn request_blocks_if_behind(
+    swarm: &mut libp2p::Swarm<HelixBehaviour>,
+    peer_tips: &HashMap<PeerId, u64>,
+    cooldown: &HashMap<PeerId, u32>,
+    our_tip: u64,
+    in_flight: &mut bool,
+) -> bool {
+    if *in_flight {
+        return false;
+    }
+    let candidate = {
+        let connected = &*swarm;
+        best_blocksync_peer(peer_tips, our_tip, cooldown, |p| connected.is_connected(p))
+    };
+    let Some((peer, peer_tip)) = candidate else {
+        return false;
+    };
+    let count = blocksync_request_count(our_tip, peer_tip);
+    if count == 0 {
+        return false;
+    }
+    debug!(
+        peer = %peer,
+        from = our_tip + 1,
+        count,
+        peer_tip,
+        "Requesting missing blocks from a peer that is ahead"
+    );
+    swarm
+        .behaviour_mut()
+        .blocksync
+        .send_request(&peer, BlockSyncRequest { from_height: our_tip + 1, count });
+    *in_flight = true;
+    true
 }
 
 /// How many blocks to ask for, given where we are and what the peer claims. Zero when we are not
@@ -1367,57 +1626,95 @@ fn broadcast_known_addrs(
 
 // ─── Application message handler ─────────────────────────────────────────────
 
-/// Returns `true` if the message was malformed (i.e. the sender should be
-/// charged a misbehavior strike).
-async fn handle_app_message(topic: &str, data: &[u8], event_tx: &mpsc::Sender<P2PEvent>) -> bool {
+/// What one gossiped application message told us.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AppMessageOutcome {
+    /// The sender should be charged a misbehavior strike.
+    malformed: bool,
+    /// A height the *sender* provably holds, for `peer_tips`. `None` when the message says
+    /// nothing about its sender's chain (a transaction, a vote, an unknown topic).
+    observed_height: Option<u64>,
+}
+
+impl AppMessageOutcome {
+    fn malformed() -> Self {
+        AppMessageOutcome { malformed: true, observed_height: None }
+    }
+
+    fn clean(observed_height: Option<u64>) -> Self {
+        AppMessageOutcome { malformed: false, observed_height }
+    }
+}
+
+/// Decode one gossiped message, hand it to the node, and report what it implies about the
+/// sender's height.
+///
+/// The two block topics are read conservatively, each for the strongest claim its message
+/// actually supports:
+///
+/// - A **committed block** at `h` means the sender finalized `h`, so its tip is at least `h`.
+/// - A **proposal** for `h` means the sender built on `h - 1`; it is claiming that as its tip,
+///   not `h`. Reading it as `h` would have us request a block nobody has committed yet, get a
+///   short answer, and cool down a peer for being honest.
+///
+/// Votes and transactions carry a height but say nothing about what their sender *holds* — a
+/// vote for `h` is a claim about the round, and a validator votes on the block it is being
+/// asked about. They contribute nothing here.
+async fn handle_app_message(
+    topic: &str,
+    data: &[u8],
+    event_tx: &mpsc::Sender<P2PEvent>,
+) -> AppMessageOutcome {
     if topic == TOPIC_BLOCKS {
         match bincode::deserialize::<Proposal>(data) {
             Ok(proposal) => {
                 debug!(height = proposal.block.height(), round = proposal.round, "Proposal from peer");
+                let proposed = proposal.block.height();
                 let _ = event_tx.send(P2PEvent::NewProposal(proposal)).await;
-                false
+                AppMessageOutcome::clean(proposed.checked_sub(1))
             }
             Err(e) => {
                 warn!("Invalid proposal from peer: {}", e);
-                true
+                AppMessageOutcome::malformed()
             }
         }
     } else if topic == TOPIC_TRANSACTIONS {
         match bincode::deserialize::<Transaction>(data) {
             Ok(tx) => {
                 let _ = event_tx.send(P2PEvent::NewTransaction(tx)).await;
-                false
+                AppMessageOutcome::clean(None)
             }
             Err(e) => {
                 warn!("Invalid tx from peer: {}", e);
-                true
+                AppMessageOutcome::malformed()
             }
         }
     } else if topic == TOPIC_VOTES {
         match bincode::deserialize::<Vote>(data) {
             Ok(vote) => {
                 let _ = event_tx.send(P2PEvent::NewVote(vote)).await;
-                false
+                AppMessageOutcome::clean(None)
             }
             Err(e) => {
                 warn!("Invalid vote from peer: {}", e);
-                true
+                AppMessageOutcome::malformed()
             }
         }
     } else if topic == TOPIC_COMMITTED_BLOCKS {
         match bincode::deserialize::<(Block, Vec<Vote>)>(data) {
             Ok((block, commit)) => {
                 debug!(height = block.height(), commit_sigs = commit.len(), "Committed block from peer");
+                let committed = block.height();
                 let _ = event_tx.send(P2PEvent::NewCommittedBlock(block, commit)).await;
-                false
+                AppMessageOutcome::clean(Some(committed))
             }
             Err(e) => {
                 warn!("Invalid committed block from peer: {}", e);
-                true
+                AppMessageOutcome::malformed()
             }
         }
     } else {
-        false
+        AppMessageOutcome::clean(None)
     }
 }
 
@@ -1722,11 +2019,11 @@ mod peer_exchange_tests {
         tips.insert(peer(2), 129); // healthy, one block lower, previously never asked
         tips.insert(peer(3), 90); // behind us — still must not be picked
 
-        let (chosen, _) = super::best_blocksync_peer(&tips, 100, &no_cooldown()).unwrap();
+        let (chosen, _) = super::best_blocksync_peer(&tips, 100, &no_cooldown(), |_| true).unwrap();
         assert_eq!(chosen, peer(1), "precondition: the highest tip wins when nobody is penalised");
 
         let cooling: std::collections::HashMap<_, _> = [(peer(1), 5)].into_iter().collect();
-        let (chosen, tip) = super::best_blocksync_peer(&tips, 100, &cooling).unwrap();
+        let (chosen, tip) = super::best_blocksync_peer(&tips, 100, &cooling, |_| true).unwrap();
         assert_eq!(chosen, peer(2), "the failing peer must not hold up catch-up");
         assert_eq!(tip, 129);
     }
@@ -1743,11 +2040,11 @@ mod peer_exchange_tests {
         let cooling: std::collections::HashMap<_, _> =
             [(peer(1), 5), (peer(2), 1)].into_iter().collect();
 
-        assert!(super::best_blocksync_peer(&tips, 100, &cooling).is_none());
+        assert!(super::best_blocksync_peer(&tips, 100, &cooling, |_| true).is_none());
 
         // One tick later peer(2) has served its penalty — the driver's `retain` drops it at zero.
         let cooling: std::collections::HashMap<_, _> = [(peer(1), 4)].into_iter().collect();
-        let (chosen, _) = super::best_blocksync_peer(&tips, 100, &cooling).unwrap();
+        let (chosen, _) = super::best_blocksync_peer(&tips, 100, &cooling, |_| true).unwrap();
         assert_eq!(chosen, peer(2), "catch-up has to resume on its own, without a reconnect");
     }
 
@@ -1758,7 +2055,7 @@ mod peer_exchange_tests {
         let mut tips = std::collections::HashMap::new();
         tips.insert(peer(1), 100);
         tips.insert(peer(2), 99);
-        assert!(super::best_blocksync_peer(&tips, 100, &no_cooldown()).is_none());
+        assert!(super::best_blocksync_peer(&tips, 100, &no_cooldown(), |_| true).is_none());
     }
 
     #[test]
@@ -1767,14 +2064,14 @@ mod peer_exchange_tests {
         tips.insert(peer(1), 105);
         tips.insert(peer(2), 130);
         tips.insert(peer(3), 90); // behind us — must not be picked
-        let (chosen, tip) = super::best_blocksync_peer(&tips, 100, &no_cooldown()).unwrap();
+        let (chosen, tip) = super::best_blocksync_peer(&tips, 100, &no_cooldown(), |_| true).unwrap();
         assert_eq!(chosen, peer(2));
         assert_eq!(tip, 130);
     }
 
     #[test]
     fn with_no_known_peers_there_is_nobody_to_ask() {
-        assert!(super::best_blocksync_peer(&std::collections::HashMap::new(), 0, &no_cooldown()).is_none());
+        assert!(super::best_blocksync_peer(&std::collections::HashMap::new(), 0, &no_cooldown(), |_| true).is_none());
     }
 
     /// The exact production shape: one block behind, so ask for exactly one block.
@@ -2159,7 +2456,26 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
                     .with_request_timeout(Duration::from_secs(30)),
             );
 
-            HelixBehaviour { gossipsub, mdns, connection_limits, ip_limits, blocksync, genesis_sync }
+            // Short timeout, unlike the two above: this request only has value inside the round
+            // that prompted it. An answer that arrives after the round is gone is at best wasted
+            // and at worst a stale proposal the engine has to reject, so it is better to give up
+            // and ask again next round than to hold the slot open.
+            let roundsync = request_response::Behaviour::with_codec(
+                RoundSyncCodec,
+                [(ROUNDSYNC_PROTOCOL, request_response::ProtocolSupport::Full)],
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(5)),
+            );
+
+            HelixBehaviour {
+                gossipsub,
+                mdns,
+                connection_limits,
+                ip_limits,
+                blocksync,
+                genesis_sync,
+                roundsync,
+            }
         })
         .expect("behaviour setup never fails")
         .with_swarm_config(|cfg| {
@@ -2180,4 +2496,129 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
         .build();
 
     Ok(swarm)
+}
+
+#[cfg(test)]
+mod blocksync_selection_tests {
+    use super::{best_blocksync_peer, BLOCKSYNC_PEER_COOLDOWN_TICKS};
+    use libp2p::PeerId;
+    use std::collections::HashMap;
+
+    fn no_cooldown() -> HashMap<PeerId, u32> {
+        HashMap::new()
+    }
+
+    /// `peer_tips` is keyed by the validator that *originated* an announcement, which is the
+    /// honest attribution but means the map can name peers we hold no connection to. Asking one
+    /// of those costs a dial attempt and an `OutboundFailure`, and the cooldown that failure
+    /// earns lands on a peer that did nothing wrong.
+    #[test]
+    fn the_highest_tip_is_skipped_when_we_have_no_connection_to_that_peer() {
+        let unreachable = PeerId::random();
+        let connected = PeerId::random();
+        let mut tips = HashMap::new();
+        tips.insert(unreachable, 900);
+        tips.insert(connected, 400);
+
+        let (chosen, tip) =
+            best_blocksync_peer(&tips, 100, &no_cooldown(), |p| *p == connected).unwrap();
+
+        assert_eq!(chosen, connected, "must ask the peer we can actually reach");
+        assert_eq!(tip, 400);
+    }
+
+    /// The single-peer case, which is the one a fresh node behind the tunnel is actually in: no
+    /// request at all beats a request that can only fail.
+    #[test]
+    fn nobody_is_asked_when_every_peer_ahead_is_unreachable() {
+        let unreachable = PeerId::random();
+        let mut tips = HashMap::new();
+        tips.insert(unreachable, 900);
+
+        assert!(best_blocksync_peer(&tips, 100, &no_cooldown(), |_| false).is_none());
+    }
+
+    /// Connectivity is an additional filter, never a replacement for the cooldown: a connected
+    /// peer serving its penalty still must not be picked.
+    #[test]
+    fn being_connected_does_not_override_a_cooldown() {
+        let cooling = PeerId::random();
+        let mut tips = HashMap::new();
+        tips.insert(cooling, 900);
+        let mut cooldown = HashMap::new();
+        cooldown.insert(cooling, BLOCKSYNC_PEER_COOLDOWN_TICKS);
+
+        assert!(best_blocksync_peer(&tips, 100, &cooldown, |_| true).is_none());
+    }
+}
+
+#[cfg(test)]
+mod observed_height_tests {
+    use super::{handle_app_message, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_VOTES};
+    use helix_consensus::proposal::Proposal;
+    use helix_core::block::{genesis_block, Block};
+    use helix_crypto::{Address, PublicKey, Signature};
+    use tokio::sync::mpsc;
+
+    fn block_at(height: u64) -> Block {
+        let pk = PublicKey::from_bytes(vec![7; 32]);
+        let mut block = genesis_block(
+            Address::from_public_key(&pk),
+            pk,
+            Signature::from_bytes(vec![9; 32]),
+            1_700_000_000_000,
+        );
+        block.header.height = height;
+        block
+    }
+
+    /// A committed block is the sender's own finalized history: it holds at least that height.
+    #[tokio::test]
+    async fn a_committed_block_claims_its_own_height() {
+        let (tx, _rx) = mpsc::channel(4);
+        let data = bincode::serialize(&(block_at(4_200), Vec::<helix_consensus::vote::Vote>::new()))
+            .unwrap();
+
+        let outcome = handle_app_message(TOPIC_COMMITTED_BLOCKS, &data, &tx).await;
+
+        assert!(!outcome.malformed);
+        assert_eq!(outcome.observed_height, Some(4_200));
+    }
+
+    /// A proposal is a claim about the block *below* it — the proposer built on its own tip and
+    /// is asking the set to accept the next one. Reading it as the proposed height would have us
+    /// request a block nobody has committed, take a short answer, and cool down an honest peer.
+    #[tokio::test]
+    async fn a_proposal_claims_only_the_height_below_it() {
+        let (tx, _rx) = mpsc::channel(4);
+        let data = bincode::serialize(&Proposal::fresh(0, block_at(4_200))).unwrap();
+
+        let outcome = handle_app_message(TOPIC_BLOCKS, &data, &tx).await;
+
+        assert!(!outcome.malformed);
+        assert_eq!(outcome.observed_height, Some(4_199));
+    }
+
+    /// And a proposal for height 0 claims nothing rather than underflowing.
+    #[tokio::test]
+    async fn a_proposal_at_the_genesis_height_claims_nothing() {
+        let (tx, _rx) = mpsc::channel(4);
+        let data = bincode::serialize(&Proposal::fresh(0, block_at(0))).unwrap();
+
+        let outcome = handle_app_message(TOPIC_BLOCKS, &data, &tx).await;
+
+        assert_eq!(outcome.observed_height, None);
+    }
+
+    /// A vote carries a height, but it is a claim about the round being decided, not about what
+    /// the sender holds — a validator votes on the block it is being asked about.
+    #[tokio::test]
+    async fn a_malformed_vote_is_a_strike_and_still_claims_no_height() {
+        let (tx, _rx) = mpsc::channel(4);
+
+        let outcome = handle_app_message(TOPIC_VOTES, b"not a vote", &tx).await;
+
+        assert!(outcome.malformed);
+        assert_eq!(outcome.observed_height, None);
+    }
 }

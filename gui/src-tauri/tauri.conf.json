@@ -19,7 +19,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://helix.silvra.net http://127.0.0.1:8545 http://localhost:8545"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://node.silvra.net http://127.0.0.1:8545 http://localhost:8545"
     }
   },
   "bundle": {

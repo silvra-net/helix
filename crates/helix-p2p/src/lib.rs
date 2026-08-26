@@ -5,6 +5,7 @@ pub mod genesis_sync;
 mod conn_limits;
 mod net_addr;
 pub mod reputation;
+pub mod roundsync;
 pub mod peer_store;
 pub mod service;
 
@@ -17,6 +18,9 @@ pub use genesis_sync::{
     GenesisPayload, GenesisProvider, GenesisRequest, GenesisResponse, GENESIS_PROTOCOL,
 };
 pub use reputation::PeerReputation;
+pub use roundsync::{
+    RoundProvider, RoundSyncRequest, RoundSyncResponse, MAX_ROUNDSYNC_VOTES, ROUNDSYNC_PROTOCOL,
+};
 pub use service::{P2PCommand, P2PEvent, P2PService, MAX_CATCHUP_SERVE_BLOCKS};
 
 use thiserror::Error;

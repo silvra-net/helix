@@ -9,7 +9,7 @@ talk to a node over its REST API — the same binary that runs the node with `he
 these commands never boot a node or open the chain database.
 
 They pick a node in this order: whatever you passed with `--node` (or `HELIX_NODE=...`), then a
-node running on this machine, then the public network (`https://helix.silvra.net`). So running
+node running on this machine, then the public network (`https://node.silvra.net`). So running
 your own node is enough to be asked — you do not have to configure anything — while a freshly
 downloaded binary still works against the live chain out of the box. When a local node answers,
 the client says so on stderr, and says it too if that node is still catching up, so a balance

@@ -10,7 +10,7 @@ use helix_crypto::Hash;
 
 /// The public Helix network's RPC endpoint — the one seed a brand-new node dials, and the one
 /// endpoint whose answers about *which chain this is* are never believed (see [`ChainIdSource`]).
-pub const DEFAULT_SEED_PEER: &str = "https://helix.silvra.net";
+pub const DEFAULT_SEED_PEER: &str = "https://node.silvra.net";
 
 /// The public Helix network's genesis hash, compiled in.
 ///

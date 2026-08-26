@@ -4,7 +4,7 @@
 
 ## REST API
 
-Base URL: `https://helix.silvra.net` for the public network, or `http://127.0.0.1:8545` for
+Base URL: `https://node.silvra.net` for the public network, or `http://127.0.0.1:8545` for
 your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 
 | Method | Path | Description |

@@ -127,6 +127,16 @@ impl VoteSet {
             .collect()
     }
 
+    /// Every vote this set holds, regardless of which hash it backs — including nil.
+    ///
+    /// Unlike `votes_for`/`quorum_votes` this makes no claim about agreement: it is the raw
+    /// record of who voted what in this round, for a peer that is asking what it missed
+    /// (`BftEngine::round_evidence`). Same provenance guarantee as the others — everything here
+    /// went through `add`, so it is signature-verified and from an in-set validator.
+    pub fn all_votes(&self) -> Vec<Vote> {
+        self.votes.values().cloned().collect()
+    }
+
     pub fn total_power_seen(&self) -> u64 {
         self.power_by_hash.values().sum()
     }

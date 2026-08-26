@@ -44,6 +44,63 @@ pub const PROPOSAL_TIMEOUT_TICKS: u32 = 2;
 /// tuning either constant can't quietly break the ordering they depend on.
 const _: () = assert!(PROPOSAL_TIMEOUT_TICKS < ROUND_TIMEOUT_TICKS);
 
+/// Ticks added to both timeouts per round already spent on this height — Tendermint's
+/// `timeoutPropose(round) = base + round · delta`.
+///
+/// **This is what makes two validators converge again, and its absence is what froze the chain.**
+/// With a *fixed* window both nodes burn rounds at exactly the same rate, so a phase offset
+/// between their clocks is preserved forever: each one's proposal arrives at the other after that
+/// other has already left the round, is discarded as stale, and the height never commits. Measured
+/// 2026-08-26 on the runtime-join test — A sat on rounds 54/56/58 receiving B's proposals for
+/// 53/55/57, and vice versa, for as long as the test ran. Both nodes agreed on the set, the
+/// height, the quorum and each other's presence; only the round numbers never met.
+///
+/// Growing the window breaks the symmetry: the node that is *ahead* holds each round longer than
+/// the node behind it, so the gap closes on its own and the two land in the same round. The
+/// classic partial-synchrony argument — eventually the timeout exceeds the real message delay —
+/// is the same reason Tendermint does it.
+const PROPOSAL_TIMEOUT_STEP_TICKS: u32 = 2;
+const ROUND_TIMEOUT_STEP_TICKS: u32 = 5;
+
+/// Rounds after which the growth stops. Unbounded backoff is what the textbook prescribes, but a
+/// chain that spent 2434 rounds on one height (live, 2026-08-05) would come back to windows
+/// measured in hours and look dead long after the fault was fixed. The cap trades the theoretical
+/// guarantee for an operational one; the round-skip rule below (`peer_round_to_jump_to`) is what
+/// carries convergence past the cap, and it does not depend on timing at all.
+const TIMEOUT_BACKOFF_MAX_ROUNDS: u32 = 8;
+
+/// Ticks a round waits for its proposal before *asking a peer* for it (`missing_proposal`).
+///
+/// Strictly below the nil-prevote window, and that ordering is the whole point. Asking at the same
+/// moment nil is cast is asking too late: `RoundState::open_for_nil_prevote` deliberately closes
+/// the round to proposals — a second, conflicting prevote from this node would be equivocation —
+/// so an answer that arrives after it cannot be used for anything. Measured 2026-08-26, when this
+/// was set to the nil window: the answer came back within 200 ms, carried the proposal, and was
+/// discarded eight times in a row while the height sat still.
+///
+/// One tick is cheap because it costs nothing on a healthy round: a proposal that arrived is
+/// already here, and `missing_proposal` returns `None` before any request is built.
+pub const PROPOSAL_PULL_TICKS: u32 = 1;
+
+/// Asking has to happen strictly before the round stops being able to use the answer.
+const _: () = assert!(PROPOSAL_PULL_TICKS < PROPOSAL_TIMEOUT_TICKS);
+
+/// Ticks to wait for round `round`'s proposal before prevoting nil.
+pub fn proposal_timeout_ticks(round: u32) -> u32 {
+    PROPOSAL_TIMEOUT_TICKS + PROPOSAL_TIMEOUT_STEP_TICKS * round.min(TIMEOUT_BACKOFF_MAX_ROUNDS)
+}
+
+/// Ticks round `round` may sit without precommit quorum before the backstop advances it.
+pub fn round_timeout_ticks(round: u32) -> u32 {
+    ROUND_TIMEOUT_TICKS + ROUND_TIMEOUT_STEP_TICKS * round.min(TIMEOUT_BACKOFF_MAX_ROUNDS)
+}
+
+/// Both windows are linear in the round, so checking the two ends checks every round between
+/// them: the nil prevote must still be cast strictly before its round's backstop fires, at round 0
+/// and at the cap alike. Without this a larger proposal step than round step would silently
+/// disable the nil-quorum fast path at high rounds.
+const _: () = assert!(PROPOSAL_TIMEOUT_STEP_TICKS <= ROUND_TIMEOUT_STEP_TICKS);
+
 /// Consecutive missed rounds (neither a prevote nor a precommit seen from a validator, see
 /// `record_round_liveness`) before this node starts *reporting* that validator as silent.
 /// Two rounds, so a single gossip hiccup stays quiet but a genuinely absent validator is
@@ -88,6 +145,40 @@ const _: () = assert!(PEER_WAIT_TIMEOUT_TICKS <= 90);
 /// flooding votes for a round we haven't started; comfortably above the handful
 /// of real early-arriving votes a normal validator set produces per round.
 const MAX_BUFFERED_VOTES: usize = 512;
+
+/// What one validator's participation in a **timed-out** round says about it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum LivenessVerdict {
+    /// Neither a prevote nor a precommit from this validator reached us. The only case that
+    /// counts toward `missed_rounds` and the only one the "Validator silent" line may name.
+    Silent,
+    /// We heard from it. `missing_precommit` marks the case that used to be invisible: the round
+    /// reached prevote quorum and then stalled, and this validator's precommit is the one that
+    /// did not arrive.
+    Heard { missing_precommit: bool },
+}
+
+/// Classify one validator's participation in a round that timed out.
+///
+/// The distinction that matters is *which phase* failed. A precommit is only cast once prevote
+/// quorum is reached (`lock_and_precommit`), so in a round that never got that far every
+/// validator is missing one — flagging that would name the whole set and say nothing. Only when
+/// the round *did* reach prevote quorum is a missing precommit a real, attributable diagnosis.
+///
+/// Kept separate from `record_round_liveness` because otherwise it is only observable through a
+/// log line, and a rule that can only be checked by reading logs is a rule nothing tests.
+fn liveness_verdict(
+    prevoted: bool,
+    precommitted: bool,
+    reached_prevote_quorum: bool,
+) -> LivenessVerdict {
+    if !prevoted && !precommitted {
+        return LivenessVerdict::Silent;
+    }
+    LivenessVerdict::Heard {
+        missing_precommit: reached_prevote_quorum && !precommitted,
+    }
+}
 
 /// BFT consensus engine — Tendermint-style two-phase commit.
 ///
@@ -250,6 +341,83 @@ impl BftEngine {
         if !dup {
             self.buffered_votes.push(vote);
         }
+    }
+
+    /// Whether `candidate` — the round a vote just arrived for — is a round peers have
+    /// demonstrably already reached and this node has not: Tendermint's round-skip rule, and the
+    /// half of round synchronization that does not depend on timing at all.
+    ///
+    /// "Demonstrably" is `> total_voting_power / 3`: strictly more than the fault budget, so at
+    /// least one honest validator is genuinely in that round. Anything less could be a single
+    /// faulty node pulling this one away from a round the rest of the network is still in.
+    ///
+    /// Every vote counted here is signature-verified against the active set first. Buffered votes
+    /// are *not* verified when they arrive (they are only checked on replay, inside `VoteSet::add`),
+    /// so without this a peer could push us to any round it liked with a forged vote for a
+    /// validator that never signed one.
+    ///
+    /// **What a peer can do with this, and why it is acceptable.** A validator holding more than a
+    /// third of the power can make us skip rounds. It could already do exactly that by proposing
+    /// at a high round (`receive_proposal` adopts a newer round), so this adds no capability. And
+    /// skipping rounds commits nothing: what gets finalized still needs a quorum *inside* one
+    /// round, and `locked_round`/`locked_block`/`should_prevote` — the entire cross-round safety
+    /// argument — are untouched here. The cost of being dragged forward is liveness, never a fork.
+    fn peer_round_to_jump_to(&self, candidate: u32) -> Option<u32> {
+        let current = self.active_round_number();
+        if candidate <= current {
+            return None;
+        }
+        let height = self.current_height + 1;
+        let fault_budget = self.validator_set.total_voting_power() / 3;
+
+        // Scoped to the round that just arrived rather than scanning the whole buffer, and that
+        // is a bound, not a shortcut: the buffer holds up to `MAX_BUFFERED_VOTES` entries, so
+        // re-scanning it per incoming vote would let a peer turn one message into hundreds of
+        // ML-DSA verifications. Deduplication is per (validator, round, type), so one round can
+        // hold at most two votes per set member — the work here is bounded by the validator set,
+        // not by what a peer sends. Nothing is lost by ignoring the other rounds: a round with
+        // enough power behind it keeps producing votes, and the next one pulls us there.
+        let mut voters: HashMap<Address, u64> = HashMap::new();
+        for vote in &self.buffered_votes {
+            if vote.height != height || vote.round != candidate {
+                continue;
+            }
+            let Some(validator) = self.validator_set.get(&vote.validator) else {
+                continue;
+            };
+            // Skip a probationer before paying for a signature verification: it carries zero
+            // voting power (#132), so it cannot move the sum below past the fault budget however
+            // many votes it sends. The threshold measured in *power* is what actually enforces
+            // "a probationer cannot pull the set to its round"; this is the cheap short-circuit,
+            // not the rule — removing it changes performance, not behaviour.
+            if validator.voting_power == 0 || vote.verify_signature().is_err() {
+                continue;
+            }
+            voters.insert(vote.validator.clone(), validator.voting_power);
+        }
+
+        (voters.values().sum::<u64>() > fault_budget).then_some(candidate)
+    }
+
+    /// Leave the round this node is on for `round`, because the network is provably there already
+    /// (see `peer_round_to_jump_to`). Abandons the active round if there is one.
+    ///
+    /// Deliberately *not* `record_round_liveness`: that names whoever failed to vote in a round
+    /// that timed out, and this round did not time out — it is being skipped because we are the
+    /// late one. Counting a silence here would report the validators that are ahead of us as the
+    /// reason we are behind them.
+    fn jump_to_round(&mut self, round: u32) {
+        if let Some(abandoned) = self.round.take() {
+            self.pending_evidence.extend(abandoned.evidence);
+        }
+        debug!(
+            height = self.current_height + 1,
+            from = self.pending_round,
+            to = round,
+            "Skipping ahead to the round peers have already reached"
+        );
+        self.pending_round = round;
+        self.round_ticks = 0;
     }
 
     /// Replay any buffered votes that belong to `round`, folding them in exactly
@@ -439,7 +607,11 @@ impl BftEngine {
     pub fn note_round_tick(&mut self, keypair: &KeyPair) -> bool {
         self.round_ticks += 1;
 
-        if self.round_ticks == PROPOSAL_TIMEOUT_TICKS {
+        // Both windows widen with the round (`proposal_timeout_ticks`): the round number is
+        // fixed for as long as the round lasts, so the value cannot change underneath the `==`.
+        let round = self.active_round_number();
+
+        if self.round_ticks == proposal_timeout_ticks(round) {
             self.prevote_nil(keypair);
         }
 
@@ -447,7 +619,13 @@ impl BftEngine {
             return true;
         }
 
-        self.round_ticks >= ROUND_TIMEOUT_TICKS
+        self.round_ticks >= round_timeout_ticks(round)
+    }
+
+    /// The round this node is currently deciding the pending height in — the active round's
+    /// number if it holds one, otherwise the round it is waiting for a proposal in.
+    fn active_round_number(&self) -> u32 {
+        self.round.as_ref().map_or(self.pending_round, |r| r.round)
     }
 
     /// Whether the network has agreed (2/3+ prevotes for `NIL_BLOCK_HASH`) that the active
@@ -470,6 +648,26 @@ impl BftEngine {
         }
         let height = self.current_height + 1;
         let round_num = self.round.as_ref().map_or(self.pending_round, |r| r.round);
+
+        // Never nil-prevote a round this node is itself the proposer of. There is nothing to give
+        // up on: the proposal is ours to make, and the block-production loop makes it in this very
+        // tick — `produce_block` runs right after `note_round_tick` when no round was active.
+        //
+        // Without this, both happen in the same tick and in this order: the clock fires, nil is
+        // cast for (h, r), then `propose` builds a fresh `RoundState` over it and casts a prevote
+        // for the real block at the same (h, r). That is textbook equivocation — two different
+        // prevotes, same height, same round — and the only thing that stopped it from being
+        // gossiped and slashed was the persisted signing guard refusing the second one. The cost
+        // was paid anyway: the proposer's own prevote never went out, so its own proposal could
+        // not gather the vote it needed and the round died. Measured 2026-08-26 on the
+        // four-validator test — two of these per run, every run, always `mark = NIL at (h, 0)`
+        // against an offered block hash at (h, 0) (backlog #176).
+        if self
+            .validator_set
+            .is_proposer(&self.address, height, round_num)
+        {
+            return;
+        }
 
         // Inspect any existing round before touching `self.round`. A proposal that did arrive
         // (phase past `Propose`) means there is nothing to abandon — our prevote for the real
@@ -728,7 +926,15 @@ impl BftEngine {
                 None => true,
             };
             if not_our_round {
+                let arrived_at = vote.round;
                 self.buffer_vote(vote);
+                // A vote from a round ahead of ours is also evidence of where the network is.
+                // Without acting on it, two validators whose round clocks drifted apart each keep
+                // buffering the other's votes and neither ever arrives in a round the other is
+                // still in — the freeze measured on 2026-08-26.
+                if let Some(round) = self.peer_round_to_jump_to(arrived_at) {
+                    self.jump_to_round(round);
+                }
                 return Ok(None);
             }
         }
@@ -921,6 +1127,72 @@ impl BftEngine {
             block,
             pol: r.proposal_pol.clone(),
         })
+    }
+
+    /// The `(height, round)` this node is waiting on a proposal for and cannot produce itself —
+    /// the one thing a peer can hand it that gossip no longer will.
+    ///
+    /// `None` in every case where asking would be pointless: we already hold the proposal, we are
+    /// this round's proposer (so it is ours to make), the round is one tick old and the proposal
+    /// may simply still be in flight (`PROPOSAL_PULL_TICKS`), or we have already prevoted nil and
+    /// so could no longer use an answer.
+    pub fn missing_proposal(&self) -> Option<(u64, u32)> {
+        let height = self.current_height + 1;
+        let round = self.active_round_number();
+        if self.round.as_ref().is_some_and(|r| r.proposal.is_some()) {
+            return None;
+        }
+        if self.validator_set.is_proposer(&self.address, height, round) {
+            return None;
+        }
+        // Already prevoted in this round — which here means nil, since holding a proposal was
+        // ruled out above. The round is closed to proposals from that moment on
+        // (`open_for_nil_prevote`), so an answer could not be applied and asking for one is a
+        // request per tick that can only ever be discarded.
+        if self.round.as_ref().is_some_and(|r| r.prevotes.has_voted(&self.address)) {
+            return None;
+        }
+        if self.round_ticks < PROPOSAL_PULL_TICKS {
+            return None;
+        }
+        Some((height, round))
+    }
+
+    /// Everything this node holds for the height it is currently deciding: the proposal envelope
+    /// and every vote it has collected or buffered for that height. This is what a peer gets when
+    /// it *asks* what it missed — the pull half of round synchronization.
+    ///
+    /// A pull is needed because gossip cannot re-deliver. Every message is published once; the
+    /// node re-offers its pending proposal each tick, but gossipsub derives a message's identity
+    /// from a hash of its bytes and refuses to publish the same bytes again for a minute
+    /// (`duplicate_cache_time`), so the re-offer never reaches a peer that was not listening the
+    /// first time — measured 2026-08-26, 483 refusals in a single node's log while the chain sat
+    /// still. A validator that was catching up during the one broadcast therefore had no way to
+    /// obtain the proposal at all, and the round could only time out.
+    ///
+    /// Nothing here is trusted by the receiver: it feeds the answer through `receive_proposal` and
+    /// `add_vote`, exactly as if it had arrived over gossip, so signatures, set membership and the
+    /// lock rules are all still applied. A peer can withhold or lie; it cannot make us accept
+    /// anything we would have rejected from the same bytes on the wire.
+    ///
+    /// Empty for any height but the one being decided — a committed height is served by block
+    /// sync, which carries the quorum certificate that proves it.
+    pub fn round_evidence(&self, height: u64) -> (Option<Proposal>, Vec<Vote>) {
+        if height != self.current_height + 1 {
+            return (None, Vec::new());
+        }
+        let mut votes = Vec::new();
+        if let Some(round) = self.round.as_ref() {
+            votes.extend(round.prevotes.all_votes());
+            votes.extend(round.precommits.all_votes());
+        }
+        votes.extend(
+            self.buffered_votes
+                .iter()
+                .filter(|v| v.height == height)
+                .cloned(),
+        );
+        (self.pending_proposal_envelope(), votes)
     }
 
     /// Tendermint prevote gate. `valid_round` is the proposal's proof-of-lock round (already
@@ -1245,24 +1517,64 @@ impl BftEngine {
     /// falls on 2-of-2, which tolerates zero absences by arithmetic — the answer to that is a
     /// fourth validator, not a lower bar.
     fn record_round_liveness(&mut self, stalled: &RoundState) {
-        for v in &self.validator_set.validators {
-            if v.address == self.address {
+        // (see `LivenessVerdict` for how the three outcomes are told apart)
+        // Only validators that can actually hold a round up. A probationer carries
+        // `voting_power = 0` and is excluded from `full_members()`, so it takes no proposer turn
+        // and contributes nothing toward quorum — its silence cannot stall anything. Reporting it
+        // as the reason sends the operator after the wrong node, which is not hypothetical: the
+        // live chain named `hlxSpsWWU…` in this line for days, at `voting_power=0`, while the vote
+        // actually missing went unnamed. Same failure as #171, one layer down.
+        let members: Vec<(Address, u64)> = self
+            .validator_set
+            .full_members()
+            .filter(|v| v.address != self.address && v.voting_power > 0)
+            .map(|v| (v.address.clone(), v.voting_power))
+            .collect();
+
+        // Drop counters for anyone no longer counted here (rotated out, or still probationary):
+        // `silent_peer_validators` reads this map, and an entry nobody can ever reset again would
+        // report a permanently silent validator that consensus is not even waiting for.
+        let counted: HashSet<Address> = members.iter().map(|(a, _)| a.clone()).collect();
+        self.missed_rounds.retain(|a, _| counted.contains(a));
+
+        // Which phase failed decides who is worth naming. A precommit is only cast once prevote
+        // quorum is reached (`lock_and_precommit`), so in a round that never got that far every
+        // validator is missing one and naming them would name the whole set.
+        let reached_prevote_quorum = stalled.prevotes.quorum_hash().is_some();
+
+        for (address, voting_power) in members {
+            let prevoted = stalled.prevotes.has_voted(&address);
+            let precommitted = stalled.precommits.has_voted(&address);
+
+            match liveness_verdict(prevoted, precommitted, reached_prevote_quorum) {
+            LivenessVerdict::Heard { missing_precommit } => {
+                self.missed_rounds.remove(&address);
+                // Heard from — but not with the vote this round was waiting on. This case was
+                // invisible: a prevote alone counted as proof of life, so the validator whose
+                // precommits never arrive, the one holding up a round that *did* reach prevote
+                // quorum, was filed as healthy and never named at all.
+                if missing_precommit {
+                    tracing::warn!(
+                        validator = %address,
+                        voting_power,
+                        quorum_threshold = self.validator_set.quorum_threshold(),
+                        "Prevoted, but its precommit never arrived here — this round had prevote quorum and stalled one phase later"
+                    );
+                }
                 continue;
             }
-            let voted = stalled.prevotes.has_voted(&v.address) || stalled.precommits.has_voted(&v.address);
-            if voted {
-                self.missed_rounds.remove(&v.address);
-                continue;
+            LivenessVerdict::Silent => {}
             }
-            let missed = self.missed_rounds.entry(v.address.clone()).or_insert(0);
+
+            let missed = self.missed_rounds.entry(address.clone()).or_insert(0);
             *missed += 1;
             if *missed >= LIVENESS_SILENCE_WARN_ROUNDS {
                 // The one line an operator of a stalled chain needs. Every round, because a
                 // stalled chain logs nothing else and "how long already" is half the diagnosis.
                 tracing::warn!(
-                    validator = %v.address,
+                    validator = %address,
                     missed_rounds = *missed,
-                    voting_power = v.voting_power,
+                    voting_power,
                     quorum_threshold = self.validator_set.quorum_threshold(),
                     total_voting_power = self.validator_set.total_voting_power(),
                     "Validator silent — consensus cannot reach quorum without its votes"
@@ -3412,6 +3724,99 @@ mod tests {
         );
     }
 
+    /// A probationer holds `voting_power = 0` and is excluded from `full_members()`, so it takes
+    /// no proposer turn and adds nothing to quorum — the round is not waiting on it and cannot
+    /// be, whatever it does. Naming it as the reason sends the operator to inspect a node whose
+    /// silence is free.
+    ///
+    /// Not hypothetical: production logged exactly this for days about `hlxSpsWWU…`, at
+    /// `voting_power=0`, in the line that reads "consensus cannot reach quorum without its
+    /// votes" — while the vote that was actually missing went unnamed.
+    ///
+    /// Mutation check: iterate `validator_set.validators` again instead of `full_members()`.
+    #[test]
+    fn a_probationary_validator_is_never_named_as_the_reason_a_round_stalled() {
+        let v = two_validators();
+        let peer_addr = Address::from_public_key(&v.peer_kp.public);
+        let probationer = Address::from_public_key(&KeyPair::generate().public);
+        let mut validators = v.validator_set.validators.clone();
+        validators.push(Validator::new_probationary(probationer.clone(), 1_000, true));
+        let set = ValidatorSet::new(validators, 0);
+        assert_eq!(
+            set.get(&probationer).unwrap().voting_power,
+            0,
+            "premise of this test: a probationer carries no power"
+        );
+        let mut engine = BftEngine::new(set, v.self_addr.clone(), 0);
+
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        for _ in 0..SILENT_ROUNDS {
+            tick_to_timeout_and_advance(&mut engine, &v.self_kp);
+        }
+
+        assert_eq!(
+            engine.missed_rounds.get(&probationer),
+            None,
+            "a validator with no voting power cannot hold a round up, so it must never be \
+             counted — or reported — as the reason one timed out"
+        );
+        assert!(
+            engine.missed_rounds.get(&peer_addr).copied().unwrap_or(0) > 0,
+            "the full member that really is silent must still be counted, or this test would \
+             pass just as well with the counting removed altogether"
+        );
+    }
+
+    /// A validator we heard prevote is not silent — whatever else is wrong with it. Reporting
+    /// it as silent points at an absent node when the node is present.
+    #[test]
+    fn a_validator_heard_in_prevote_is_not_silent() {
+        assert_eq!(
+            liveness_verdict(true, false, false),
+            LivenessVerdict::Heard { missing_precommit: false }
+        );
+    }
+
+    /// The case that used to be invisible: the round reached prevote quorum and then stalled,
+    /// and this validator's precommit is the one missing. Before, a prevote alone reset the
+    /// silence counter and nothing looked at the second phase, so the validator actually holding
+    /// the round up was filed as healthy and never named.
+    #[test]
+    fn a_missing_precommit_after_prevote_quorum_is_its_own_diagnosis() {
+        assert_eq!(
+            liveness_verdict(true, false, true),
+            LivenessVerdict::Heard { missing_precommit: true },
+            "prevote quorum was reached and this validator's precommit did not arrive — that is \
+             the vote the round is stuck on, and it must be nameable"
+        );
+    }
+
+    /// And it is only a diagnosis *because* prevote quorum was reached. Without it every
+    /// validator is missing a precommit — they are cast only after prevote quorum — so flagging
+    /// that would name the whole set and mean nothing.
+    #[test]
+    fn a_missing_precommit_without_prevote_quorum_is_not_reported() {
+        assert_eq!(
+            liveness_verdict(true, false, false),
+            LivenessVerdict::Heard { missing_precommit: false },
+            "no prevote quorum means nobody precommitted yet — that is the protocol working, \
+             not a validator to name"
+        );
+    }
+
+    /// Silence is the absence of *both* phases. A validator that only precommitted (its prevote
+    /// lost in gossip) is still one we heard from.
+    #[test]
+    fn only_hearing_nothing_at_all_counts_as_silent() {
+        assert_eq!(liveness_verdict(false, false, false), LivenessVerdict::Silent);
+        assert_eq!(liveness_verdict(false, false, true), LivenessVerdict::Silent);
+        assert_eq!(
+            liveness_verdict(false, true, true),
+            LivenessVerdict::Heard { missing_precommit: false },
+            "a precommit is proof of life even if we never saw the prevote"
+        );
+    }
+
     /// The other half of the same rule, stated positively: silence is *reported*, never acted
     /// on. A peer that has said nothing for far longer than the old jail window keeps every bit
     /// of its voting power, so this node's quorum threshold never moves.
@@ -3569,10 +3974,14 @@ mod tests {
         );
 
         // Open (or confirm) a round for the current pending round, exactly as `prevote_nil`
-        // would by `PROPOSAL_TIMEOUT_TICKS` — needed to know the real round number to target;
-        // `active_round_num()` is `None` right after the loop above, since the last
+        // would at this round's proposal window — needed to know the real round number to
+        // target; `active_round_num()` is `None` right after the loop above, since the last
         // `advance_round` call always clears `self.round` before returning.
-        for _ in 0..PROPOSAL_TIMEOUT_TICKS {
+        //
+        // The window is asked for by round rather than hardcoded to `PROPOSAL_TIMEOUT_TICKS`:
+        // it widens with the round (see `proposal_timeout_ticks`), and by here this engine is
+        // five rounds in.
+        for _ in 0..proposal_timeout_ticks(engine.pending_round()) {
             engine.note_round_tick(&v.self_kp);
         }
         engine.take_outbound_votes();
@@ -3614,4 +4023,226 @@ mod tests {
         );
     }
 
+
+    // ── Round synchronization (2026-08-26): the freeze a fixed round window caused ──────────
+
+    /// **The equivocation the signing guard was catching twice per run.** A node that is the
+    /// proposer for a round must not nil-prevote it: the block-production loop calls
+    /// `note_round_tick` and then, in the same tick, `produce_block`. With nil cast first, `propose`
+    /// builds a fresh round over it and casts a prevote for the real block at the same
+    /// (height, round) — two different prevotes, one round, which is exactly what gets a validator
+    /// slashed 5 %. Only the persisted `SigningGuard` stopped it from going out, and it stopped the
+    /// *useful* one: the proposer's own prevote for its own block.
+    ///
+    /// Mutation check: remove the `is_proposer` guard in `prevote_nil` and this fails.
+    #[test]
+    fn the_proposer_of_a_round_never_prevotes_nil_in_it() {
+        let v = two_validators();
+        // `two_validators` puts `self_addr` at the index that proposes height 1, round 0.
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        assert!(
+            engine.validator_set.is_proposer(&v.self_addr, 1, 0),
+            "precondition: this node is the proposer for height 1 round 0"
+        );
+
+        // Run the clock past the nil window without ever proposing — the state the loop is in when
+        // it has been held back a tick or two (sync gate, peer wait) before `produce_block` runs.
+        for _ in 0..proposal_timeout_ticks(0) + 3 {
+            engine.note_round_tick(&v.self_kp);
+        }
+
+        let cast = engine.take_outbound_votes();
+        assert!(
+            cast.is_empty(),
+            "the proposer gave up on a proposal that is its own to make and cast {} vote(s): {:?}",
+            cast.len(),
+            cast.iter().map(|c| (c.round, c.block_hash)).collect::<Vec<_>>()
+        );
+
+        // …and the proposal it then makes carries exactly one prevote, its own, uncontested.
+        engine
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![])
+            .expect_err("a two-validator set awaits the peer's vote");
+        let after = engine.take_outbound_votes();
+        assert_eq!(after.len(), 1, "exactly one prevote for the proposed block");
+        assert_ne!(
+            after[0].block_hash, NIL_BLOCK_HASH,
+            "and it must be for the block, not nil — a nil here is the equivocation"
+        );
+    }
+
+
+    /// The windows must actually widen. Two validators with a fixed window burn rounds at
+    /// identical rates, so a phase offset between their clocks survives forever and each one's
+    /// proposal always lands in a round the other has already left — measured live, height 300,
+    /// both nodes healthy and agreeing on everything but the round number.
+    ///
+    /// Mutation check: set `PROPOSAL_TIMEOUT_STEP_TICKS`/`ROUND_TIMEOUT_STEP_TICKS` to 0 and this
+    /// fails.
+    #[test]
+    fn a_later_round_waits_longer_than_an_earlier_one() {
+        assert!(
+            proposal_timeout_ticks(3) > proposal_timeout_ticks(0),
+            "a later round must give the proposal more time, or two drifted validators never meet"
+        );
+        assert!(
+            round_timeout_ticks(3) > round_timeout_ticks(0),
+            "the backstop has to widen with it, or the wider proposal window is simply cut off"
+        );
+        // The nil prevote must still be cast strictly inside its own round, at every round.
+        for round in [0, 1, 5, TIMEOUT_BACKOFF_MAX_ROUNDS, TIMEOUT_BACKOFF_MAX_ROUNDS + 50] {
+            assert!(
+                proposal_timeout_ticks(round) < round_timeout_ticks(round),
+                "round {round}: nil has to be cast before the backstop fires"
+            );
+        }
+        assert_eq!(
+            proposal_timeout_ticks(TIMEOUT_BACKOFF_MAX_ROUNDS + 1_000),
+            proposal_timeout_ticks(TIMEOUT_BACKOFF_MAX_ROUNDS),
+            "growth stops at the cap — a chain that spent thousands of rounds on one height must \
+             not come back with windows measured in hours"
+        );
+    }
+
+    /// Tendermint's round-skip rule: enough voting power in a later round is proof the network is
+    /// there, and this node follows rather than waiting out a round nobody else is in.
+    ///
+    /// Mutation check: remove the `peer_round_to_jump_to` call in `add_vote` and this fails.
+    #[test]
+    fn a_vote_from_a_round_ahead_pulls_this_node_forward() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        assert_eq!(engine.pending_round(), 0, "precondition: this node starts at round 0");
+
+        let ahead = peer_vote(&v.peer_kp, VoteType::Prevote, 1, 7, NIL_BLOCK_HASH);
+        engine.add_vote(&v.self_kp, ahead).expect("a vote from a later round is not an error");
+
+        assert_eq!(
+            engine.pending_round(),
+            7,
+            "half the set voting in round 7 is where the round is — sitting in round 0 waiting \
+             for a proposal nobody will make again is the freeze this rule exists to end"
+        );
+    }
+
+    /// The jump counts *verified* votes only. Buffered votes are not checked when they arrive
+    /// (only on replay, inside `VoteSet::add`), so without the signature check here a single
+    /// forged message would move this node to any round its sender liked.
+    #[test]
+    fn a_forged_vote_cannot_drag_this_node_to_another_round() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+
+        let mut forged = peer_vote(&v.peer_kp, VoteType::Prevote, 1, 9, NIL_BLOCK_HASH);
+        // Signed for round 9, presented as round 11: the signature no longer matches the content.
+        forged.round = 11;
+        engine.add_vote(&v.self_kp, forged).expect("a vote we cannot use is not an error");
+
+        assert_eq!(
+            engine.pending_round(),
+            0,
+            "an unverifiable vote is not evidence of anything"
+        );
+    }
+
+    /// A probationer holds zero voting power by construction (#132), so where it happens to be is
+    /// no evidence of where the quorum is — and following it would hand a stake with no chain
+    /// weight behind it the power to move everyone else's rounds.
+    ///
+    /// Mutation check, stated precisely because neither obvious single-line mutation makes this
+    /// red — measured, not assumed. Deleting the `voting_power == 0` short-circuit leaves it green
+    /// (a zero-power vote adds zero to the sum either way), and switching the threshold to a vote
+    /// *count* leaves it green too (the short-circuit already dropped the probationer). Only both
+    /// together turn it red, which is the honest description of this test: it pins the behaviour
+    /// against two independent guards, not one implementation detail.
+    #[test]
+    fn a_zero_power_probationer_cannot_pull_the_set_to_its_round() {
+        let (full_kp, full_addr, probationer_kp, _, set) = full_power_plus_probationer();
+        let mut engine = BftEngine::new(set, full_addr, 0);
+
+        let ahead = peer_vote(&probationer_kp, VoteType::Prevote, 1, 12, NIL_BLOCK_HASH);
+        engine.add_vote(&full_kp, ahead).expect("a probationer's vote is not an error");
+
+        assert_eq!(engine.pending_round(), 0, "zero power proves nothing about the round");
+    }
+
+    /// The pull is asked for only when it can help: not on the tick the round opened (the
+    /// proposal may still be in flight), never when the proposal is ours to make, and — the
+    /// ordering that matters — *before* this node prevotes nil, because a round closed for nil
+    /// can no longer accept the answer.
+    #[test]
+    fn a_missing_proposal_is_only_reported_once_waiting_for_it_stopped_being_normal() {
+        let v = two_validators();
+        // Round 0 of height 1 belongs to `self_addr` (see `two_validators`), so start at round 1,
+        // where this node is *not* the proposer and has to wait for one.
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let _ = engine.advance_round(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        engine.take_outbound_votes();
+        assert_eq!(engine.pending_round(), 1);
+
+        assert_eq!(
+            engine.missing_proposal(),
+            None,
+            "a round that just opened has a proposal in flight, not a missing one"
+        );
+
+        engine.note_round_tick(&v.self_kp);
+        engine.take_outbound_votes();
+
+        assert_eq!(
+            engine.missing_proposal(),
+            Some((1, 1)),
+            "a tick later it is not coming by itself — gossip publishes once, and the re-offer \
+             is refused as a duplicate"
+        );
+
+        // …and the asking has to stop once nil is cast: `open_for_nil_prevote` closes the round to
+        // proposals, so from here an answer could only be discarded. Measured 2026-08-26: eight
+        // answers carrying the proposal, all thrown away, while the height stood still.
+        for _ in 0..proposal_timeout_ticks(1) {
+            engine.note_round_tick(&v.self_kp);
+        }
+        engine.take_outbound_votes();
+        assert_eq!(
+            engine.missing_proposal(),
+            None,
+            "after prevoting nil this node cannot use a proposal for this round — asking anyway \
+             is one wasted request per tick"
+        );
+    }
+
+    /// The proposer of a round has nothing to ask anyone for.
+    #[test]
+    fn the_proposer_never_asks_a_peer_for_its_own_proposal() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        // Round 0 of height 1 is this node's turn.
+        for _ in 0..proposal_timeout_ticks(0) + 5 {
+            engine.note_round_tick(&v.self_kp);
+        }
+        engine.take_outbound_votes();
+
+        assert_eq!(engine.missing_proposal(), None, "we are the one who makes it");
+    }
+
+    /// What a peer gets when it asks: the proposal we hold and the votes we have seen — and
+    /// nothing at all for a height we are not deciding, which block sync serves with a quorum
+    /// certificate instead.
+    #[test]
+    fn round_evidence_serves_the_pending_proposal_and_stays_empty_for_other_heights() {
+        let v = two_validators();
+        let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), vec![]);
+        engine.take_outbound_votes();
+
+        let (proposal, votes) = engine.round_evidence(1);
+        assert!(proposal.is_some(), "the height being decided must be servable");
+        assert!(
+            votes.iter().any(|vote| vote.validator == v.self_addr),
+            "our own prevote is part of what a peer is missing"
+        );
+
+        let (nothing, none) = engine.round_evidence(2);
+        assert!(nothing.is_none() && none.is_empty(), "we hold no round for another height");
+    }
 }
