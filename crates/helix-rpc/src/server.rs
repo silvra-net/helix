@@ -1213,6 +1213,7 @@ fn chain_db_kb(path: Option<&std::path::Path>) -> u64 {
 /// and reporting space this process cannot actually use would promise headroom that is not
 /// there. Blocks are counted in `f_frsize` units, not `f_bsize` — the two differ on some
 /// filesystems, and using the wrong one is a silent factor-of-something error.
+#[cfg(unix)]
 fn disk_stats(path: Option<&std::path::Path>) -> (u64, u64) {
     let Some(path) = path else { return (0, 0) };
     // The volume, not the file: on a missing database file the parent directory still answers,
@@ -1228,6 +1229,20 @@ fn disk_stats(path: Option<&std::path::Path>) -> (u64, u64) {
         }
         Err(_) => (0, 0),
     }
+}
+
+/// `statvfs` is POSIX and `rustix` configures its `fs` module out on Windows entirely, so the
+/// call above does not merely fail there — it does not compile.
+///
+/// It went in on 2026-08-12, *after* the v0.11.1 tag, and broke every Windows job in the release
+/// workflow from that moment on. Nobody noticed for two weeks because no release was cut in
+/// between; the red "Build Helix Wallet" runs on master were saying exactly this and were read as
+/// noise. Reporting `(0, 0)` keeps the diagnostics endpoint honest on Windows (the two figures
+/// already mean "unreadable" everywhere else) rather than blocking a whole platform for one
+/// cosmetic number.
+#[cfg(not(unix))]
+fn disk_stats(_path: Option<&std::path::Path>) -> (u64, u64) {
+    (0, 0)
 }
 
 /// The one-minute load average, or 0.0 where `/proc` is unavailable.

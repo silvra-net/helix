@@ -22,7 +22,12 @@ tracing.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 hex.workspace = true
-rustix.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+# Unix only: its sole use is `statvfs` for the diagnostics endpoint, and rustix configures its
+# `fs` module out on Windows — declaring the dependency there would pull a crate whose only
+# needed module does not exist. See `disk_stats`.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
