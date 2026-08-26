@@ -20,9 +20,24 @@ pub const NANO_PER_HLX: u64 = 1_000_000_000;
 pub const TOTAL_SUPPLY_HLX: u64 = 33_000_000;
 
 /// Minimum stake required to enter the active validator set.
-/// 100 k HLX = 0.1 % of total supply — enough skin-in-the-game for slashing to hurt,
-/// low enough that legitimate node operators can participate.
-pub const MIN_VALIDATOR_STAKE: u64 = 100_000 * NANO_PER_HLX;
+///
+/// 10 k HLX = 0.03 % of total supply. **Lowered from 100 k on 2026-08-26**, and the reason is not
+/// economics: at 100 k this bar was a barrier to *us*, not to an attacker. Every operator on this
+/// network is funded out of `VALIDATOR_GENESIS_LIQUID_HLX`, so the minimum decides how many
+/// validators the launch reserve can seed — four at 100 k, thirty-three at 10 k. The measured
+/// bottleneck has never been stake-weighted attacks; it is that a set of three tolerates **zero**
+/// absences (`3f + 1`), and the chain sat frozen for three days in August 2026 for exactly that
+/// reason. Seven validators tolerate two, and seven is reachable at 10 k.
+///
+/// What the minimum does *not* control is voting power: `ValidatorSet::new` caps every member at
+/// `total_stake / 100`, so above that cap all validators are exactly equal however much they
+/// staked. Lowering the bar changes who may enter, never who weighs more.
+///
+/// One-way door, so chosen with the devnet's whole life in mind: lowering it again is free,
+/// raising it ejects everyone below the new bar at the next rotation (and governance may not raise
+/// it past `max_single_stake`, which would empty the set outright). It also sets the governance
+/// floor at `MIN_VALIDATOR_STAKE / 100` = 100 HLX.
+pub const MIN_VALIDATOR_STAKE: u64 = 10_000 * NANO_PER_HLX;
 
 /// Default validator pre-stake at genesis, for a chain being launched fresh. The validator
 /// needs this staked from block 0 so it survives the first epoch rotation (which filters by
@@ -33,15 +48,20 @@ pub const MIN_VALIDATOR_STAKE: u64 = 100_000 * NANO_PER_HLX;
 /// `ChainState::genesis_validator_stake` and handed to joining nodes via `GET /genesis`, so
 /// retuning this constant does not retroactively rewrite the genesis of chains already
 /// running under the old value. It applies to new chains only.
-pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 100_000; // = MIN_VALIDATOR_STAKE
+pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 10_000; // = MIN_VALIDATOR_STAKE
 
 /// Liquid balance the bootstrap validator holds at genesis, on top of its stake.
 ///
 /// Exists because `VALIDATOR_GENESIS_STAKE_HLX` sits exactly on `MIN_VALIDATOR_STAKE`: a single
-/// 5% slash (`SLASH_FRACTION_BPS`) leaves 95k and drops the validator out of the set at the next
-/// epoch, and it cannot stake its way back out of thin air. This reserve makes that recoverable
-/// in one transaction — staking takes effect immediately, only *unstaking* waits out the
-/// unbonding period. It doubles as an operator's working balance before block rewards accumulate.
+/// 5% slash (`SLASH_FRACTION_BPS`) leaves the validator below the bar and drops it out of the set
+/// at the next epoch, and it cannot stake its way back out of thin air. This reserve makes that
+/// recoverable in one transaction — staking takes effect immediately, only *unstaking* waits out
+/// the unbonding period. It doubles as an operator's working balance before block rewards
+/// accumulate.
+///
+/// The same trap applies to everyone else, which is why funding an operator with exactly the
+/// minimum is a mistake: hand them a margin above it, or their first slash ends their validator
+/// with no way back.
 ///
 /// Credited to whoever `GenesisConfig::validator` is, never a hardcoded address: this constant
 /// ships in a public repo, and naming one deployment's wallet here would prefund it on every
@@ -50,17 +70,21 @@ pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 100_000; // = MIN_VALIDATOR_STAKE
 ///
 /// Raised from 100k on 2026-07-22, and the reason is arithmetic rather than appetite. A
 /// validator set needs **four** members before it survives one going offline (`3f + 1`), each
-/// needs `MIN_VALIDATOR_STAKE` (100k), and block rewards accrue at ~0.56 HLX per block — so
-/// nobody can earn their way in, and a bootstrap validator holding 100k cannot fund even one
-/// other operator. That is not a theoretical limit: this chain sat halted with two validators
-/// because the second one's operator was unreachable, and the whole circulating supply was
-/// short of what a third would have cost. 500k funds three additional validators (110k each,
-/// the extra 10k being fee headroom — an operator who stakes every coin cannot afford the
-/// `Unjail` transaction that gets them back) and leaves a working reserve.
+/// needs `MIN_VALIDATOR_STAKE`, and block rewards accrue at ~0.56 HLX per block — so nobody can
+/// earn their way in, and a bootstrap validator that can fund no one else is a set of one. That is
+/// not a theoretical limit: this chain sat halted with two validators because the second one's
+/// operator was unreachable, and the whole circulating supply was short of what a third would have
+/// cost.
+///
+/// Kept at 500k when the minimum dropped to 10k on 2026-08-26 (Vistos' decision), which turns the
+/// same reserve from "three more validators" into **thirty-three** at 15k apiece. Seeding the set
+/// is the one thing this chain has never had enough of; headroom here costs nothing while it sits
+/// unspent, and the alternative — resetting again because the reserve ran dry — costs the whole
+/// chain.
 ///
 /// It is a launch reserve to be handed out, not a holding. If a deployment ever wants a
 /// genuinely small founder balance, lower this *and* accept that its validator set grows only
-/// as fast as people arrive with their own 100k.
+/// as fast as people arrive with their own stake.
 pub const VALIDATOR_GENESIS_LIQUID_HLX: u64 = 500_000;
 
 /// Pre-funded genesis wallets beyond the validator's bootstrap stake: (address, balance_HLX).

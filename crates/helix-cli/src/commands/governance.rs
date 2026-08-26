@@ -270,20 +270,28 @@ async fn submit(tx: &Transaction, node: &str) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helix_executor::genesis::MIN_VALIDATOR_STAKE;
+    use helix_executor::genesis::{MIN_VALIDATOR_STAKE, NANO_PER_HLX};
 
     /// Ties the CLI's unit handling to the chain's own floor check rather than restating the
     /// conversion factor — a test that recomputes `typed * 1e9` would pass against any
     /// consistent mistake, including the one this replaced.
+    ///
+    /// The figure typed at the floor is *derived* from `MIN_VALIDATOR_STAKE`, not written out.
+    /// It used to be the literal `1000.0`, which was the floor only while the minimum was 100 k —
+    /// lowering it to 10 k on 2026-08-26 turned this test red, and a test that goes red because a
+    /// constant it claims not to restate has moved was restating it after all.
     #[test]
     fn a_stake_typed_in_hlx_clears_the_chains_floor() {
-        // 1,000 HLX *is* the floor (`MIN_VALIDATOR_STAKE / 100`).
-        let (at_floor, _) = on_chain_value(&GovParamArg::MinValidatorStake, 1000.0).unwrap();
+        // Governance may lower the minimum to a hundredth of the compiled-in value; typed in HLX,
+        // that is what an operator would enter.
+        let floor_hlx = (MIN_VALIDATOR_STAKE / 100) as f64 / NANO_PER_HLX as f64;
+
+        let (at_floor, _) = on_chain_value(&GovParamArg::MinValidatorStake, floor_hlx).unwrap();
         assert_eq!(at_floor, MIN_VALIDATOR_STAKE / 100);
         assert!(GovernanceParam::MinValidatorStake.validate(at_floor).is_ok());
 
-        let (five_k, shown) = on_chain_value(&GovParamArg::MinValidatorStake, 5000.0).unwrap();
-        assert!(GovernanceParam::MinValidatorStake.validate(five_k).is_ok());
+        let (above, shown) = on_chain_value(&GovParamArg::MinValidatorStake, floor_hlx * 5.0).unwrap();
+        assert!(GovernanceParam::MinValidatorStake.validate(above).is_ok());
         assert!(shown.contains("HLX"), "the unit must be visible before signing: {shown}");
     }
 
