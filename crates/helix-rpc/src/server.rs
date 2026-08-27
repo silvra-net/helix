@@ -95,11 +95,52 @@ pub struct AppState {
 /// publicly reachable endpoint rather than relying on axum's implicit 2 MB default.
 const TX_SUBMIT_BODY_LIMIT_BYTES: usize = 64 * 1024;
 
+/// Default request budget per client IP: a burst of 30, refilling at 10/second.
+///
+/// Generous for a wallet or an explorer page and tight enough to blunt a single-source flood
+/// against a publicly reachable endpoint. It is also, and this is the part worth knowing, **the
+/// binding limit on how fast anyone can submit transactions** — well below what the chain itself
+/// can include (a 2 MB block every 2 s is ~180 transfers/second). Measured 2026-08-27 by flooding
+/// a node: 2000 signed transactions, 45 admitted, which is the bucket to the token.
+const DEFAULT_RPC_BURST: f64 = 30.0;
+const DEFAULT_RPC_REFILL_PER_SEC: f64 = 10.0;
+
+/// Override for `HELIX_RPC_RATE_LIMIT`, as `burst,refill_per_sec` (e.g. `2000,1000`).
+///
+/// The default is right for the public endpoint and wrong for two real cases it used to have no
+/// answer for: an operator running a private node for their own high-volume use, and any attempt
+/// to measure what the chain can actually do — a load test against the default measures this
+/// limiter and nothing else. Malformed input is ignored with a warning rather than failing the
+/// start: a node that refuses to boot over a typo'd tuning knob is worse than one that boots with
+/// its documented default.
+fn rate_limit_from_env() -> (f64, f64) {
+    let Ok(raw) = std::env::var("HELIX_RPC_RATE_LIMIT") else {
+        return (DEFAULT_RPC_BURST, DEFAULT_RPC_REFILL_PER_SEC);
+    };
+    let parsed = raw.split_once(',').and_then(|(b, r)| {
+        let burst: f64 = b.trim().parse().ok()?;
+        let refill: f64 = r.trim().parse().ok()?;
+        (burst >= 1.0 && refill > 0.0).then_some((burst, refill))
+    });
+    match parsed {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                value = %raw,
+                "HELIX_RPC_RATE_LIMIT is not `burst,refill_per_sec` with burst >= 1 and refill > 0 \
+                 — ignoring it and using the default {DEFAULT_RPC_BURST}/{DEFAULT_RPC_REFILL_PER_SEC}"
+            );
+            (DEFAULT_RPC_BURST, DEFAULT_RPC_REFILL_PER_SEC)
+        }
+    }
+}
+
 pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
-    // Burst of 30 requests per IP, sustained refill of 10/sec — generous enough
-    // for normal wallet/explorer use, tight enough to blunt a single-source flood
-    // against the publicly reachable RPC endpoint.
-    let limiter = Arc::new(RateLimiter::new(30.0, 10.0));
+    let (burst, refill) = rate_limit_from_env();
+    if (burst, refill) != (DEFAULT_RPC_BURST, DEFAULT_RPC_REFILL_PER_SEC) {
+        tracing::info!(burst, refill_per_sec = refill, "RPC rate limit overridden");
+    }
+    let limiter = Arc::new(RateLimiter::new(burst, refill));
 
     let app = Router::new()
         .route("/", get(root))
@@ -2227,6 +2268,30 @@ mod tests {
             }
         }
         state
+    }
+
+    /// The knob a load test needs and an operator can want — and the parsing that must never take
+    /// the node down with it.
+    #[test]
+    fn the_rate_limit_override_is_parsed_or_ignored_but_never_fatal() {
+        // Not set: the documented default, unchanged.
+        std::env::remove_var("HELIX_RPC_RATE_LIMIT");
+        assert_eq!(rate_limit_from_env(), (DEFAULT_RPC_BURST, DEFAULT_RPC_REFILL_PER_SEC));
+
+        std::env::set_var("HELIX_RPC_RATE_LIMIT", "2000,1000");
+        assert_eq!(rate_limit_from_env(), (2000.0, 1000.0));
+
+        // Everything malformed falls back rather than panicking or refusing to boot: a node that
+        // will not start over a typo'd tuning value is worse than one running its default.
+        for bad in ["", "nonsense", "10", "10,", ",10", "0,10", "10,0", "-5,10", "10,-1"] {
+            std::env::set_var("HELIX_RPC_RATE_LIMIT", bad);
+            assert_eq!(
+                rate_limit_from_env(),
+                (DEFAULT_RPC_BURST, DEFAULT_RPC_REFILL_PER_SEC),
+                "{bad:?} must fall back to the default"
+            );
+        }
+        std::env::remove_var("HELIX_RPC_RATE_LIMIT");
     }
 
     /// Backlog #156: an expired transaction must be answerable as expired, not as never seen.
