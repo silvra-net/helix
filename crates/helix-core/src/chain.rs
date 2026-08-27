@@ -27,7 +27,7 @@ pub const DEFAULT_SEED_PEER: &str = "https://node.silvra.net";
 /// pin.sh` exists because no unit test can catch this — the stale hash was perfectly well-formed
 /// and every suite was green. The check needs the live network.
 pub const DEFAULT_GENESIS_HASH: &str =
-    "2995f9332ee675596d14e4892b9afd77a927b673d0974ad521457b4985b17e37";
+    "dd98548a5c946adbb1ee5d66e25b0b5318b65294cc38c661e228657f3b347a21";
 
 /// [`DEFAULT_GENESIS_HASH`] as a [`Hash`].
 ///
