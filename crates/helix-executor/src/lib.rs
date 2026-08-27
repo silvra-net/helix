@@ -1865,13 +1865,31 @@ fn execute_vote_proposal(
     if proposal.yes_stake >= governance::quorum_threshold(proposal.total_staked_at_creation) {
         match proposal.param {
             GovernanceParam::MinValidatorStake => {
-                state.governance_params.min_validator_stake = proposal.new_value;
+                // The same ceiling `execute_create_proposal` applies, **re-checked here**, because
+                // the two moments are up to `VOTING_PERIOD_BLOCKS` apart and stakes move in
+                // between. Creation-time alone was not enough: propose the current largest stake,
+                // have that staker unstake most of it while the vote is still open, and the
+                // proposal passes into a value no remaining staker meets. `stakers()` is then
+                // empty, so `rotate_active_validators` retains nobody, `engine_validator_set`
+                // falls through to an empty `stakers()`, total voting power is 0 — and every node
+                // takes its bootstrap fallback and treats *itself* as the sole validator. That is
+                // not a stall, it is a fork, reached through the one path meant to prevent it.
+                //
+                // Refused rather than clamped: clamping would enact a value nobody voted for. The
+                // proposal simply does not pass yet — `yes_stake` only grows, so the next vote
+                // re-tries this check, and it succeeds as soon as some staker meets the value
+                // again. The voter's vote is still recorded either way.
+                let ceiling = state.max_single_stake();
+                if proposal.new_value <= ceiling {
+                    state.governance_params.min_validator_stake = proposal.new_value;
+                    proposal.executed = true;
+                }
             }
             GovernanceParam::FuelPerFeeUnit => {
                 state.governance_params.fuel_per_fee_unit = proposal.new_value;
+                proposal.executed = true;
             }
         }
-        proposal.executed = true;
     }
     state.set_proposal(proposal);
 
@@ -3575,6 +3593,135 @@ mod tests {
             receipt.error,
         );
         assert!(state.proposal(0).is_none(), "nothing may be recorded for it");
+    }
+
+    /// **The creation-time ceiling is not enough on its own, and the gap is a fork.**
+    ///
+    /// Creation and execution are up to `VOTING_PERIOD_BLOCKS` apart, and stakes move in that
+    /// window. Propose the current largest stake, let that staker unstake most of it while the
+    /// vote is open, and the proposal passes into a value no remaining staker meets — exactly the
+    /// state `a_proposal_that_would_disqualify_every_validator_is_refused_at_creation` exists to
+    /// prevent, reached by walking around it.
+    ///
+    /// What that costs is worse than a stall: `stakers()` empties, so `rotate_active_validators`
+    /// retains nobody and `engine_validator_set` falls through to an empty staker list. Total
+    /// voting power is then 0, which is the bootstrap condition every node treats as "I am the
+    /// only validator" — so each node continues on its own chain.
+    #[test]
+    fn a_minimum_stake_proposal_cannot_pass_into_a_value_nobody_meets_any_more() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let min = crate::genesis::MIN_VALIDATOR_STAKE;
+
+        // Three equal stakers. Total 9 units, so the supermajority is 7 — reachable by two full
+        // votes plus one reduced one, which is exactly the sequence that walks around the
+        // creation-time ceiling.
+        let kps: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+        let addrs: Vec<Address> =
+            kps.iter().map(|kp| Address::from_public_key(&kp.public)).collect();
+        let mut state = ChainState::new(0);
+        for a in &addrs {
+            state.update_account(a, |acc| {
+                acc.balance = 1_000_000_000;
+                acc.staked = 3 * min;
+            });
+        }
+
+        // Legitimate at creation: exactly the largest stake in existence.
+        let data = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, 3 * min);
+        let create =
+            signed_governance_tx(&kps[0], &addrs[0], TxType::CreateProposal, data, 0, 10_000);
+        assert!(execute_transaction(&mut state, &create, &validator, 0, 0).success);
+
+        // Two vote at full weight — 6 of the 7 needed, so nothing executes yet.
+        for i in 0..2 {
+            let nonce = if i == 0 { 1 } else { 0 };
+            let vote = signed_governance_tx(&kps[i], &addrs[i], TxType::VoteProposal,
+                governance::encode_vote(0), nonce, 10_000);
+            assert!(execute_transaction(&mut state, &vote, &validator, 1, 0).success);
+        }
+        assert!(!state.proposal(0).unwrap().executed, "premise: not yet passed");
+
+        // Everyone winds down to a third of what they had. Nothing here is against the rules —
+        // `execute_unstake`'s guard only protects the *last* validator, and there are three.
+        for a in &addrs {
+            state.update_account(a, |acc| acc.staked = min);
+        }
+        assert!(
+            state.max_single_stake() < 3 * min,
+            "premise: nobody meets the proposed minimum any more"
+        );
+
+        // The third vote now crosses the threshold — 6 + 1 = 7 — against the denominator frozen
+        // at creation.
+        let vote = signed_governance_tx(&kps[2], &addrs[2], TxType::VoteProposal,
+            governance::encode_vote(0), 0, 10_000);
+        let receipt = execute_transaction(&mut state, &vote, &validator, 2, 0);
+
+        assert!(receipt.success, "the vote itself is valid and must be recorded: {:?}", receipt.error);
+        let proposal = state.proposal(0).expect("the proposal still exists");
+        assert!(
+            proposal.yes_stake >= governance::quorum_threshold(proposal.total_staked_at_creation),
+            "premise: this vote does cross the supermajority ({} of {})",
+            proposal.yes_stake,
+            governance::quorum_threshold(proposal.total_staked_at_creation),
+        );
+        assert!(
+            !proposal.executed,
+            "but it must not take effect — the value no staker meets any more would empty the set"
+        );
+        assert_eq!(
+            state.governance_params.min_validator_stake, min,
+            "the parameter must be untouched"
+        );
+        assert!(
+            !state.stakers().is_empty(),
+            "and the validator set must still have somebody in it — an empty one is a fork, not a stall"
+        );
+    }
+
+    /// The other half, so the guard above cannot be satisfied by simply never executing anything:
+    /// once a stake meets the proposed value again, the same proposal passes on the next vote.
+    /// `yes_stake` only grows, so the re-check is genuinely a retry and not a permanent refusal.
+    #[test]
+    fn a_held_back_minimum_stake_proposal_passes_once_a_stake_meets_it_again() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let a_kp = KeyPair::generate();
+        let a = Address::from_public_key(&a_kp.public);
+        let b_kp = KeyPair::generate();
+        let b = Address::from_public_key(&b_kp.public);
+
+        let target = 5 * crate::genesis::MIN_VALIDATOR_STAKE;
+        let mut state = ChainState::new(0);
+        state.update_account(&a, |acc| {
+            acc.balance = 1_000_000_000;
+            acc.staked = target;
+        });
+        state.update_account(&b, |acc| {
+            acc.balance = 1_000_000_000;
+            acc.staked = crate::genesis::MIN_VALIDATOR_STAKE;
+        });
+
+        let data =
+            governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, target);
+        let create = signed_governance_tx(&a_kp, &a, TxType::CreateProposal, data, 0, 10_000);
+        assert!(execute_transaction(&mut state, &create, &validator, 0, 0).success);
+
+        // Same walk-around as above: it passes while nobody meets the value, and is held back.
+        state.update_account(&a, |acc| acc.staked = crate::genesis::MIN_VALIDATOR_STAKE);
+        let vote_a = signed_governance_tx(&a_kp, &a, TxType::VoteProposal,
+            governance::encode_vote(0), 1, 10_000);
+        assert!(execute_transaction(&mut state, &vote_a, &validator, 1, 0).success);
+        assert!(!state.proposal(0).unwrap().executed, "premise: held back");
+
+        // Someone stakes up to the proposed value, and the next vote enacts it.
+        state.update_account(&b, |acc| acc.staked = target);
+        let vote_b = signed_governance_tx(&b_kp, &b, TxType::VoteProposal,
+            governance::encode_vote(0), 0, 10_000);
+        assert!(execute_transaction(&mut state, &vote_b, &validator, 2, 0).success);
+
+        assert!(state.proposal(0).unwrap().executed, "the proposal must now take effect");
+        assert_eq!(state.governance_params.min_validator_stake, target);
+        assert!(!state.stakers().is_empty(), "and somebody still qualifies");
     }
 
     /// The control: raising the minimum up to what the largest staker actually holds must still
@@ -5317,6 +5464,96 @@ mod tests {
 
         assert_eq!(r1, crate::genesis::INITIAL_BLOCK_REWARD_HLX * crate::genesis::NANO_PER_HLX);
         assert_eq!(r2, r1 / 2, "reward must halve once height crosses a halving interval boundary");
+    }
+
+    /// Blocks straddling a halving boundary, executed one after another, and the books checked
+    /// against the schedule afterwards.
+    ///
+    /// The two tests above check the *edges* — the first block of an era, and the clamp at the
+    /// cap. Neither runs a sequence, and a sequence is where accounting drifts: `total_issued` is
+    /// a running sum maintained by `execute_block`, and nothing else re-derives it. A halving is
+    /// the one moment the addend changes, which makes it the one moment an off-by-one in the era
+    /// boundary would show up as a permanent supply discrepancy between nodes rather than a
+    /// visible error. This chain has already been bitten twice by a block reward minted where it
+    /// should not have been (#142, #145), both times found as a small fixed difference in
+    /// `circulating_supply` between nodes that agreed on every block hash.
+    ///
+    /// Note this never executes 15 million blocks: it runs the last few heights of era 0 and the
+    /// first few of era 1 directly, which is the boundary the schedule actually turns on.
+    #[test]
+    fn a_run_of_blocks_across_a_halving_boundary_keeps_the_books_exact() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        let issued_before = state.total_issued;
+
+        let boundary = crate::genesis::HALVING_INTERVAL_BLOCKS;
+        let heights: Vec<u64> = (boundary - 3..boundary + 3).collect();
+
+        let mut expected: u128 = 0;
+        for h in &heights {
+            let receipt = execute_block(&mut state, &empty_block(&validator, *h), None);
+            let scheduled = crate::genesis::scheduled_block_reward(*h);
+            assert_eq!(
+                receipt.block_reward_minted, scheduled,
+                "height {h} must mint exactly what the schedule says for it",
+            );
+            expected += u128::from(scheduled);
+        }
+
+        // The boundary really was crossed — otherwise this test would pass on a schedule that
+        // never halves at all.
+        let last_of_era_0 = crate::genesis::scheduled_block_reward(boundary - 1);
+        let first_of_era_1 = crate::genesis::scheduled_block_reward(boundary);
+        assert_eq!(
+            first_of_era_1,
+            last_of_era_0 / 2,
+            "premise: these heights straddle a real halving"
+        );
+
+        assert_eq!(
+            u128::from(state.total_issued - issued_before),
+            expected,
+            "the running total must equal the sum of the schedule over exactly these heights — a \
+             drift here is a supply divergence between nodes, not a visible failure"
+        );
+        assert!(
+            state.total_issued <= state.total_supply,
+            "and it must never cross the cap"
+        );
+    }
+
+    /// The other book: nothing minted may go missing, and nothing burned may be double-counted.
+    ///
+    /// `circulating_supply` is reported to every wallet and explorer as `total_issued -
+    /// total_burned`, so the two counters have to be exactly the balances they claim to summarise.
+    /// Checked against the sum of every account, because that is the number a reader would
+    /// reconstruct by hand if they doubted it.
+    #[test]
+    fn issued_minus_burned_matches_what_the_accounts_actually_hold() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+
+        for h in 1..=5u64 {
+            execute_block(&mut state, &empty_block(&validator, h), None);
+        }
+
+        let held: u128 = state
+            .accounts
+            .values()
+            .map(|a| u128::from(a.balance) + u128::from(a.staked) + u128::from(a.unbonding_stake))
+            .sum();
+        let pooled: u128 = state
+            .validator_pools
+            .values()
+            .map(|p| u128::from(p.total_delegated_stake))
+            .sum();
+
+        assert_eq!(
+            u128::from(state.total_issued) - u128::from(state.total_burned),
+            held + pooled,
+            "every nano ever minted is either burned or sitting in an account or a pool — if this \
+             drifts, `circulating_supply_hlx` is a number nobody can reconstruct"
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

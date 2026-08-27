@@ -276,7 +276,7 @@ export default function App() {
           {route === "validate" && <Validate node={node} net={net} onNodeChange={onNodeChange} walletEncrypted={meta.encrypted} />}
           {route === "earn" && <Earn node={node} />}
           {route === "identity" && <Identity node={node} address={meta.address ?? ""} />}
-          {route === "governance" && <Governance node={node} />}
+          {route === "governance" && <Governance node={node} chainHeight={net?.height ?? 0} />}
           {route === "settings" && <Settings address={meta.address ?? ""} />}
         </section>
 

@@ -217,7 +217,7 @@ async fn show(proposal_id: u64, node: &str) -> Result<()> {
     )
     .await?
     .ok_or_else(|| anyhow!("there is no proposal #{} on this chain", proposal_id))?;
-    print_proposal(&res);
+    print_proposal(&res, chain_height(node).await);
     Ok(())
 }
 
@@ -229,8 +229,9 @@ async fn list(node: &str) -> Result<()> {
         println!("No governance proposals yet.");
         return Ok(());
     }
+    let height = chain_height(node).await;
     for p in proposals {
-        print_proposal(p);
+        print_proposal(p, height);
         println!();
     }
     Ok(())
@@ -250,17 +251,56 @@ async fn params(node: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_proposal(p: &serde_json::Value) {
+/// One proposal, printed so the two questions a voter actually has are answerable from it: how
+/// much more yes-stake it needs, and whether voting is still open.
+///
+/// Neither used to be. "Yes votes: 1 (12000 HLX)" is a number with nothing to compare it to, and
+/// the quorum denominator cannot be worked out client-side — it is frozen at proposal creation
+/// precisely so a voter cannot unstake afterwards and shrink the bar behind them, so the chain's
+/// *current* total stake gives a different, wrong, entirely plausible-looking answer. Same for the
+/// deadline: `VOTING_PERIOD_BLOCKS` is a protocol constant no client knows, so an expired proposal
+/// printed exactly like a live one. Both now come from the node (`quorum_stake_hlx`,
+/// `expires_at_height`); `chain_height`, when known, turns the second into a plain verdict.
+/// The chain's current height, or `None` if it cannot be had.
+///
+/// Best-effort on purpose: it decides only whether a proposal is *labelled* expired, and a
+/// listing that fails because the status line could not be filled in would be a worse trade than
+/// a listing that says "open" without knowing.
+async fn chain_height(node: &str) -> Option<u64> {
+    super::get_json(node, "/status", "read the chain height")
+        .await
+        .ok()
+        .and_then(|v| v["height"].as_u64())
+}
+
+fn print_proposal(p: &serde_json::Value, chain_height: Option<u64>) {
     println!("Proposal #{}", p["id"]);
     println!("  Proposer   : {}", p["proposer"].as_str().unwrap_or("?"));
     println!("  Param      : {}", p["param"].as_str().unwrap_or("?"));
     println!("  New value  : {}", p["new_value"]);
     println!("  Created at : height {}", p["created_at_height"]);
-    println!(
-        "  Yes votes  : {} ({} HLX)",
-        p["yes_votes"], p["yes_stake_hlx"].as_f64().unwrap_or(0.0)
-    );
-    println!("  Executed   : {}", p["executed"].as_bool().unwrap_or(false));
+    let yes = p["yes_stake_hlx"].as_f64().unwrap_or(0.0);
+    match p["quorum_stake_hlx"].as_f64() {
+        // Older node: it does not report the threshold, and inventing one would be worse than
+        // leaving the figure bare.
+        None => println!("  Yes votes  : {} ({} HLX)", p["yes_votes"], yes),
+        Some(needed) => println!(
+            "  Yes votes  : {} ({:.9} of {:.9} HLX needed)",
+            p["yes_votes"], yes, needed
+        ),
+    }
+    let executed = p["executed"].as_bool().unwrap_or(false);
+    let expires = p["expires_at_height"].as_u64();
+    let status = if executed {
+        "passed".to_string()
+    } else {
+        match (expires, chain_height) {
+            (Some(e), Some(h)) if h > e => format!("expired (voting closed at height {e})"),
+            (Some(e), _) => format!("open until height {e}"),
+            _ => "open".to_string(),
+        }
+    };
+    println!("  Status     : {status}");
 }
 
 async fn submit(tx: &Transaction, node: &str) -> Result<serde_json::Value> {

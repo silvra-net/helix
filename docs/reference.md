@@ -32,7 +32,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/governance/proposals` | All proposals (`?limit=&offset=`) |
 | GET | `/governance/proposals/:id` | One proposal's status |
 | GET | `/mempool` | Pending transaction count |
-| GET | `/sync/blocks` | Raw block range for peer sync (`?from=&count=`) |
+| GET | `/sync/blocks` | Raw block range for peer sync (`?from=&count=`). `&encoding=bincode` returns the same blocks as `application/octet-stream` instead of JSON — ~3.5× fewer bytes and a fraction of the serving node's CPU, because JSON renders every byte of an ML-DSA key or signature as a decimal number. Clients try it once and fall back to JSON if the peer does not know it |
 | GET | `/sync/tip-certificate` | The commit certificate for this node's current tip — the one certificate `/sync/blocks` cannot carry, because a block's proof lives in its *successor* and the tip has none yet |
 | GET | `/validators` | The active validator set: each validator's tier, stake and `voting_power`, plus the set's `total_voting_power` and `quorum_threshold` |
 | GET | `/diagnostics` | Operational state of this node — see below |

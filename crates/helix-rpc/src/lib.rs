@@ -291,6 +291,21 @@ pub struct GovernanceProposalResponse {
     pub yes_stake_hlx: f64,
     pub yes_votes: usize,
     pub executed: bool,
+    /// Yes-stake this proposal needs to pass — `2/3 + 1` of the total staked **at creation**.
+    ///
+    /// Reported rather than left to the caller, because the caller cannot compute it. The
+    /// denominator is frozen when the proposal is made (see `total_staked_at_creation`) precisely
+    /// so a voter cannot unstake afterwards and shrink the bar behind them; deriving it from the
+    /// chain's *current* total stake would therefore be a different, wrong number — and one that
+    /// looks entirely plausible. Without this, a wallet can show "12,000 HLX yes" and nothing to
+    /// measure it against.
+    pub quorum_stake_hlx: f64,
+    /// Last height at which a vote on this proposal is still accepted.
+    ///
+    /// `VOTING_PERIOD_BLOCKS` is a protocol constant a client has no way to know, so an expired
+    /// proposal was indistinguishable from a live one over this API: the wallet offered a "Vote
+    /// yes" button on proposals whose votes the chain had been rejecting for thousands of blocks.
+    pub expires_at_height: u64,
 }
 
 impl From<&helix_executor::GovernanceProposal> for GovernanceProposalResponse {
@@ -304,6 +319,12 @@ impl From<&helix_executor::GovernanceProposal> for GovernanceProposalResponse {
             yes_stake_hlx: p.yes_stake as f64 / 1_000_000_000.0,
             yes_votes: p.voters.len(),
             executed: p.executed,
+            quorum_stake_hlx: helix_executor::governance::quorum_threshold(
+                p.total_staked_at_creation,
+            ) as f64
+                / 1_000_000_000.0,
+            expires_at_height: p.created_at_height
+                + helix_executor::governance::VOTING_PERIOD_BLOCKS,
         }
     }
 }

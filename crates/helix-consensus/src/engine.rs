@@ -25,7 +25,24 @@ use crate::{
 /// two-phase commit. A wide window keeps every validator on the same round long
 /// enough for prevotes *and* precommits to both propagate. Only faulty-proposer
 /// recovery pays the cost, never the common case.
-pub const ROUND_TIMEOUT_TICKS: u32 = 15;
+///
+/// **15 until 2026-08-27, and by then it was 15 for reasons two other mechanisms had taken
+/// over.** The skew argument above is now carried by the per-round backoff
+/// (`ROUND_TIMEOUT_STEP_TICKS` — the node that is ahead holds longer, so the gap closes) and by
+/// the round-skip rule (`peer_round_to_jump_to`), neither of which existed when this was chosen.
+/// What was left was the cost: in a two- or three-validator set a nil quorum is unreachable
+/// without the proposer, so **every** round that loses its proposal falls through to this
+/// backstop and costs the whole window. Measured on the live chain over 995 blocks: 99.8 % land
+/// under 3 s (median 1.43 s, p99 2.49 s) and the two that did not were 18.6 s and exactly
+/// 30.00 s — the backstop, to the centisecond.
+///
+/// 8 ticks is still more than six times the p99 of a complete propose→prevote→precommit→commit
+/// cycle, so the margin the paragraph above asks for is intact. Measured rather than argued, on
+/// `tests/round_convergence.rs` (two real engines, ten network shapes, 200 ticks each): commits
+/// rose in **every** shape — 11→19 at zero latency, 5→15 and 4→12 in the middle, and 3→4 even at
+/// the extreme 8-tick latency this file's harness uses to stand in for a broken network. Nothing
+/// regressed, which is the half that mattered.
+pub const ROUND_TIMEOUT_TICKS: u32 = 8;
 
 /// Block-production ticks a validator waits for its round's proposal before giving up on it and
 /// prevoting **nil** (`NIL_BLOCK_HASH`) — see `note_round_tick`.
@@ -36,7 +53,16 @@ pub const ROUND_TIMEOUT_TICKS: u32 = 15;
 /// advances once 2/3+ of the power says the same thing, so validators leave together and the
 /// per-node timer skew that forces `ROUND_TIMEOUT_TICKS` to be so generous cannot pull them
 /// apart here. Being early merely costs a nil prevote that fails to reach quorum.
-pub const PROPOSAL_TIMEOUT_TICKS: u32 = 2;
+///
+/// **Being early is not free any more, which is why this went from 2 to 4 on 2026-08-27.**
+/// Casting nil closes the round to proposals (`RoundState::open_for_nil_prevote`) — a second,
+/// different prevote would be equivocation — so the nil window is also the deadline for the
+/// round-sync pull to bring the missing proposal in. At 2 ticks the pull got **one** attempt and
+/// one network round trip; if that single answer was late, the round was dead and the full
+/// backstop was spent. At 4 it gets three attempts, and the only thing it costs is four extra
+/// seconds before a genuinely dead proposer is routed around — in a set of two or three, not even
+/// that, since nil quorum is unreachable there without the proposer anyway.
+pub const PROPOSAL_TIMEOUT_TICKS: u32 = 4;
 
 /// The nil prevote has to be cast strictly before the round it belongs to can time out,
 /// otherwise the backstop fires first and no nil quorum ever forms — the dead-proposer latency

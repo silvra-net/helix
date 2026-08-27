@@ -18,7 +18,23 @@ function formatProposedValue(param: string, newValue: number): string {
   const isStake = param === "MinValidatorStake" || param === "min_validator_stake";
   return isStake ? `${hlx(newValue / 1e9)} HLX` : newValue.toLocaleString();
 }
-export default function Governance({ node }: { node: string }) {
+/// Where a proposal stands, in the only three states a voter can act on differently.
+///
+/// "Open" is not the absence of the other two: a proposal whose voting period ran out still comes
+/// back from the chain looking exactly like a live one — same fields, `executed: false` — and the
+/// wallet offered it a "Vote yes" button that the chain had been rejecting for thousands of
+/// blocks with "voting period has expired". The height is what separates them, which is why the
+/// node now reports `expires_at_height` at all.
+export function proposalState(
+  p: Pick<Proposal, "executed" | "expires_at_height">,
+  chainHeight: number,
+): "passed" | "expired" | "open" {
+  if (p.executed) return "passed";
+  if (chainHeight > p.expires_at_height) return "expired";
+  return "open";
+}
+
+export default function Governance({ node, chainHeight }: { node: string; chainHeight: number }) {
   const [params, setParams] = useState<GovParams | null>(null);
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
@@ -94,13 +110,20 @@ export default function Governance({ node }: { node: string }) {
                 <div className="list-main">
                   <div className="list-title">#{p.id} · {p.param} → {formatProposedValue(p.param, p.new_value)}</div>
                   <div className="muted small">
-                    by {shortAddr(p.proposer)} · {hlx(p.yes_stake_hlx)} HLX yes
-                    {p.executed ? " · executed" : ""}
+                    by {shortAddr(p.proposer)} · {hlx(p.yes_stake_hlx)} of {hlx(p.quorum_stake_hlx)} HLX
+                    needed
+                    {proposalState(p, chainHeight) === "expired"
+                      ? ` · voting closed at block ${p.expires_at_height.toLocaleString()}`
+                      : proposalState(p, chainHeight) === "open"
+                        ? ` · open until block ${p.expires_at_height.toLocaleString()}`
+                        : ""}
                   </div>
                 </div>
                 <div className="list-right">
-                  {p.executed ? (
+                  {proposalState(p, chainHeight) === "passed" ? (
                     <span className="pill ok">passed</span>
+                  ) : proposalState(p, chainHeight) === "expired" ? (
+                    <span className="pill">expired</span>
                   ) : (
                     <button className="mini primary" onClick={() => run(() => api.voteProposal(node, p.id))}>Vote yes</button>
                   )}

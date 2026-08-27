@@ -454,12 +454,39 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// Blocks for a catching-up node, as JSON by default and as bincode on request.
+///
+/// **`?encoding=bincode` exists because the JSON form is the reason syncing is slow**, and the
+/// numbers are not close. A block on this chain is ~15.8 KB of ML-DSA material — one proposer
+/// public key and signature plus the two commit signatures — and `serde_json` renders every one
+/// of those bytes as a decimal number in an array, so the same block goes out as **71 KB** of
+/// text. Measured against the live chain, one 200-block batch:
+///
+/// | | bytes | server CPU |
+/// |---|---|---|
+/// | JSON | 11.37 MB | 0.42 s |
+/// | JSON + gzip | 4.09 MB | 3.24 s |
+/// | bincode (+ gzip) | ~3.2 MB (~2.1 MB) | ~0.1 s |
+///
+/// The gzip row is what production actually serves, and the 3.24 s is a cost the *serving* node
+/// pays — on this chain that node is the one running consensus, so a joining follower currently
+/// taxes the validator that is helping it. Compression is doing the work of undoing an inflation
+/// that should not have happened: only **two distinct public keys** appear across a 200-block
+/// batch, repeated 600 times.
+///
+/// Additive on purpose. A node that does not know the parameter answers JSON exactly as before —
+/// or rejects the request outright, since the query used to deserialize into `HashMap<String,
+/// u64>` and `encoding=bincode` is not a number. The client tries binary once, remembers a
+/// refusal, and falls back for the rest of the sync (see `fetch_sync_blocks`). Taking strings
+/// here also means a future parameter no longer turns older-peer requests into a 400.
 async fn get_sync_blocks(
     State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, u64>>,
-) -> impl IntoResponse {
-    let from = params.get("from").copied().unwrap_or(1);
-    let count = params.get("count").copied().unwrap_or(200).min(200);
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let from: u64 = params.get("from").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let count: u64 =
+        params.get("count").and_then(|v| v.parse().ok()).unwrap_or(200).min(200);
+    let binary = params.get("encoding").map(String::as_str) == Some("bincode");
     let store = state.store.read().await;
     let mut blocks: Vec<Block> = Vec::with_capacity(count as usize);
     for h in from..from.saturating_add(count) {
@@ -468,7 +495,19 @@ async fn get_sync_blocks(
             Err(_) => break,
         }
     }
-    (StatusCode::OK, Json(json!(blocks)))
+    if binary {
+        // A serialization failure here is not worth failing the request over: answering JSON is
+        // always correct, just larger, and the caller handles both.
+        if let Ok(bytes) = bincode::serialize(&blocks) {
+            return (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                bytes,
+            )
+                .into_response();
+        }
+    }
+    (StatusCode::OK, Json(json!(blocks))).into_response()
 }
 
 /// The commit certificate for this node's current tip — see [`crate::TipCertificate`].
@@ -2168,6 +2207,28 @@ mod tests {
         }
     }
 
+    /// A state holding `n` blocks that carry **real** ML-DSA material.
+    ///
+    /// The `block()` helper above leaves the public key and signature empty, which is fine for
+    /// every test that only cares about transactions — and useless for measuring an encoding,
+    /// because the entire size difference between JSON and bincode is those two fields. A block
+    /// with no key and no signature is ~4 % of a real one.
+    async fn fresh_test_state_with_blocks(n: u64) -> AppState {
+        let state = fresh_test_state();
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&kp.public);
+        {
+            let mut store = state.store.write().await;
+            for h in 1..=n {
+                let mut b = block(h, &validator, vec![]);
+                b.header.public_key = kp.public.clone();
+                b.header.signature = kp.sign(b.header.signing_hash().as_bytes()).unwrap();
+                store.put_block(b).unwrap();
+            }
+        }
+        state
+    }
+
     /// Backlog #156: an expired transaction must be answerable as expired, not as never seen.
     ///
     /// The two were the same 404, which is worst precisely when it matters most: while the chain
@@ -2531,11 +2592,69 @@ mod tests {
     async fn get_sync_blocks_does_not_overflow_near_u64_max() {
         let state = fresh_test_state();
         let mut params = std::collections::HashMap::new();
-        params.insert("from".to_string(), u64::MAX - 1);
-        params.insert("count".to_string(), 10);
+        params.insert("from".to_string(), (u64::MAX - 1).to_string());
+        params.insert("count".to_string(), "10".to_string());
 
         let response = get_sync_blocks(State(state), Query(params)).await;
         assert_eq!(response.into_response().status(), StatusCode::OK);
+    }
+
+    /// The compact encoding must be the *same blocks*, not merely a smaller answer — a transport
+    /// that is faster and subtly different is worse than a slow one. JSON is what a peer that has
+    /// never heard of the parameter answers, so both forms have to decode to the same thing.
+    #[tokio::test]
+    async fn sync_blocks_serve_the_same_blocks_as_bincode_and_as_json() {
+        let state = fresh_test_state_with_blocks(5).await;
+
+        let mut json_params = std::collections::HashMap::new();
+        json_params.insert("from".to_string(), "1".to_string());
+        json_params.insert("count".to_string(), "5".to_string());
+        let mut bin_params = json_params.clone();
+        bin_params.insert("encoding".to_string(), "bincode".to_string());
+
+        let as_json = get_sync_blocks(State(state.clone()), Query(json_params)).await;
+        let as_bin = get_sync_blocks(State(state), Query(bin_params)).await;
+
+        assert_eq!(
+            as_bin
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream"),
+            "the compact form must announce itself, or the client cannot tell the two apart"
+        );
+
+        let json_body = axum::body::to_bytes(as_json.into_body(), usize::MAX).await.unwrap();
+        let bin_body = axum::body::to_bytes(as_bin.into_body(), usize::MAX).await.unwrap();
+        let from_json: Vec<Block> = serde_json::from_slice(&json_body).unwrap();
+        let from_bin: Vec<Block> = bincode::deserialize(&bin_body).unwrap();
+
+        assert_eq!(from_json.len(), 5, "premise: the fixture really served five blocks");
+        assert_eq!(
+            from_json.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+            from_bin.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+            "the two encodings must carry identical blocks"
+        );
+        assert!(
+            bin_body.len() * 3 < json_body.len(),
+            "and the compact one must actually be compact — {} bytes against {}",
+            bin_body.len(),
+            json_body.len()
+        );
+    }
+
+    /// An unknown parameter must not turn into a 400. The query used to deserialize into
+    /// `HashMap<String, u64>`, so any non-numeric value — `encoding=bincode` among them — failed
+    /// the extractor and took the whole request with it.
+    #[tokio::test]
+    async fn an_unknown_query_parameter_does_not_break_the_sync_endpoint() {
+        let state = fresh_test_state_with_blocks(2).await;
+        let mut params = std::collections::HashMap::new();
+        params.insert("from".to_string(), "1".to_string());
+        params.insert("something_from_the_future".to_string(), "yes".to_string());
+
+        let response = get_sync_blocks(State(state), Query(params)).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn dummy_proposal(id: u64) -> helix_executor::governance::GovernanceProposal {

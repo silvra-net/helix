@@ -38,8 +38,10 @@ impl GovernanceParam {
     /// Minimum safe value for this parameter — below this, the parameter is close enough
     /// to zero to cause (or contribute to) the same failure a value of exactly zero would.
     ///
-    /// `MinValidatorStake`: `MIN_VALIDATOR_STAKE / 100` (1,000 HLX vs. the genesis default
-    /// of 100,000 HLX). A value near zero (even a nonzero one, e.g. 1 nano-HLX) would let
+    /// `MinValidatorStake`: `MIN_VALIDATOR_STAKE / 100` — **100 HLX against today's genesis
+    /// default of 10,000** (it read "1,000 HLX vs. 100,000" until 2026-08-27, from before the
+    /// minimum was lowered; the ratio is the rule, the numbers were only ever an illustration and
+    /// went stale the moment the constant moved). A value near zero (even a nonzero one, e.g. 1 nano-HLX) would let
     /// almost every account pass `ChainState::stakers()`'s filter, exploding the validator
     /// set and — since unverified-personhood voting power is `stake / 2` — collapsing total
     /// voting power toward 0, stalling BFT quorum. The floor is expressed relative to the

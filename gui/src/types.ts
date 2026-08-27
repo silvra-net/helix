@@ -136,6 +136,13 @@ export interface Proposal {
   yes_votes: number;
   yes_stake_hlx: number;
   executed: boolean;
+  /// Yes-stake needed to pass — 2/3+1 of the total staked *when the proposal was made*. The
+  /// client cannot compute this: the denominator is frozen at creation, so deriving it from the
+  /// chain's current total stake gives a different, wrong, plausible-looking number.
+  quorum_stake_hlx: number;
+  /// Last height at which a vote is still accepted. Without it an expired proposal is
+  /// indistinguishable from a live one and the wallet offers a button that can only fail.
+  expires_at_height: number;
 }
 
 export interface GovParams {

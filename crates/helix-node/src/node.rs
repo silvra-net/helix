@@ -957,11 +957,11 @@ impl HelixNode {
             }
             let local_tip = self.store.read().await.latest_height();
             info!(peer = %peer_url, local_tip, "Syncing blocks from peer");
-            let result = {
-                let mut s = self.store.write().await;
-                let mut cs = self.chain_state.write().await;
-                sync_blocks_from_peer(&peer_url, local_tip, &mut s, &mut cs).await
-            };
+            // No lock taken here any more: `sync_blocks_from_peer` acquires the store and
+            // chain state per batch and lets go in between, so the RPC can answer `is_syncing`
+            // and a moving height throughout — which is the whole point of starting the server
+            // before the sync (Masterplan stage 1). Holding them here made that promise false.
+            let result = sync_blocks_from_peer(&peer_url, local_tip, &self.store, &self.chain_state).await;
             let failed = result.is_err();
             match result {
                 Ok(synced) => info!(applied = synced, "Block sync complete"),
@@ -1553,12 +1553,16 @@ async fn handle_p2p_event(
                     if block_height <= base {
                         return; // another path already applied this in the meantime
                     }
-                    let result = {
-                        let mut s = store.write().await;
-                        let mut cs = chain_state.write().await;
-                        sync_blocks_from_peer(peer_url, base, &mut s, &mut cs)
-                            .await
-                            .map(|n| (n, s.latest_height(), s.latest_hash()))
+                    // `last_applied_height` above stays held across this — that is the guard
+                    // that keeps a concurrent apply for the same height out. The store and chain
+                    // state are taken per batch inside.
+                    let result = match sync_blocks_from_peer(peer_url, base, store, chain_state).await
+                    {
+                        Ok(n) => {
+                            let s = store.read().await;
+                            Ok((n, s.latest_height(), s.latest_hash()))
+                        }
+                        Err(e) => Err(e),
                     };
                     // Whatever the outcome, the guard must not be left behind the store: a sync
                     // that applied blocks and then aborted returns `Err`, and the arm below would
@@ -4367,12 +4371,14 @@ async fn rpc_sync_loop(
             continue; // another path already caught us up while we waited for the lock
         }
 
-        let result = {
-            let mut s = store.write().await;
-            let mut cs = chain_state.write().await;
-            sync_blocks_from_peer(&peer_url, base, &mut s, &mut cs)
-                .await
-                .map(|n| (n, s.latest_height(), s.latest_hash()))
+        // Same as the gap-fill path: `last_applied_height` is the guard, the store and chain
+        // state are locked per batch inside.
+        let result = match sync_blocks_from_peer(&peer_url, base, &store, &chain_state).await {
+            Ok(n) => {
+                let s = store.read().await;
+                Ok((n, s.latest_height(), s.latest_hash()))
+            }
+            Err(e) => Err(e),
         };
         // Same as the gap-fill path: a partial apply returns `Err` and must still move the guard,
         // or the next ingest path re-executes what this one already wrote (#145).
@@ -4435,11 +4441,66 @@ fn multiaddr_kind(host: &str) -> &'static str {
 /// genuinely fresh node, adopted from this same peer via `fetch_genesis_from_peer` before
 /// this function is ever called.
 /// Returns the number of blocks successfully applied.
+/// Fetch one batch of blocks, in the compact encoding when the peer speaks it.
+///
+/// `binary` is the caller's memory across the whole sync: tried once, and once a peer has refused
+/// it, never tried again — an old node rejects `encoding=bincode` outright (its query
+/// deserialized into `HashMap<String, u64>`, and "bincode" is not a number), so retrying it per
+/// batch would double the request count against exactly the peers least able to spare it.
+///
+/// Why bother: a block on this chain is ~15.8 KB of ML-DSA keys and signatures, and JSON renders
+/// every byte of that as a decimal number in an array — 71 KB per block, 11.37 MB for a 200-block
+/// batch, which gzip then spends 3.24 s of the *serving* node's CPU squeezing back down to
+/// 4.09 MB. Measured against production. Bincode is ~3.2 MB with no compression at all, ~2.1 MB
+/// with, and the repeated public keys — only two distinct ones in a whole batch, sent 600 times —
+/// stop being something a compressor has to discover.
+///
+/// The decoded value is identical either way, so nothing downstream knows which was used.
+async fn fetch_sync_blocks(
+    client: &reqwest::Client,
+    peer_url: &str,
+    from: u64,
+    binary: &mut bool,
+) -> Result<Vec<Block>> {
+    let base = format!("{}/sync/blocks?from={}&count=200", peer_url.trim_end_matches('/'), from);
+    if *binary {
+        let url = format!("{base}&encoding=bincode");
+        let resp = client.get(&url).send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let is_binary = r
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.starts_with("application/octet-stream"));
+                let bytes = r
+                    .bytes()
+                    .await
+                    .with_context(|| format!("could not read {url}'s response body"))?;
+                if is_binary {
+                    return bincode::deserialize(&bytes).with_context(|| {
+                        format!("{url} answered octet-stream that is not a block batch")
+                    });
+                }
+                // A peer that ignored the parameter and answered JSON anyway: use the answer, and
+                // stop asking for binary.
+                *binary = false;
+                return serde_json::from_slice(&bytes)
+                    .with_context(|| format!("{url} did not answer with valid JSON"));
+            }
+            // Refused or unreachable — fall through to plain JSON. An unreachable peer fails
+            // there too, with the diagnosis `fetch_json` already produces.
+            _ => *binary = false,
+        }
+    }
+    fetch_json(client, &base).await
+}
+
 async fn sync_blocks_from_peer(
     peer_url: &str,
     local_tip: u64,
-    store: &mut HelixDb,
-    chain_state: &mut ChainState,
+    store: &Arc<RwLock<HelixDb>>,
+    chain_state: &Arc<RwLock<ChainState>>,
 ) -> Result<u64> {
     let client = peer_http_client(Duration::from_secs(30))?;
 
@@ -4449,13 +4510,25 @@ async fn sync_blocks_from_peer(
     // reported "0 block(s) already applied" while four were persisted — the one number somebody
     // reads when deciding whether an interrupted sync left the node clean.
     let mut total_applied = 0u64;
-    // Tracks the hash each next block must chain from — starts at our current tip
-    // and advances to the just-applied block's own hash after each iteration.
-    let mut expected_prev_hash = store.latest_hash();
+    // Tried once per sync, not once per batch — see `fetch_sync_blocks`.
+    let mut binary_encoding = true;
 
     loop {
-        let url = format!("{}/sync/blocks?from={}&count=200", peer_url.trim_end_matches('/'), from);
-        let blocks: Vec<Block> = fetch_json(&client, &url).await?;
+        // **Nothing is locked while this fetches.** Until 2026-08-27 the caller took the store and
+        // chain-state write locks and held both for the *entire* sync, so every RPC route that
+        // reads the chain blocked for as long as catching up took — around forty minutes at
+        // height 41,644, and hours on a longer chain. Masterplan stage 1 put the RPC server up
+        // before the sync precisely so a joining operator could watch `is_syncing` and
+        // `sync_target_height` move; the server did come up, and then answered nothing. Measured
+        // on a real catch-up against production: `GET /status` on the syncing node did not return
+        // at all. That silence is exactly what "irgendwas hängt beim Blöcke ziehen" looks like
+        // from outside, and it is a second, independent cause from the one fixed earlier today.
+        //
+        // The fetch is also the slow part — a 200-block batch is ~4 MB gzipped over the wire
+        // against ~0.4 s of local work — so holding a lock across it buys nothing and costs
+        // everything.
+        let blocks: Vec<Block> =
+            fetch_sync_blocks(&client, peer_url, from, &mut binary_encoding).await?;
         if blocks.is_empty() {
             break; // caught up
         }
@@ -4465,6 +4538,29 @@ async fn sync_blocks_from_peer(
         // every block except the chain tip itself.
         let peer_has_more = blocks.len() >= 200;
         let apply_count = if peer_has_more { blocks.len() - 1 } else { blocks.len() };
+
+        // Locks held for this batch only, and released again at the bottom of the loop.
+        let mut store = store.write().await;
+        let mut chain_state = chain_state.write().await;
+        let store = &mut *store;
+        let chain_state = &mut *chain_state;
+
+        // Re-anchor to the store now that the lock is actually held. Another ingest path — the
+        // committed-block gossip arm, or a P2P block-sync batch — may have advanced the tip while
+        // this batch was in flight, and applying blocks numbered from a stale tip would either
+        // skip a height or execute one twice (the second mints its block reward again, #142/#145).
+        // Discarding and re-fetching is the simple, obviously-correct answer: it costs one request
+        // in a case that is rare, and it cannot loop, because the other path advancing the tip is
+        // itself progress.
+        let tip = store.latest_height();
+        if tip + 1 != from {
+            from = tip + 1;
+            continue;
+        }
+        // Tracks the hash each next block must chain from — the tip as of this batch, advancing
+        // to each just-applied block's own hash.
+        let mut expected_prev_hash = store.latest_hash();
+
         // How far this batch proves *itself* final — see `last_quorum_certified_index`. Computed
         // once per batch rather than once per block, which is the whole correction: a chain does
         // not certify every block individually, and demanding that it does is what stopped a
@@ -4585,32 +4681,43 @@ async fn sync_blocks_from_peer(
             if !proven {
                 if idx + 1 == blocks.len() && !peer_has_more {
                     // The chain tip — the one block with no successor anywhere. Its certificate
-                    // has to be asked for (`/sync/tip-certificate`, #133).
+                    // has to be asked for (`/sync/tip-certificate`, #133), and it may not prove
+                    // anything: the peer can have none to give, or one that falls short of
+                    // quorum. **Both are the same situation and get the same answer** — applied,
+                    // with a warning that says so.
+                    //
+                    // Refusing on a short certificate while accepting on a missing one, which is
+                    // what this did until 2026-08-27, is wrong twice over:
+                    //
+                    // * **It rewards serving less.** A peer that wants an unproven tip adopted
+                    //   simply returns no certificate and is believed. A check any peer can pass
+                    //   by omitting data is not a check.
+                    // * **It can freeze a chain permanently, and did.** A stalled chain's live
+                    //   tip-certificate cell holds only whatever precommits its own node
+                    //   collected. Measured on production 2026-08-27 while the chain sat at
+                    //   41644: the cell carried exactly one of the two signatures quorum needed.
+                    //   Every node syncing from it therefore stopped at 41643 — including the
+                    //   validator whose return was the only thing that could restart the chain.
+                    //   The rule meant to protect finality was keeping the chain dead.
+                    //
+                    // The trade is the one #137/#158 already made and it is unchanged: exactly
+                    // one block — the tip — is applied on the strength of proposer signature, set
+                    // membership and prev_hash alone, and the very next block proves it
+                    // retroactively through the batch rule above. Being one block short of a small
+                    // validator set stops the chain outright; that has happened and cost 14.5
+                    // hours, while the failure avoided by refusing is hypothetical and needs the
+                    // operator's own configured sync peer to be hostile.
                     let set = ValidatorSet::new(validators_from_state(chain_state), h);
                     let certificate = fetch_tip_certificate(peer_url, h, block.hash()).await;
-                    if certificate.is_empty() {
-                        // No certificate obtainable — an older peer, or one that just restarted
-                        // with an empty tip-certificate cell. Applied on the pre-#136 terms rather
-                        // than refused: holding the tip back would leave this node one block
-                        // short, and a validator one block short of a small set stops the chain
-                        // outright (#137). That failure has happened and cost 14.5 hours; this one
-                        // is hypothetical and requires the operator's own sync peer to be hostile.
+                    if !set.precommits_reach_quorum(&certificate, h, &block.hash()) {
                         warn!(
                             height = h,
                             peer = %peer_url,
+                            signatures = certificate.len(),
                             "Applying the chain tip without a quorum certificate — this peer \
-                             served none. The block is signed by a set member and chains \
-                             correctly, but its finality is unproven until a successor arrives."
-                        );
-                    } else if !set.precommits_reach_quorum(&certificate, h, &block.hash()) {
-                        store.save_chain_state(chain_state)?;
-                        anyhow::bail!(
-                            "block {} from sync peer is not backed by a BFT quorum — the tip \
-                             certificate this peer served does not reach the threshold for the \
-                             validator set of that height. Aborting sync, {} block(s) already \
-                             applied",
-                            h,
-                            total_applied
+                             served none, or too few signatures to reach the threshold. The block \
+                             is signed by a set member and chains correctly, but its finality is \
+                             unproven until a successor arrives."
                         );
                     }
                 } else {
@@ -4667,12 +4774,16 @@ async fn sync_blocks_from_peer(
         }
         let held_back = applied_this_batch < apply_count as u64;
         from += applied_this_batch;
+        // Persisted per batch rather than once at the end. It has to be, now that the locks are
+        // released here: a reader between batches must not see a chain state older than the blocks
+        // already on disk. It is also the safer shape regardless — a node killed mid-sync used to
+        // leave every applied block persisted with a chain state from before the sync started.
+        store.save_chain_state(chain_state)?;
         if !peer_has_more && !held_back {
             break; // last batch — we're at the peer tip
         }
     }
 
-    store.save_chain_state(chain_state)?;
     Ok(total_applied)
 }
 
@@ -4766,7 +4877,7 @@ mod genesis_join_tests {
 #[cfg(test)]
 mod sync_blocks_from_peer_tests {
     use super::*;
-    use axum::{extract::Query, routing::get, Json, Router};
+    use axum::{extract::Query, response::IntoResponse, routing::get, Json, Router};
     use helix_core::genesis_block;
     use helix_crypto::{Hash, KeyPair, Signature as Sig};
     use std::collections::HashMap;
@@ -4996,13 +5107,13 @@ mod sync_blocks_from_peer_tests {
         let blocks = chained_blocks(&kp, &[1, 2, 3]);
         let peer_url = serve_blocks(blocks).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &kp);
-        let applied = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await.unwrap();
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &kp);
+        let applied = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await.unwrap();
 
         assert_eq!(applied, 3);
-        assert_eq!(store.latest_height(), 3);
+        assert_eq!(store.read().await.latest_height(), 3);
     }
 
     /// End-to-end reproduction of the join-stall, and the fix for it. A second operator stakes to
@@ -5059,11 +5170,9 @@ mod sync_blocks_from_peer_tests {
 
         // Catch up across the activation rotation over the sync path.
         let new_height = {
-            let mut s = store.write().await;
-            let mut cs = chain_state.write().await;
-            let applied = sync_blocks_from_peer(&peer_url, 0, &mut s, &mut cs).await.unwrap();
+            let applied = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await.unwrap();
             assert_eq!(applied, helix_consensus::EPOCH_LENGTH * 2);
-            s.latest_height()
+            store.read().await.latest_height()
         };
 
         // Chain state rotated the joiner into PROBATION — the synced blocks carry no `last_commit`
@@ -5170,10 +5279,8 @@ mod sync_blocks_from_peer_tests {
         // Phase 1: C follows the chain across A and B's activation at height 200 — a rotation it is
         // not part of — over the sync path.
         let h1 = {
-            let mut s = store.write().await;
-            let mut cs = chain_state.write().await;
-            sync_blocks_from_peer(&peer1, 0, &mut s, &mut cs).await.unwrap();
-            s.latest_height()
+            sync_blocks_from_peer(&peer1, 0, &store, &chain_state).await.unwrap();
+            store.read().await.latest_height()
         };
         assert_eq!(h1, helix_consensus::EPOCH_LENGTH * 2);
         reconcile_engine_validator_set(&engine, &chain_state, h1).await;
@@ -5197,10 +5304,10 @@ mod sync_blocks_from_peer_tests {
         // Phase 2: C keeps syncing across ITS OWN activation rotation at height 400 — still the sync
         // path, never the finalize path.
         let h2 = {
-            let mut s = store.write().await;
-            let mut cs = chain_state.write().await;
-            sync_blocks_from_peer(&peer2, helix_consensus::EPOCH_LENGTH * 2, &mut s, &mut cs).await.unwrap();
-            s.latest_height()
+            sync_blocks_from_peer(&peer2, helix_consensus::EPOCH_LENGTH * 2, &store, &chain_state)
+                .await
+                .unwrap();
+            store.read().await.latest_height()
         };
         assert_eq!(h2, helix_consensus::EPOCH_LENGTH * 4);
         {
@@ -5310,20 +5417,18 @@ mod sync_blocks_from_peer_tests {
         // The caller sequence, exactly as gap-fill and rpc_sync_loop run it.
         let (applied_height, issued_after_sync) = {
             let mut last = last_applied_height.lock().await;
-            let mut s = store.write().await;
-            let mut cs = chain_state.write().await;
-            let result = sync_blocks_from_peer(&peer_url, 0, &mut s, &mut cs).await;
+            let result = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await;
             assert!(result.is_err(), "precondition: the tampered block must abort the sync");
             // Exactly what the callers do: advance the guard only on success — and then settle it
             // against the store regardless, which is the fix.
             if let Ok(n) = result {
                 if n > 0 {
-                    *last = s.latest_height();
+                    *last = store.read().await.latest_height();
                 }
             }
-            drop(s);
             settle_applied_height(&mut last, &store).await;
             let s = store.read().await;
+            let cs = chain_state.read().await;
             (s.latest_height(), cs.total_issued)
         };
         assert_eq!(applied_height, 1, "precondition: block 1 was applied before the abort");
@@ -5348,6 +5453,58 @@ mod sync_blocks_from_peer_tests {
     /// Like `serve_blocks`, but also serves `/sync/tip-certificate` for the last block — what a
     /// current peer does. Lets a syncing node prove the chain tip, which has no successor to
     /// certify it (backlog #158).
+    /// A peer that speaks `encoding=bincode`, and counts how often it was asked for it.
+    ///
+    /// Returns the base URL and the counter, so a test can assert both that the compact encoding
+    /// was actually used and — for a peer that refuses it — that the client stopped asking.
+    async fn serve_blocks_counting_encoding(
+        blocks: Vec<Block>,
+        speaks_bincode: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let asked_for_router = asked.clone();
+        let blocks = Arc::new(blocks);
+        let app = Router::new().route(
+            "/sync/blocks",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let blocks = blocks.clone();
+                let asked = asked_for_router.clone();
+                async move {
+                    let from: u64 = params.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let count: usize =
+                        params.get("count").and_then(|s| s.parse().ok()).unwrap_or(200);
+                    let wants_binary = params.get("encoding").map(String::as_str) == Some("bincode");
+                    if wants_binary {
+                        asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if !speaks_bincode {
+                            // What a node from before this parameter does: its query
+                            // deserializes into `HashMap<String, u64>`, so "bincode" is a
+                            // deserialization failure and the whole request is a 400.
+                            return axum::http::StatusCode::BAD_REQUEST.into_response();
+                        }
+                    }
+                    let page: Vec<Block> =
+                        blocks.iter().filter(|b| b.height() >= from).take(count).cloned().collect();
+                    if wants_binary {
+                        return (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            bincode::serialize(&page).unwrap(),
+                        )
+                            .into_response();
+                    }
+                    Json(page).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), asked)
+    }
+
     async fn serve_blocks_with_tip_certificate(blocks: Vec<Block>, certifiers: &[&KeyPair]) -> String {
         let tip = blocks.last().expect("need at least one block").clone();
         let cert = TipCertificate {
@@ -5406,15 +5563,19 @@ mod sync_blocks_from_peer_tests {
             stranger.sign(blocks[3].header.signing_hash().as_bytes()).unwrap();
         let peer_url = serve_blocks(blocks).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &kp);
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &kp);
 
-        let err = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+        let err = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state)
             .await
             .expect_err("a block from outside the set must abort the sync");
 
-        assert_eq!(store.latest_height(), 3, "precondition: three blocks really were applied");
+        assert_eq!(
+            store.read().await.latest_height(),
+            3,
+            "precondition: three blocks really were applied"
+        );
         assert!(
             err.to_string().contains("3 block(s) already applied"),
             "the message must say how many are on disk, not zero: {err}"
@@ -5431,40 +5592,96 @@ mod sync_blocks_from_peer_tests {
         let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
         let peer_url = serve_blocks_with_tip_certificate(blocks, &[&a, &b]).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &a);
-        stake_validator(&mut chain_state, &b);
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &a);
+        stake_validator(&mut *chain_state.write().await, &b);
 
-        let applied = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+        let applied = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state)
             .await
             .expect("a chain whose tip is certified must sync in full");
 
         assert_eq!(applied, 3, "including the tip");
-        assert_eq!(store.latest_height(), 3);
+        assert_eq!(store.read().await.latest_height(), 3);
     }
-
-    /// And the tip must be refused when the certificate the peer serves does not carry a quorum —
-    /// otherwise consulting it proves nothing. Here the tip is certified by one of two validators.
+    /// **This asserted a refusal until 2026-08-27, and the refusal could not have been kept.**
+    ///
+    /// The rule it guarded — a short tip certificate aborts the sync — was wrong in two
+    /// independent ways, and production demonstrated the second one while this file was being
+    /// written. A peer that wanted its unproven tip adopted only had to serve *no* certificate
+    /// instead of a short one; and a stalled chain's own tip cell legitimately holds fewer
+    /// signatures than quorum, so refusing it stops every node one block below the tip — the
+    /// validator whose return would restart the chain included. Measured against the live chain
+    /// sitting at 41644: one signature of the two quorum needed, and a fresh node stuck at 41643
+    /// retrying every four seconds, forever.
+    ///
+    /// So both cases now do what a missing certificate always did (#137/#158): apply the one
+    /// block, warn that its finality is unproven, and let the next block prove it. This test
+    /// keeps the shape and asserts the behaviour that replaced it.
     #[tokio::test]
-    async fn a_tip_whose_certificate_is_short_of_quorum_is_refused() {
+    async fn a_tip_whose_certificate_is_short_of_quorum_is_applied_with_a_warning() {
         let a = KeyPair::generate();
         let b = KeyPair::generate();
         let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
         // Tip certificate signed by A alone — half the power, short of the threshold.
         let peer_url = serve_blocks_with_tip_certificate(blocks, &[&a]).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &a);
-        stake_validator(&mut chain_state, &b);
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &a);
+        stake_validator(&mut *chain_state.write().await, &b);
 
-        let err = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+        let applied = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state)
             .await
-            .expect_err("a tip certificate short of quorum must not pass");
-        assert!(err.to_string().contains("not backed by a BFT quorum"), "{err}");
-        assert_eq!(store.latest_height(), 2, "the certified blocks below it stay applied");
+            .expect("an unprovable tip must not stop the sync — that is what freezes a chain");
+
+        assert_eq!(applied, 3, "the tip included");
+        assert_eq!(store.read().await.latest_height(), 3);
     }
+
+    /// The property that makes the decision above the only coherent one: **serving less must not
+    /// get a peer further than serving something.**
+    ///
+    /// The old rule failed exactly here. A short certificate was refused and an empty one was
+    /// applied, so any peer wanting an unproven tip adopted just had to send nothing — the check
+    /// was one an attacker passed by omission and only an honest peer could fail.
+    #[tokio::test]
+    async fn serving_no_tip_certificate_gets_a_peer_no_further_than_serving_a_short_one() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+
+        let short = {
+            let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
+            let peer = serve_blocks_with_tip_certificate(blocks, &[&a]).await;
+            let store = Arc::new(RwLock::new(fresh_store()));
+            let cs = Arc::new(RwLock::new(ChainState::new(0)));
+            stake_validator(&mut *cs.write().await, &a);
+            stake_validator(&mut *cs.write().await, &b);
+            let _ = sync_blocks_from_peer(&peer, 0, &store, &cs).await;
+            let h = store.read().await.latest_height();
+            h
+        };
+
+        let none = {
+            let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
+            // `serve_blocks` has no `/sync/tip-certificate` route at all — the peer serves none.
+            let peer = serve_blocks(blocks).await;
+            let store = Arc::new(RwLock::new(fresh_store()));
+            let cs = Arc::new(RwLock::new(ChainState::new(0)));
+            stake_validator(&mut *cs.write().await, &a);
+            stake_validator(&mut *cs.write().await, &b);
+            let _ = sync_blocks_from_peer(&peer, 0, &store, &cs).await;
+            let h = store.read().await.latest_height();
+            h
+        };
+
+        assert_eq!(
+            short, none,
+            "a peer serving a short certificate and one serving none must reach the same height — \
+             any difference is an incentive to send less"
+        );
+    }
+
 
     /// Backlog #136, the hole this path had since it was written: signature + set membership +
     /// prev_hash are all satisfiable by a single validator serving a branch it alone signed.
@@ -5493,17 +5710,17 @@ mod sync_blocks_from_peer_tests {
             chained_blocks_with_short_certificates(&a, &[&a, &b], &[1, 2, 3, 4, 5, 6], &[2, 4]);
         let peer_url = serve_blocks_with_tip_certificate(blocks, &[&a, &b]).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &a);
-        stake_validator(&mut chain_state, &b);
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &a);
+        stake_validator(&mut *chain_state.write().await, &b);
 
-        let applied = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+        let applied = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state)
             .await
             .expect("an honest chain with gaps in its certificates must still sync");
 
         assert_eq!(applied, 6, "every block, not just the ones certified individually");
-        assert_eq!(store.latest_height(), 6);
+        assert_eq!(store.read().await.latest_height(), 6);
     }
 
     /// The index that decides how far a batch vouches for itself. It is the *last* directly
@@ -5585,6 +5802,61 @@ mod sync_blocks_from_peer_tests {
         assert!(err.contains("reaches a BFT quorum"), "{err}");
     }
 
+    /// The compact encoding carries exactly the same blocks — that is the whole requirement.
+    /// A transport that is faster and subtly different would be worse than a slow one.
+    #[tokio::test]
+    async fn the_compact_encoding_yields_byte_identical_blocks() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3, 4, 5]);
+        let expected: Vec<Hash> = blocks.iter().map(|blk| blk.hash()).collect();
+        let (peer_url, asked) = serve_blocks_counting_encoding(blocks, true).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &a);
+        stake_validator(&mut *chain_state.write().await, &b);
+
+        sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await.expect("must sync");
+
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst) > 0, "the compact encoding was used");
+        let s = store.read().await;
+        for (i, want) in expected.iter().enumerate() {
+            let got = s.get_block_by_height(i as u64 + 1).expect("block stored");
+            assert_eq!(&got.hash(), want, "block {} must survive the round trip unchanged", i + 1);
+        }
+    }
+
+    /// A peer from before the parameter existed answers 400, because its query deserialized into
+    /// `HashMap<String, u64>` and "bincode" is not a number. The sync must not break on that, and
+    /// must not keep asking: retrying per batch would double the request count against exactly
+    /// the peers least able to spare it.
+    #[tokio::test]
+    async fn a_peer_that_refuses_the_compact_encoding_is_asked_once_and_then_left_alone() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        // Long enough to need several batches, so "asked once" is a real claim.
+        let heights: Vec<u64> = (1..=450).collect();
+        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &heights);
+        let (peer_url, asked) = serve_blocks_counting_encoding(blocks, false).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &a);
+        stake_validator(&mut *chain_state.write().await, &b);
+
+        let applied = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state)
+            .await
+            .expect("a peer that refuses the compact encoding must still be syncable");
+
+        assert_eq!(applied, 450, "every block, over the JSON fallback");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "asked once, then never again — one wasted request per sync, not one per batch"
+        );
+    }
+
     #[tokio::test]
     async fn rejects_a_branch_one_validator_signed_alone() {
         let attacker = KeyPair::generate();
@@ -5595,19 +5867,19 @@ mod sync_blocks_from_peer_tests {
         let blocks = chained_blocks_certified_by(&attacker, &[&attacker], &[1, 2, 3]);
         let peer_url = serve_blocks(blocks).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &attacker);
-        stake_validator(&mut chain_state, &honest);
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &attacker);
+        stake_validator(&mut *chain_state.write().await, &honest);
 
-        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+        let result = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await;
 
         let err = result.expect_err("a branch without a quorum must not be adopted").to_string();
         // The wording moved with the rule on 2026-08-27 (per-block proof → the batch must contain
         // one), the refusal did not: a batch nothing in it can prove is still refused whole.
         assert!(err.contains("not one of them is backed by a BFT quorum"), "{err}");
         assert_eq!(
-            store.latest_height(),
+            store.read().await.latest_height(),
             0,
             "and nothing from that branch may be persisted — a single applied block from it puts \
              this node on a fork the rest of the network will never extend",
@@ -5625,19 +5897,19 @@ mod sync_blocks_from_peer_tests {
         let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3, 4, 5]);
         let peer_url = serve_blocks(blocks).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &a);
-        stake_validator(&mut chain_state, &b);
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &a);
+        stake_validator(&mut *chain_state.write().await, &b);
 
-        let applied = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+        let applied = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state)
             .await
             .expect("a properly certified chain must sync");
 
         assert_eq!(applied, 5);
         // The last block has no successor in the stream, so it carries no proof yet — it is
         // applied on the same terms as before this check, and certified on the next poll.
-        assert_eq!(store.latest_height(), 5);
+        assert_eq!(store.read().await.latest_height(), 5);
     }
 
     #[tokio::test]
@@ -5647,19 +5919,19 @@ mod sync_blocks_from_peer_tests {
         blocks[1].header.height = 99; // invalidates the signature without re-signing
         let peer_url = serve_blocks(blocks).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &kp);
-        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &kp);
+        let result = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await;
 
         // Sync aborts with an error instead of panicking/crashing ...
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("signature verification"));
         // ... but the one valid block seen before the bad one stays applied.
-        assert_eq!(store.latest_height(), 1);
+        assert_eq!(store.read().await.latest_height(), 1);
         // The forged/height-99 and any block after it must never be persisted.
-        assert!(store.get_block_by_height(99).is_err());
-        assert!(store.get_block_by_height(3).is_err());
+        assert!(store.read().await.get_block_by_height(99).is_err());
+        assert!(store.read().await.get_block_by_height(3).is_err());
     }
 
     #[tokio::test]
@@ -5676,12 +5948,12 @@ mod sync_blocks_from_peer_tests {
         let blocks = vec![signed_block(&kp, 1, Hash::ZERO)];
         let peer_url = serve_blocks(blocks).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0); // no stakers registered
-        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0))); // no stakers registered
+        let result = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await;
 
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(store.latest_height(), 1);
+        assert_eq!(store.read().await.latest_height(), 1);
     }
 
     #[tokio::test]
@@ -5700,16 +5972,16 @@ mod sync_blocks_from_peer_tests {
             attacker_kp.sign(block2.header.signing_hash().as_bytes()).unwrap();
         let peer_url = serve_blocks(vec![block1, block2]).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &real_kp);
-        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &real_kp);
+        let result = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("outside the current validator set"));
         // Block 1 (the real staker) stays applied, block 2 (the impersonator) does not.
-        assert_eq!(store.latest_height(), 1);
-        assert!(store.get_block_by_height(2).is_err());
+        assert_eq!(store.read().await.latest_height(), 1);
+        assert!(store.read().await.get_block_by_height(2).is_err());
     }
 
     #[tokio::test]
@@ -5727,16 +5999,16 @@ mod sync_blocks_from_peer_tests {
         let blocks = vec![block1, non_chaining_block2];
         let peer_url = serve_blocks(blocks).await;
 
-        let mut store = fresh_store();
-        let mut chain_state = ChainState::new(0);
-        stake_validator(&mut chain_state, &kp);
-        let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &kp);
+        let result = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("does not chain"));
         // Block 1 stays applied, block 2 (the non-chaining one) is never persisted.
-        assert_eq!(store.latest_height(), 1);
-        assert!(store.get_block_by_height(2).is_err());
+        assert_eq!(store.read().await.latest_height(), 1);
+        assert!(store.read().await.get_block_by_height(2).is_err());
     }
 }
 
