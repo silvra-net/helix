@@ -57,6 +57,24 @@ pub struct Account {
     pub missed_blocks: Option<u32>,
 }
 
+impl Account {
+    /// An address the chain has no record of: zero everywhere, nonce 0 — the state it will have
+    /// the instant anyone sends it anything.
+    pub fn empty(address: &str) -> Self {
+        Account {
+            address: address.to_string(),
+            balance_hlx: 0.0,
+            staked_hlx: 0.0,
+            unbonding_stake_hlx: 0.0,
+            unbonding_unlock_height: 0,
+            unbonding_source: None,
+            nonce: 0,
+            jailed_until: None,
+            missed_blocks: None,
+        }
+    }
+}
+
 /// One delegation this account holds — mirrors the node's `/accounts/:address/delegations` rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delegation {
@@ -240,25 +258,47 @@ pub async fn get_status(node: &str) -> Result<NetworkStatus, String> {
         .map_err(err)
 }
 
-pub async fn get_account(node: &str, address: &str) -> Result<Account, String> {
+/// One account, or `None` when the chain has never heard of it.
+///
+/// **A 404 is an answer, not a failure.** The node returns one for any address with no on-chain
+/// history, which is every freshly created wallet and every address nobody has sent anything to
+/// yet — so treating it as an error made a brand-new wallet greet its owner with
+/// "node returned 404 Not Found for hlx…" on every screen. Everything that is *not* a 404 stays an
+/// error: a node that is unreachable, proxied behind an error page, or still syncing has not told
+/// us this account is empty, and pretending it did is how a wallet signs against the wrong state.
+/// Same split the CLI settled on in backlog #167, for the same reason.
+pub async fn get_account_opt(node: &str, address: &str) -> Result<Option<Account>, String> {
     let resp = client()
         .get(format!("{node}/accounts/{address}"))
         .send()
         .await
         .map_err(err)?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
     if !resp.status().is_success() {
         return Err(format!("node returned {} for {address}", resp.status()));
     }
-    resp.json::<Account>().await.map_err(err)
+    resp.json::<Account>().await.map(Some).map_err(err)
 }
 
-/// Current per-account nonce, or 0 if the account has never transacted (same fallback the CLI
-/// uses). Never fails the send flow — a missing account is nonce 0.
-pub async fn fetch_nonce(node: &str, address: &str) -> u64 {
-    match get_account(node, address).await {
-        Ok(a) => a.nonce,
-        Err(_) => 0,
-    }
+/// The account as the wallet shows it: an address the chain has never seen reads as an empty one,
+/// which is exactly what it is.
+pub async fn get_account(node: &str, address: &str) -> Result<Account, String> {
+    Ok(get_account_opt(node, address)
+        .await?
+        .unwrap_or_else(|| Account::empty(address)))
+}
+
+/// Current per-account nonce, or 0 for an account the chain has never seen.
+///
+/// Returns an error for anything else. It used to swallow every failure into 0, and that is the
+/// dangerous half: a node that is unreachable or behind produces a signature over a nonce the
+/// chain has already consumed, and the resulting transaction can never be applied — it is simply
+/// re-included and re-rejected for as long as anything keeps submitting it. Observed on the live
+/// chain: one stake transaction mined into five separate blocks, failing every time.
+pub async fn fetch_nonce(node: &str, address: &str) -> Result<u64, String> {
+    Ok(get_account_opt(node, address).await?.map_or(0, |a| a.nonce))
 }
 
 pub async fn fetch_base_fee(node: &str) -> Result<u64, String> {
@@ -418,4 +458,80 @@ pub async fn submit_tx(node: &str, tx: &Transaction) -> Result<SubmitResult, Str
         tx_hash: tx_hash.to_string(),
         status: body.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A one-shot HTTP server that answers the first request with a canned status and body.
+    /// Hand-rolled on purpose: this crate has no test HTTP server and adding one to check two
+    /// status-code branches would be a heavier dependency than the thing under test.
+    fn serve_once(status_line: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The node answers 404 for any address with no on-chain history — which is every freshly
+    /// created wallet. Reading that as a failure is what made a new wallet greet its owner with
+    /// "node returned 404 Not Found for hlx…" on every screen.
+    #[tokio::test]
+    async fn a_404_reads_as_an_account_the_chain_has_never_seen() {
+        let node = serve_once("404 Not Found", r#"{"error":"account hlxabc not found"}"#);
+
+        let account = get_account(&node, "hlxabc").await.expect("404 is an answer, not a failure");
+
+        assert_eq!(account.address, "hlxabc");
+        assert_eq!(account.balance_hlx, 0.0);
+        assert_eq!(account.nonce, 0);
+    }
+
+    /// Everything that is not a 404 stays an error. A node that is unreachable, behind a proxy
+    /// error page, or still syncing has not told us the account is empty.
+    #[tokio::test]
+    async fn a_server_error_is_still_an_error() {
+        let node = serve_once("502 Bad Gateway", "<html>proxy</html>");
+
+        let result = get_account(&node, "hlxabc").await;
+
+        assert!(result.is_err(), "a 502 must not be mistaken for an empty account: {result:?}");
+    }
+
+    /// The dangerous half, and the reason this is a `Result` at all. `fetch_nonce` used to answer
+    /// 0 for *every* failure. Signing a transaction against a guessed nonce produces bytes the
+    /// chain can never apply — and because a transaction that fails on execution burns no fee, it
+    /// is simply re-included and re-rejected for as long as anything keeps submitting it.
+    /// Measured on the live chain: one stake transaction mined into five separate blocks.
+    #[tokio::test]
+    async fn fetch_nonce_refuses_to_guess_when_the_node_did_not_answer() {
+        let node = serve_once("500 Internal Server Error", "{}");
+
+        let result = fetch_nonce(&node, "hlxabc").await;
+
+        assert!(result.is_err(), "a node that did not answer must not be read as nonce 0");
+    }
+
+    /// But an account the chain genuinely has never seen *is* nonce 0 — that is the case the old
+    /// fallback was written for, and it still holds.
+    #[tokio::test]
+    async fn fetch_nonce_is_zero_for_an_address_the_chain_has_never_seen() {
+        let node = serve_once("404 Not Found", r#"{"error":"account hlxabc not found"}"#);
+
+        assert_eq!(fetch_nonce(&node, "hlxabc").await.unwrap(), 0);
+    }
 }

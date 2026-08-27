@@ -1291,12 +1291,16 @@ async fn submit_transaction(
     Json(tx): Json<Transaction>,
 ) -> impl IntoResponse {
     let tx_hash = tx.hash().to_hex();
-    let (recovery_key, can_pay, chain_id) = {
+    let (recovery_key, can_pay, chain_id, account_nonce) = {
         let chain = state.chain_state.read().await;
         (
             chain.recovery_key(&tx.from).cloned(),
             helix_executor::can_pay_fee(&chain, &tx),
             chain.chain_id,
+            // The nonce the executor will measure this transaction against. Read here, where the
+            // state is already open, so the pool can refuse a spent nonce instead of letting it
+            // ride into a block to fail there for free.
+            chain.accounts.get(tx.from.as_str()).map_or(0, |a| a.nonce),
         )
     };
     // The pool ranks on a fee the sender only claims, and cannot check the claim itself — it has
@@ -1310,7 +1314,7 @@ async fn submit_transaction(
         );
     }
     let mut mempool = state.mempool.write().await;
-    let result = mempool.add_with_recovery_key(tx.clone(), recovery_key.as_ref(), chain_id);
+    let result = mempool.add_with_recovery_key(tx.clone(), recovery_key.as_ref(), chain_id, Some(account_nonce));
     drop(mempool);
     match result {
         Ok(()) => {
@@ -1802,7 +1806,7 @@ mod tests {
         let mut pending = Transaction { fee: 10_000, public_key: keypair.public.clone(), ..tx(&alice, &addr(2), 1, 0) };
         pending.signature = keypair.sign(pending.signing_hash().as_bytes()).unwrap();
         let hash = pending.hash();
-        state.mempool.write().await.add(pending, Hash::ZERO).unwrap();
+        state.mempool.write().await.add(pending, Hash::ZERO, None).unwrap();
 
         let response = get_transaction_status(State(state), Path(hash.to_hex()))
             .await
@@ -2195,7 +2199,7 @@ mod tests {
             let mut pool = state.mempool.write().await;
             // A TTL short enough to expire within the test; everything else as in production.
             *pool = Mempool::with_limits_and_ttl(100, 1_000, std::time::Duration::from_millis(1));
-            pool.add(t, Hash::ZERO).expect("the transaction must be admitted before it can expire");
+            pool.add(t, Hash::ZERO, None).expect("the transaction must be admitted before it can expire");
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         // Expiry is lazy, driven by pool operations — same as in production.

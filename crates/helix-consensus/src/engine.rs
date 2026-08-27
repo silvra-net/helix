@@ -1712,14 +1712,30 @@ impl BftEngine {
         // `(height, block_hash)`, no validator counted twice — and anything failing is dropped.
         // Membership against the current validator set is deliberately not checked (same accepted
         // approximation as `verify_last_commit`: the parent height's set can differ slightly around
-        // a rotation, and a stale-but-genuine signature must not be discarded). Salvage wins when
-        // present: it is this node's own first-hand view, and preferring it keeps the participating
-        // path byte-for-byte unchanged.
-        let commit = if salvaged.is_empty() {
-            self.verified_commit_certificate(certificate, height, &block_hash)
-        } else {
-            salvaged
-        };
+        // a rotation, and a stale-but-genuine signature must not be discarded).
+        //
+        // **The two are merged, not ranked.** Preferring the salvage whenever it exists — which is
+        // what this did until 2026-08-27 — throws away a full quorum certificate in favour of this
+        // node's own single precommit, because that is exactly the situation: the node cast its
+        // precommit, lost the race to finalize, and the block arrived carrying the winner's
+        // complete certificate. Measured on the live chain: **20 % of all blocks** (203 of a
+        // 1000-block sample, every one of them proposed by the node that habitually loses that
+        // race) carried a `last_commit` with a single signature where a quorum of two existed. Two
+        // things then break downstream — an RPC-syncing node cannot prove those blocks final and
+        // stops dead (see `sync_blocks_from_peer`), and #132's probation gate loses the very
+        // evidence it promotes on.
+        //
+        // Merging is strictly better than either half alone and cannot be worse than the old
+        // behaviour: every salvaged vote is still there, in front, so the participating path keeps
+        // its own first-hand view; the peer's votes are appended only for validators the salvage
+        // does not already name, and only after `verified_commit_certificate` has checked each
+        // signature for this exact `(height, block_hash)`.
+        let mut commit = salvaged;
+        for vote in self.verified_commit_certificate(certificate, height, &block_hash) {
+            if !commit.iter().any(|held| held.validator == vote.validator) {
+                commit.push(vote);
+            }
+        }
 
         self.current_height = height;
         self.last_committed = Some(block_hash);
@@ -2801,13 +2817,24 @@ mod tests {
         );
     }
 
-    /// Positive control that the participating path is untouched: when this node *does* hold its own
-    /// precommits for the committed block, those win and the gossiped certificate is ignored — the
-    /// salvage branch behaves byte-for-byte as it did before #114. Here the node's own precommit is
-    /// for the real block, while the certificate carries an extra signer; the extra one must NOT
-    /// appear, proving the certificate was not consulted.
+    /// **This test asserted the opposite until 2026-08-27, and the assertion was the bug.**
+    ///
+    /// It was written as a positive control that "the participating path is untouched": a node
+    /// holding its own precommits kept them and ignored the gossiped certificate. That is a
+    /// perfectly reasonable-sounding rule and it cost the chain a fifth of its commit
+    /// certificates. The situation it describes is not a rare one — it is the *normal* one for a
+    /// node that loses the finalize race: it holds exactly one precommit, its own, and the
+    /// finished block arrives carrying the winner's complete quorum. Preferring the salvage then
+    /// means writing a one-signature `last_commit` while holding a two-signature certificate.
+    /// Measured on the live chain: 203 of a 1000-block sample, every one from the node that
+    /// habitually lost that race, which left an RPC-syncing node unable to prove those blocks
+    /// final and permanently stuck (see `sync_blocks_from_peer`).
+    ///
+    /// The rule now is that the two are merged, so this checks both halves: the node's own
+    /// precommit survives (the original point of the salvage) **and** the extra signer that only
+    /// the gossiped certificate names is picked up.
     #[test]
-    fn a_gossiped_certificate_is_ignored_when_this_node_has_its_own_precommits() {
+    fn a_gossiped_certificate_is_merged_with_this_nodes_own_precommits() {
         let v = four_validators();
         let mut proposer_engine =
             BftEngine::new(v.validator_set.clone(), Address::from_public_key(&v.b_kp.public), 1);
@@ -2827,9 +2854,25 @@ mod tests {
         let certificate = vec![peer_vote(&v.a_kp, VoteType::Precommit, 2, 0, block_hash)];
         engine.sync_to_externally_finalized_block(2, block_hash, certificate);
 
+        let signers: Vec<&Address> = engine.last_commit.iter().map(|vote| &vote.validator).collect();
         assert!(
-            !engine.last_commit.iter().any(|vote| vote.validator == a_addr),
-            "salvage wins: a signer present only in the gossiped certificate must not appear"
+            signers.contains(&&v.self_addr),
+            "this node's own first-hand precommit must survive the round teardown"
+        );
+        assert!(
+            signers.contains(&&Address::from_public_key(&v.b_kp.public)),
+            "and so must the peer precommit it had already verified itself"
+        );
+        assert!(
+            signers.contains(&&a_addr),
+            "the signer only the gossiped certificate names must be picked up too — dropping it \
+             is how a full quorum became a one-signature certificate on 20 % of live blocks"
+        );
+        assert_eq!(
+            engine.last_commit.len(),
+            3,
+            "merged, not concatenated: no validator may appear twice, or any tally computed over \
+             this certificate double-counts it"
         );
     }
 

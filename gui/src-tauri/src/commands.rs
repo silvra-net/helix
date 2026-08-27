@@ -168,7 +168,7 @@ async fn build_sign_submit(
     let from_str = state.address().ok_or("wallet is locked")?;
     let from = Address::from_str(&from_str).map_err(|e| e.to_string())?;
 
-    let nonce = rpc::fetch_nonce(node, &from_str).await;
+    let nonce = rpc::fetch_nonce(node, &from_str).await?;
     let base_fee = match fee {
         Some(_) => 0,
         None => rpc::fetch_base_fee(node).await?,

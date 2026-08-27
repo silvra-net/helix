@@ -1474,12 +1474,15 @@ async fn handle_p2p_event(
 ) {
     match event {
         P2PEvent::NewTransaction(tx) => {
-            let (recovery_key, can_pay, chain_id) = {
+            let (recovery_key, can_pay, chain_id, account_nonce) = {
                 let chain = chain_state.read().await;
                 (
                     chain.recovery_key(&tx.from).cloned(),
                     helix_executor::can_pay_fee(&chain, &tx),
                     chain.chain_id,
+                    // Same gate as the RPC submit path, and for the same reason it exists there:
+                    // a spent nonce is refused at the pool rather than inside a block.
+                    chain.accounts.get(tx.from.as_str()).map_or(0, |a| a.nonce),
                 )
             };
             // The same gate the RPC submit path applies. Without it here, the RPC's rate limiter
@@ -1490,7 +1493,7 @@ async fn handle_p2p_event(
                 return;
             }
             let mut pool = mempool.write().await;
-            match pool.add_with_recovery_key(tx, recovery_key.as_ref(), chain_id) {
+            match pool.add_with_recovery_key(tx, recovery_key.as_ref(), chain_id, Some(account_nonce)) {
                 Ok(()) => {}
                 Err(e) => warn!("Rejected peer tx: {}", e),
             }
@@ -1772,9 +1775,11 @@ async fn apply_synced_batch(
         )
     };
 
-    {
+    // How much of this batch its own proof covers. A prefix rather than the whole batch is normal,
+    // not a warning sign — see `verify_block_batch`. The rest arrives certified in the next batch.
+    let proven = {
         let cs = chain_state.read().await;
-        if let Err(e) = verify_block_batch(
+        match verify_block_batch(
             &batch.blocks,
             &batch.tip_certificate,
             base + 1,
@@ -1782,6 +1787,8 @@ async fn apply_synced_batch(
             &cs,
             &validator_set,
         ) {
+            Ok(proven) => proven,
+            Err(e) => {
             warn!(peer = %peer, err = %e, "Rejected a block-sync batch from a peer — nothing applied");
             // Tell the P2P service, or it will ask this same peer again on the very next tick:
             // it picks by highest claimed tip, and from its side a batch we threw away looks
@@ -1790,13 +1797,14 @@ async fn apply_synced_batch(
             // catch-up while a healthy peer sits one block lower, unasked.
             let _ = p2p_tx.try_send(P2PCommand::BlocksyncBatchRejected(peer));
             return;
+            }
         }
-    }
+    };
 
     let (new_height, new_hash) = {
         let mut s = store.write().await;
         let mut cs = chain_state.write().await;
-        for block in &batch.blocks {
+        for block in &batch.blocks[..proven] {
             execute_block(&mut cs, block, None);
             cs.applied_height = block.height();
             if let Err(e) = s.put_block(block.clone()) {
@@ -1819,7 +1827,11 @@ async fn apply_synced_batch(
 
     // The batch carried its tip's certificate in-band, so unlike the RPC path there is nothing to
     // fetch — hand it straight to the engine, which verifies it again on its own terms (#114/#133).
-    let tip_votes = if batch.blocks.last().map(|b| b.height()) == Some(new_height) {
+    // Only when the whole batch applied: a certificate for the batch's last block says nothing
+    // about a prefix's last block, and handing it over would attest a height we did not reach.
+    let tip_votes = if proven == batch.blocks.len()
+        && batch.blocks.last().map(|b| b.height()) == Some(new_height)
+    {
         batch.tip_certificate.clone()
     } else {
         Vec::new()
@@ -1931,7 +1943,7 @@ fn verify_block_batch(
     expected_prev_hash: Hash,
     chain_state: &ChainState,
     validator_set: &ValidatorSet,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<usize, String> {
     // Structure first, cryptography second: a peer must not be able to make us verify signatures
     // over a batch that is already provably not ours.
     let Some(first) = blocks.first() else {
@@ -1978,23 +1990,54 @@ fn verify_block_batch(
     // The proof that carries the batch. Checked before the per-block signatures below because it is
     // the cheaper of the two (one certificate versus one signature per block) and the one that a
     // forged batch fails.
+    //
+    // Returns how many blocks of the batch that proof actually covers, which is the whole batch
+    // whenever its tip is certified — and a prefix when it is not. **The prefix is not a
+    // concession, it is the same inherited-finality argument the tip check already rests on:** the
+    // hash chain is verified above, so one genuine quorum anywhere in the batch proves every
+    // ancestor of it in the batch too.
+    //
+    // Refusing the whole batch instead was a permanent wedge, not a slow path. A serving node
+    // certifies a non-tip block from its successor's `last_commit`, and until 2026-08-27 that
+    // field held a single signature on 20 % of live blocks (see
+    // `BftEngine::sync_to_externally_finalized_block`). The batch boundary is deterministic —
+    // `our_tip + MAX_BLOCKSYNC_BATCH` — so a catching-up node whose boundary landed on one of
+    // those asked for the same batch, was refused, and asked again, forever. That is what stopped
+    // the live chain on 2026-08-27: the second of two validators wiped its data, could get past
+    // neither this path nor the RPC one, and a 2-of-2 quorum has no way to continue without it.
     let tip = blocks.last().expect("non-empty, checked above");
     let bootstrapping = validator_set.total_voting_power() == 0;
-    if !bootstrapping
-        && !validator_set.precommits_reach_quorum(tip_certificate, tip.height(), &tip.hash())
+    let proven = if bootstrapping
+        || validator_set.precommits_reach_quorum(tip_certificate, tip.height(), &tip.hash())
     {
-        return Err(format!(
-            "the certificate for the batch tip (height {}) does not reach a BFT quorum — \
-             refusing the whole batch",
-            tip.height()
-        ));
-    }
+        blocks.len()
+    } else {
+        let anchor = (0..blocks.len().saturating_sub(1)).rev().find(|&i| {
+            let hash = blocks[i].hash();
+            let certificate = commit_sigs_to_votes(
+                blocks[i + 1].header.last_commit.clone(),
+                blocks[i].height(),
+                hash,
+            );
+            validator_set.precommits_reach_quorum(&certificate, blocks[i].height(), &hash)
+        });
+        match anchor {
+            Some(i) => i + 1,
+            None => {
+                return Err(format!(
+                    "nothing in this batch reaches a BFT quorum — neither the certificate for its \
+                     tip (height {}) nor any block inside it — refusing the whole batch",
+                    tip.height()
+                ))
+            }
+        }
+    };
 
     // Per-block proposer checks. Strictly implied by the quorum-certified tip plus the hash chain
     // above, kept because they are cheap relative to being wrong and because every other ingest
     // path applies them — a batch that passes here passes the same bar as one that arrived over
     // gossip or RPC.
-    for block in blocks {
+    for block in &blocks[..proven] {
         if let Err(e) = block.header.verify_signature() {
             return Err(format!("block {} failed signature verification: {}", block.height(), e));
         }
@@ -2014,7 +2057,7 @@ fn verify_block_batch(
         }
     }
 
-    Ok(())
+    Ok(proven)
 }
 
 /// Answers inbound block-sync requests from our own store (#138).
@@ -2253,7 +2296,7 @@ async fn report_double_sign_evidence(
         "Double-sign evidence detected — reporting on-chain"
     );
 
-    if let Err(e) = mempool.write().await.add(tx.clone(), chain_id) {
+    if let Err(e) = mempool.write().await.add(tx.clone(), chain_id, None) {
         // Most likely a peer's report of the same incident already made it into our
         // mempool first (same evidence, different reporter) — not an error.
         debug!(err = %e, "Local mempool rejected our own evidence tx");
@@ -2331,7 +2374,7 @@ async fn send_probation_heartbeat_if_due(
     // The pool rejects every attempt after the first (same nonce still pending) — expected, and
     // not a reason to skip the broadcast: it is the *peers'* pools that decide whether this ever
     // reaches a block, and each retry is a distinct message to them.
-    let first_attempt = mempool.write().await.add(tx.clone(), chain_id).is_ok();
+    let first_attempt = mempool.write().await.add(tx.clone(), chain_id, None).is_ok();
     if first_attempt {
         info!(height = applied_height, "Proving this node is live so the validator can leave probation");
     } else {
@@ -2463,6 +2506,44 @@ async fn reconcile_engine_validator_set(
 /// verifies a certificate carried in a gossiped block: `precommit_signing_bytes` backs both (see
 /// `Vote::signing_bytes`). The engine re-verifies every signature in `verified_commit_certificate`,
 /// so forged or mismatched entries from a lying peer are dropped there regardless of this rebuild.
+/// Index of the last block in `blocks` whose finality the batch itself proves: the highest `i`
+/// whose successor `blocks[i + 1]` carries a `last_commit` reaching a BFT quorum for it.
+///
+/// Every earlier block inherits that proof through `prev_hash`, which `sync_blocks_from_peer`
+/// verifies as it applies them — a quorum that committed `blocks[i]` committed a block whose
+/// ancestry runs through all of them. `None` means no block in the batch is certified at all, and
+/// the caller refuses the batch.
+///
+/// **The set is the one as of the start of the batch**, not as of the certified block. Across an
+/// epoch rotation inside the batch those can differ by a member. That is the same approximation
+/// `verify_block_batch` makes for a P2P batch and `BftEngine::verify_last_commit` makes for an
+/// embedded certificate, and it is bounded in the same way: the certificate still has to carry
+/// genuine signatures from validators that really held stake, so a wrong-by-one set changes the
+/// threshold, never who can sign.
+///
+/// `None` during the bootstrap window too (no staked power yet, so no set to weigh a certificate
+/// against). The caller does **not** read that as "apply everything": it re-checks
+/// `stakers().is_empty()` per block, so a batch that begins before the network's first `Stake` and
+/// contains it stops at that transaction and resumes with a real set. Deciding the whole batch
+/// from the pre-batch state would leave every block after that first stake unchecked — the exact
+/// window an attacker would aim at.
+fn last_quorum_certified_index(blocks: &[Block], chain_state: &ChainState) -> Option<usize> {
+    let first = blocks.first()?;
+    let set = ValidatorSet::new(validators_from_state(chain_state), first.height());
+    if set.total_voting_power() == 0 {
+        return None;
+    }
+    (0..blocks.len().saturating_sub(1)).rev().find(|&i| {
+        let hash = blocks[i].hash();
+        let certificate = commit_sigs_to_votes(
+            blocks[i + 1].header.last_commit.clone(),
+            blocks[i].height(),
+            hash,
+        );
+        set.precommits_reach_quorum(&certificate, blocks[i].height(), &hash)
+    })
+}
+
 fn commit_sigs_to_votes(sigs: Vec<CommitSig>, height: u64, block_hash: Hash) -> Vec<Vote> {
     sigs.into_iter()
         .map(|s| Vote {
@@ -4384,6 +4465,15 @@ async fn sync_blocks_from_peer(
         // every block except the chain tip itself.
         let peer_has_more = blocks.len() >= 200;
         let apply_count = if peer_has_more { blocks.len() - 1 } else { blocks.len() };
+        // How far this batch proves *itself* final — see `last_quorum_certified_index`. Computed
+        // once per batch rather than once per block, which is the whole correction: a chain does
+        // not certify every block individually, and demanding that it does is what stopped a
+        // catching-up node dead (see the gate inside the loop).
+        let proven_through_idx = last_quorum_certified_index(&blocks, chain_state);
+        // Blocks this batch actually contributed. `from` advances by this, not by `apply_count`:
+        // the loop below can stop early when the batch runs out of proof, and re-requesting from
+        // the wrong height would either skip blocks or spin on the same ones forever.
+        let mut applied_this_batch = 0u64;
 
         for (idx, block) in blocks.iter().take(apply_count).enumerate() {
             let h = block.height();
@@ -4457,67 +4547,84 @@ async fn sync_blocks_from_peer(
                     total_applied
                 );
             }
-            // Quorum proof, the check this path never had (backlog #136).
+            // Quorum proof, the check this path never had (backlog #136) — **and the reason it
+            // has to be transitive rather than per block (2026-08-27).**
             //
             // Signature + set membership + prev_hash together still allow one byzantine validator
             // — or anyone holding a validator key who can answer as this node's `sync_peer` — to
             // serve a self-signed branch that satisfies all three. That is the hole audit item A1
-            // closed on the gossip fast path, left open here.
+            // closed on the gossip fast path, and it is closed here by requiring a real quorum of
+            // precommits somewhere in the stream.
             //
-            // The proof is already in the stream: a block's successor carries, in its
-            // `last_commit`, the precommits that finalized it — `BftEngine` fills that field from
-            // `precommits.quorum_votes()`, so it is a quorum by construction. Checking against the
-            // *next* block rather than fetching a certificate per block is what makes this
-            // workable at all; the 2026-07-31 attempt tried to obtain one per segment, could not
-            // for any segment not ending exactly on the peer tip, and broke catch-up outright.
+            // What it must NOT require is one per block. The original comment here asserted that a
+            // successor's `last_commit` "is a quorum by construction"; it is not. A node that
+            // adopts a block over the committed-block fast path writes into its next proposal only
+            // the precommits it holds for that block, and until 2026-08-27 that was its own single
+            // vote even when the finished block arrived carrying a full certificate (see
+            // `BftEngine::sync_to_externally_finalized_block`). Measured on the live chain:
+            // **20 % of blocks** carried a one-signature certificate. Against a per-block rule a
+            // catching-up node therefore aborted within a hundred blocks, resumed at the same
+            // height, and aborted again — a permanent wedge, reported by an operator whose node
+            // could not get past height 4092. The producer side is fixed, but every block already
+            // written stays as it is, so the rule itself has to be the one that was always
+            // sufficient.
             //
-            // Verified against the set as of *before* this block: `chain_state` has had every
-            // earlier block applied and nothing later, and a rotation happens while executing the
-            // block whose height is a multiple of EPOCH_LENGTH — so this is the set that signed
-            // the certificate. Deriving it from the batch instead would be self-certifying.
-            {
-                let set = ValidatorSet::new(validators_from_state(chain_state), h);
-                // Bootstrap, mirroring the `stakers().is_empty()` fallback above: before anyone
-                // has staked there is no set to weigh a certificate against, and every node's own
-                // engine falls back to itself as sole validator. Demanding a quorum here would
-                // make the first blocks of any chain unsyncable, for everyone, forever. As soon as
-                // a set exists this check applies with no exception.
-                if set.total_voting_power() > 0 {
-                // The successor's `last_commit` where there is one; for the chain tip — the only
-                // block with no successor anywhere — the peer's `/sync/tip-certificate` (#133),
-                // which exists for exactly this and is already used by the other catch-up paths.
-                let certificate = match blocks.get(idx + 1) {
-                    Some(successor) => commit_sigs_to_votes(
-                        successor.header.last_commit.clone(),
-                        h,
-                        block.hash(),
-                    ),
-                    None => fetch_tip_certificate(peer_url, h, block.hash()).await,
-                };
-                if certificate.is_empty() {
-                    // No certificate obtainable — an older peer, or one that just restarted with
-                    // an empty tip-certificate cell. Applied on the pre-#136 terms rather than
-                    // refused: holding the tip back would leave this node one block short, and a
-                    // validator one block short of a small set stops the chain outright (#137).
-                    // That failure has happened and cost 14.5 hours; this one is hypothetical and
-                    // requires the operator's own sync peer to be hostile.
-                    warn!(
+            // **Finality is inherited.** `prev_hash` is checked block by block above, so if any
+            // block in this batch is backed by a genuine quorum, every ancestor of it in the batch
+            // is final too: the quorum committed a block whose ancestry runs through them. So one
+            // certificate anchors the whole run before it. This is not a new argument — it is
+            // exactly the rule `verify_block_batch` already applies to a P2P block-sync batch
+            // ("Strictly implied by the quorum-certified tip plus the hash chain above"), and the
+            // two paths disagreeing is what made this one the only one that wedged.
+            //
+            // Unproven blocks are **held back, not applied optimistically**: `proven_through_idx`
+            // is the last index the batch vouches for, and the loop stops there. The next request
+            // starts with the first unproven block, and by then its certifier exists.
+            let proven = chain_state.stakers().is_empty()
+                || matches!(proven_through_idx, Some(p) if idx <= p);
+            if !proven {
+                if idx + 1 == blocks.len() && !peer_has_more {
+                    // The chain tip — the one block with no successor anywhere. Its certificate
+                    // has to be asked for (`/sync/tip-certificate`, #133).
+                    let set = ValidatorSet::new(validators_from_state(chain_state), h);
+                    let certificate = fetch_tip_certificate(peer_url, h, block.hash()).await;
+                    if certificate.is_empty() {
+                        // No certificate obtainable — an older peer, or one that just restarted
+                        // with an empty tip-certificate cell. Applied on the pre-#136 terms rather
+                        // than refused: holding the tip back would leave this node one block
+                        // short, and a validator one block short of a small set stops the chain
+                        // outright (#137). That failure has happened and cost 14.5 hours; this one
+                        // is hypothetical and requires the operator's own sync peer to be hostile.
+                        warn!(
+                            height = h,
+                            peer = %peer_url,
+                            "Applying the chain tip without a quorum certificate — this peer \
+                             served none. The block is signed by a set member and chains \
+                             correctly, but its finality is unproven until a successor arrives."
+                        );
+                    } else if !set.precommits_reach_quorum(&certificate, h, &block.hash()) {
+                        store.save_chain_state(chain_state)?;
+                        anyhow::bail!(
+                            "block {} from sync peer is not backed by a BFT quorum — the tip \
+                             certificate this peer served does not reach the threshold for the \
+                             validator set of that height. Aborting sync, {} block(s) already \
+                             applied",
+                            h,
+                            total_applied
+                        );
+                    }
+                } else {
+                    // Nothing later in this batch carries a quorum for it yet. Not an error and
+                    // not an abort: stop here and ask again from this height, where the block that
+                    // certifies it will be in range.
+                    debug!(
                         height = h,
                         peer = %peer_url,
-                        "Applying the chain tip without a quorum certificate — this peer served \
-                         none. The block is signed by a set member and chains correctly, but its \
-                         finality is unproven until a successor arrives."
+                        "Holding back the rest of this batch — no block in it is backed by a \
+                         quorum from here on, so their finality is not yet provable. Resuming \
+                         from this height on the next request."
                     );
-                } else if !set.precommits_reach_quorum(&certificate, h, &block.hash()) {
-                    store.save_chain_state(chain_state)?;
-                    anyhow::bail!(
-                        "block {} from sync peer is not backed by a BFT quorum — its successor's \
-                         commit certificate does not reach the threshold for the validator set of \
-                         that height. Aborting sync, {} block(s) already applied",
-                        h,
-                        total_applied
-                    );
-                }
+                    break;
                 }
             }
             if let Err(e) = block.header.verify_signature() {
@@ -4539,12 +4646,28 @@ async fn sync_blocks_from_peer(
             store.put_block(block.clone())?;
             expected_prev_hash = block.hash();
             total_applied += 1;
+            applied_this_batch += 1;
             if h % 1000 == 0 {
                 info!("Synced block {}", h);
             }
         }
-        from += apply_count as u64;
-        if !peer_has_more {
+        if applied_this_batch == 0 {
+            // Every block this peer served is unproven, so there is nothing to resume from and
+            // asking again would spin on the same batch. This is the case the per-block rule was
+            // reaching for and the only one that deserves an abort.
+            store.save_chain_state(chain_state)?;
+            anyhow::bail!(
+                "sync peer served {} block(s) from height {} and not one of them is backed by a \
+                 BFT quorum — refusing the batch rather than applying an unproven branch. \
+                 Aborting sync, {} block(s) already applied",
+                blocks.len(),
+                from,
+                total_applied
+            );
+        }
+        let held_back = applied_this_batch < apply_count as u64;
+        from += applied_this_batch;
+        if !peer_has_more && !held_back {
             break; // last batch — we're at the peer tip
         }
     }
@@ -4713,6 +4836,41 @@ mod sync_blocks_from_peer_tests {
                         .map(|c| commit_sig_for(c, ph, &prev_hash))
                         .collect();
                     // Re-sign: the certificate is folded into the header's signing hash.
+                    block.header.signature =
+                        proposer.sign(block.header.signing_hash().as_bytes()).unwrap();
+                }
+                prev_hash = block.hash();
+                prev_height = Some(h);
+                block
+            })
+            .collect()
+    }
+
+    /// Like `chained_blocks_certified_by`, but the certificate for every height named in
+    /// `short_for` is cut down to a single signer.
+    ///
+    /// That is not a hypothetical shape — it is what a real chain looks like. A node that adopts a
+    /// block over the committed-block fast path writes into its next proposal only the precommits
+    /// it holds for that block, and on the live chain on 2026-08-27 that was one signature on
+    /// **20 % of all blocks**. A sync path that demands a quorum from every single block therefore
+    /// refuses a perfectly honest chain.
+    fn chained_blocks_with_short_certificates(
+        proposer: &KeyPair,
+        certifiers: &[&KeyPair],
+        heights: &[u64],
+        short_for: &[u64],
+    ) -> Vec<Block> {
+        let mut prev_hash = Hash::ZERO;
+        let mut prev_height: Option<u64> = None;
+        heights
+            .iter()
+            .map(|&h| {
+                let mut block = signed_block(proposer, h, prev_hash);
+                if let Some(ph) = prev_height {
+                    let signers: &[&KeyPair] =
+                        if short_for.contains(&ph) { &certifiers[..1] } else { certifiers };
+                    block.header.last_commit =
+                        signers.iter().map(|c| commit_sig_for(c, ph, &prev_hash)).collect();
                     block.header.signature =
                         proposer.sign(block.header.signing_hash().as_bytes()).unwrap();
                 }
@@ -5316,6 +5474,117 @@ mod sync_blocks_from_peer_tests {
     /// set is large enough that one signature is not a quorum. Before this check the node adopted
     /// the branch outright; audit item A1 closed the same hole on the gossip fast path and left
     /// this one open, reachable through a compromised or impersonated `sync_peer`.
+    /// **The regression for a chain that could not be caught up with.** An operator's node
+    /// synced 4,091 blocks, hit one whose certificate held a single signature, aborted, resumed at
+    /// the same height and aborted again — a permanent wedge, on an honest chain, against an
+    /// honest peer.
+    ///
+    /// The rule that fixes it is not a relaxation. `prev_hash` is verified block by block, so a
+    /// single genuine quorum anchors every ancestor of it in the batch: the quorum committed a
+    /// block whose ancestry runs through them. `verify_block_batch` has always applied exactly
+    /// this rule to a P2P batch; the RPC path demanding one certificate per block is what made it
+    /// the only path that wedged.
+    #[tokio::test]
+    async fn a_chain_whose_certificates_have_gaps_still_syncs_in_full() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        // Heights 2 and 4 are certified by one signer only — short of the two-validator quorum.
+        let blocks =
+            chained_blocks_with_short_certificates(&a, &[&a, &b], &[1, 2, 3, 4, 5, 6], &[2, 4]);
+        let peer_url = serve_blocks_with_tip_certificate(blocks, &[&a, &b]).await;
+
+        let mut store = fresh_store();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &a);
+        stake_validator(&mut chain_state, &b);
+
+        let applied = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state)
+            .await
+            .expect("an honest chain with gaps in its certificates must still sync");
+
+        assert_eq!(applied, 6, "every block, not just the ones certified individually");
+        assert_eq!(store.latest_height(), 6);
+    }
+
+    /// The index that decides how far a batch vouches for itself. It is the *last* directly
+    /// certified block, not the first: stopping at the first gap would give up proof the batch
+    /// already carries.
+    #[test]
+    fn the_certified_index_is_the_last_block_the_batch_can_vouch_for() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &a);
+        stake_validator(&mut chain_state, &b);
+
+        // Heights 1..5. Every certificate is a real quorum except the one for height 3, so the
+        // last block a successor certifies is height 4 — index 3.
+        let blocks = chained_blocks_with_short_certificates(&a, &[&a, &b], &[1, 2, 3, 4, 5], &[3]);
+        assert_eq!(last_quorum_certified_index(&blocks, &chain_state), Some(3));
+
+        // Nothing certified at all: the caller must refuse the batch rather than apply any of it.
+        let unproven = chained_blocks_certified_by(&a, &[&a], &[1, 2, 3]);
+        assert_eq!(
+            last_quorum_certified_index(&unproven, &chain_state),
+            None,
+            "one validator's own signature is not a quorum, at any index"
+        );
+    }
+
+    /// The P2P block-sync path wedged for the same reason and needs the same rule. A serving node
+    /// certifies a non-tip block from its successor's `last_commit`, which was a single signature
+    /// on 20 % of live blocks — and because the batch boundary is deterministic
+    /// (`our_tip + MAX_BLOCKSYNC_BATCH`), a node whose boundary landed on one of those asked for
+    /// the same batch and was refused, forever. Now the batch yields the prefix its own contents
+    /// prove, and the next request certifies the rest.
+    #[test]
+    fn a_batch_whose_tip_certificate_is_missing_still_yields_its_proven_prefix() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &a);
+        stake_validator(&mut chain_state, &b);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+
+        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3, 4, 5]);
+
+        let proven = verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set)
+            .expect("a batch that certifies four of its own blocks is not a refusal");
+        assert_eq!(
+            proven, 4,
+            "every block up to the last one a successor inside the batch certifies — block 5 has \
+             no successor here, so only its own tip certificate could prove it"
+        );
+
+        // Positive control: with a real tip certificate the whole batch is proven, as before.
+        let tip_certificate = commit_sigs_to_votes(
+            [&a, &b].iter().map(|kp| commit_sig_for(kp, 5, &blocks[4].hash())).collect(),
+            5,
+            blocks[4].hash(),
+        );
+        assert_eq!(
+            verify_block_batch(&blocks, &tip_certificate, 1, Hash::ZERO, &chain_state, &set),
+            Ok(5)
+        );
+    }
+
+    /// The security property is unchanged: a batch nothing in it can prove is still refused whole.
+    #[test]
+    fn a_batch_with_no_quorum_anywhere_is_refused_whole() {
+        let attacker = KeyPair::generate();
+        let honest = KeyPair::generate();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &attacker);
+        stake_validator(&mut chain_state, &honest);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+
+        let blocks = chained_blocks_certified_by(&attacker, &[&attacker], &[1, 2, 3]);
+
+        let err = verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set)
+            .expect_err("one validator's own signature is not a quorum, anywhere in the batch");
+        assert!(err.contains("reaches a BFT quorum"), "{err}");
+    }
+
     #[tokio::test]
     async fn rejects_a_branch_one_validator_signed_alone() {
         let attacker = KeyPair::generate();
@@ -5334,7 +5603,9 @@ mod sync_blocks_from_peer_tests {
         let result = sync_blocks_from_peer(&peer_url, 0, &mut store, &mut chain_state).await;
 
         let err = result.expect_err("a branch without a quorum must not be adopted").to_string();
-        assert!(err.contains("not backed by a BFT quorum"), "{err}");
+        // The wording moved with the rule on 2026-08-27 (per-block proof → the batch must contain
+        // one), the refusal did not: a batch nothing in it can prove is still refused whole.
+        assert!(err.contains("not one of them is backed by a BFT quorum"), "{err}");
         assert_eq!(
             store.latest_height(),
             0,
@@ -6449,12 +6720,17 @@ mod handle_p2p_event_tests {
     /// refused, because nothing proves the network ever finalized them. Without this a single peer
     /// could hand us any history it liked.
     #[tokio::test]
-    async fn a_batch_whose_tip_certificate_lacks_quorum_is_refused_entirely() {
+    async fn a_batch_with_no_quorum_anywhere_in_it_is_refused_entirely() {
         let kp = KeyPair::generate();
         let other = KeyPair::generate();
         let (store, chain_state, engine, cell) = blocksync_fixture(&kp).await;
         // A second staker, so one signature is genuinely short of the 2/3 threshold.
         stake_in_state(&mut *chain_state.write().await, &other);
+        // Renamed 2026-08-27 with the rule it guards. A short *tip* certificate is no longer on
+        // its own a reason to refuse — a quorum anywhere inside the batch proves every ancestor
+        // through the hash chain, and demanding one at the tip specifically wedged catch-up. What
+        // must still be refused, and is what this builds, is a batch nothing in it can prove:
+        // every certificate below carries the one signature `chained_blocks` puts there.
 
         let blocks = chained_blocks(&kp, &[1, 2, 3]);
         let tip = blocks.last().unwrap();
