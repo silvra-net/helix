@@ -100,6 +100,21 @@ pub enum P2PCommand {
     /// cleanly are both just a non-empty response. Without this the peer keeps being picked — it
     /// is by definition the one claiming the highest tip — and catch-up never moves.
     BlocksyncBatchRejected(String),
+    /// A peer proved, by what it served, that it is on a different history: its batch did not
+    /// chain from our tip. Stronger than [`Self::BlocksyncBatchRejected`] and used instead of it,
+    /// because a cooldown only paces the retries — the peer keeps its claimed tip, keeps winning
+    /// `best_blocksync_peer`, and keeps being asked forever.
+    ///
+    /// **This is evidence, where `PeerChain` is advertisement.** A node from before peer exchange
+    /// carried `genesis_hash` reports none, which is `PeerChain::Unknown`, which is deliberately
+    /// treated as `Same` — refusing the unknown costs more than it saves. Live on 2026-08-27: a
+    /// node still running the chain that was reset away on 2026-08-26 sat at height 477,478, was
+    /// never recognised as foreign because it advertised nothing, and had V1 fetching and
+    /// discarding a 56-block batch every ten seconds — 310 of them, the exact noise #175 exists to
+    /// end. Worse than noise: it claimed the highest tip on the network by an order of magnitude,
+    /// so it won every `best_blocksync_peer` choice, which is precisely the wrong peer to prefer
+    /// when a real validator needs to catch up.
+    BlocksyncPeerOnAnotherChain(String),
     /// A synced batch is on disk and `tip_height` has moved — ask for the next one now instead of
     /// waiting out the rest of `blocksync_interval`.
     ///
@@ -384,6 +399,9 @@ impl P2PService {
         // a flood. Cleared on a response and on any failure, so a peer that never answers costs one
         // request and one timeout, not a wedged sync.
         let mut blocksync_in_flight = false;
+        // Peers that have *demonstrated* a different history, whatever they advertise. See
+        // `P2PCommand::BlocksyncPeerOnAnotherChain`.
+        let mut foreign_by_evidence: HashSet<PeerId> = HashSet::new();
         // One outstanding round-sync request at a time, and the peer to ask next (round-robin
         // over whoever is connected).
         let mut roundsync_in_flight = false;
@@ -477,8 +495,12 @@ impl P2PService {
                                     // back to the relay keeps the old behaviour for the case the
                                     // types allow but Strict rejects before it reaches us.
                                     let origin = message.source.unwrap_or(propagation_source);
-                                    peer_tips.insert(origin, tip);
-                                    publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
+                                    // A peer that has already served us a batch off another
+                                    // history gets no say in what we sync, whatever it now claims.
+                                    if !foreign_by_evidence.contains(&origin) {
+                                        peer_tips.insert(origin, tip);
+                                        publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
+                                    }
                                 }
                                 if let Some(peer_tip) = outcome.serve_from_tip {
                                     let _ = event_tx
@@ -988,6 +1010,28 @@ impl P2PService {
                         }
                         P2PCommand::ConnectPeer(addr) => {
                             let _ = swarm.dial(addr);
+                        }
+                        P2PCommand::BlocksyncPeerOnAnotherChain(peer) => {
+                            match peer.parse::<PeerId>() {
+                                Ok(peer_id) => {
+                                    // Forget its tip and stop believing any it sends later. Not a
+                                    // ban and not a disconnect: it is a peer we simply have nothing
+                                    // to learn blocks from. It stays connected, its gossip is still
+                                    // validated on its merits, and if it ever resyncs onto this
+                                    // chain a restart of either side clears this.
+                                    if foreign_by_evidence.insert(peer_id) {
+                                        warn!(
+                                            peer = %peer,
+                                            "This peer serves blocks that do not chain from our tip \
+                                             — it is on a different history. No longer asking it for \
+                                             blocks or believing the tip it claims."
+                                        );
+                                    }
+                                    peer_tips.remove(&peer_id);
+                                    publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
+                                }
+                                Err(_) => warn!(peer = %peer, "Unparseable peer id in block-sync report"),
+                            }
                         }
                         P2PCommand::BlocksyncBatchRejected(peer) => {
                             // The node verified the batch and threw it away. From the service's own
@@ -2506,6 +2550,67 @@ mod blocksync_selection_tests {
 
     fn no_cooldown() -> HashMap<PeerId, u32> {
         HashMap::new()
+    }
+
+    /// **The live case this exists for**, as arithmetic rather than a story.
+    ///
+    /// A node left running on the chain that was reset away on 2026-08-26 claimed height 477,478
+    /// while the real chain sat at 41,644. Because it ran a build whose peer exchange predates
+    /// `genesis_hash` it was never recognised as foreign, so its tip went into this map — and this
+    /// function picks the highest, so it won every choice, over the one peer that could actually
+    /// serve blocks. The cooldown paced the damage at one wasted 56-block fetch every ten seconds
+    /// and never ended it.
+    ///
+    /// Dropping such a peer's tip on the evidence of what it served is the fix; this pins the
+    /// selection consequence, so the two halves cannot be repaired independently and drift.
+    #[test]
+    fn a_peer_dropped_for_serving_another_history_stops_winning_the_choice() {
+        let zombie = PeerId::random();
+        let real = PeerId::random();
+        let mut tips = HashMap::new();
+        tips.insert(zombie, 477_478);
+        tips.insert(real, 41_700);
+
+        let chosen = best_blocksync_peer(&tips, 41_644, &no_cooldown(), |_| true);
+        assert_eq!(
+            chosen.map(|(p, _)| p),
+            Some(zombie),
+            "premise: the highest claim wins, which is exactly why a dead chain's claim is harmful"
+        );
+
+        // What `BlocksyncPeerOnAnotherChain` does: forget the tip entirely, rather than cool it
+        // down and let it win again ten seconds later.
+        tips.remove(&zombie);
+        assert_eq!(
+            best_blocksync_peer(&tips, 41_644, &no_cooldown(), |_| true).map(|(p, _)| p),
+            Some(real),
+            "with its tip forgotten, catch-up goes to the peer that can actually serve it"
+        );
+    }
+
+    /// A cooldown alone would not have been enough, and this says why in one assertion: it expires.
+    #[test]
+    fn a_cooldown_only_postpones_a_peer_that_should_never_be_asked_again() {
+        let zombie = PeerId::random();
+        let real = PeerId::random();
+        let mut tips = HashMap::new();
+        tips.insert(zombie, 477_478);
+        tips.insert(real, 41_700);
+
+        let mut cooling = HashMap::new();
+        cooling.insert(zombie, BLOCKSYNC_PEER_COOLDOWN_TICKS);
+        assert_eq!(
+            best_blocksync_peer(&tips, 41_644, &cooling, |_| true).map(|(p, _)| p),
+            Some(real),
+            "while cooling, the real peer is preferred"
+        );
+
+        // …and the moment it lapses, the dead chain is back at the front of the queue.
+        assert_eq!(
+            best_blocksync_peer(&tips, 41_644, &no_cooldown(), |_| true).map(|(p, _)| p),
+            Some(zombie),
+            "which is the whole reason the tip has to be dropped and not merely delayed"
+        );
     }
 
     /// `peer_tips` is keyed by the validator that *originated* an announcement, which is the

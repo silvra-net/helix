@@ -1799,7 +1799,22 @@ async fn apply_synced_batch(
             // exactly like one that applied cleanly (backlog #140). Nothing here trusts the peer
             // any less — the batch is already discarded — this only stops it from monopolising
             // catch-up while a healthy peer sits one block lower, unasked.
-            let _ = p2p_tx.try_send(P2PCommand::BlocksyncBatchRejected(peer));
+            //
+            // **A batch that does not chain from our tip is a different report from the others.**
+            // The base height was re-checked under the lock a few lines above, so this is not a
+            // batch computed against a tip that moved underneath it — it is a peer serving another
+            // history, and a cooldown merely paces how often it does so. Live on 2026-08-27: a
+            // node left running on the chain reset away the day before advertised no genesis (an
+            // older payload, so `PeerChain::Unknown`, deliberately treated as `Same`), claimed
+            // height 477,478 — the highest on the network by far, so it won every peer choice —
+            // and had this node fetching and discarding 56 blocks every ten seconds. Evidence,
+            // unlike advertisement, does not depend on the peer choosing to tell the truth.
+            let does_not_chain = e.contains("does not chain from the previous block");
+            let _ = p2p_tx.try_send(if does_not_chain {
+                P2PCommand::BlocksyncPeerOnAnotherChain(peer)
+            } else {
+                P2PCommand::BlocksyncBatchRejected(peer)
+            });
             return;
             }
         }
