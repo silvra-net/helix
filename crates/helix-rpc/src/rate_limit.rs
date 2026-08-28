@@ -74,7 +74,18 @@ impl RateLimiter {
 /// socket peer is loopback — otherwise a client could send a fresh spoofed
 /// value on every request and bypass the limiter entirely. In that case the
 /// real socket address is used, which is exactly what the limiter needs.
-fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+/// The address the request really came from.
+///
+/// A direct connection answers itself — the socket's peer *is* the client. Behind a reverse proxy
+/// or a Cloudflare tunnel every request arrives from loopback instead, and the forwarding headers
+/// are the only remaining source; they are trusted **only** in that case, so a client on a direct
+/// connection cannot spoof its way into another bucket by sending the header itself.
+///
+/// Shared with `/whoami` (`server::get_whoami`), which answers a node asking how it looks from
+/// outside so it can announce a dialable address without the operator configuring one. Same
+/// question, same answer — a second copy would be a duplicated invariant of exactly the kind that
+/// drifts.
+pub(crate) fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
     if !peer.ip().is_loopback() {
         return peer.ip();
     }

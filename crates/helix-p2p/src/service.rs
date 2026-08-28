@@ -49,6 +49,11 @@ pub enum P2PEvent {
     NewCommittedBlock(Block, Vec<Vote>),
     PeerConnected(String),
     PeerDisconnected(String),
+    /// This node started announcing `addr` as its own, after a peer confirmed it could reach it.
+    ///
+    /// Purely so the node layer can log it once, in the operator's terms. The decision itself is
+    /// already made by the time this is sent.
+    SelfAddressAnnounced(String),
     /// A peer announced, on the periodic peer-exchange gossip, a committed tip *below* ours and
     /// close enough behind to be worth serving over gossip. The node layer answers by
     /// re-broadcasting the committed blocks that peer is missing, each with its commit
@@ -132,6 +137,14 @@ pub enum P2PCommand {
     /// answer being non-empty and verifying fine — nothing charged a cooldown or logged a
     /// retry. That capped catch-up at one batch per *sample*, 20 blocks/s, not per tick.
     BlocksyncAdvance(u64),
+    /// Start announcing `addr` as this node's own on peer exchange.
+    ///
+    /// Separate from the probe because the two happen on different nodes: whoever asked
+    /// `/whoami` gets the verdict, and only that node announces. It lives here rather than in the
+    /// node layer because `known_addrs` lives in this task, and the address must become this
+    /// node's `self_addr` in the same moment — the filter that stops it dialing its own
+    /// announcement when a peer echoes it back.
+    AnnounceSelfAddress(String),
 }
 
 #[derive(NetworkBehaviour)]
@@ -377,6 +390,12 @@ impl P2PService {
         // because it is the same kind of thing: per-peer state the loop owns and the pure helpers
         // must not.
         let mut unreadable_peer_exchange_counts: HashMap<PeerId, u32> = HashMap::new();
+        // The address this node announces as its own. Starts as whatever the operator configured
+        // and stays there for a node behind a proxy, whose reachable address it cannot discover.
+        // A successful probe replaces it — so it must be a variable, not `config.public_addr`,
+        // which is fixed at startup and is also the `self_addr` filter that keeps this node from
+        // dialing its own announcement when it comes back around the gossip.
+        let mut announced_self: Option<String> = config.public_addr.clone();
         // Peers we have announced as connected, so `PeerConnected`/`PeerDisconnected` reach the
         // node strictly in pairs (backlog #147).
         //
@@ -468,7 +487,7 @@ impl P2PService {
                                 let outcome = handle_peer_exchange_message(
                                     &message.data,
                                     &mut known_addrs,
-                                    config.public_addr.as_deref(),
+                                    announced_self.as_deref(),
                                     &mut swarm,
                                     &mut peer_warnings,
                                     tip_height.load(Ordering::Relaxed),
@@ -1010,6 +1029,29 @@ impl P2PService {
                         }
                         P2PCommand::ConnectPeer(addr) => {
                             let _ = swarm.dial(addr);
+                        }
+                        P2PCommand::AnnounceSelfAddress(addr) => {
+                            // Dropping the address this replaces is the one place anything is ever
+                            // removed from `known_addrs`, and it is deliberate: on a connection
+                            // whose address changes, keeping the old one would have this node
+                            // broadcasting a growing list of addresses that no longer reach it,
+                            // and every peer that learned one would keep dialing into nothing.
+                            // Only *this node's own* previous address is dropped — never one
+                            // learned from a peer, which this node has no standing to call dead.
+                            if announced_self.as_deref() == Some(addr.as_str()) {
+                                continue; // already announcing it; nothing to say
+                            }
+                            if let Some(previous) = announced_self.replace(addr.clone()) {
+                                known_addrs.remove(&previous);
+                                info!(
+                                    old = %previous,
+                                    new = %addr,
+                                    "This node's reachable address changed — announcing the new \
+                                     one and dropping the old"
+                                );
+                            }
+                            known_addrs.insert(addr.clone());
+                            let _ = event_tx.send(P2PEvent::SelfAddressAnnounced(addr)).await;
                         }
                         P2PCommand::BlocksyncPeerOnAnotherChain(peer) => {
                             match peer.parse::<PeerId>() {
@@ -2727,3 +2769,4 @@ mod observed_height_tests {
         assert_eq!(outcome.observed_height, None);
     }
 }
+

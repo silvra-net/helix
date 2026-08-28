@@ -71,6 +71,36 @@ Network" above. `base_fee_per_byte` is what the next block will charge per trans
 price against it rather than hardcoding a fee, since a flat number is only right until the
 network gets busy (see "Fees" above).
 
+### `GET /whoami`
+
+Answers the one question a node cannot answer about itself: **what address does the rest of the
+world reach me at?** A node knows the port it listens on and nothing about how it looks from
+outside, so without this it can only announce an address its operator configured by hand.
+
+```json
+{ "ip": "203.0.113.7", "multiaddr_kind": "ip4" }
+```
+
+`ip` is the address the request arrived from — the socket's peer on a direct connection, or the
+forwarding header (`CF-Connecting-IP`, `X-Forwarded-For`) when the request came through a proxy
+and the socket therefore says `127.0.0.1`. Headers are trusted **only** in that case, so a caller
+on a direct connection cannot talk itself into a different answer. `multiaddr_kind` is `ip4` or
+`ip6`, matching the address.
+
+Add `?p2p_port=<n>` and this node also opens a TCP connection back to `<ip>:<n>` and reports
+whether it got through:
+
+```json
+{ "ip": "203.0.113.7", "multiaddr_kind": "ip4",
+  "probed": "/ip4/203.0.113.7/tcp/8546", "reachable": true }
+```
+
+The probed address is always built from the address the request came from — only the port is the
+caller's to choose — so this cannot be aimed at a third party. `reachable: false` carries a
+`probe_error` naming the cause (refused vs. timed out, which distinguishes a closed port from a
+firewalled one). Nodes call this on their sync peer at startup and every ten minutes; see
+"Network Resilience" in `running-a-node.md`.
+
 ### Diagnostics response
 
 `GET /diagnostics` answers the questions that come up when a node is misbehaving. It is

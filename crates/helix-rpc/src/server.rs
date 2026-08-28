@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 use std::sync::{atomic::Ordering, Arc};
 
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{get, post},
@@ -102,6 +102,14 @@ const TX_SUBMIT_BODY_LIMIT_BYTES: usize = 64 * 1024;
 /// binding limit on how fast anyone can submit transactions** — well below what the chain itself
 /// can include (a 2 MB block every 2 s is ~180 transfers/second). Measured 2026-08-27 by flooding
 /// a node: 2000 signed transactions, 45 admitted, which is the bucket to the token.
+/// How long `/whoami?p2p_port=` waits for its dial before answering "not reachable".
+///
+/// A *closed* port refuses immediately; a *filtered* one — the common firewall default — swallows
+/// the packet and the dial hangs until the OS gives up, which can be minutes. Someone is waiting
+/// on this HTTP request, so it is bounded. Five seconds is far more than a real handshake needs
+/// and short enough that the answer arrives while the operator is still watching.
+const PROBE_TIMEOUT_SECS: u64 = 5;
+
 const DEFAULT_RPC_BURST: f64 = 30.0;
 const DEFAULT_RPC_REFILL_PER_SEC: f64 = 10.0;
 
@@ -175,6 +183,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/sync/blocks", get(get_sync_blocks))
         .route("/sync/tip-certificate", get(get_tip_certificate))
         .route("/diagnostics", get(get_diagnostics))
+        .route("/whoami", get(get_whoami))
         .route(
             "/transactions",
             post(submit_transaction).layer(DefaultBodyLimit::max(TX_SUBMIT_BODY_LIMIT_BYTES)),
@@ -432,6 +441,103 @@ async fn get_blocks_range(
 /// describe how a *new* chain would launch on today's build — not how this one launched. Together
 /// they let a joining node rebuild the exact same initial `ChainState` this chain started from,
 /// whatever build it happens to be running.
+/// Build the address to probe from the connection a request arrived on, plus a port the caller
+/// names.
+///
+/// **The IP is never taken from the request.** That is the whole security property: this endpoint
+/// makes *this* node dial an address on a stranger's say-so, so the address has to be pinned to
+/// where the request actually came from. Take the IP from the request instead and it becomes a
+/// way to have somebody else's node connect to any host on demand.
+///
+/// The port is the caller's to choose — they know which port they listen on and this node cannot
+/// — but it must be a real one. Port 0 means "any" to the OS and nothing at all to a dialer.
+fn probe_target(ip: std::net::IpAddr, port: u64) -> Option<(String, u16)> {
+    let port = u16::try_from(port).ok().filter(|p| *p != 0)?;
+    let kind = if ip.is_ipv4() { "ip4" } else { "ip6" };
+    Some((format!("/{kind}/{ip}/tcp/{port}"), port))
+}
+
+/// `GET /whoami` — tells the caller the address its request arrived from, and optionally whether
+/// this node can reach it back there.
+///
+/// **Why a node cannot answer either half for itself.** It knows the port it listens on and
+/// nothing about the address the world reaches it at: `known_addrs` is built from the operator's
+/// configured `HELIX_P2P_PUBLIC_ADDR`, the seed list and the peer file, and no code path anywhere
+/// records the address of an arriving connection. So a node whose operator configured nothing
+/// announces nothing, every other node has nothing to dial, and a network of four stays a star
+/// around whoever *was* configured — measured on 2026-08-28, when this node's peer file held
+/// exactly one address after a month of running: its own.
+///
+/// Nor can a node test its own port by connecting to itself. libp2p drops any address the node is
+/// already listening on before the dial leaves the process (`Swarm::dial`), so the attempt fails
+/// with `DialError::NoAddresses` whether the port is wide open or firewalled shut — and a local
+/// socket connect proves only that the process is listening, which was never in doubt. Someone
+/// else has to try the door from outside. That is what `?p2p_port=` asks for, and it is the same
+/// shape as libp2p's own AutoNAT.
+///
+/// Bitcoin closes the first half inside its handshake — the `version` message tells each side how
+/// the other sees it. This is that, over the transport a joining node already speaks to a seed.
+///
+/// ```text
+/// GET /whoami                  -> {"ip": "203.0.113.7", "multiaddr_kind": "ip4"}
+/// GET /whoami?p2p_port=8546    -> … plus {"probed": "/ip4/203.0.113.7/tcp/8546",
+///                                         "reachable": true, "peer_id": "12D3Koo…"}
+/// ```
+async fn get_whoami(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(params): Query<std::collections::HashMap<String, u64>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let ip = crate::rate_limit::client_ip(&headers, peer);
+    let mut body = json!({
+        "ip": ip.to_string(),
+        // Derived here so the two places that answer "v4 or v6?" cannot drift apart, and so the
+        // caller need not re-parse a string this node already parsed.
+        "multiaddr_kind": if ip.is_ipv4() { "ip4" } else { "ip6" },
+    });
+
+    let Some(port) = params.get("p2p_port").copied() else {
+        return (StatusCode::OK, Json(body));
+    };
+    let Some((target, port)) = probe_target(ip, port) else {
+        body["probe_error"] = json!("p2p_port must be between 1 and 65535");
+        return (StatusCode::OK, Json(body));
+    };
+    body["probed"] = json!(target);
+
+    // A plain TCP connect, not a libp2p dial. The question is only "is this port open from out
+    // here", and libp2p answers it badly: a dial to a peer this node is already connected to is
+    // refused by its own `max_established_per_peer` limit *after* the handshake succeeds
+    // (measured 2026-08-28: `Exceeded { limit: 2, kind: EstablishedPerPeer }`), and the refusal
+    // is indistinguishable from a genuinely closed port. Raising the limit does not help — the
+    // regular connections fill whatever it is set to. A socket has no such history.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+        tokio::net::TcpStream::connect((ip, port)),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => {
+            body["reachable"] = json!(true);
+        }
+        Ok(Err(e)) => {
+            body["reachable"] = json!(false);
+            body["probe_error"] = json!(format!(
+                "nothing accepted a connection there ({e}) — the port is closed from the outside, \
+                 so open it in the firewall or router"
+            ));
+        }
+        Err(_) => {
+            body["reachable"] = json!(false);
+            body["probe_error"] = json!(format!(
+                "nothing answered within {PROBE_TIMEOUT_SECS}s — the port is most likely \
+                 firewalled rather than closed, which drops the packet instead of refusing it"
+            ));
+        }
+    }
+    (StatusCode::OK, Json(body))
+}
+
 async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
     let store = state.store.read().await;
     let block = match store.get_block_by_height(0) {
@@ -2212,7 +2318,7 @@ mod tests {
         assert!(parsed["previous_run"].is_null(), "a first run has no previous run: {parsed}");
     }
 
-    fn fresh_test_state() -> AppState {
+    pub(super) fn fresh_test_state() -> AppState {
         let path = std::env::temp_dir().join(format!(
             "helix-rpc-test-store-{}-{}.redb",
             std::process::id(),
@@ -2832,5 +2938,116 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod whoami_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    async fn whoami(peer: &str, headers: HeaderMap) -> Value {
+        let params = std::collections::HashMap::new();
+        let response = get_whoami(ConnectInfo(peer.parse().unwrap()), Query(params), headers)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_direct_caller_is_told_the_address_it_connected_from() {
+        let body = whoami("203.0.113.7:44321", HeaderMap::new()).await;
+        assert_eq!(body["ip"], "203.0.113.7");
+        assert_eq!(body["multiaddr_kind"], "ip4");
+        assert!(body.get("probed").is_none(), "no port asked for, so nothing probed");
+    }
+
+    /// The reason this endpoint can exist at all. Every request through the tunnel arrives from
+    /// loopback, so without reading the forwarding header the answer would be `127.0.0.1` for
+    /// everyone — worse than useless, since a node that announced it would have the whole network
+    /// dialing itself.
+    #[tokio::test]
+    async fn a_caller_behind_the_tunnel_is_told_its_real_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "198.51.100.42".parse().unwrap());
+        let body = whoami("127.0.0.1:8545", headers).await;
+        assert_eq!(body["ip"], "198.51.100.42");
+    }
+
+    /// A caller on a direct connection must not be able to talk itself into a different answer.
+    /// The socket is the fact whenever there is one; the header is consulted only when a proxy
+    /// has already replaced it.
+    #[tokio::test]
+    async fn a_direct_caller_cannot_spoof_its_address_with_a_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "198.51.100.42".parse().unwrap());
+        headers.insert("x-forwarded-for", "192.0.2.1".parse().unwrap());
+        let body = whoami("203.0.113.7:44321", headers).await;
+        assert_eq!(body["ip"], "203.0.113.7", "the socket wins over any header a client sends");
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_caller_is_labelled_ip6() {
+        let body = whoami("[2001:db8::1]:44321", HeaderMap::new()).await;
+        assert_eq!(body["ip"], "2001:db8::1");
+        assert_eq!(body["multiaddr_kind"], "ip6");
+    }
+
+    /// The security property of the whole endpoint, and it has to be checked *through the
+    /// handler*, not on `probe_target` alone.
+    ///
+    /// This route makes this node open a connection on a stranger's request. If the address came
+    /// from the request rather than from the connection it arrived on, anyone could aim it at any
+    /// host — a port scanner with someone else's node as the source. Testing only `probe_target`
+    /// leaves that untested: a red run that moved the address lookup into the request body kept
+    /// the pure-function test green, which is exactly the shape of a test that passes while the
+    /// property it is named after is broken.
+    ///
+    /// Port 1 on the caller's own address so the connection fails immediately rather than sitting
+    /// out the probe timeout; what is asserted is `probed`, not the verdict.
+    #[tokio::test]
+    async fn the_probed_address_comes_from_the_connection_not_from_the_request() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "198.51.100.42".parse().unwrap());
+        headers.insert("x-forwarded-for", "192.0.2.1".parse().unwrap());
+        let mut params = std::collections::HashMap::new();
+        params.insert("p2p_port".to_string(), 1u64);
+        let response =
+            get_whoami(ConnectInfo("127.0.0.1:44321".parse().unwrap()), Query(params), headers)
+                .await
+                .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        // Loopback socket, so the forwarding header is honoured — but only the *first* one, and
+        // never the raw request. What must never appear is 192.0.2.1: a caller cannot pick.
+        assert_eq!(body["probed"], "/ip4/198.51.100.42/tcp/1");
+    }
+
+    #[test]
+    fn the_probed_address_is_always_the_callers_own() {
+        let caller: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(
+            probe_target(caller, 8546),
+            Some(("/ip4/203.0.113.7/tcp/8546".to_string(), 8546))
+        );
+        let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(
+            probe_target(v6, 8546),
+            Some(("/ip6/2001:db8::1/tcp/8546".to_string(), 8546))
+        );
+    }
+
+    /// Port 0 means "any" to the OS and nothing to a dialer, and anything above 65535 is not a
+    /// port at all — both would produce an address that cannot be dialed, so they are refused
+    /// before a dial is ever started rather than failing obscurely inside libp2p.
+    #[test]
+    fn a_port_that_cannot_be_dialed_is_refused_before_dialing() {
+        let caller: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        for bad in [0, 65_536, 1 << 40] {
+            assert!(probe_target(caller, bad).is_none(), "port {bad} must be refused");
+        }
+        assert!(probe_target(caller, 65_535).is_some(), "65535 is a real port");
     }
 }

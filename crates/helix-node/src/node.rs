@@ -287,6 +287,14 @@ const MAX_TXS_PER_BLOCK: usize = 1_000;
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
 /// Validator health heartbeat cadence and thresholds (see `validator_health_loop`).
 const VALIDATOR_HEALTH_SECS: u64 = 60;
+
+/// How often a node re-checks whether it is reachable from outside (`discover_own_address`).
+///
+/// Ten minutes, because the answer only changes when an operator changes something — a firewall
+/// rule, a port forward, an address — and every check costs the seed a real connection back to
+/// this node. The first one fires immediately (`tokio::time::interval` yields at once), which is
+/// the one that matters: it is what turns a freshly started node into a reachable one.
+const SELF_PROBE_INTERVAL_SECS: u64 = 600;
 /// How many recent blocks the signing check looks across. A healthy validator is legitimately
 /// absent from a large fraction of individual commit certificates (the gossip fast-path drops
 /// precommits it already had), so "not in the last block" is noise — "not in any of the last
@@ -1248,6 +1256,28 @@ impl HelixNode {
         // Proof of life for the production loop, watched by the health heartbeat (#151).
         let production_ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+        // Find out how this node looks from outside and announce it — but only when the operator
+        // has not already said, and only when there is a peer to ask. A node with no sync peer is
+        // the origin of its own chain and has nobody to ask in the first place.
+        match (&self.p2p_public_addr, &self.sync_peer) {
+            (Some(addr), _) => {
+                info!(
+                    addr = %addr,
+                    "Announcing the address configured in HELIX_P2P_PUBLIC_ADDR — skipping \
+                     automatic discovery, since an explicit answer beats a derived one"
+                );
+            }
+            (None, Some(peer_url)) => {
+                tokio::spawn(discover_own_address(
+                    reqwest::Client::new(),
+                    peer_url.clone(),
+                    self.p2p_port,
+                    self.p2p_command_tx.clone(),
+                ));
+            }
+            (None, None) => {}
+        }
+
         tokio::spawn(validator_health_loop(
             self.store.clone(),
             self.chain_state.clone(),
@@ -1705,6 +1735,14 @@ async fn handle_p2p_event(
         }
         P2PEvent::BlocksSynced(batch, peer) => {
             apply_synced_batch(batch, peer, store, chain_state, engine, mempool, last_applied_height, tip_certificate, p2p_tx).await;
+        }
+        P2PEvent::SelfAddressAnnounced(addr) => {
+            info!(
+                addr = %addr,
+                "A peer confirmed it can reach this node, which is now announcing that address to \
+                 the network — other nodes can dial it directly instead of going through a shared \
+                 hub."
+            );
         }
     }
 }
@@ -3973,6 +4011,169 @@ fn diagnose_non_json(body: &str) -> String {
         " — the peer answered with an empty body".to_string()
     } else {
         format!(" — the peer answered with: {snippet}")
+    }
+}
+
+/// What a seed's `/whoami` answer means for this node's own address.
+#[derive(Debug, PartialEq, Eq)]
+enum SelfAddress {
+    /// The seed reached this node at this address. Safe to announce.
+    Confirmed(String),
+    /// The address is this node's, but nothing got through to it.
+    Unreachable { addr: String, reason: String },
+    /// The answer says nothing usable — an old build, a malformed body, or a seed reporting on an
+    /// address this node never asked about.
+    Unusable(String),
+}
+
+/// Decide whether to announce an address, from a seed's answer alone.
+///
+/// Pure and separate from the request, because this is the whole security decision and inside an
+/// async HTTP loop no test could reach it. Two properties it exists to hold:
+///
+/// **The address is rebuilt here, never taken from the answer.** The seed reports which address it
+/// probed, and that report must match what this node derived from the reported IP and its *own*
+/// port. Without the check a seed could answer "I probed 198.51.100.9 and it was reachable" and
+/// have this node announce a stranger's address to the whole network.
+///
+/// **`reachable` must be explicitly true.** A missing field, a null, a string "true" — all mean an
+/// answer this code does not understand, and the safe reading of an answer you do not understand
+/// is "not confirmed".
+fn self_address_verdict(body: &serde_json::Value, p2p_port: u16) -> SelfAddress {
+    let Some(candidate) = candidate_self_multiaddr(body, p2p_port) else {
+        return SelfAddress::Unusable("no usable address in the answer".to_string());
+    };
+    match body.get("probed").and_then(|v| v.as_str()) {
+        Some(probed) if probed == candidate => {}
+        other => {
+            return SelfAddress::Unusable(format!(
+                "the seed reported probing {other:?}, but this node asked about {candidate}"
+            ))
+        }
+    }
+    if body.get("reachable").and_then(|v| v.as_bool()) == Some(true) {
+        SelfAddress::Confirmed(candidate)
+    } else {
+        SelfAddress::Unreachable {
+            addr: candidate,
+            reason: body
+                .get("probe_error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("the seed did not say why")
+                .to_string(),
+        }
+    }
+}
+
+/// Turn a seed's `/whoami` answer plus this node's own listen port into an address to probe.
+///
+/// Pure and separate from the request, so the parts worth getting wrong are testable without a
+/// network. Two of them are:
+///
+/// **The port is never taken from the answer.** A peer knows which address our request came from
+/// and has no idea which port we listen on — those are different numbers (the source port of an
+/// outgoing connection is ephemeral). Reading a port from the peer would also hand a hostile seed
+/// a second field to lie in.
+///
+/// **A loopback or unspecified answer is refused outright.** It is what a peer behind a reverse
+/// proxy sees for every client, and announcing `127.0.0.1` would be worse than announcing nothing:
+/// every node that learned it would dial *itself*.
+fn candidate_self_multiaddr(body: &serde_json::Value, p2p_port: u16) -> Option<String> {
+    let ip = body.get("ip").and_then(|v| v.as_str())?;
+    let parsed: std::net::IpAddr = ip.parse().ok()?;
+    if parsed.is_loopback() || parsed.is_unspecified() {
+        return None;
+    }
+    let kind = match body.get("multiaddr_kind").and_then(|v| v.as_str()) {
+        // Trusted only as far as it agrees with the address itself — the address is the fact, the
+        // label is a convenience, and they must not be able to disagree.
+        Some(k @ ("ip4" | "ip6")) if (k == "ip4") == parsed.is_ipv4() => k,
+        _ if parsed.is_ipv4() => "ip4",
+        _ => "ip6",
+    };
+    Some(format!("/{kind}/{ip}/tcp/{p2p_port}"))
+}
+
+/// Work out this node's own reachable address and start announcing it, so operators do not have
+/// to configure one by hand.
+///
+/// **Why this exists.** A node knows the port it listens on and nothing about the address the rest
+/// of the world reaches it at; `known_addrs` is built from the configured `HELIX_P2P_PUBLIC_ADDR`,
+/// the seed list and the peer file, and no code path records the address of an arriving
+/// connection. Without this, a node whose operator set nothing announces nothing, and every other
+/// node has nothing to dial it at. Measured on 2026-08-28: after a month of running with three
+/// permanently-connected peers, this node's peer file held exactly one address — its own. Four
+/// validators, one possible network shape: a star, whose centre going offline stops the chain even
+/// though the other three hold quorum between them.
+///
+/// **Why it has to ask.** Neither half of the question can be answered locally. The address is
+/// only visible from outside, and the port cannot be tested by dialing it either — libp2p drops
+/// any address the node is already listening on before the dial leaves the process, so a self-dial
+/// fails with `DialError::NoAddresses` whether the port is wide open or firewalled shut. (Found by
+/// running it, not by reading it: the unit tests all passed against a probe that never left the
+/// building.) So the seed is asked to try the door from its side, which is the same shape as
+/// libp2p's own AutoNAT.
+///
+/// **What is trusted, and what is not.** The address is rebuilt here from the reported IP and this
+/// node's *own* port, and the seed's report of what it probed must match it exactly — otherwise a
+/// seed could answer "I probed 198.51.100.9 and it was reachable" and have this node announce a
+/// stranger's address. The residual trust is real and bounded: a lying seed can still name a
+/// wrong IP, and the cost of that is peers dialing an address whose handshake fails. A node whose
+/// operator would rather not extend even that much sets `HELIX_P2P_PUBLIC_ADDR` and skips this
+/// entirely.
+async fn discover_own_address(
+    client: reqwest::Client,
+    seed_rpc_url: String,
+    p2p_port: u16,
+    p2p_tx: mpsc::Sender<P2PCommand>,
+) {
+    // One probe at startup, then rarely. The answer changes only when an operator changes
+    // something — a firewall rule, a port forward, an address — and each probe costs the seed a
+    // real dial.
+    let mut ticker = tokio::time::interval(Duration::from_secs(SELF_PROBE_INTERVAL_SECS));
+    let mut announced: Option<String> = None;
+    loop {
+        ticker.tick().await;
+        let url = format!(
+            "{}/whoami?p2p_port={p2p_port}",
+            seed_rpc_url.trim_end_matches('/')
+        );
+        let body: serde_json::Value = match fetch_json(&client, &url).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Not a warning. A peer on an older build has no `/whoami`, which is an ordinary
+                // state of a network mid-upgrade and not something an operator broke.
+                debug!(url = %url, err = %e, "Could not ask the seed how this node looks from outside");
+                continue;
+            }
+        };
+        match self_address_verdict(&body, p2p_port) {
+            SelfAddress::Confirmed(candidate) => {
+                if announced.as_deref() == Some(candidate.as_str()) {
+                    continue; // already announcing it, nothing changed
+                }
+                if p2p_tx.send(P2PCommand::AnnounceSelfAddress(candidate.clone())).await.is_err() {
+                    return; // service is gone; so is the node
+                }
+                announced = Some(candidate);
+            }
+            SelfAddress::Unreachable { addr, reason } => {
+                // Deliberately a warning, and deliberately repeated. A node that cannot be
+                // reached still works perfectly — it syncs, validates and votes — so nothing else
+                // about its behaviour hints at the problem, and what it costs stays invisible
+                // until the hub everyone hangs off drops its link.
+                warn!(
+                    addr = %addr,
+                    reason = %reason,
+                    "This node is NOT reachable from the outside, so other nodes can only find it \
+                     through whichever peer it dialed. Open the P2P port to fix it."
+                );
+                announced = None;
+            }
+            SelfAddress::Unusable(why) => {
+                debug!(url = %url, reason = %why, "Ignoring the seed's /whoami answer");
+            }
+        }
     }
 }
 
@@ -8962,5 +9163,163 @@ mod round_sync_tests {
 
         let nothing = provider.round_state(2, 0).await;
         assert!(nothing.is_empty(), "we hold no round for a height we are not deciding");
+    }
+}
+
+#[cfg(test)]
+mod self_address_discovery_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_public_address_becomes_a_dialable_multiaddr_on_our_own_port() {
+        let body = json!({ "ip": "203.0.113.7", "multiaddr_kind": "ip4" });
+        assert_eq!(
+            candidate_self_multiaddr(&body, 8546).as_deref(),
+            Some("/ip4/203.0.113.7/tcp/8546")
+        );
+    }
+
+    /// The port in the answer would be the *source* port of our own outgoing request — ephemeral,
+    /// and nothing to do with what we listen on. This test exists because taking it would look
+    /// perfectly reasonable and would produce an address that is wrong every single time.
+    #[test]
+    fn a_port_offered_by_the_peer_is_ignored_in_favour_of_our_listen_port() {
+        let body = json!({ "ip": "203.0.113.7", "multiaddr_kind": "ip4", "port": 54321 });
+        assert_eq!(
+            candidate_self_multiaddr(&body, 8546).as_deref(),
+            Some("/ip4/203.0.113.7/tcp/8546")
+        );
+    }
+
+    /// What a peer behind a reverse proxy reports for *every* client when the forwarding headers
+    /// are missing. Announcing it would be actively harmful: every node that learned the address
+    /// would dial itself, so this has to fail closed rather than pass something through.
+    #[test]
+    fn a_loopback_or_unspecified_answer_is_refused() {
+        for ip in ["127.0.0.1", "::1", "0.0.0.0"] {
+            let body = json!({ "ip": ip, "multiaddr_kind": "ip4" });
+            assert!(
+                candidate_self_multiaddr(&body, 8546).is_none(),
+                "{ip} must never be announced"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ipv6_answer_is_wrapped_as_ip6() {
+        let body = json!({ "ip": "2001:db8::1", "multiaddr_kind": "ip6" });
+        assert_eq!(
+            candidate_self_multiaddr(&body, 8546).as_deref(),
+            Some("/ip6/2001:db8::1/tcp/8546")
+        );
+    }
+
+    /// The address is the fact; the label is a convenience that a hostile or buggy peer could set
+    /// to anything. A disagreement resolves to what the address actually is — otherwise the label
+    /// alone decides, and `/ip4/2001:db8::1/...` does not parse as an address at all.
+    #[test]
+    fn the_address_wins_when_the_label_disagrees_with_it() {
+        let body = json!({ "ip": "2001:db8::1", "multiaddr_kind": "ip4" });
+        assert_eq!(
+            candidate_self_multiaddr(&body, 8546).as_deref(),
+            Some("/ip6/2001:db8::1/tcp/8546")
+        );
+        let body = json!({ "ip": "203.0.113.7", "multiaddr_kind": "nonsense" });
+        assert_eq!(
+            candidate_self_multiaddr(&body, 8546).as_deref(),
+            Some("/ip4/203.0.113.7/tcp/8546")
+        );
+    }
+
+    #[test]
+    fn a_malformed_answer_yields_nothing_rather_than_a_broken_address() {
+        for body in [json!({}), json!({ "ip": "not-an-address" }), json!({ "ip": 7 })] {
+            assert!(candidate_self_multiaddr(&body, 8546).is_none(), "{body}");
+        }
+    }
+
+    fn answer(ip: &str, probed: &str, reachable: bool) -> serde_json::Value {
+        json!({ "ip": ip, "multiaddr_kind": "ip4", "probed": probed, "reachable": reachable })
+    }
+
+    #[test]
+    fn a_seed_that_reached_us_gets_its_address_announced() {
+        let body = answer("203.0.113.7", "/ip4/203.0.113.7/tcp/8546", true);
+        assert_eq!(
+            self_address_verdict(&body, 8546),
+            SelfAddress::Confirmed("/ip4/203.0.113.7/tcp/8546".to_string())
+        );
+    }
+
+    /// The security property of the whole feature. Without this check a seed could answer "I
+    /// probed 198.51.100.9 and it was reachable" and have this node announce a stranger's address
+    /// to the entire network — every peer that learned it would dial a third party.
+    #[test]
+    fn a_seed_reporting_on_a_different_address_is_ignored_entirely() {
+        let body = answer("203.0.113.7", "/ip4/198.51.100.9/tcp/8546", true);
+        match self_address_verdict(&body, 8546) {
+            SelfAddress::Unusable(why) => assert!(why.contains("198.51.100.9"), "{why}"),
+            other => panic!("a mismatched probe must never be announced, got {other:?}"),
+        }
+    }
+
+    /// Same property from the other side: the port has to match too. A seed that probed some
+    /// other port of ours proves nothing about the one we announce.
+    #[test]
+    fn a_seed_reporting_on_a_different_port_is_ignored_entirely() {
+        let body = answer("203.0.113.7", "/ip4/203.0.113.7/tcp/9999", true);
+        assert!(matches!(self_address_verdict(&body, 8546), SelfAddress::Unusable(_)));
+    }
+
+    /// An answer with no `probed` field at all is an older build, not a confirmation. The safe
+    /// reading of an answer this code does not understand is "not confirmed".
+    #[test]
+    fn an_answer_without_a_probe_report_is_not_a_confirmation() {
+        let body = json!({ "ip": "203.0.113.7", "multiaddr_kind": "ip4", "reachable": true });
+        assert!(matches!(self_address_verdict(&body, 8546), SelfAddress::Unusable(_)));
+    }
+
+    /// `reachable` has to be a real `true`. A string "true", a 1, or a missing field are all
+    /// answers this code does not understand — and "not understood" must never read as "yes".
+    #[test]
+    fn reachable_must_be_an_explicit_true() {
+        for v in [json!("true"), json!(1), json!(null)] {
+            let body = json!({
+                "ip": "203.0.113.7", "multiaddr_kind": "ip4",
+                "probed": "/ip4/203.0.113.7/tcp/8546", "reachable": v,
+            });
+            assert!(
+                matches!(self_address_verdict(&body, 8546), SelfAddress::Unreachable { .. }),
+                "reachable={v} must not confirm"
+            );
+        }
+    }
+
+    /// The failure case still has to carry the seed's reason, because that sentence is what the
+    /// operator reads and acts on.
+    #[test]
+    fn an_unreachable_verdict_carries_the_reason_through() {
+        let mut body = answer("203.0.113.7", "/ip4/203.0.113.7/tcp/8546", false);
+        body["probe_error"] = json!("connection refused");
+        match self_address_verdict(&body, 8546) {
+            SelfAddress::Unreachable { addr, reason } => {
+                assert_eq!(addr, "/ip4/203.0.113.7/tcp/8546");
+                assert_eq!(reason, "connection refused");
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    /// Every candidate this function produces has to survive the parse that happens right after
+    /// it in `discover_own_address` — otherwise the probe never goes out and the only sign is a
+    /// debug line nobody reads.
+    #[test]
+    fn what_it_produces_always_parses_as_a_multiaddr() {
+        for ip in ["203.0.113.7", "2001:db8::1", "198.51.100.42"] {
+            let body = json!({ "ip": ip });
+            let candidate = candidate_self_multiaddr(&body, 8546).expect("should build");
+            candidate.parse::<libp2p::Multiaddr>().unwrap_or_else(|e| panic!("{candidate}: {e}"));
+        }
     }
 }

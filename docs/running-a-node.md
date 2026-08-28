@@ -288,12 +288,42 @@ seconds after that. A node that receives an address it didn't already know dials
 The practical effect: once even a handful of nodes know each other's public addresses, the
 network self-heals into a real mesh instead of depending on any single node staying up.
 
-Only nodes with `p2p_public_addr` (or `HELIX_P2P_PUBLIC_ADDR`) set actually announce
-themselves — set this on any node with a real, externally-reachable P2P port (a public IP,
-or a domain pointing at one, with port `8546`/your configured P2P port open). A node behind
-NAT with no forwarded port should leave it unset; it still participates fully, both dialing
-addresses it learns and relaying them onward, it just never advertises an address of its own
-that nobody could actually reach.
+**In most cases you do not need to configure an address at all — just open the port.** On
+startup, and every ten minutes after, a node asks its sync peer `GET /whoami?p2p_port=<its port>`:
+*what address did my request come from, and can you reach me back there?* The peer answers with
+the address it saw and the result of actually connecting to that port from its side. Only if that
+connection succeeded does the node start announcing the address on peer exchange. The log says
+which happened:
+
+```
+INFO  This node is reachable from the outside and is now announcing that address to the network.
+WARN  This node is NOT reachable from the outside, so other nodes can only find it through
+      whichever peer it dialed. Open the P2P port to fix it.
+```
+
+A node cannot answer either half for itself. The address is only visible from outside, and the
+port cannot be tested locally either — connecting to your own port proves the process is
+listening, which was never in doubt, and says nothing about whether a firewall lets anyone else
+through. Someone has to try the door from outside.
+
+The address is rebuilt locally from the reported IP and the node's *own* port, and the peer's
+report of what it probed must match exactly — so a peer cannot answer "I probed 198.51.100.9 and
+it worked" and have your node announce a stranger's address. The residual trust is bounded: a
+lying sync peer could still name a wrong IP, and the cost of that is other nodes dialing an
+address whose handshake fails. If you would rather not extend even that much, set
+`HELIX_P2P_PUBLIC_ADDR` and discovery is skipped entirely.
+
+**Set `p2p_public_addr` (or `HELIX_P2P_PUBLIC_ADDR`) explicitly when discovery cannot work**, and
+it then wins outright — automatic discovery is skipped entirely. Two cases need it:
+
+- **Behind a reverse proxy or tunnel.** The reachable address is a WebSocket multiaddr on a port
+  the node does not listen on (`/dns4/host/tcp/443/tls/ws`); no probe can derive that, and the
+  probe will correctly report "not reachable".
+- **A node with no sync peer** — the origin of its own chain has nobody to ask.
+
+A node behind NAT with no forwarded port needs neither: it participates fully, dialing addresses
+it learns and relaying them onward. It just never advertises one nobody could reach — and now it
+*says so* once every ten minutes, instead of leaving the operator to guess.
 
 ### Validating from behind a reverse proxy / Cloudflare tunnel
 
@@ -442,10 +472,12 @@ server / firewall, so this assumes the WebSocket-tunnel setup:
    ```
    (On a machine with a real public IP and an open port, skip the tunnel and just set
    `HELIX_P2P_PUBLIC_ADDR="yourdomain.net"` — the raw TCP P2P port is appended automatically.)
-4. **Announce yourself** — step 3's `HELIX_P2P_PUBLIC_ADDR` is what makes you *reachable* by
-   other validators via peer exchange. Without it you can only make outbound connections;
-   with it you become a full mesh member. This is the answer to "can everyone connect to
-   everyone?": yes — but only between the nodes that each publish a reachable address.
+4. **Announce yourself.** On a machine with a real public IP this is automatic — open the P2P
+   port and the node discovers and announces its own address (see "Network Resilience" above);
+   watch for `This node is reachable from the outside` in the log. Behind a proxy or tunnel it
+   is step 3's `HELIX_P2P_PUBLIC_ADDR` that does it. Either way, this is what makes you
+   *reachable* by other validators rather than only able to dial out — the answer to "can
+   everyone connect to everyone?": yes, between the nodes that each have a reachable address.
 5. **Mesh with the other validators** so consensus votes never depend on a single hub. Set
    each of the other validators as seeds (in addition to the one `sync_peer` that bootstraps
    your history):
