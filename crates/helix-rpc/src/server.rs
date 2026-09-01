@@ -110,8 +110,24 @@ const TX_SUBMIT_BODY_LIMIT_BYTES: usize = 64 * 1024;
 /// and short enough that the answer arrives while the operator is still watching.
 const PROBE_TIMEOUT_SECS: u64 = 5;
 
-const DEFAULT_RPC_BURST: f64 = 30.0;
-const DEFAULT_RPC_REFILL_PER_SEC: f64 = 10.0;
+/// Per-IP token bucket for the RPC. Raised from 30/10 on 2026-09-01.
+///
+/// 30/10 was not a limit on anything the chain cared about — it was a limit on *submitting*, set
+/// an order of magnitude below what a block can hold. A block takes 1000 transactions or 2 MB,
+/// measured at 367 transfers per block on 2026-08-27; the old bucket let a single sender place
+/// 30 up front and 10 per second after. Someone submitting a 422-transaction batch at 0.01s
+/// spacing therefore got ~70 in and 350 rejected with a 429, and the chain — which would have
+/// packed the lot into two blocks — never saw them. The blocks that looked "full" at 9
+/// transactions were not full: that was simply everything the mempool held by the time the
+/// proposer asked.
+///
+/// The new values put the limiter above the chain's own ceiling, so what bounds a submitter is
+/// the thing that should: block capacity, the mempool cap, and the base fee that rises under
+/// load. 500 up front clears a batch in one go, and 100/s sustained is comfortably above the
+/// ~183 tx/s the 2s cadence can actually absorb. Cheap reads were never the concern and are not
+/// the reason this moved.
+const DEFAULT_RPC_BURST: f64 = 500.0;
+const DEFAULT_RPC_REFILL_PER_SEC: f64 = 100.0;
 
 /// Override for `HELIX_RPC_RATE_LIMIT`, as `burst,refill_per_sec` (e.g. `2000,1000`).
 ///

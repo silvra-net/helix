@@ -19,12 +19,31 @@ pub const UNBONDING_PERIOD: u64 = 302_400;
 /// the shared chain state, so every node reaches the same verdict from the same blocks. A
 /// per-node RAM-only exclusion used to sit in front of it (`helix-consensus`'s liveness jail);
 /// it was removed on 2026-07-22 after it forked the live chain, because nodes could and did
-/// disagree about who was excluded. 150 blocks ≈ 5 minutes at the 2s block time.
+/// disagree about who was excluded.
 ///
 /// Note the consequence: jailing needs blocks, and blocks need quorum. A set that has lost
 /// more than a third of its power halts and stays halted until the missing validators return —
 /// `3f+1` arithmetic, not a gap. Tolerating one absence takes four validators.
-pub const DOWNTIME_JAIL_THRESHOLD_BLOCKS: u32 = 150;
+///
+/// **Raised from 150 on 2026-09-01, and the reason is that reading the old value against the
+/// live chain showed it costing more than it bought.** 150 blocks was documented as "≈5 minutes
+/// at the 2s block time"; the chain's measured median is ~1s, so it had quietly become ~2.5
+/// minutes. Every one of the five jails on this chain hit the same validator, and the last one
+/// was measured end to end: its node stopped both co-signing and proposing at height 279154 and
+/// was jailed 150 blocks later — a ~9.5 minute outage, with the TCP connection never dropping.
+/// In the window before and after it participated in 100% of blocks. That is the profile of a
+/// routine freeze (a backup, an upgrade, a reboot, an I/O stall), not of an absent operator.
+///
+/// The cost side is what decides it. Jailing removes power from the quorum, so on a small set it
+/// *lowers* fault tolerance: `floor((n-1)/3)` is 1 at four validators and 0 at three. On
+/// 2026-09-01 that jail took the set from four to three, and 36 minutes later the chain stalled
+/// on the first lost precommit — the eviction of a healthy validator cost more than its absence
+/// ever did. A threshold has to be longer than the routine interruptions of an unattended node,
+/// or it does not distinguish "gone" from "busy", and jails the operators who are actually
+/// there. 1800 blocks is ~30 minutes at the measured cadence and an hour at the nominal one,
+/// which clears a reboot and an unattended upgrade with room to spare. It is still far stricter
+/// than Cosmos SDK's own default, which tolerates 9500 missed blocks in a 10000-block window.
+pub const DOWNTIME_JAIL_THRESHOLD_BLOCKS: u32 = 1_800;
 
 /// Minimum blocks a downtime-jailed validator must wait before `TxType::Unjail` is accepted —
 /// see its doc comment for why unjailing isn't automatic. 300 blocks ≈ 10 minutes at the 2s

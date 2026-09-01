@@ -1419,21 +1419,50 @@ impl BftEngine {
             .get(&block.header.validator)
             .ok_or_else(|| ConsensusError::UnknownValidator(block.header.validator.clone()))?;
 
-        // Verify the proposer is correct. A fresh proposal is checked against the current
-        // round; a re-proposal carries the block originally proposed in `valid_round`, whose
-        // header is signed by that round's proposer — so check against `valid_round`.
-        let proposer_round = valid_round.unwrap_or(round);
-        if !self
-            .validator_set
-            .is_proposer(&block.header.validator, h, proposer_round)
+        // Verify the proposer is correct — for a *fresh* proposal, which is the round
+        // proposer's alone to make.
+        //
+        // A re-proposal deliberately is not checked this way, and the attempt to is what
+        // stalled the live chain twice on 2026-09-01. `valid_round` is the round a prevote
+        // quorum formed in, NOT the round the block was proposed in, and the two come apart
+        // the moment a round reaches a prevote quorum but no precommit quorum — the ordinary
+        // outcome of a single lost precommit. The value is then locked at a round whose
+        // proposer never built it, every later round re-proposes it carrying that
+        // `valid_round`, every peer measures the header's proposer against that round's
+        // schedule, and no round can ever close again. Observed at heights 276420 and 280939:
+        // the same rejection every few seconds, its round number frozen at the lock round
+        // while the rounds themselves climbed, until every node was restarted.
+        //
+        // What legitimises a re-proposal is the POL verified below: prevotes from 2/3+ of the
+        // set, for exactly this block, at exactly `valid_round`. A value that cannot be forged
+        // without those signatures does not additionally need its header measured against a
+        // proposer schedule — and that header's proposer was confirmed to be a set member
+        // immediately above.
+        if valid_round.is_none()
+            && !self.validator_set.is_proposer(&block.header.validator, h, round)
         {
             return Err(ConsensusError::InvalidBlock {
                 height: h,
                 reason: format!(
                     "{} is not the proposer for height {} round {}",
-                    block.header.validator, h, proposer_round
+                    block.header.validator, h, round
                 ),
             });
+        }
+
+        // A lock can only come from a round already left behind. This is the bound the
+        // proposer check used to supply for re-proposals: without it a replayed certificate
+        // could name any round at all.
+        if let Some(vr) = valid_round {
+            if vr >= round {
+                return Err(ConsensusError::InvalidBlock {
+                    height: h,
+                    reason: format!(
+                        "re-proposal for round {round} claims a proof-of-lock from round {vr} \
+                         — a lock can only come from a round already past"
+                    ),
+                });
+            }
         }
 
         // A re-proposal must carry a valid proof-of-lock: a prevote-quorum for exactly this
@@ -4313,5 +4342,81 @@ mod tests {
 
         let (nothing, none) = engine.round_evidence(2);
         assert!(nothing.is_none() && none.is_empty(), "we hold no round for another height");
+    }
+
+    /// A value locked in a *later* round than the one it was proposed in must still be
+    /// re-proposable. `locked_round` is the round a prevote quorum formed in — not the round
+    /// the block was proposed in — and the two differ whenever a round reaches a prevote
+    /// quorum but not a precommit quorum, which is the ordinary outcome of a lost precommit.
+    ///
+    /// Live incident 2026-09-01: the chain stalled twice this way (heights 276420 and 280939,
+    /// 39 minutes and 21+ minutes). Every peer refused the same re-proposal with "is not the
+    /// proposer for height N round R", with R frozen at the lock round while the rounds
+    /// themselves kept climbing — the signature of a `valid_round` that no longer matches the
+    /// block's proposing round. Nothing recovers on its own from there: every later round
+    /// re-proposes the same locked value with the same `valid_round`, and every peer rejects
+    /// it for the same reason.
+    #[test]
+    fn a_value_locked_in_a_later_round_than_it_was_proposed_in_is_still_re_proposable() {
+        let v = four_validators();
+        let engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+
+        // Block A is proposed by `self`, height 1's round-0 proposer ((1 + 0) % 4 == 1).
+        let (_locked, block_a, hash_a) = locked_self_engine(&v);
+        assert!(v.validator_set.is_proposer(&v.self_addr, 1, 0));
+
+        // Round 0 lost its precommits, so round 1 re-proposed A and *that* round is where the
+        // prevote quorum formed. b — not self — is round 1's proposer ((1 + 1) % 4 == 2), so
+        // the lock round and the block's proposing round now name different validators.
+        let b_addr = Address::from_public_key(&v.b_kp.public);
+        assert!(v.validator_set.is_proposer(&b_addr, 1, 1));
+        let pol_round_1 = vec![
+            peer_vote(&v.a_kp, VoteType::Prevote, 1, 1, hash_a.clone()),
+            peer_vote(&v.b_kp, VoteType::Prevote, 1, 1, hash_a.clone()),
+            peer_vote(&v.c_kp, VoteType::Prevote, 1, 1, hash_a.clone()),
+        ];
+        engine
+            .verify_pol(&pol_round_1, &hash_a, 1, 1)
+            .expect("three of four prevotes is a genuine quorum for round 1");
+
+        // Round 2's proposer re-proposes A carrying that certificate. The POL is what proves
+        // the network locked this value in round 1; A's header names round 0's proposer
+        // because that is who built it, and no rule says those have to be the same validator.
+        engine
+            .validate_block(&block_a, 2, Some(1), &pol_round_1)
+            .expect("a re-proposal backed by a genuine POL must be accepted");
+    }
+
+    /// The bound the proposer check used to supply for re-proposals, now standing on its own:
+    /// a proof-of-lock can only come from a round already left behind. Without it a replayed
+    /// certificate could name any round at all, and `receive_proposal` adopts a proposal's
+    /// round as its own — so one recorded POL would let anyone drag every node to an arbitrary
+    /// round number for the rest of the height.
+    #[test]
+    fn a_reproposal_claiming_a_lock_from_its_own_or_a_later_round_is_refused() {
+        let v = four_validators();
+        let engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        let (_locked, block_a, hash_a) = locked_self_engine(&v);
+
+        // A genuine round-1 certificate — the same one the test above proves is acceptable
+        // when it backs a *later* round.
+        let pol = vec![
+            peer_vote(&v.a_kp, VoteType::Prevote, 1, 1, hash_a.clone()),
+            peer_vote(&v.b_kp, VoteType::Prevote, 1, 1, hash_a.clone()),
+            peer_vote(&v.c_kp, VoteType::Prevote, 1, 1, hash_a.clone()),
+        ];
+        engine.validate_block(&block_a, 2, Some(1), &pol).expect("round 2 > lock round 1 is fine");
+
+        for claimed in [1u32, 0] {
+            let err = engine.validate_block(&block_a, claimed, Some(1), &pol).unwrap_err();
+            match err {
+                ConsensusError::InvalidBlock { reason, .. } => assert!(
+                    reason.contains("a lock can only come from a round already past"),
+                    "round {claimed} against a round-1 lock must be refused for the lock \
+                     ordering, got: {reason}"
+                ),
+                other => panic!("expected InvalidBlock for round {claimed}, got {other:?}"),
+            }
+        }
     }
 }

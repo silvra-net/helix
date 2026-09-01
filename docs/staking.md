@@ -96,7 +96,7 @@ conflicting blocks and slash you. There is no remote-signer coordination yet; "o
 is a discipline you keep, not something the software can currently enforce across machines.
 
 **Downtime risk (no slash, but real friction):** a validator whose precommit is missing from
-`last_commit` for ~150 consecutive blocks (~5 minutes) is downtime-jailed — excluded from
+`last_commit` for ~1800 consecutive blocks (~30-60 minutes) is downtime-jailed — excluded from
 `stakers()`, earning nothing, until it explicitly rejoins:
 ```bash
 helix tx unjail --key validator-key.json   # only once your node is actually back and connected

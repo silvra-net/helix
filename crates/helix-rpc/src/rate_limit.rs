@@ -155,13 +155,18 @@ mod tests {
 
     #[test]
     fn refills_over_time() {
-        // Low enough refill rate that back-to-back calls don't spuriously
-        // refill a whole token, but a 5ms sleep clearly does.
-        let limiter = RateLimiter::new(1.0, 200.0);
+        // The refill rate sets how much wall-clock slack this test tolerates, because the
+        // "not yet refilled" assertion fails if the scheduler simply takes that long between
+        // two statements. At 200 tokens/sec that budget was 5ms, and 5ms is well within what
+        // a loaded machine spends preempting a thread — this went red inside `build-all.sh`
+        // under a load average of 13 and passed three times in a row at 1.1, on identical
+        // code. 20 tokens/sec makes one token 50ms, so the same assertion now needs a 50ms
+        // stall to misfire, and the wait below is still only 60ms.
+        let limiter = RateLimiter::new(1.0, 20.0);
         let addr = ip(1);
-        assert!(limiter.check(addr));
-        assert!(!limiter.check(addr));
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(limiter.check(addr), "the first request spends the single token");
+        assert!(!limiter.check(addr), "the bucket is empty and 50ms have not passed");
+        std::thread::sleep(std::time::Duration::from_millis(60));
         assert!(limiter.check(addr), "bucket should have refilled after waiting");
     }
 

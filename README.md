@@ -254,7 +254,7 @@ The README covers what Helix is and how to get started. The full reference lives
   than free-form log text, which is what makes it safe to share when asking for help: no
   addresses, no paths, no keys. See [Reference](docs/reference.md#diagnostics-response)
 - A validator that goes silent is **downtime-jailed** on-chain (`last_commit` +
-  `ChainState::jailed_until`) after ~150 blocks of confirmed absence — removed from the active set
+  `ChainState::jailed_until`) after ~1800 blocks of confirmed absence (~30-60 minutes) — removed from the active set
   until it submits an explicit `Unjail` transaction, surviving node restarts and carrying no slash
   for downtime alone. That recovers a large-enough set automatically; a set so small that quorum
   needs every validator halts instead — the safe failure, never a fork. See
