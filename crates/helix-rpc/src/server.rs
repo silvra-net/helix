@@ -1305,6 +1305,16 @@ const MAX_ACCOUNT_TX_LIMIT: u64 = 200;
 /// every `put_block` rather than a scan of every block in the chain: cost is
 /// proportional to how many transactions actually touched this address, not to
 /// chain height, and stays bounded per request via `limit`/`offset`.
+///
+/// One transaction appears at most once, even when the chain contains it more than once. The
+/// address index records every occurrence — correctly, they are all really in the chain — but
+/// only one of them ever had an effect, and listing the inert duplicates alongside it showed a
+/// sender the same transaction two or three times, each carrying the *effective* execution's
+/// receipt. That reads as "I staked three times", or, before the receipt half of #185 was fixed,
+/// as "my stake failed" for a stake that had applied. `tx_location` names the occurrence that
+/// counts, so anything else at the same hash is dropped here. A page may therefore return fewer
+/// rows than `limit`; the alternative is a page whose row count is honest and whose contents are
+/// not.
 async fn get_account_transactions(
     State(state): State<AppState>,
     Path(address_str): Path<String>,
@@ -1334,7 +1344,16 @@ async fn get_account_transactions(
     for (height, tx_index) in refs {
         let Ok(block) = store.get_block_by_height(height) else { continue };
         let Some(tx) = block.transactions.get(tx_index as usize) else { continue };
-        let outcome = receipt_outcome(&store, &tx.hash());
+        let hash = tx.hash();
+        // Skip an occurrence that is not the one this hash resolves to (see the doc comment).
+        // An unreadable or absent location is not a reason to hide a transaction the index just
+        // handed us, so only a location that positively disagrees drops the row.
+        if let Ok(Some(canonical)) = store.tx_location(&hash) {
+            if canonical != (height, tx_index) {
+                continue;
+            }
+        }
+        let outcome = receipt_outcome(&store, &hash);
         history.push(tx_history_entry(&block, tx, outcome));
     }
 
@@ -1836,6 +1855,54 @@ mod tests {
         let response = submit_transaction(State(state.clone()), Json(tx)).await.into_response();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert!(!state.mempool.read().await.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #185, the end-to-end shape of it: this is exactly what an operator saw in the explorer
+    /// when they went looking for their stake. The address index holds every occurrence of a
+    /// transaction — all of them genuinely in the chain — but only one had an effect, so a
+    /// history that lists them all shows the same stake two or three times.
+    #[tokio::test]
+    async fn a_transaction_the_chain_holds_twice_appears_once_in_an_account_history() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let bob = addr(2);
+        let replayed = tx(&alice, &bob, 10, 0);
+        let hash = replayed.hash();
+        {
+            let mut store = state.store.write().await;
+            // The occurrence that applied.
+            store.put_block(block(1, &alice, vec![replayed.clone()])).unwrap();
+            store.put_receipts(&[Receipt::success(hash, 40, 60)]).unwrap();
+            // The duplicate two blocks later, rejected on the nonce it already spent.
+            store.put_block(block(3, &alice, vec![replayed])).unwrap();
+            store
+                .put_receipts(&[Receipt::failure(hash, "nonce mismatch: expected 1, got 0", 0, 0)])
+                .unwrap();
+
+            assert_eq!(
+                store.address_transactions(alice.to_string().as_str(), 10, 0).unwrap().len(),
+                2,
+                "premise: the index really does hold both occurrences — otherwise this test \
+                 would pass without the handler doing anything"
+            );
+        }
+
+        let response = get_account_transactions(
+            State(state.clone()),
+            Path(alice.to_string()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let history = json["transactions"].as_array().expect("history array");
+
+        assert_eq!(history.len(), 1, "one transaction, one row — however many blocks hold it");
+        assert_eq!(history[0]["block_height"], 1, "and the row must be the execution that applied");
+        assert_eq!(history[0]["status"], "applied");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2451,7 +2518,7 @@ mod tests {
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         // Expiry is lazy, driven by pool operations — same as in production.
-        let _ = state.mempool.write().await.take(10);
+        let _ = state.mempool.write().await.take(10, &|_| None);
 
         let response = get_transaction_status(State(state), Path(hash.to_hex()))
             .await

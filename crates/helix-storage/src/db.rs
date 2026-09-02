@@ -922,6 +922,31 @@ impl HelixDb {
     }
 }
 
+/// Does `RECEIPTS` already hold a *successful* receipt for this transaction hash?
+///
+/// The one question both halves of the #185 fix ask, kept in one place so the two call sites
+/// cannot drift apart — they must agree, or the location a hash resolves to and the receipt it
+/// resolves to would describe different executions. A hash with no receipt yet answers `false`,
+/// which is what makes the first occurrence of any transaction take the normal path.
+///
+/// A receipt that fails to deserialize is treated as "no success on record" rather than an error:
+/// the caller is mid-write on a block, and refusing to store a block because an unrelated older
+/// receipt is unreadable would trade a cosmetic problem for a halted node.
+fn receipt_succeeded(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    tx_hash_bytes: &[u8],
+) -> StorageResult<bool> {
+    let existing = table
+        .get(tx_hash_bytes)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(match existing {
+        Some(v) => bincode::deserialize::<Receipt>(v.value())
+            .map(|r| r.success)
+            .unwrap_or(false),
+        None => false,
+    })
+}
+
 impl BlockStore for HelixDb {
     fn get_block_by_hash(&self, hash: &Hash) -> StorageResult<Block> {
         let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
@@ -946,6 +971,21 @@ impl BlockStore for HelixDb {
         }
     }
 
+    /// Store one receipt per transaction hash — **except** that a recorded success is never
+    /// overwritten by a later failure.
+    ///
+    /// The same transaction can legitimately reach the chain more than once (a peer re-gossips it,
+    /// two proposers pack it a block apart). Every occurrence after the one that applied fails on
+    /// the spent nonce, and a blind `insert` let that failure replace the success — so the sender
+    /// was shown `failed` for a transaction the chain had applied. Found on 2026-09-02: a stake in
+    /// blocks 54822 and 54824, identical hash, both reading `nonce mismatch: expected 1, got 0`,
+    /// while the account showed the stake in place (#185).
+    ///
+    /// "Success wins" is well-defined rather than a tie-break: a hash commits to its sender's
+    /// nonce, applying it spends that nonce, and no transaction can spend the same nonce twice —
+    /// so at most one occurrence of a given hash can ever succeed. The reverse direction stays
+    /// open on purpose: a failure *may* be replaced by a success, because a transaction packed
+    /// ahead of its predecessors fails on a nonce gap and can legitimately apply later.
     fn put_receipts(&mut self, receipts: &[Receipt]) -> StorageResult<()> {
         if receipts.is_empty() {
             return Ok(());
@@ -958,6 +998,9 @@ impl BlockStore for HelixDb {
                 // index here is keyed by, so a lookup takes a Hash and not a string convention.
                 let hash = Hash::from_hex(&r.tx_hash)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                if !r.success && receipt_succeeded(&table, hash.as_bytes().as_slice())? {
+                    continue;
+                }
                 let encoded = bincode::serialize(r)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 table
@@ -996,6 +1039,7 @@ impl BlockStore for HelixDb {
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut address_tx_index = tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut tx_hash_index = tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
+            let receipts_ro = tx.open_table(RECEIPTS).map_err(|e| StorageError::Db(e.to_string()))?;
 
             blocks.insert(hash.as_bytes().as_slice(), encoded.as_slice())
                 .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1007,8 +1051,18 @@ impl BlockStore for HelixDb {
                 value[..8].copy_from_slice(&height.to_be_bytes());
                 value[8..].copy_from_slice(&(tx_index as u32).to_be_bytes());
 
-                tx_hash_index.insert(txn.hash().as_bytes().as_slice(), value.as_slice())
-                    .map_err(|e| StorageError::Db(e.to_string()))?;
+                // Same rule as `put_receipts`, and for the same reason: once an occurrence of
+                // this hash has applied, a later duplicate must not move the location this hash
+                // resolves to. Otherwise `tx_location` points at block N+2 while the receipt
+                // describes the execution in block N — one lookup, two different executions
+                // (#185). Receipts for a block are written straight after its `put_block`, so by
+                // the time a duplicate arrives the earlier success is already on record.
+                let tx_hash_bytes = txn.hash();
+                let tx_hash_bytes = tx_hash_bytes.as_bytes();
+                if !receipt_succeeded(&receipts_ro, tx_hash_bytes.as_slice())? {
+                    tx_hash_index.insert(tx_hash_bytes.as_slice(), value.as_slice())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
                 address_tx_index.insert(txn.from.as_str(), value.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
                 if let Some(to) = &txn.to {
@@ -1324,6 +1378,74 @@ mod tests {
         // Carol only appears once, in block 1.
         let carol_refs = db.address_transactions(carol.to_string().as_str(), 10, 0).unwrap();
         assert_eq!(carol_refs, vec![(1, 1)]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #185, the half a sender actually sees. The same transaction can reach the chain twice —
+    /// a peer re-gossips it, or two proposers pack it a block apart — and every occurrence after
+    /// the one that applied fails on the now-spent nonce. A blind `insert` let that failure
+    /// replace the success, so the chain told the sender their stake had failed while the stake
+    /// sat in their account. Live on 2026-09-02: blocks 54822 and 54824, identical hash.
+    #[test]
+    fn a_replay_cannot_overwrite_its_own_success_with_a_failure() {
+        let (mut db, path) = fresh_db();
+        let alice = addr(1);
+        let tx = transfer(&alice, &addr(2), 0);
+        let hash = tx.hash();
+
+        // First occurrence: applied.
+        db.put_block(block_with_txs(0, &alice, vec![tx.clone()])).unwrap();
+        db.put_receipts(&[Receipt::success(hash, 40, 60)]).unwrap();
+
+        // Second occurrence, two blocks later: the same bytes, rejected on the spent nonce.
+        db.put_block(block_with_txs(1, &alice, vec![tx])).unwrap();
+        db.put_receipts(&[Receipt::failure(hash, "nonce mismatch: expected 1, got 0", 0, 0)])
+            .unwrap();
+
+        let receipt = db.get_receipt(&hash).unwrap().expect("the receipt must still be there");
+        assert!(
+            receipt.success,
+            "the execution that applied must survive the replay's failure — the sender is otherwise \
+             told their transaction failed while its effect is in their account"
+        );
+        assert_eq!(receipt.error, None);
+        assert_eq!(
+            db.tx_location(&hash).unwrap(),
+            Some((0, 0)),
+            "the hash must resolve to the execution that applied, not the inert duplicate — a \
+             location and a receipt describing different executions is worse than either alone"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The other direction has to stay open, and this is why "first write wins" would be wrong:
+    /// a transaction packed ahead of its predecessors fails on the nonce gap, and applies for
+    /// real once they land. Only *success* is final, because a nonce can be spent exactly once.
+    #[test]
+    fn a_failure_is_replaced_when_the_same_transaction_later_applies() {
+        let (mut db, path) = fresh_db();
+        let alice = addr(1);
+        let tx = transfer(&alice, &addr(2), 0);
+        let hash = tx.hash();
+
+        db.put_block(block_with_txs(0, &alice, vec![tx.clone()])).unwrap();
+        db.put_receipts(&[Receipt::failure(hash, "nonce mismatch: expected 0, got 3", 0, 0)])
+            .unwrap();
+
+        db.put_block(block_with_txs(1, &alice, vec![tx])).unwrap();
+        db.put_receipts(&[Receipt::success(hash, 40, 60)]).unwrap();
+
+        assert!(
+            db.get_receipt(&hash).unwrap().unwrap().success,
+            "a later success must replace an earlier failure"
+        );
+        assert_eq!(
+            db.tx_location(&hash).unwrap(),
+            Some((1, 0)),
+            "and the location must follow it to the block where it actually applied"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

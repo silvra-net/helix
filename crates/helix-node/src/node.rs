@@ -3780,11 +3780,25 @@ async fn block_production_loop(
         // ~5.4 KB per transfer, 1000 transactions is a 5.2 MB block, past what gossipsub will
         // transmit — so it would never reach a peer, never collect a vote, and be rebuilt
         // identically by the next proposer out of the same mempool.
+        // The nonces are snapshotted before the pool lock rather than looked up through it: the
+        // pool needs to know, per sender, what nonce the chain is on (see `take_within`), and
+        // answering that lazily would mean holding the chain-state lock across the mempool lock.
+        // Three sequential locks cost nothing here and cannot deadlock against a call site that
+        // takes them the other way around.
+        let senders = mempool.read().await.senders();
+        let account_nonces: std::collections::HashMap<String, u64> = {
+            let chain = chain_state.read().await;
+            senders
+                .into_iter()
+                .filter_map(|s| chain.accounts.get(s.as_str()).map(|a| (s, a.nonce)))
+                .collect()
+        };
         let txs = {
-            mempool
-                .write()
-                .await
-                .take_within(MAX_TXS_PER_BLOCK, helix_core::fee::MAX_BLOCK_BYTES)
+            mempool.write().await.take_within(
+                MAX_TXS_PER_BLOCK,
+                helix_core::fee::MAX_BLOCK_BYTES,
+                &|addr: &str| account_nonces.get(addr).copied(),
+            )
         };
         let prev_hash = store.read().await.latest_hash();
 
@@ -8295,7 +8309,7 @@ mod handle_p2p_event_tests {
         publish_fee_exempt_probationers(&chain_state, &mempool).await;
         send_probation_heartbeat_if_due(&kp, &chain_state, &mempool, &p2p_tx).await;
 
-        let pending = mempool.write().await.take(10);
+        let pending = mempool.write().await.take(10, &|_| None);
         assert_eq!(pending.len(), 1, "the heartbeat must reach this node's own pool");
         assert_eq!(pending[0].tx_type, TxType::ProbationHeartbeat);
         assert_eq!(pending[0].from, addr);

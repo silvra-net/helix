@@ -273,6 +273,33 @@ impl Mempool {
         }
     }
 
+    /// Drop every held transaction whose nonce the sender has already spent on chain.
+    ///
+    /// Such a transaction can never be applied again — its nonce is consumed, and the hash that
+    /// identifies it commits to that nonce, so no later state makes it valid. Leaving it in the
+    /// pool is not merely wasteful: it will be packed into a block, rejected by the executor, and
+    /// burn no fee doing so, which is exactly how the same stake transaction landed in two blocks
+    /// on 2026-09-02 (#185).
+    ///
+    /// Dropped, not skipped, and deliberately: skipping would re-examine the same dead transaction
+    /// on every block for the full TTL while it holds its `(sender, nonce)` slot against a real
+    /// replacement. These are not counted as expired (#156) — the sender is not owed "your
+    /// transaction timed out" for one whose nonce they themselves spent elsewhere; the chain can
+    /// answer for the transaction that did go through.
+    fn drop_spent_nonces(&mut self, account_nonce: &dyn Fn(&str) -> Option<u64>) {
+        let spent: Vec<String> = self
+            .by_hash
+            .iter()
+            .filter(|(_, tx)| {
+                account_nonce(&tx.from.to_string()).is_some_and(|current| tx.nonce < current)
+            })
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        for hash in spent {
+            self.detach(&hash);
+        }
+    }
+
     /// Records a hash as recently expired, evicting the oldest once the ring is full (#156).
     fn remember_expired(&mut self, hash: String) {
         if !self.expired_set.insert(hash.clone()) {
@@ -467,8 +494,14 @@ impl Mempool {
     /// TXs are sorted by (sender, nonce) after the fee-priority pass so that a
     /// sender's sequential nonces always land in the correct order in the block.
     /// Without this, nonce N+1 arriving before N would be dropped by the executor.
-    pub fn take(&mut self, max_count: usize) -> Vec<Transaction> {
-        self.take_within(max_count, u64::MAX)
+    ///
+    /// See [`Mempool::take_within`] for what `account_nonce` is and why it is a parameter.
+    pub fn take(
+        &mut self,
+        max_count: usize,
+        account_nonce: &dyn Fn(&str) -> Option<u64>,
+    ) -> Vec<Transaction> {
+        self.take_within(max_count, u64::MAX, account_nonce)
     }
 
     /// Like [`Mempool::take`], but also stops once the selected transactions would exceed
@@ -485,8 +518,29 @@ impl Mempool {
     /// A transaction that is *itself* larger than `max_bytes` would otherwise wedge the pool
     /// forever, so the first one is always taken: a block containing it can still be produced, and
     /// the alternative is a transaction that is admitted and can never be mined.
-    pub fn take_within(&mut self, max_count: usize, max_bytes: u64) -> Vec<Transaction> {
+    ///
+    /// `account_nonce` answers "what nonce is this sender on right now", straight from committed
+    /// chain state, and is consulted here and not only at admission because a nonce can be spent
+    /// *while a transaction sits in the pool*. That is not hypothetical: on 2026-09-02 one stake
+    /// transaction was packed into blocks 54822 and 54824 with the same hash — applied the first
+    /// time, rejected the second with `nonce mismatch: expected 1, got 0` — because nothing between
+    /// admission and selection re-asked. The admission check (`add_inner`) cannot cover this: it
+    /// runs once, and the pool's whole purpose is to hold transactions across the interval in which
+    /// the answer changes.
+    ///
+    /// Like the admission check, only a nonce *below* the account's is refused. A nonce above it is
+    /// a normal queued transaction waiting for its predecessors. It is a `&dyn Fn` parameter rather
+    /// than stored state for the reason `chain_id` and the admission `account_nonce` are: the
+    /// caller holds the chain state, a stored copy is one more thing that can go stale, and a
+    /// required parameter makes the compiler ask every call site where its answer comes from.
+    pub fn take_within(
+        &mut self,
+        max_count: usize,
+        max_bytes: u64,
+        account_nonce: &dyn Fn(&str) -> Option<u64>,
+    ) -> Vec<Transaction> {
         self.evict_expired();
+        self.drop_spent_nonces(account_nonce);
         let mut result = Vec::with_capacity(max_count.min(1024));
         let mut bytes = 0u64;
         'outer: for hashes in self.by_tip.values() {
@@ -511,6 +565,20 @@ impl Mempool {
             a.from.to_string().cmp(&b.from.to_string()).then_with(|| a.nonce.cmp(&b.nonce))
         });
         result
+    }
+
+    /// Every distinct sender currently holding a transaction in the pool.
+    ///
+    /// Exists so a caller can look up exactly the account nonces `take_within` will ask about,
+    /// under its own lock, and hand them over as a plain map — rather than holding the chain-state
+    /// lock across the pool lock to answer the question lazily. Two locks held at once in one
+    /// order is a deadlock waiting for the second place that takes them in the other.
+    pub fn senders(&self) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        for tx in self.by_hash.values() {
+            seen.insert(tx.from.to_string());
+        }
+        seen.into_iter().collect()
     }
 
     /// Remove transactions that were committed in a block
@@ -570,6 +638,76 @@ mod tests {
         make_tx_with_data(keypair, fee, nonce, 0)
     }
 
+    /// #185. The admission check (`a_transaction_whose_nonce_is_already_spent_is_refused`) fires
+    /// once, on the way in. A nonce can be spent *while a transaction waits in the pool* — the
+    /// sender resubmits, a peer gossips a copy, the first copy is mined — and nothing re-asked
+    /// before the pool handed it to the next proposer. Live on 2026-09-02: one stake transaction
+    /// packed into blocks 54822 and 54824, applied the first time and rejected the second.
+    #[test]
+    fn a_transaction_whose_nonce_the_sender_has_since_spent_is_not_packed_again() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        let tx = make_tx(&kp, 10_000, 0);
+        let sender = tx.from.to_string();
+        let hash = tx.hash();
+        // Admitted legitimately: at this moment the account really is on nonce 0.
+        pool.add(tx, Hash::ZERO, Some(0)).expect("premise: the pool accepts it while the nonce is live");
+        assert!(pool.contains(&hash));
+
+        // The chain moves on — this exact transaction applied in a block.
+        let taken = pool.take(10, &|addr| (addr == sender).then_some(1));
+
+        assert!(
+            taken.is_empty(),
+            "a transaction whose nonce the chain has already consumed must not be offered for \
+             inclusion again: it burns no fee when the executor rejects it, so the round trip is \
+             free and endlessly repeatable"
+        );
+        assert!(
+            !pool.contains(&hash),
+            "and it must be dropped, not merely skipped — it can never become valid again, and \
+             holding it keeps its (sender, nonce) slot against a real replacement"
+        );
+    }
+
+    /// The positive control for the sweep above, and the reason it compares `<` and never `!=`:
+    /// a nonce *above* the account's is an ordinary queued transaction waiting for the ones in
+    /// front of it. Dropping those would break every wallet that sends two transactions in a row.
+    #[test]
+    fn a_transaction_queued_ahead_of_its_predecessors_survives_the_sweep() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        let tx = make_tx(&kp, 10_000, 5);
+        let sender = tx.from.to_string();
+        let hash = tx.hash();
+        pool.add(tx, Hash::ZERO, Some(3)).expect("a future nonce is a normal queued transaction");
+
+        let taken = pool.take(10, &|addr| (addr == sender).then_some(3));
+
+        assert_eq!(taken.len(), 1, "a transaction waiting for its predecessors must still be offered");
+        assert!(pool.contains(&hash), "and must stay in the pool");
+    }
+
+    /// A caller with no chain state to answer from — the node's own self-built transactions —
+    /// must not have its pool quietly emptied. `None` means "no answer", not "nonce zero".
+    #[test]
+    fn without_an_account_nonce_the_sweep_drops_nothing() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+
+        let hash = {
+            let tx = make_tx(&kp, 10_000, 0);
+            let h = tx.hash();
+            pool.add(tx, Hash::ZERO, None).unwrap();
+            h
+        };
+
+        assert_eq!(pool.take(10, &|_| None).len(), 1);
+        assert!(pool.contains(&hash));
+    }
+
     /// Found live on 2026-08-11, minutes after 0.11.0 went out, and not by any test here.
     ///
     /// The executor refuses a foreign chain's transaction (#174), so nothing unsafe could happen —
@@ -627,7 +765,7 @@ mod tests {
 
         let one = make_tx(&kp, 10_000, 0).size_bytes();
         // Room for five and a bit — the sixth must not be squeezed in.
-        let taken = pool.take_within(1_000, one * 5 + one / 2);
+        let taken = pool.take_within(1_000, one * 5 + one / 2, &|_| None);
 
         assert_eq!(taken.len(), 5, "the budget, not the count, has to decide");
         let packed: u64 = taken.iter().map(|t| t.size_bytes()).sum();
@@ -643,7 +781,7 @@ mod tests {
         let mut pool = Mempool::with_limits(1_000, 1_000);
         pool.add(make_tx(&kp, 10_000, 0), Hash::ZERO, None).unwrap();
 
-        let taken = pool.take_within(1_000, 1);
+        let taken = pool.take_within(1_000, 1, &|_| None);
         assert_eq!(taken.len(), 1, "the first transaction always goes in, budget or not");
     }
 
@@ -657,7 +795,7 @@ mod tests {
             pool.add(make_tx(&kp, 10_000 + nonce, nonce), Hash::ZERO, None).unwrap();
         }
 
-        assert_eq!(pool.take_within(7, u64::MAX).len(), 7);
+        assert_eq!(pool.take_within(7, u64::MAX, &|_| None).len(), 7);
     }
 
     /// `take` is the same selection with no byte budget — existing callers must be unaffected.
@@ -668,8 +806,8 @@ mod tests {
         for nonce in 0..6 {
             pool.add(make_tx(&kp, 10_000 + nonce, nonce), Hash::ZERO, None).unwrap();
         }
-        let plain: Vec<_> = pool.take(4).iter().map(|t| t.hash()).collect();
-        let budgeted: Vec<_> = pool.take_within(4, u64::MAX).iter().map(|t| t.hash()).collect();
+        let plain: Vec<_> = pool.take(4, &|_| None).iter().map(|t| t.hash()).collect();
+        let budgeted: Vec<_> = pool.take_within(4, u64::MAX, &|_| None).iter().map(|t| t.hash()).collect();
         assert_eq!(plain, budgeted);
     }
 
@@ -686,7 +824,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(5));
         // Expiry is lazy — any pool operation drives it, as in production.
-        let _ = pool.take(10);
+        let _ = pool.take(10, &|_| None);
 
         assert!(!pool.contains(&hash), "precondition: it really was dropped");
         assert!(pool.expired_recently(&hash), "and the sender must be able to learn why");
@@ -852,7 +990,7 @@ mod tests {
 
         assert_eq!(pool.len(), 3);
 
-        let taken = pool.take(10);
+        let taken = pool.take(10, &|_| None);
         assert_eq!(taken.len(), 3);
 
         // kp1's TXs must be consecutive and nonce-ordered (0 before 1)
@@ -957,7 +1095,7 @@ mod tests {
         pool.add(big, Hash::ZERO, None).unwrap();
         pool.add(small, Hash::ZERO, None).unwrap();
 
-        let taken = pool.take(1);
+        let taken = pool.take(1, &|_| None);
         assert_eq!(taken.len(), 1);
         assert_eq!(
             taken[0].hash(),
@@ -1009,7 +1147,7 @@ mod tests {
         pool.add(evidence, Hash::ZERO, None).unwrap();
         pool.add(make_tipping_tx(&other, 0, 5_000), Hash::ZERO, None).unwrap();
 
-        let taken = pool.take(1);
+        let taken = pool.take(1, &|_| None);
         assert_eq!(
             taken[0].hash(),
             evidence_hash,
@@ -1097,7 +1235,7 @@ mod tests {
         for nonce in [2u64, 0, 1] {
             pool.add(make_tx(&kp, 10_000, nonce), Hash::ZERO, None).unwrap();
         }
-        let taken = pool.take(10);
+        let taken = pool.take(10, &|_| None);
         assert_eq!(taken.iter().map(|t| t.nonce).collect::<Vec<_>>(), vec![0, 1, 2]);
     }
 
@@ -1239,7 +1377,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(10));
 
-        let taken = pool.take(10);
+        let taken = pool.take(10, &|_| None);
         assert!(taken.is_empty(), "expired tx must not be included in take()");
         assert_eq!(pool.len(), 0);
     }
