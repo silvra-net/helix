@@ -514,10 +514,13 @@ impl P2PService {
                                     // back to the relay keeps the old behaviour for the case the
                                     // types allow but Strict rejects before it reaches us.
                                     let origin = message.source.unwrap_or(propagation_source);
-                                    // A peer that has already served us a batch off another
-                                    // history gets no say in what we sync, whatever it now claims.
-                                    if !foreign_by_evidence.contains(&origin) {
-                                        peer_tips.insert(origin, tip);
+                                    if record_peer_tip(
+                                        &mut peer_tips,
+                                        &foreign_by_evidence,
+                                        origin,
+                                        tip,
+                                        TipSource::PeerExchange,
+                                    ) {
                                         publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
                                     }
                                 }
@@ -559,11 +562,15 @@ impl P2PService {
                                 // mesh must never push a tip back up.
                                 if let Some(height) = outcome.observed_height {
                                     let origin = message.source.unwrap_or(propagation_source);
-                                    let entry = peer_tips.entry(origin).or_insert(height);
-                                    if *entry < height {
-                                        *entry = height;
+                                    if record_peer_tip(
+                                        &mut peer_tips,
+                                        &foreign_by_evidence,
+                                        origin,
+                                        height,
+                                        TipSource::GossipedBlock,
+                                    ) {
+                                        publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
                                     }
-                                    publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
                                     // Learning the tip is the fix; requesting against it here is
                                     // deliberately left to `blocksync_interval`. `tip_height` is a
                                     // 5-second sample of our own store, so during ordinary
@@ -1593,6 +1600,62 @@ fn peer_departed(remaining_connections: u32, was_announced: bool) -> bool {
 /// peer we have no connection to — and `send_request` to one of those buys a dial attempt and
 /// an `OutboundFailure`, which costs the *responding* peer a cooldown it did not earn. Asking
 /// only reachable peers keeps the higher-quality tip data without paying for it in failures.
+/// Where a peer's claimed tip came from. The two sources are not interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TipSource {
+    /// A peer-exchange message: the peer's own statement about what it holds. Authoritative, so
+    /// it may *lower* a tip — a peer that reset now legitimately claims less (#175).
+    PeerExchange,
+    /// The height of a block this peer gossiped. Raise-only: an old block replayed through the
+    /// mesh must never push a tip back up.
+    GossipedBlock,
+}
+
+/// The one place a peer's claimed tip enters `peer_tips`. Returns whether the claim was accepted
+/// — i.e. whether the peer is allowed to inform our sync at all. Deliberately *not* "the map
+/// changed": the caller republishes the highest tip on every accepted claim, exactly as both call
+/// sites did before they were merged, so this stays a pure refactor for every peer but the
+/// excluded one.
+///
+/// It exists because the gate below was written once and then missed by the second writer.
+/// `peer_tips` is the sole input to `best_blocksync_peer`, and it had two authors: the
+/// peer-exchange path checked `foreign_by_evidence`, the gossiped-block path — added later, to
+/// stop a freshly started node idling for up to 30s without a known tip — did not. So a peer that
+/// had already *proved* a different history walked straight back in through its own gossip.
+///
+/// That is not a theoretical hole, it is a loop, measured on 2026-09-02 against the node still
+/// running the pre-reset 280941 chain: it proposes a block, that block's height lands in
+/// `peer_tips`, it wins `best_blocksync_peer` on the highest claimed tip, serves 46 blocks that do
+/// not chain from our tip, `BlocksyncPeerOnAnotherChain` drops the tip again — and the next
+/// gossiped proposal puts it right back. 49 proposal→request pairs in a single log, every gap
+/// exactly 1.0s. The evidence set held perfectly the whole time; it was simply asked at one of the
+/// two doors.
+fn record_peer_tip(
+    peer_tips: &mut HashMap<PeerId, u64>,
+    foreign_by_evidence: &HashSet<PeerId>,
+    origin: PeerId,
+    height: u64,
+    source: TipSource,
+) -> bool {
+    // A peer that has already served a batch off another history gets no say in what we sync,
+    // whatever it now claims and however it claims it.
+    if foreign_by_evidence.contains(&origin) {
+        return false;
+    }
+    match source {
+        TipSource::PeerExchange => {
+            peer_tips.insert(origin, height);
+        }
+        TipSource::GossipedBlock => {
+            let entry = peer_tips.entry(origin).or_insert(height);
+            if *entry < height {
+                *entry = height;
+            }
+        }
+    }
+    true
+}
+
 fn best_blocksync_peer<F: Fn(&PeerId) -> bool>(
     peer_tips: &HashMap<PeerId, u64>,
     our_tip: u64,
@@ -2770,3 +2833,91 @@ mod observed_height_tests {
     }
 }
 
+#[cfg(test)]
+mod peer_tip_gate_tests {
+    use super::TipSource;
+    use libp2p::PeerId;
+    use std::collections::{HashMap, HashSet};
+
+    fn no_cooldown() -> HashMap<PeerId, u32> {
+        HashMap::new()
+    }
+
+    /// The regression this whole helper exists for. Both doors into `peer_tips` must be shut
+    /// against a peer that proved a different history — the gossip door was open, and that turned
+    /// a one-time exclusion into a loop that reinstated the peer every round.
+    #[test]
+    fn a_peer_that_proved_another_history_cannot_walk_back_in_through_either_door() {
+        let zombie = PeerId::random();
+        let mut tips: HashMap<PeerId, u64> = HashMap::new();
+        let mut foreign: HashSet<PeerId> = HashSet::new();
+        foreign.insert(zombie);
+
+        assert!(
+            !super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, TipSource::PeerExchange),
+            "peer exchange from a peer on another history must not set a tip",
+        );
+        assert!(
+            !super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, TipSource::GossipedBlock),
+            "a gossiped block is the same claim through a different door — it must not set a tip \
+             either, or the exclusion undoes itself on the peer's next proposal",
+        );
+        assert!(tips.is_empty(), "an excluded peer must leave no tip behind at all");
+    }
+
+    /// Live reproduction of the 2026-09-02 loop: exclude, then let the peer gossip. Before the
+    /// gate, `best_blocksync_peer` picked the excluded peer straight back out.
+    #[test]
+    fn an_excluded_peer_does_not_win_the_blocksync_choice_again_after_gossiping() {
+        let zombie = PeerId::random();
+        let honest = PeerId::random();
+        let mut tips: HashMap<PeerId, u64> = HashMap::new();
+        let mut foreign: HashSet<PeerId> = HashSet::new();
+
+        // Both peers announce; the zombie claims the far higher tip, so it wins on merit.
+        super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, TipSource::PeerExchange);
+        super::record_peer_tip(&mut tips, &foreign, honest, 27_960, TipSource::PeerExchange);
+        let (chosen, _) =
+            super::best_blocksync_peer(&tips, 27_954, &no_cooldown(), |_| true).unwrap();
+        assert_eq!(chosen, zombie, "positive control: the highest claimed tip wins");
+
+        // Its batch did not chain. This is what `BlocksyncPeerOnAnotherChain` does.
+        foreign.insert(zombie);
+        tips.remove(&zombie);
+
+        // Now it proposes a block, exactly as the real one did every couple of minutes.
+        super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, TipSource::GossipedBlock);
+
+        let (chosen, _) =
+            super::best_blocksync_peer(&tips, 27_954, &no_cooldown(), |_| true).unwrap();
+        assert_eq!(
+            chosen, honest,
+            "after proving another history the peer must stay out, however loudly it gossips",
+        );
+    }
+
+    /// The gate must not cost the reason the gossip path was added: a peer we have nothing against
+    /// still teaches us its height, and raise-only still holds.
+    #[test]
+    fn an_ordinary_peer_still_teaches_its_tip_and_a_replayed_block_cannot_lower_it() {
+        let peer = PeerId::random();
+        let mut tips: HashMap<PeerId, u64> = HashMap::new();
+        let foreign: HashSet<PeerId> = HashSet::new();
+
+        assert!(super::record_peer_tip(&mut tips, &foreign, peer, 100, TipSource::GossipedBlock));
+        assert_eq!(tips.get(&peer), Some(&100));
+
+        super::record_peer_tip(&mut tips, &foreign, peer, 90, TipSource::GossipedBlock);
+        assert_eq!(
+            tips.get(&peer),
+            Some(&100),
+            "an old block replayed through the mesh must not move the tip",
+        );
+
+        assert!(
+            super::record_peer_tip(&mut tips, &foreign, peer, 90, TipSource::PeerExchange),
+            "peer exchange is the authority and must still be able to lower a tip (#175)",
+        );
+        assert_eq!(tips.get(&peer), Some(&90));
+    }
+}
