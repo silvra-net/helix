@@ -34,10 +34,10 @@ mutually exclusive:
    `HELIX_VALIDATOR_KEY` at its key file, or restore it into place with
    `helix wallet restore --mnemonic "…" --output validator-key.json`, then re-check the address
    above. The node signs with whatever `validator-key.json` holds, nothing else.
-2. **Stake at least the minimum** (100,000 HLX — ~0.3% of the total supply) **from that exact
+2. **Stake at least the minimum** (10,000 HLX — ~0.03% of the total supply) **from that exact
    address**, using that same key file:
    ```bash
-   helix tx stake 100000 --key validator-key.json
+   helix tx stake 10000 --key validator-key.json
    ```
    The `--key` here must be the same file whose address you read in step 1. If `helix tx stake`
    uses any other key, you have just created a phantom validator — see the warning above.

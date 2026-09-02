@@ -166,8 +166,8 @@ advances, since real compute was spent either way.
   1 HLX/block, halves every 15,768,000 blocks (~1 year at the 2s block time) — the same
   geometric-decay shape as Bitcoin's coinbase subsidy, always clamped so cumulative issuance
   never crosses the 33M cap regardless of what the schedule alone would pay out.
-- **Minimum validator stake:** 100,000 HLX (~0.3% of supply) — runtime-adjustable via
-  governance, floored at 1,000 HLX so it can never be pushed low enough to let unstaked
+- **Minimum validator stake:** 10,000 HLX (~0.03% of supply) — runtime-adjustable via
+  governance, floored at 100 HLX so it can never be pushed low enough to let unstaked
   accounts flood the validator set.
 - **Unbonding period:** 7 days from `tx unstake` to claimable — stake stays slashable the
   whole time. Same for delegated stake redeemed via `tx undelegate`: it remains slashable for

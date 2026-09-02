@@ -383,15 +383,15 @@ leaves the largest one holding a quorum by itself, so killing it still halts the
 small ones are decoration. As a rule of thumb, a new validator needs more than `total_stake/50`
 staked for the cap to bind it (`total_stake/100` if it has verified personhood).
 
-Growing organically means funding each new validator with `MIN_VALIDATOR_STAKE` (100,000 HLX)
+Growing organically means funding each new validator with `MIN_VALIDATOR_STAKE` (10,000 HLX)
 via transfers, or waiting for the existing validator's block rewards to accumulate it — at 1
-HLX/block and 2s blocks that is ~43,200 HLX/day, so roughly two days per validator. Real, but
-slow if you want a fault-tolerant network standing up today.
+HLX/block and 2s blocks that is ~43,200 HLX/day, so under six hours per validator. Funding is
+rarely the bottleneck at this minimum; finding operators who will actually keep a node up is.
 
 `MIN_VALIDATOR_STAKE` is not fixed, though: it is a **governance parameter** (floor
-`MIN_VALIDATOR_STAKE / 100` = 1,000 HLX). Lowering it by vote is often the cheaper path to more
-validators than funding each one to 100,000 — a smaller stake still carries full voting weight as
-long as it clears the 1% cap (`> total_stake/50`). See the governance flow in
+`MIN_VALIDATOR_STAKE / 100` = 100 HLX). Lowering it by vote is another path to more validators
+than funding each one to 10,000 — a smaller stake still carries full voting weight as long as it
+clears the 1% cap (`> total_stake/50`). See the governance flow in
 [Using the CLI](cli.md#governance).
 
 Every validator joins the same way — there is no genesis shortcut that pre-stakes extra
@@ -405,7 +405,7 @@ yesterday or years ago. Concretely, to add Bob and Carol to your network:
 2. Fund each validator's address with at least `MIN_VALIDATOR_STAKE` plus a fee margin — by
    transfer from an already-funded account (`helix tx send`), or by letting block rewards
    accumulate.
-3. **On the node whose key holds that stake**, send `helix tx stake 100000`. Verify the staking
+3. **On the node whose key holds that stake**, send `helix tx stake 10000`. Verify the staking
    address matches the node's own key first (`helix wallet address --key validator-key.json`) —
    staking from one wallet while the node signs as a *different* self-generated key produces a
    "phantom" validator that is in the set but never signs, which freezes a small set.
@@ -459,7 +459,7 @@ server / firewall, so this assumes the WebSocket-tunnel setup:
 
 1. **Generate a validator key** on the machine that will run the node, and never let the
    24-word phrase leave it: `helix wallet new -o validator-key.json`. Note the address.
-2. **Fund that address** with at least `MIN_VALIDATOR_STAKE` (100,000 HLX) by transfer or
+2. **Fund that address** with at least `MIN_VALIDATOR_STAKE` (10,000 HLX) by transfer or
    accumulated block rewards. Fund it now, but **do not send the `Stake` transaction yet** — that
    is the last step, once the node is provably connected. Budget somewhat above the minimum: a
    slash takes 5% of your stake, and landing below `MIN_VALIDATOR_STAKE` drops you out of the set
