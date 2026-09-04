@@ -184,6 +184,65 @@ enum LivenessVerdict {
     Heard { missing_precommit: bool },
 }
 
+/// Who was heard from in a timed-out round, and whether that was enough power to have closed it.
+///
+/// Exists because on 2026-09-04 this question could not be answered from six and a half hours of
+/// log. The engine computes every part of it on every timed-out round and threw all of it away
+/// except the names over a silence threshold — so "who voted in this round" was reconstructable
+/// only by grepping counters and inferring, which produced two wrong diagnoses in one day.
+///
+/// The distinction that matters is `enough_power_heard`. "Votes are missing" and "the votes were
+/// there and the round still did not close" are different failures with different fixes, and
+/// nothing in the log separated them.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct RoundAttendance {
+    /// Other validators whose prevote or precommit reached us this round.
+    pub heard: Vec<Address>,
+    /// Other validators we heard nothing from.
+    pub silent: Vec<Address>,
+    /// Voting power behind `heard`, plus this node's own if it voted. What the round actually had.
+    pub power_heard: u64,
+    pub quorum: u64,
+    pub reached_prevote_quorum: bool,
+}
+
+impl RoundAttendance {
+    /// Was there enough voting power in the room? A `false` here says the round could not have
+    /// closed whatever else is true, and points at the absent validators. A `true` says the power
+    /// was present and the round failed anyway — which is not a liveness problem at all and sends
+    /// the diagnosis somewhere completely different.
+    pub(crate) fn enough_power_heard(&self) -> bool {
+        self.power_heard >= self.quorum
+    }
+}
+
+/// Build the summary from what the round holds. Separated from the logging for the same reason
+/// `liveness_verdict` is: a rule that can only be checked by reading a log line is a rule nothing
+/// tests.
+///
+/// `participants` is `(address, voting_power, heard_from)` for every *other* validator that can
+/// hold a round up. `own_power` is this node's own, counted only when it voted itself — a node
+/// that did not vote must not credit itself with power the round never had.
+pub(crate) fn round_attendance(
+    participants: &[(Address, u64, bool)],
+    own_power: u64,
+    quorum: u64,
+    reached_prevote_quorum: bool,
+) -> RoundAttendance {
+    let mut heard = Vec::new();
+    let mut silent = Vec::new();
+    let mut power_heard = own_power;
+    for (address, power, was_heard) in participants {
+        if *was_heard {
+            power_heard = power_heard.saturating_add(*power);
+            heard.push(address.clone());
+        } else {
+            silent.push(address.clone());
+        }
+    }
+    RoundAttendance { heard, silent, power_heard, quorum, reached_prevote_quorum }
+}
+
 /// Classify one validator's participation in a round that timed out.
 ///
 /// The distinction that matters is *which phase* failed. A precommit is only cast once prevote
@@ -280,6 +339,11 @@ pub struct BftEngine {
     /// stall, never who counts toward quorum. Reset to 0 for a validator the instant it votes
     /// again; absent rather than stored as 0.
     missed_rounds: HashMap<Address, u32>,
+    /// The silent set as it stood the last time it was reported. Only *changes* are worth an
+    /// `info!`: a steady situation says the same thing every round and teaches an operator to skim
+    /// the log, while every transition — someone dropping out, someone coming back — is the line a
+    /// later diagnosis actually needs and cannot reconstruct afterwards.
+    last_reported_silent: Vec<Address>,
     /// The precommit quorum certificate that finalized `current_height`, carried forward one
     /// height so the *next* block this engine proposes can attach it as `last_commit` — see
     /// `BlockHeader::last_commit`'s doc comment for why it travels one block late. Empty after
@@ -314,6 +378,7 @@ impl BftEngine {
             pending_round: 0,
             current_base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
             missed_rounds: HashMap::new(),
+            last_reported_silent: Vec::new(),
             peer_wait_ticks: 0,
             last_commit: Vec::new(),
         }
@@ -1597,9 +1662,14 @@ impl BftEngine {
         // validator is missing one and naming them would name the whole set.
         let reached_prevote_quorum = stalled.prevotes.quorum_hash().is_some();
 
+        // Collected for the attendance line below, from the same three facts the verdict uses —
+        // one pass, not a second walk over the round.
+        let mut participants: Vec<(Address, u64, bool)> = Vec::with_capacity(members.len());
+
         for (address, voting_power) in members {
             let prevoted = stalled.prevotes.has_voted(&address);
             let precommitted = stalled.precommits.has_voted(&address);
+            participants.push((address.clone(), voting_power, prevoted || precommitted));
 
             match liveness_verdict(prevoted, precommitted, reached_prevote_quorum) {
             LivenessVerdict::Heard { missing_precommit } => {
@@ -1635,6 +1705,52 @@ impl BftEngine {
                     "Validator silent — consensus cannot reach quorum without its votes"
                 );
             }
+        }
+
+        // The line that was missing on 2026-09-04, when "who voted in this round" had to be
+        // inferred from counters and was inferred wrongly, twice.
+        //
+        // Only on a *change* of the silent set, and that is the whole design: a stalled chain
+        // repeats its situation every round, so reporting it every round teaches an operator to
+        // skim past exactly the lines that matter. Every transition gets one line and every steady
+        // stretch gets none, which is also what makes it affordable at `info!` — the level a
+        // diagnosis after the fact can actually rely on, since `debug!` has to have been switched
+        // on before the incident nobody knew was coming (#190).
+        let own_voted = stalled.prevotes.has_voted(&self.address)
+            || stalled.precommits.has_voted(&self.address);
+        let own_power = if own_voted {
+            self.validator_set.get(&self.address).map(|v| v.voting_power).unwrap_or(0)
+        } else {
+            0
+        };
+        let attendance = round_attendance(
+            &participants,
+            own_power,
+            self.validator_set.quorum_threshold(),
+            reached_prevote_quorum,
+        );
+        if attendance.silent != self.last_reported_silent {
+            self.last_reported_silent = attendance.silent.clone();
+            let names = |v: &[Address]| {
+                if v.is_empty() {
+                    "none".to_string()
+                } else {
+                    v.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                }
+            };
+            tracing::info!(
+                height = self.current_height + 1,
+                heard = %names(&attendance.heard),
+                silent = %names(&attendance.silent),
+                power_heard = attendance.power_heard,
+                quorum = attendance.quorum,
+                enough_power_heard = attendance.enough_power_heard(),
+                reached_prevote_quorum,
+                own_vote_counted = own_voted,
+                "Who this round was heard from changed. `enough_power_heard=false` means the round \
+                 could not have closed and the named validators are why; `true` means the power was \
+                 present and it failed anyway, which is a different problem entirely."
+            );
         }
     }
 
@@ -4419,4 +4535,59 @@ mod tests {
             }
         }
     }
+    /// The distinction the whole attendance line exists for, and the one nothing in the log made
+    /// on 2026-09-04: "the votes were not there" against "the votes were there and the round still
+    /// did not close". Those are different failures with different fixes, and six and a half hours
+    /// of log could not tell them apart.
+    #[test]
+    fn attendance_says_whether_the_round_could_have_closed_at_all() {
+        let a = Address::from_public_key(&KeyPair::generate().public);
+        let b = Address::from_public_key(&KeyPair::generate().public);
+        let c = Address::from_public_key(&KeyPair::generate().public);
+        let d = Address::from_public_key(&KeyPair::generate().public);
+
+        // Five validators of 500 each, quorum 1667 — four have to be heard from.
+        let quorum = 1667;
+        let heard_from_three = round_attendance(
+            &[(a.clone(), 500, true), (b.clone(), 500, true), (c.clone(), 500, false), (d.clone(), 500, false)],
+            500,
+            quorum,
+            false,
+        );
+        assert_eq!(heard_from_three.power_heard, 1500, "own 500 plus the two heard from");
+        assert!(
+            !heard_from_three.enough_power_heard(),
+            "1500 is under the quorum of {quorum}: this round could not have closed, and the two \
+             silent validators are the reason"
+        );
+        assert_eq!(heard_from_three.silent, vec![c.clone(), d.clone()]);
+
+        let heard_from_four = round_attendance(
+            &[(a, 500, true), (b, 500, true), (c, 500, true), (d.clone(), 500, false)],
+            500,
+            quorum,
+            true,
+        );
+        assert!(
+            heard_from_four.enough_power_heard(),
+            "2000 clears the quorum — a round that still failed here is not a missing-votes problem"
+        );
+        assert_eq!(heard_from_four.silent, vec![d]);
+    }
+
+    /// A node that did not vote itself must not credit itself with power the round never had.
+    /// Getting this backwards would report "there was enough power" for a round this node sat out,
+    /// which is the one reading that sends a diagnosis away from the node that is actually broken.
+    #[test]
+    fn a_node_that_did_not_vote_does_not_count_its_own_power() {
+        let a = Address::from_public_key(&KeyPair::generate().public);
+        let silent_self = round_attendance(&[(a.clone(), 500, true)], 0, 900, false);
+        assert_eq!(silent_self.power_heard, 500, "only what actually voted");
+        assert!(!silent_self.enough_power_heard());
+
+        let voting_self = round_attendance(&[(a, 500, true)], 500, 900, false);
+        assert_eq!(voting_self.power_heard, 1000);
+        assert!(voting_self.enough_power_heard());
+    }
+
 }
