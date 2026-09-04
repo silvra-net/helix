@@ -100,6 +100,11 @@ const WS_B_P2P: u16 = 29_656;
 
 /// Fifth port range, for the runtime-join test — a validator funded, staked and activated *at
 /// runtime* rather than pre-staked in genesis. Same shared-binary concurrency reason as above.
+const GAP_A_RPC: u16 = 29_685;
+const GAP_A_P2P: u16 = 29_686;
+const GAP_B_RPC: u16 = 29_695;
+const GAP_B_P2P: u16 = 29_696;
+
 const JOIN_A_RPC: u16 = 29_665;
 const JOIN_A_P2P: u16 = 29_666;
 const JOIN_B_RPC: u16 = 29_675;
@@ -982,4 +987,161 @@ mod tempdir {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+}
+
+
+/// A node that fell behind while its peers kept going must catch back up, without a restart and
+/// without anyone noticing.
+///
+/// **This is #188, and it was the most expensive open defect this project had.** On 2026-09-04 the
+/// production validator sat exactly one block under the tip for 6 h 20 min with four peers
+/// connected. A validator below the tip cannot vote on the next height, so it was absent from the
+/// quorum and the chain stopped — the chain that looked like it was waiting for other validators
+/// was waiting for it. It came back 33 seconds after a restart, which proves the block was
+/// available the whole time and nothing fetched it.
+///
+/// The consensus engine provably cannot close a height gap on its own — `fault_injection.rs`
+/// measures that, and the reason is structural: committed-block gossip applies only at `tip + 1`
+/// and the missing block is by definition already past, while the round-sync pull is answered only
+/// for the *server's* `current_height + 1`. Block-sync is therefore not a backstop but the only
+/// path, and it had no test at all.
+///
+/// **SIGSTOP rather than a kill, deliberately.** A killed node restarts and runs the startup-sync
+/// path, which is a different mechanism with its own tests; the failure being reproduced here is a
+/// *running* node that fell behind and has to notice by itself. SIGSTOP freezes it mid-flight,
+/// leaves its TCP connections and its peers' view of it intact, and on SIGCONT it wakes up exactly
+/// where production was: behind, connected, and nobody is going to resend what it missed.
+///
+/// **Both gap sizes, because one of them is the production case.** Ten blocks is the comfortable
+/// version and the one a reader expects. One block is what actually happened, and it is the harder
+/// case to be confident about by reading: it is the smallest gap that exists, the one most easily
+/// mistaken for ordinary lag, and — since the missing block is the one that was dropped — the one
+/// where no later committed block can ever chain onto the tip that is held.
+///
+/// A follower rather than a validator, because the driver under test is identical either way and
+/// this needs neither funding, staking, nor an activation epoch — the same reproduction for two
+/// processes instead of five, and half a minute instead of a quarter of an hour. What it does not
+/// cover is a node that is behind *while the chain is stalled*, which is the full production
+/// shape; that needs five validators with one already silent and is recorded in the backlog rather
+/// than pretended at here.
+#[tokio::test]
+#[ignore = "spawns two real node processes and freezes one with SIGSTOP, twice (~60s wall-clock) — run explicitly with --ignored"]
+async fn a_node_frozen_until_it_falls_behind_catches_up_again_on_its_own() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
+    for gap in [10u64, 1u64] {
+        catches_up_after_falling_behind(gap).await;
+    }
+}
+
+async fn catches_up_after_falling_behind(gap: u64) {
+    let _node_a = spawn_node(GAP_A_RPC, GAP_A_P2P, None);
+    wait_until_reachable(GAP_A_RPC, Duration::from_secs(15)).await;
+    wait_for_height(GAP_A_RPC, 2, Duration::from_secs(30)).await;
+
+    let node_b = spawn_node_with(
+        GAP_B_RPC,
+        GAP_B_P2P,
+        Some(GAP_A_RPC),
+        &[("HELIX_P2P_SEED_PEERS", &format!("/ip4/127.0.0.1/tcp/{GAP_A_P2P}"))],
+        None,
+    );
+    wait_until_reachable(GAP_B_RPC, Duration::from_secs(15)).await;
+    wait_for_height(GAP_B_RPC, 3, Duration::from_secs(60)).await;
+
+    // Read B's height *before* freezing it, and not only because that is the honest value.
+    // A SIGSTOPped process keeps its listen socket: the kernel completes the handshake and
+    // nothing ever answers, so an HTTP GET against it does not fail — it hangs, forever, and
+    // `reqwest::get` here carries no timeout. The first version of this test asked B how far it
+    // had got *after* stopping it and never reached its next line. R2, in the plainest form: the
+    // instrument has to survive the condition it is measuring.
+    let frozen_at = status(GAP_B_RPC).await.and_then(|s| s["height"].as_u64()).unwrap_or(0);
+    assert!(frozen_at > 0, "B has to be following the chain before it is frozen");
+
+    // Freeze B. Its process stays, its sockets stay, and A keeps producing — so the gap opens
+    // exactly the way it opened in production, rather than by restarting into a different path.
+    let pid = node_b.child.id();
+    signal_node(pid, "STOP");
+    wait_for_height(GAP_A_RPC, frozen_at + gap, Duration::from_secs(120)).await;
+    let ahead = status(GAP_A_RPC).await.unwrap()["height"].as_u64().unwrap();
+    println!("gap {gap}: froze B on {frozen_at}, A advanced to {ahead}");
+
+    signal_node(pid, "CONT");
+
+    // Positive control, asserted before the recovery: if B were never actually behind, everything
+    // below would pass for the wrong reason. A test of catching up that never fell behind measures
+    // the healthy path and calls it a fix.
+    let woke_at = wait_for_status(GAP_B_RPC, Duration::from_secs(60))
+        .await
+        .expect("B must answer again once resumed");
+    let b_height = woke_at["height"].as_u64().unwrap_or(0);
+    println!("gap {gap}: B woke on {b_height}");
+    assert!(
+        b_height < ahead,
+        "B was frozen while A advanced, so it has to wake up behind — it woke on {b_height} \
+         against A's {ahead}. Nothing after this line would be measuring a recovery."
+    );
+
+    // The assertion. Block-sync is the only mechanism that can do this, so if it fails, it failed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let a = status_within(GAP_A_RPC, Duration::from_secs(3)).await.and_then(|s| s["height"].as_u64()).unwrap_or(0);
+        let b = status_within(GAP_B_RPC, Duration::from_secs(3)).await.and_then(|s| s["height"].as_u64()).unwrap_or(0);
+        if b + 1 >= a && b > b_height {
+            println!("gap {gap}: B caught up: {b_height} -> {b}, A on {a}");
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "gap {gap}: B woke on {b_height} and is on {b} while A is on {a} — it never caught \
+                 up. A node below the tip is a node missing from the quorum, which is how a single \
+                 lost block became a 6 h 20 min stall on 2026-09-04 (#188). Block-sync is the only \
+                 path back and it did not run, or ran and achieved nothing."
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Send a signal to a spawned node by PID.
+///
+/// `kill -STOP`/`-CONT` by pid, never by pattern: `pkill -f` matches its own command line and
+/// kills itself before reaching the target, which this repo has walked into four times (R4).
+fn signal_node(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .expect("send signal to node process");
+    assert!(status.success(), "kill -{signal} {pid} failed");
+}
+
+/// `status`, but waiting for the node to answer at all — a process that has just been resumed
+/// from SIGSTOP needs a moment before its RPC responds.
+async fn wait_for_status(rpc_port: u16, timeout: Duration) -> Option<serde_json::Value> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(s) = status_within(rpc_port, Duration::from_secs(3)).await {
+            return Some(s);
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+
+/// `status`, but it gives up. The plain one has no timeout, which is fine against a node that is
+/// either answering or refusing the connection — and useless against one that has been stopped,
+/// where the socket accepts and nothing replies.
+async fn status_within(rpc_port: u16, timeout: Duration) -> Option<serde_json::Value> {
+    let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
+    client
+        .get(format!("http://127.0.0.1:{rpc_port}/status"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()
 }

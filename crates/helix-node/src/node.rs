@@ -1807,7 +1807,21 @@ async fn apply_synced_batch(
     };
     // Another path may have caught us up while we waited for the lock — this is a re-check under
     // it, not a redundant one.
+    //
+    // Logged because it was the one thing that happened, invisibly, in the six and a half hours of
+    // 2026-09-04: the last block-sync line in the whole outage was a batch arriving here at
+    // 11:09:40 and vanishing without a word. It turned out to be this branch and to be harmless —
+    // our own tip had moved between sending the request and reading the answer — but "a batch
+    // arrived and the height did not move" cost hours to tell apart from a defect, and one debug
+    // line settles it. `debug!`, not `warn!`: during a normal catch-up this is ordinary.
     if batch.blocks.last().map(|b| b.height()).unwrap_or(0) <= base {
+        debug!(
+            peer = %peer,
+            base,
+            blocks = batch.blocks.len(),
+            last = batch.blocks.last().map(|b| b.height()).unwrap_or(0),
+            "Discarding a block-sync batch we no longer need — our tip moved while it was in flight"
+        );
         return;
     }
 
@@ -1880,7 +1894,7 @@ async fn apply_synced_batch(
     };
 
     if new_height <= base {
-        return; // nothing actually persisted
+        return; // nothing actually persisted; the only way here is the logged storage error above
     }
     *last = new_height;
 
