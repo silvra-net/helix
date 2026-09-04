@@ -75,6 +75,9 @@ pub struct AppState {
     /// reasoning as the health loop (backlog #150).
     pub started_at_unix: u64,
     pub silent_peer_validators: Arc<std::sync::atomic::AtomicUsize>,
+    /// Highest tip any connected peer claims (backlog #154). Published for `/diagnostics` so that
+    /// "this node is behind" is answerable from outside the process.
+    pub highest_peer_tip: Arc<std::sync::atomic::AtomicU64>,
     /// Path of the chain database, used only to measure it and the volume it sits on.
     ///
     /// **Never serialised.** `GET /diagnostics` reports the size and the free space, not where
@@ -1402,6 +1405,10 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
         is_syncing: state.syncing.load(Ordering::Relaxed),
         peer_count: state.peer_count.load(Ordering::Relaxed),
         validators_not_heard_from: state.silent_peer_validators.load(Ordering::Relaxed),
+        peer_tip_height: match state.highest_peer_tip.load(Ordering::Relaxed) {
+            0 => None,
+            h => Some(h),
+        },
         last_cosigned_height: (last_height > 0).then_some(last_height),
         last_cosigned_secs_ago: (last_at > 0).then(|| now.saturating_sub(last_at)),
         rss_kb: read_kb_field("/proc/self/status", "VmRSS:"),
@@ -1768,6 +1775,7 @@ mod tests {
             tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
             started_at_unix: 0,
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             previous_run: None,
@@ -2388,6 +2396,36 @@ mod tests {
         assert!(d["open_fds"].as_u64().unwrap_or(0) > 0, "it also has the file it opened: {d}");
     }
 
+    /// "Am I behind?" has to be answerable from outside the process, and the two states must be
+    /// distinguishable: *nobody has claimed a tip yet* is not *every peer is level with me*.
+    ///
+    /// On 2026-09-04 this node sat one block below its peers for 6 h 20 min. The number was in
+    /// the process the whole time (`highest_peer_tip`, backlog #154) and had no way out of it —
+    /// not through the log, which reports block-sync at `debug!`, and not through RPC. Diagnosing
+    /// it took a restart. `null` versus a number is the difference between "unknown" and "level",
+    /// and reporting 0 for the first would read as a peer on the genesis block.
+    #[tokio::test]
+    async fn diagnostics_answer_whether_this_node_is_behind_its_peers() {
+        let state = fresh_test_state();
+        let response = get_diagnostics(State(state.clone())).await.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let d: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            d["peer_tip_height"].is_null(),
+            "before any peer has claimed a tip this is unknown, not zero: {d}"
+        );
+
+        state.highest_peer_tip.store(114_116, std::sync::atomic::Ordering::Relaxed);
+        let response = get_diagnostics(State(state)).await.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let d: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            d["peer_tip_height"].as_u64(),
+            Some(114_116),
+            "the highest tip a peer claims must be readable next to our own height: {d}"
+        );
+    }
+
     /// A node that has never co-signed must say so, rather than claiming height 0 — which reads
     /// as "co-signed the genesis block" and is the sort of small lie that costs an hour later.
     #[tokio::test]
@@ -2427,6 +2465,7 @@ mod tests {
             tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
             started_at_unix: 0,
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             previous_run: None,

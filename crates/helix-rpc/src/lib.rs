@@ -353,6 +353,14 @@ pub struct NodeDiagnostics {
     /// node observes, not a claim that those validators are down — it cannot tell an absent peer
     /// from a broken link to a healthy one.
     pub validators_not_heard_from: usize,
+    /// The highest tip any connected peer currently claims. Compare it against `height`: anything
+    /// above means **this** node is the one behind, and a validator below the tip cannot vote on
+    /// the next height, so it is missing from the quorum.
+    ///
+    /// Exists because on 2026-09-04 that difference was one block, lasted 6 h 20 min, and was not
+    /// visible anywhere — not in the log, not over RPC. The number was already in the process; it
+    /// had no way out of it. `None` while no peer has claimed anything yet.
+    pub peer_tip_height: Option<u64>,
     /// Height at which this node last co-signed, and how long ago. `None` on a node that has not
     /// co-signed during this run — including every non-validator.
     pub last_cosigned_height: Option<u64>,

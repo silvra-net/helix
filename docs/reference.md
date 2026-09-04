@@ -115,6 +115,7 @@ deliberately **not** the node's log — see the note below on why.
   "is_syncing": false,
   "peer_count": 2,
   "validators_not_heard_from": 1,
+  "peer_tip_height": 36378,
   "last_cosigned_height": 36376,
   "last_cosigned_secs_ago": 5982,
   "rss_kb": 344328,
@@ -139,6 +140,13 @@ What each field is for:
 - **`validators_not_heard_from`** — how many validators' votes are not arriving *here*. Read the
   direction carefully: it is what this node observes, not a claim that those validators are down.
   This node cannot tell an absent peer from a broken link to a healthy one.
+- **`peer_tip_height`** — the highest tip any connected peer claims. Compare it with `height`.
+  Anything above it means **this** node is the one behind, and that matters more than it sounds:
+  a validator below the tip cannot vote on the next height, so it is missing from the quorum, and
+  a chain that looks like it is waiting for somebody else is in fact waiting for you. On
+  2026-09-04 that difference was a single block, lasted 6 h 20 min, and could not be read anywhere
+  — the node's own health line reported the chain as stalled and advised checking the *other*
+  validators. `null` while no peer has claimed a tip yet, which is not the same as being level.
 - **`rss_kb` / `machine_total_kb`** — an out-of-memory kill leaves nothing in the node's own log,
   because the kernel decides and the process never runs again. These two numbers are how that
   becomes visible instead of mysterious.

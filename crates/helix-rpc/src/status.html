@@ -845,6 +845,20 @@
       $("uptime").textContent = diag ? "up " + duration(diag.uptime_secs) : "";
 
       if (diag) {
+        // "This node is behind" is the state that cost 6 h 20 min on 2026-09-04 and was visible
+        // nowhere — not in the log (block-sync reports at debug level), not over RPC, not here.
+        // A validator below the tip cannot vote on the next height, so it is absent from the
+        // quorum and the chain it appears to be waiting for is in fact waiting for it. One glance
+        // at this board should say so.
+        if (fin(diag.peer_tip_height) && diag.peer_tip_height > status.height) {
+          const behind = diag.peer_tip_height - status.height;
+          $("height").innerHTML = nf(status.height) +
+            '<small> ' + nf(behind) + ' behind — peers report ' + nf(diag.peer_tip_height) + '</small>';
+          $("height").style.color = "var(--bad)";
+        } else {
+          $("height").style.color = "";
+        }
+
         const mb = Math.round(diag.rss_kb / 1024);
         $("rss").innerHTML = nf(mb) + "<small> MB</small>";
         const pct = diag.machine_total_kb ? (diag.rss_kb / diag.machine_total_kb) * 100 : 0;

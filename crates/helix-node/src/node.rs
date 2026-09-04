@@ -900,6 +900,7 @@ impl HelixNode {
             tip_certificate: tip_certificate.clone(),
             started_at_unix: crate::run_record::now_unix(),
             silent_peer_validators: silent_peer_validators.clone(),
+            highest_peer_tip: self.highest_peer_tip.clone(),
             last_cosigned: last_cosigned.clone(),
             last_cosigned_at_unix: last_cosigned_at_unix.clone(),
             previous_run: self.previous_run.clone(),
@@ -1289,6 +1290,7 @@ impl HelixNode {
             last_cosigned,
             last_cosigned_at_unix,
             production_ticks.clone(),
+            self.highest_peer_tip.clone(),
         ));
 
         // Block production loop
@@ -3208,8 +3210,32 @@ fn production_stall_beats(current_ticks: u64, previous_ticks: u64, beats_so_far:
 /// again with an empty chain database was not — it pinned that node at height 1 and turned a
 /// recoverable outage into a 21-hour stall (#147). Hence the explicit line about the data
 /// directory: the mistake that actually cost the time was not the restart.
-fn not_validating_advice(quorum_peers_missing: bool, silent_peer_validators: usize) -> &'static str {
-    if quorum_peers_missing {
+fn not_validating_advice(
+    behind_the_tip: bool,
+    quorum_peers_missing: bool,
+    silent_peer_validators: usize,
+) -> &'static str {
+    if behind_the_tip {
+        // First, because it is the only branch that is a statement about *this* node, and the
+        // three below all send the operator to look at somebody else's.
+        //
+        // On 2026-09-04 this node sat one block below the tip for 6 h 20 min and printed the
+        // "check the other validators" advice 377 times. It was wrong every time: block 114116
+        // existed with all five signatures, this node simply never received it, and a validator
+        // below the tip cannot vote on the next height — so the chain could not reach quorum
+        // *because of this node*. The information needed to say so was already in the process
+        // (`highest_peer_tip`, backlog #154); nothing read it.
+        //
+        // The restart recommendation is deliberate here and nowhere else: it is the one case
+        // where a restart provably fixes it — 33 seconds, measured, after 6 h 20 min of the
+        // opposite advice. Block-sync is supposed to close the gap without one (#188), so a line
+        // that keeps appearing is itself the report that it did not.
+        "This node is BEHIND the tip its peers report — so the missing votes are most likely its own: \
+         a validator below the tip cannot vote on the next height and is therefore absent from \
+         the quorum. Block-sync should close this by itself; if this line keeps appearing, it is \
+         not, and restarting THIS node is the fastest way back. Do NOT delete its chain data — \
+         syncing from scratch takes far longer than the gap."
+    } else if quorum_peers_missing {
         "This node is healthy — the chain is waiting for other validators to reconnect, and \
          restarting will not speed that up. Do NOT delete this node's chain data: a node that \
          starts with an empty database has to sync from scratch and cannot vote until it does."
@@ -3261,6 +3287,11 @@ async fn validator_health_loop(
     // Monotonic tick counter of the block production loop (backlog #151). Its *movement* is the
     // only local evidence that the loop is alive at all; its value means nothing on its own.
     production_ticks: Arc<std::sync::atomic::AtomicU64>,
+    // Highest tip any connected peer claims (backlog #154, published by the P2P service). Read
+    // here so the health line can tell "the chain is waiting for someone else" apart from "this
+    // node is the one that is behind" — two states that produced the identical warning until
+    // 2026-09-04, when the wrong one of them cost 6 h 20 min.
+    highest_peer_tip: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use std::sync::atomic::Ordering;
     let started = std::time::Instant::now();
@@ -3351,6 +3382,10 @@ async fn validator_health_loop(
 
         let quorum_missing = quorum_peers_missing.load(Ordering::Relaxed);
         let silent_peers = silent_peer_validators.load(Ordering::Relaxed);
+        // How far this node is below what its peers claim. `saturating_sub` because being *ahead*
+        // is the ordinary state for whoever finalized first, and must read as zero rather than
+        // wrap into an enormous "behind".
+        let blocks_behind = highest_peer_tip.load(Ordering::Relaxed).saturating_sub(height);
 
         // Is the loop that produces blocks still running at all (#151)? Reported separately from
         // the verdict below, and before it, because if that loop is dead every other line here is
@@ -3411,6 +3446,29 @@ async fn validator_health_loop(
                     Some(secs) => format!("chain STALLED at #{} for {}s", height, secs),
                     None => format!("height {}", height),
                 };
+                // The clause that was missing on 2026-09-04. Without it "chain STALLED at #114115"
+                // reads as a statement about the network, when the network was on #114116 and
+                // only this node was not.
+                //
+                // Phrased as a *claim*, not a fact, and that is not politeness. `highest_peer_tip`
+                // is a maximum over unauthenticated announcements (`best_blocksync_peer`'s own
+                // doc says so: highest is not most trustworthy, it only decides whom to ask), so
+                // one peer inventing a number moves this line on its own. Stating it as fact would
+                // repeat the mistake R2 was written for — "Validator silent" once read as "that
+                // peer is down" and sent the diagnosis after a validator that was fine, 596 times
+                // in one outage. Known and accepted: a liar can also make this branch take
+                // precedence over the silent-validator advice. Both branches end in "restart this
+                // node, do not delete its data", which is safe either way, and a validator lying
+                // to its own set is a larger problem than a misleading log line.
+                let behind = if blocks_behind > 0 {
+                    format!(
+                        ", and THIS NODE IS BEHIND what its peers claim — they report #{}, {} block(s) above us",
+                        height + blocks_behind,
+                        blocks_behind
+                    )
+                } else {
+                    String::new()
+                };
                 // The advice has to match the cause, because operators act on it. This warning
                 // used to end with "restarting the node re-establishes its round" no matter what
                 // — including when this node is fine and the chain is held up by *other*
@@ -3423,11 +3481,15 @@ async fn validator_health_loop(
                 // turning a recoverable outage into a 21-hour stall (#147/#150). Hence also the
                 // explicit warning about the data directory — the restart itself was survivable,
                 // wiping the chain was not.
-                let advice = not_validating_advice(quorum_missing, silent_peers);
+                //
+                // 2026-09-04 added the case that outranks all three: a node *below the tip*. The
+                // warning was accurate about the chain and wrong about who had to act, for 6 h
+                // 20 min.
+                let advice = not_validating_advice(blocks_behind > 0, quorum_missing, silent_peers);
                 warn!(
                     "Health: ⚠ NOT validating — this node is an active validator but is not \
-                     co-signing ({}, {}, peers {}). {}",
-                    last, chain, peers, advice
+                     co-signing ({}, {}{}, peers {}). {}",
+                    last, chain, behind, peers, advice
                 );
             }
             HealthVerdict::Settling => {
@@ -4203,6 +4265,61 @@ async fn discover_own_address(
 /// itself — which is exactly why the seed's own operator could not see it.
 ///
 /// So: check the status, look at what actually came back, and name the likely cause.
+/// Read a response body, refusing anything past `cap` bytes.
+///
+/// `reqwest::Response::bytes()` and `::text()` read until the peer stops sending, with no upper
+/// bound — and this client is built with `gzip`, so what it reads is what the peer's payload
+/// *decompresses to*. A few hundred kilobytes on the wire can become gigabytes in this process,
+/// and the node dies to the OOM killer without writing a line about why (the failure mode #172
+/// exists to make visible at all).
+///
+/// Nothing about that requires an attacker in the usual sense: a node's sync peer is whatever
+/// `HELIX_SYNC_PEER` says, defaulting to one hard-coded host, so "trusted endpoint" here means
+/// "one machine, and the operator's spelling of a URL". Bounding the read costs nothing and turns
+/// a remote crash into an error message.
+///
+/// `chunk()` rather than a stream, deliberately: it needs no extra dependency and no `stream`
+/// feature, and it yields already-decompressed bytes, which is the quantity that has to be
+/// bounded.
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize, url: &str) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("could not read {url}'s response body"))?
+    {
+        if out.len() + chunk.len() > cap {
+            bail!(
+                "{url} sent more than {cap} bytes — refusing to keep reading. A response this \
+                 large is either a misconfigured endpoint or a decompression bomb; neither is \
+                 worth an out-of-memory kill."
+            );
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// The largest a `/sync/blocks` answer can legitimately be: every block it may contain, each at
+/// the protocol's own size limit. Derived rather than picked, so it can never reject an honest
+/// answer however large blocks grow — the point is to bound the read by what the protocol allows,
+/// not to guess a number that will one day break a real sync.
+fn sync_body_cap(count: u64) -> usize {
+    (count as usize).saturating_mul(helix_core::fee::MAX_BLOCK_BYTES as usize).saturating_add(1 << 20)
+}
+
+/// Bound for the documents `fetch_json` retrieves — status, whoami, genesis, a tip certificate.
+///
+/// The largest of them is a single block, so this is the block size limit times the cost of
+/// writing it as JSON. That factor is not a guess: `serde_json` renders every byte of ML-DSA
+/// material as a decimal number, and the measurement on 2026-08-27 was 15.8 KB of block becoming
+/// 71 KB of JSON — 4.5×. Eight is that, doubled, so an honest answer cannot hit the ceiling.
+///
+/// Derived rather than picked, for the same reason as `sync_body_cap`: a flat "8 MB looks like
+/// plenty" was the first version of this constant, and it would have refused a full genesis block
+/// — a bound that rejects honest traffic is an outage, not a defence.
+const JSON_BODY_CAP: usize = helix_core::fee::MAX_BLOCK_BYTES as usize * 8;
+
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
@@ -4213,10 +4330,8 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         .await
         .with_context(|| format!("could not reach {url}"))?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .with_context(|| format!("could not read {url}'s response body"))?;
+    let raw = read_body_capped(resp, JSON_BODY_CAP, url).await?;
+    let body = String::from_utf8_lossy(&raw).into_owned();
 
     if !status.is_success() {
         bail!("{url} answered HTTP {status}{}", diagnose_non_json(&body));
@@ -4703,10 +4818,7 @@ async fn fetch_sync_blocks(
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|v| v.starts_with("application/octet-stream"));
-                let bytes = r
-                    .bytes()
-                    .await
-                    .with_context(|| format!("could not read {url}'s response body"))?;
+                let bytes = read_body_capped(r, sync_body_cap(200), &url).await?;
                 if is_binary {
                     return bincode::deserialize(&bytes).with_context(|| {
                         format!("{url} answered octet-stream that is not a block batch")
@@ -6308,7 +6420,7 @@ mod validator_health_tests {
     /// perfectly fine while the chain waits for absent validators.
     #[test]
     fn a_node_held_up_by_missing_validators_is_not_told_to_restart() {
-        let advice = not_validating_advice(true, 0);
+        let advice = not_validating_advice(false, true, 0);
         assert!(
             advice.contains("will not speed that up"),
             "must say plainly that restarting does not help: {advice}"
@@ -6323,7 +6435,7 @@ mod validator_health_tests {
     /// chain database, which pinned that node at height 1 (#147). The restart was survivable.
     #[test]
     fn the_waiting_advice_warns_against_deleting_chain_data() {
-        let advice = not_validating_advice(true, 0);
+        let advice = not_validating_advice(false, true, 0);
         assert!(
             advice.contains("Do NOT delete"),
             "must warn against wiping the data directory: {advice}"
@@ -6410,7 +6522,7 @@ mod validator_health_tests {
     /// above and leave a genuinely wedged validator with nothing to do.
     #[test]
     fn a_node_that_is_itself_stuck_is_still_told_to_restart() {
-        let advice = not_validating_advice(false, 0);
+        let advice = not_validating_advice(false, false, 0);
         assert!(
             advice.contains("re-establishes its round"),
             "a genuinely stuck node must still be told to restart: {advice}"
@@ -6427,7 +6539,7 @@ mod validator_health_tests {
     /// one that had stopped.
     #[test]
     fn a_node_waiting_on_a_silent_peer_is_not_told_to_restart_either() {
-        let advice = not_validating_advice(false, 1);
+        let advice = not_validating_advice(false, false, 1);
         assert!(
             advice.contains("will not help"),
             "must say plainly that restarting this node is not the answer: {advice}"
@@ -6448,7 +6560,7 @@ mod validator_health_tests {
     /// happened 596 times in one outage on 2026-07-29.
     #[test]
     fn the_advice_does_not_claim_the_other_validator_is_down() {
-        let advice = not_validating_advice(false, 2).to_lowercase();
+        let advice = not_validating_advice(false, false, 2).to_lowercase();
         assert!(
             advice.contains("not arriving here"),
             "must describe what this node observes, not what the peer is doing: {advice}"
@@ -6466,8 +6578,110 @@ mod validator_health_tests {
     /// decides which line an operator reads.
     #[test]
     fn disconnected_peers_keep_their_own_more_specific_advice() {
-        let advice = not_validating_advice(true, 3);
+        let advice = not_validating_advice(false, true, 3);
         assert!(advice.contains("waiting for other validators to reconnect"), "{advice}");
+    }
+
+    /// Being behind outranks every other diagnosis, and this is the case that has actually cost
+    /// time. On 2026-09-04 all three of these flags were true at once: peers were connected, one
+    /// validator really was silent, and this node was one block below the tip. The advice printed
+    /// 377 times was "check the other validators" — it sent the diagnosis after somebody else's
+    /// node for six hours while the fix was a restart of this one, which then took 33 seconds.
+    ///
+    /// Precedence is the whole assertion. Any ordering that lets the silent-peer branch win here
+    /// reproduces that outage exactly.
+    #[test]
+    fn a_node_below_the_tip_is_told_it_is_the_one_that_is_behind() {
+        let advice = not_validating_advice(true, true, 3);
+        assert!(
+            advice.contains("BEHIND the tip"),
+            "a node below the tip must be told so before anything else — got: {advice}"
+        );
+        assert!(
+            !advice.contains("waiting for other validators"),
+            "the advice must not send the operator after another validator while this node is the \
+             one missing from the quorum: {advice}"
+        );
+        assert!(
+            advice.contains("Do NOT delete its chain data"),
+            "every restart recommendation carries this, because the 2026-08-04 outage was caused \
+             by the deletion and not by the restart: {advice}"
+        );
+    }
+
+    /// The other half, so the branch above cannot swallow the ordinary cases: a node that is level
+    /// with its peers must still get the diagnosis that points outward.
+    #[test]
+    fn a_node_level_with_its_peers_still_gets_the_outward_diagnosis() {
+        let advice = not_validating_advice(false, false, 1);
+        assert!(
+            !advice.contains("BEHIND the tip"),
+            "a node that is not behind must never be told it is: {advice}"
+        );
+        assert!(advice.contains("not arriving here"), "{advice}");
+    }
+}
+
+#[cfg(test)]
+mod body_cap_tests {
+    use super::*;
+    use axum::{routing::get, Router};
+
+    /// Serves `size` bytes on `/big`, over a real socket, so the cap is exercised where it has to
+    /// hold: against a peer that keeps sending.
+    async fn serve_bytes(size: usize) -> String {
+        let app = Router::new().route("/big", get(move || async move { vec![b'x'; size] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    /// A body past the cap must fail, not be read.
+    ///
+    /// `reqwest::Response::bytes()` and `::text()` have no upper bound, and this client runs with
+    /// `gzip`, so the quantity that matters is what the payload *decompresses to* — a few hundred
+    /// kilobytes on the wire can become gigabytes in this process. An OOM kill leaves nothing in
+    /// the node's own log, which is the failure mode that cost this network a validator once
+    /// already (#118) and that #172 exists to make visible at all.
+    #[tokio::test]
+    async fn a_body_past_the_cap_is_refused_instead_of_read() {
+        let url = format!("{}/big", serve_bytes(64 * 1024).await);
+        let client = reqwest::Client::new();
+        let resp = client.get(&url).send().await.unwrap();
+        let err = read_body_capped(resp, 8 * 1024, &url).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("more than") && msg.contains("refusing"),
+            "the error has to say what happened and why, since it will be read by an operator \
+             whose sync just stopped: {msg}"
+        );
+    }
+
+    /// Positive control. Without it the test above passes for a cap of zero, which would refuse
+    /// every response this node ever makes — a bound that rejects everything is not a bound, it
+    /// is an outage.
+    #[tokio::test]
+    async fn a_body_within_the_cap_is_returned_whole() {
+        let url = format!("{}/big", serve_bytes(4096).await);
+        let client = reqwest::Client::new();
+        let resp = client.get(&url).send().await.unwrap();
+        let body = read_body_capped(resp, 8 * 1024, &url).await.unwrap();
+        assert_eq!(body.len(), 4096, "an answer under the cap must arrive intact");
+    }
+
+    /// The sync cap is derived from the protocol, never guessed: whatever a batch may legitimately
+    /// contain must fit, or the bound becomes an outage the first time blocks get bigger.
+    #[test]
+    fn the_sync_cap_admits_every_batch_the_protocol_allows() {
+        let count = 200u64;
+        let largest_honest_batch = count as usize * helix_core::fee::MAX_BLOCK_BYTES as usize;
+        assert!(
+            sync_body_cap(count) > largest_honest_batch,
+            "a batch of {count} blocks at the block size limit must fit under the cap"
+        );
     }
 }
 
