@@ -5668,6 +5668,11 @@ mod sync_blocks_from_peer_tests {
         let mut acc = helix_executor::AccountState::new(&addr);
         acc.staked = min_stake;
         chain_state.accounts.insert(addr.to_string(), acc);
+        // What a real `Stake` transaction also does. A `CommitSig` no longer carries the signer's
+        // key, so a validator whose key the chain never recorded can sign nothing anyone can
+        // check — which is correct, and which a fixture that writes `staked` directly has to
+        // account for rather than work around.
+        chain_state.set_validator_key(&addr, kp.public.clone());
     }
 
     #[tokio::test]
@@ -5977,8 +5982,14 @@ mod sync_blocks_from_peer_tests {
             let mut acc = helix_executor::AccountState::new(&addr);
             acc.staked = min_stake;
             cs.accounts.insert(addr.to_string(), acc);
+            // What a real `Stake` would have recorded: without it nothing can verify this
+            // validator's commit signatures, and the sync applies no block at all.
+            cs.set_validator_key(&addr, kp.public.clone());
         }
-        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let validator_set = ValidatorSet::new(
+            vec![Validator::with_key(addr.clone(), Some(kp.public.clone()), 1_000_000, true)],
+            0,
+        );
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr.clone(), 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0u64));
@@ -7988,7 +7999,14 @@ mod handle_p2p_event_tests {
         let provider = StoreBlockProvider {
             store,
             tip_certificate: cell,
-            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+            // The provider rebuilds certificates, which needs the signer's key from the chain —
+            // a `CommitSig` no longer carries one. Seeded with the keypair these blocks were
+            // signed by, exactly as staking would have.
+            chain_state: {
+                let mut cs = ChainState::new(0);
+                cs.set_validator_key(&Address::from_public_key(&kp.public), kp.public.clone());
+                Arc::new(RwLock::new(cs))
+            },
         };
 
         let served = provider.blocks(1, 3).await;
@@ -8011,7 +8029,14 @@ mod handle_p2p_event_tests {
         let provider = StoreBlockProvider {
             store,
             tip_certificate: cell,
-            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+            // The provider rebuilds certificates, which needs the signer's key from the chain —
+            // a `CommitSig` no longer carries one. Seeded with the keypair these blocks were
+            // signed by, exactly as staking would have.
+            chain_state: {
+                let mut cs = ChainState::new(0);
+                cs.set_validator_key(&Address::from_public_key(&kp.public), kp.public.clone());
+                Arc::new(RwLock::new(cs))
+            },
         };
 
         let served = provider.blocks(1, 50).await;
@@ -8029,7 +8054,14 @@ mod handle_p2p_event_tests {
         let provider = StoreBlockProvider {
             store,
             tip_certificate: cell,
-            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+            // The provider rebuilds certificates, which needs the signer's key from the chain —
+            // a `CommitSig` no longer carries one. Seeded with the keypair these blocks were
+            // signed by, exactly as staking would have.
+            chain_state: {
+                let mut cs = ChainState::new(0);
+                cs.set_validator_key(&Address::from_public_key(&kp.public), kp.public.clone());
+                Arc::new(RwLock::new(cs))
+            },
         };
 
         let served = provider.blocks(9, 10).await;
@@ -8055,7 +8087,14 @@ mod handle_p2p_event_tests {
         let provider = StoreBlockProvider {
             store,
             tip_certificate: empty_cell,
-            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+            // The provider rebuilds certificates, which needs the signer's key from the chain —
+            // a `CommitSig` no longer carries one. Seeded with the keypair these blocks were
+            // signed by, exactly as staking would have.
+            chain_state: {
+                let mut cs = ChainState::new(0);
+                cs.set_validator_key(&Address::from_public_key(&kp.public), kp.public.clone());
+                Arc::new(RwLock::new(cs))
+            },
         };
 
         let served = provider.blocks(1, 3).await;
@@ -8627,6 +8666,10 @@ mod handle_p2p_event_tests {
             let mut cs = chain_state.write().await;
             cs.governance_params.min_validator_stake = 1;
             cs.update_account(&genesis_addr, |acc| acc.staked = 1_000_000);
+            // Both keys registered as a real `Stake` would: a `CommitSig` carries none, so
+            // liveness can only be proved for a validator the chain has a key for.
+            cs.set_validator_key(&genesis_addr, genesis_kp.public.clone());
+            cs.set_validator_key(&new_staker_addr, new_staker_kp.public.clone());
             // Staked directly rather than via a `Stake` tx — the rotation only cares about
             // `stakers()`, and this keeps the test focused on the rotation wiring itself.
             cs.update_account(&new_staker_addr, |acc| acc.staked = 1_000_000);

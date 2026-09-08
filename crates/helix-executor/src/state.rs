@@ -1002,11 +1002,18 @@ impl ChainState {
             .into_iter()
             .map(|(addr, stake, probationary)| {
                 let has_personhood = self.has_personhood(&addr);
-                if probationary {
+                // The signing key travels with the set, because a `CommitSig` no longer carries
+                // one: this is the single point where the chain's registry reaches consensus.
+                // Missing here means missing everywhere, and every verification that needs it
+                // fails closed — which is why it is filled in the one place the set is built
+                // rather than at each of the call sites that later needs it.
+                let public_key = self.validator_key(&addr).cloned();
+                let v = if probationary {
                     helix_consensus::Validator::new_probationary(addr, stake, has_personhood)
                 } else {
                     helix_consensus::Validator::new(addr, stake, has_personhood)
-                }
+                };
+                helix_consensus::Validator { public_key, ..v }
             })
             .collect();
         helix_consensus::ValidatorSet::new(validators, 0)
