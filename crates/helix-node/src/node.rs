@@ -284,6 +284,49 @@ const HEARTBEAT_TICK_INTERVAL: u32 = 10;
 /// multi-validator set. See the startup gate in `block_production_loop`.
 const MESH_SETTLE_TICKS: u32 = 5;
 const MAX_TXS_PER_BLOCK: usize = 1_000;
+
+/// Transaction bytes this node packs into a block **it proposes**. Local policy, not a consensus
+/// rule: the protocol maximum stays `MAX_BLOCK_BYTES`, every node still accepts blocks up to it,
+/// and nothing about validation changes. This only bounds what *we* choose to put on the wire.
+///
+/// **Why a proposer should choose less than it is allowed.** Measured on the live network on
+/// 2026-09-08: the same 4 MB of blocks that the node serves locally in **0.023 s** takes **17.8 s**
+/// through the Cloudflare tunnel every peer reaches it by — about 250 KB/s on one stream and
+/// 510 KB/s across four. Every validator's gossip crosses that path, and this node relays it: a
+/// proposal of size `S` costs roughly `4·S / 500 KB` seconds just to reach the other five. At the
+/// 250 KB blocks the chain was producing that is ~2 s of pure fan-out, and the measured time from
+/// "proposal received" to "block committed" was 3.5–7 s against a 2 s target.
+///
+/// That sets up a loop with the wrong sign. A round that takes longer accumulates more
+/// transactions (arrivals are a steady ~2/s, measured across every block size), the next block is
+/// therefore larger, its fan-out is slower, and a proposal that misses enough validators inside
+/// the proposal window splits their prevotes and loses the round outright — 16 more seconds, and
+/// more transactions again. About 23 % of heights were losing a round this way. The loop is at its
+/// worst exactly after a stall, when the mempool is deepest and recovery matters most.
+///
+/// 256 KB is the size the network was already producing when it ran at its best, not a number
+/// picked for roundness — the point is to stop the *tail*, where a backlog turns into a block far
+/// larger than the link can distribute in time. Throughput is barely affected either way: when
+/// fan-out dominates, block time scales with size, so smaller blocks arrive proportionally sooner.
+/// What is gained is the rounds that are no longer lost.
+///
+/// Raise it with `HELIX_MAX_PROPOSAL_BYTES` on a network whose validators peer directly instead of
+/// through one relay (#177) — there the fan-out cost is paid by each proposer's own uplink and
+/// this cap only holds throughput back.
+const DEFAULT_MAX_PROPOSAL_BYTES: u64 = 256 * 1024;
+
+/// The proposer's byte budget from the raw `HELIX_MAX_PROPOSAL_BYTES` value.
+///
+/// Clamped to `MAX_BLOCK_BYTES` because this is restraint, not permission: an operator who sets it
+/// higher than the protocol allows must not end up building blocks every other node refuses —
+/// that would turn a tuning knob into a way to forfeit every proposer turn. Zero and unparseable
+/// fall back to the default rather than to "no limit", for the same reason `HELIX_DB_CACHE_MB`
+/// does: a typo must not silently restore the behaviour the default exists to avoid.
+fn resolved_max_proposal_bytes(raw: Option<u64>) -> u64 {
+    raw.filter(|b| *b > 0)
+        .unwrap_or(DEFAULT_MAX_PROPOSAL_BYTES)
+        .min(helix_core::fee::MAX_BLOCK_BYTES)
+}
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
 /// Validator health heartbeat cadence and thresholds (see `validator_health_loop`).
 const VALIDATOR_HEALTH_SECS: u64 = 60;
@@ -3550,6 +3593,17 @@ async fn block_production_loop(
     // its (fixed, 100-block) activation epochs in seconds instead of minutes; unset in production,
     // where it stays `BLOCK_TIME_MS`.
     let block_time_ms = config::resolve_u64("HELIX_BLOCK_TIME_MS", None).unwrap_or(BLOCK_TIME_MS);
+    // Never above the protocol maximum: this is a proposer's own restraint, not a way to build
+    // blocks the rest of the network would refuse.
+    let max_proposal_bytes =
+        resolved_max_proposal_bytes(config::resolve_u64("HELIX_MAX_PROPOSAL_BYTES", None));
+    if max_proposal_bytes != DEFAULT_MAX_PROPOSAL_BYTES {
+        info!(
+            max_proposal_bytes,
+            protocol_max = helix_core::fee::MAX_BLOCK_BYTES,
+            "Packing at most this many transaction bytes into blocks this node proposes"
+        );
+    }
     let mut interval = tokio::time::interval(Duration::from_millis(block_time_ms));
 
     // One-time startup gate: in a multi-validator set, don't produce the very first
@@ -3888,7 +3942,7 @@ async fn block_production_loop(
         let txs = {
             mempool.write().await.take_within(
                 MAX_TXS_PER_BLOCK,
-                helix_core::fee::MAX_BLOCK_BYTES,
+                max_proposal_bytes,
                 &|addr: &str| account_nonces.get(addr).copied(),
             )
         };
@@ -6724,6 +6778,27 @@ mod body_cap_tests {
         let resp = client.get(&url).send().await.unwrap();
         let body = read_body_capped(resp, 8 * 1024, &url).await.unwrap();
         assert_eq!(body.len(), 4096, "an answer under the cap must arrive intact");
+    }
+
+    /// A proposer's byte budget is restraint, never permission.
+    ///
+    /// Set above the protocol maximum it must clamp, not obey: a node that builds blocks larger
+    /// than `MAX_BLOCK_BYTES` has them refused by every peer and forfeits every turn it takes —
+    /// a tuning knob that quietly disables the validator who touched it.
+    #[test]
+    fn a_proposers_byte_budget_is_restraint_and_never_permission() {
+        assert_eq!(resolved_max_proposal_bytes(None), DEFAULT_MAX_PROPOSAL_BYTES);
+        assert_eq!(resolved_max_proposal_bytes(Some(0)), DEFAULT_MAX_PROPOSAL_BYTES, "zero is a typo, not 'no limit'");
+        assert_eq!(resolved_max_proposal_bytes(Some(64 * 1024)), 64 * 1024, "lower is the operator's call");
+        assert_eq!(
+            resolved_max_proposal_bytes(Some(helix_core::fee::MAX_BLOCK_BYTES * 4)),
+            helix_core::fee::MAX_BLOCK_BYTES,
+            "above the protocol maximum must clamp — otherwise this knob builds blocks nobody accepts"
+        );
+        assert!(
+            DEFAULT_MAX_PROPOSAL_BYTES < helix_core::fee::MAX_BLOCK_BYTES,
+            "the default has to actually restrain something, or it is decoration"
+        );
     }
 
     /// The sync cap is derived from the protocol, never guessed: whatever a batch may legitimately

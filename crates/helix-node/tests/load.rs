@@ -56,6 +56,12 @@ fn spawn_loaded_node(kp: &KeyPair, block_time_ms: &str) -> NodeGuard {
         // number that looks like a chain problem and is not one. Raised here so what is measured
         // is the mempool, the packer and the block limits.
         .env("HELIX_RPC_RATE_LIMIT", "50000,20000")
+        // This file exists to push the *protocol* limits, so the proposer's own restraint has to
+        // be lifted out of the way — `HELIX_MAX_PROPOSAL_BYTES` defaults to 256 KB, which is a
+        // policy for a network whose gossip crosses one slow relay and would otherwise cap every
+        // block here at a fraction of what `MAX_BLOCK_BYTES` allows. A test of the ceiling must
+        // not measure the floor somebody sensibly put below it.
+        .env("HELIX_MAX_PROPOSAL_BYTES", helix_core::fee::MAX_BLOCK_BYTES.to_string())
         .env("RUST_LOG", std::env::var("HELIX_TEST_LOG").unwrap_or_else(|_| "error".into()))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
