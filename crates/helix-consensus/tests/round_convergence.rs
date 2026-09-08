@@ -69,10 +69,14 @@ impl Node {
         self.offer_proposal(out);
         let stalled = self.engine.note_round_tick(&self.kp);
         let prev = self.prev;
+        // The engine now checks that the parent is the block directly below the one it builds.
+        // In this model the two never drift — that is the point of the check, which exists for
+        // the live node where the store and the consensus height can.
+        let prev_height = self.engine.current_height();
         let produced = if stalled {
-            self.engine.advance_round(&self.kp, prev, vec![])
+            self.engine.advance_round(&self.kp, prev, prev_height, vec![])
         } else {
-            self.engine.produce_block(&self.kp, prev, vec![])
+            self.engine.produce_block(&self.kp, prev, prev_height, vec![])
         };
         if let Ok(block) = produced {
             self.note_commit(&block);

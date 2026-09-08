@@ -44,6 +44,18 @@ pub enum ConsensusError {
     #[error("Not the proposer for height {height} round {round}")]
     NotProposer { height: u64, round: u32 },
 
+    /// This node's turn came while its own stored chain is not the parent of the block it would
+    /// build — its tip is `tip`, but a block for `height` must be built on `height - 1`.
+    ///
+    /// Producing anyway is what the live chain did until 2026-09-08: a validator one block behind
+    /// proposed height 157570 on the hash of block 157568, every peer rejected it with
+    /// `prev_hash mismatch`, and the round was lost. With six validators and a quorum of five,
+    /// one lost round per proposer rotation is enough to stall the chain — and from outside it
+    /// looks like split prevotes (#192), because that is exactly what a rejected proposal
+    /// produces: some nodes prevote the block, the rest prevote nil.
+    #[error("cannot propose block {height}: this node's chain ends at {tip}, not {}", height - 1)]
+    ProposerBehind { height: u64, tip: u64 },
+
     #[error("Awaiting votes from peers for height {height} round {round}")]
     AwaitingVotes { height: u64, round: u32 },
 

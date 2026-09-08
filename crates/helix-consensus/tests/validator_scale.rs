@@ -203,10 +203,14 @@ impl Net {
         self.offer(i, out);
         let stalled = self.engines[i].note_round_tick(&self.kps[i]);
         let prev = self.prev;
+        // The engine now verifies that the parent is the block directly below the one it builds.
+        // These engines share one `prev`, so their heights never drift — which is precisely the
+        // condition the live node cannot assume (#178/#192).
+        let prev_height = self.engines[i].current_height();
         let produced = if stalled {
-            self.engines[i].advance_round(&self.kps[i], prev, vec![])
+            self.engines[i].advance_round(&self.kps[i], prev, prev_height, vec![])
         } else {
-            self.engines[i].produce_block(&self.kps[i], prev, vec![])
+            self.engines[i].produce_block(&self.kps[i], prev, prev_height, vec![])
         };
         if let Ok(block) = produced {
             self.prev = block.hash();

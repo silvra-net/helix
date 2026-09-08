@@ -3892,12 +3892,18 @@ async fn block_production_loop(
                 &|addr: &str| account_nonces.get(addr).copied(),
             )
         };
-        let prev_hash = store.read().await.latest_hash();
+        // Height and hash read together, under one lock: the engine checks that the parent is the
+        // block directly below the one it is about to build, and two separate reads could
+        // straddle a commit and hand it a matched pair that never existed.
+        let (prev_hash, prev_height) = {
+            let s = store.read().await;
+            (s.latest_hash(), s.latest_height())
+        };
 
         let produced = if stalled {
-            engine.write().await.advance_round(&keypair, prev_hash, txs)
+            engine.write().await.advance_round(&keypair, prev_hash, prev_height, txs)
         } else {
-            engine.write().await.produce_block(&keypair, prev_hash, txs)
+            engine.write().await.produce_block(&keypair, prev_hash, prev_height, txs)
         };
         match produced {
             Ok(block) => {
@@ -3918,6 +3924,24 @@ async fn block_production_loop(
                 // Expected every tick for non-proposer validators, and for a
                 // deferring validator right after a round timeout — wait for
                 // the actual proposer's Proposal to arrive over P2P instead.
+            }
+            Err(e @ ConsensusError::ProposerBehind { .. }) => {
+                // Our turn came while this node's own chain does not reach the height being
+                // decided, so the block it would build is one every honest peer rejects with
+                // `prev_hash mismatch` — which is how the live chain lost rounds until
+                // 2026-09-08 (#178/#192). The round now passes to the next proposer on its own
+                // clock instead.
+                //
+                // `warn!`, and per tick rather than once: this is not a passing race. A validator
+                // that stays behind keeps forfeiting its slot, and the operator needs the reason
+                // in front of them — the block-sync that closes the gap is the fix, and until it
+                // runs this node is a proposer that cannot propose.
+                warn!(
+                    err = %e,
+                    "Skipping our proposer turn — this node's chain is behind the height being \
+                     decided. Block-sync should close the gap; while it has not, this validator \
+                     forfeits every turn it is given."
+                );
             }
             Err(ConsensusError::NoActiveRound) => {
                 // Benign race: a peer vote arriving via handle_p2p_event
@@ -8818,7 +8842,8 @@ mod handle_p2p_event_tests {
             for _ in 0..4 {
                 while !eng.note_round_tick(&kp) {}
                 eng.take_outbound_votes();
-                let _ = eng.advance_round(&kp, Hash::digest(b"genesis"), vec![]);
+                let h = eng.current_height();
+                let _ = eng.advance_round(&kp, Hash::digest(b"genesis"), h, vec![]);
                 eng.take_outbound_votes();
             }
             assert!(
@@ -9298,7 +9323,7 @@ mod round_sync_tests {
 
         // The proposer builds a real round-0 proposal for height 1.
         let mut proposer_engine = BftEngine::new(set.clone(), Address::from_public_key(&proposer_kp.public), 0);
-        let _ = proposer_engine.produce_block(&proposer_kp, Hash::ZERO, vec![]);
+        let _ = proposer_engine.produce_block(&proposer_kp, Hash::ZERO, proposer_engine.current_height(), vec![]);
         let (proposal, votes) = proposer_engine.round_evidence(1);
         let proposal = proposal.expect("the proposer holds its own proposal");
 
@@ -9385,7 +9410,8 @@ mod round_sync_tests {
             Address::from_public_key(&proposer_kp.public),
             0,
         )));
-        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, vec![]);
+        let h = engine.read().await.current_height();
+        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, h, vec![]);
         engine.write().await.take_outbound_votes();
 
         for _ in 0..proposal_timeout_ticks(0) + 5 {
@@ -9414,7 +9440,8 @@ mod round_sync_tests {
             Address::from_public_key(&proposer_kp.public),
             0,
         )));
-        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, vec![]);
+        let h = engine.read().await.current_height();
+        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, h, vec![]);
         engine.write().await.take_outbound_votes();
 
         let provider = EngineRoundProvider { engine: engine.clone() };
