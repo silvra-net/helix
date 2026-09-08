@@ -228,7 +228,12 @@ impl Sim {
         let kps: Vec<KeyPair> = (0..n).map(|_| KeyPair::generate()).collect();
         let set = ValidatorSet::new(
             kps.iter()
-                .map(|kp| Validator::new(Address::from_public_key(&kp.public), 1_000, true))
+                .map(|kp| Validator::with_key(
+                    Address::from_public_key(&kp.public),
+                    Some(kp.public.clone()),
+                    1_000,
+                    true,
+                ))
                 .collect(),
             0,
         );
