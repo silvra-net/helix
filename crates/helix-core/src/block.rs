@@ -45,9 +45,6 @@ pub fn precommit_signing_bytes(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitSig {
     pub validator: Address,
-    /// Travels with the signature for the same reason `Vote::public_key`/
-    /// `BlockHeader::public_key` do — `Address` is one-way.
-    pub public_key: PublicKey,
     pub crypto_version: CryptoVersion,
     /// The round (within the parent height) this precommit was cast in.
     pub round: u32,
@@ -64,14 +61,31 @@ impl CommitSig {
     /// one — see `verify_pol`'s doc comment). `last_commit` exists to feed the downtime
     /// counter, not to re-prove the parent block's finality (that's already established by
     /// `prev_hash` chaining and the engine's own live quorum tracking).
-    pub fn verify(&self, height: u64, block_hash: &Hash) -> helix_crypto::CryptoResult<()> {
-        if Address::from_public_key(&self.public_key) != self.validator {
+    /// `public_key` is the key the **chain** has on record for `self.validator`, not one the block
+    /// carried. That is the whole point of taking it as a parameter: an ML-DSA key is 1952 bytes,
+    /// there is one per signature, and the same handful repeated in every block was 11.7 KB of an
+    /// 80 KB block at six validators — growing linearly with the set, on disk and in every relayed
+    /// proposal alike. The registry it comes from (`ChainState::validator_keys`) is filled from
+    /// each validator's own staking transaction, whose signature check already proved the key
+    /// derives that address.
+    ///
+    /// The derivation check stays, and it is not redundant: it is what makes the *caller's* lookup
+    /// safe to trust. A caller that resolved the wrong address — or a registry entry that somehow
+    /// disagreed with the address it is filed under — fails here rather than verifying a genuine
+    /// signature against the wrong identity.
+    pub fn verify(
+        &self,
+        public_key: &PublicKey,
+        height: u64,
+        block_hash: &Hash,
+    ) -> helix_crypto::CryptoResult<()> {
+        if Address::from_public_key(public_key) != self.validator {
             return Err(helix_crypto::CryptoError::InvalidPublicKey(
                 "commit sig public key does not derive declared validator address".into(),
             ));
         }
         let bytes = precommit_signing_bytes(height, self.round, block_hash, self.crypto_version);
-        helix_crypto::verify_with_scheme(self.crypto_version, &self.public_key, &bytes, &self.signature)
+        helix_crypto::verify_with_scheme(self.crypto_version, public_key, &bytes, &self.signature)
     }
 }
 
@@ -89,9 +103,10 @@ pub struct BlockHeader {
     pub merkle_root: Hash,
     /// Address of the validator that proposed this block
     pub validator: Address,
-    /// Public key of the proposing validator. `Address` is one-way so the key
-    /// must travel with the header for `signature` to be self-verifiable —
-    /// same pattern as `Vote::public_key`.
+    /// Public key of the proposing validator. Still carried here, unlike in `CommitSig`: a header
+    /// has to be verifiable by a node that does not yet hold this chain's state at all — the very
+    /// first thing a joining node does is check a block it cannot yet look anything up for. One
+    /// key per block is 1952 bytes; the `CommitSig`s were `N` of them.
     pub public_key: PublicKey,
     /// Which crypto scheme the validator used — supports migration
     pub crypto_version: CryptoVersion,

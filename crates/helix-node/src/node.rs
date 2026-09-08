@@ -2138,6 +2138,7 @@ fn verify_block_batch(
                 blocks[i + 1].header.last_commit.clone(),
                 blocks[i].height(),
                 hash,
+                &key_from_set(validator_set),
             );
             validator_set.precommits_reach_quorum(&certificate, blocks[i].height(), &hash)
         });
@@ -2664,19 +2665,44 @@ fn last_quorum_certified_index(blocks: &[Block], chain_state: &ChainState) -> Op
     })
 }
 
-fn commit_sigs_to_votes(sigs: Vec<CommitSig>, height: u64, block_hash: Hash) -> Vec<Vote> {
+/// Rebuild the precommit votes a block's `last_commit` stands for.
+///
+/// `key_for` resolves a validator's signing key, which the `CommitSig` no longer carries — an
+/// ML-DSA key is 1952 bytes and the same handful were repeated in every block forever. A signature
+/// whose signer the caller cannot resolve is **dropped**, not passed through with a guess: it can
+/// never be verified, so it can never count toward a quorum, and carrying it further would only
+/// let it be mistaken for participation.
+fn commit_sigs_to_votes(
+    sigs: Vec<CommitSig>,
+    height: u64,
+    block_hash: Hash,
+    key_for: &dyn Fn(&Address) -> Option<PublicKey>,
+) -> Vec<Vote> {
     sigs.into_iter()
-        .map(|s| Vote {
-            vote_type: VoteType::Precommit,
-            height,
-            round: s.round,
-            block_hash,
-            validator: s.validator,
-            public_key: s.public_key,
-            crypto_version: s.crypto_version,
-            signature: s.signature,
+        .filter_map(|s| {
+            let public_key = key_for(&s.validator)?;
+            Some(Vote {
+                vote_type: VoteType::Precommit,
+                height,
+                round: s.round,
+                block_hash,
+                validator: s.validator,
+                public_key,
+                crypto_version: s.crypto_version,
+                signature: s.signature,
+            })
         })
         .collect()
+}
+
+/// A key resolver backed by the validator set — the source every consensus path already holds.
+fn key_from_set(set: &ValidatorSet) -> impl Fn(&Address) -> Option<PublicKey> + '_ {
+    move |addr: &Address| set.get(addr).and_then(|v| v.public_key.clone())
+}
+
+/// A key resolver backed by the chain's registry, for callers that hold state rather than a set.
+fn key_from_state(state: &ChainState) -> impl Fn(&Address) -> Option<PublicKey> + '_ {
+    move |addr: &Address| state.validator_key(addr).cloned()
 }
 
 /// Snapshot the engine's current commit certificate — its `last_commit`, the precommits that
@@ -2700,7 +2726,6 @@ async fn publish_tip_certificate(
         .iter()
         .map(|v| CommitSig {
             validator: v.validator.clone(),
-            public_key: v.public_key.clone(),
             crypto_version: v.crypto_version,
             round: v.round,
             signature: v.signature.clone(),

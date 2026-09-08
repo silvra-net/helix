@@ -251,6 +251,22 @@ pub struct ChainState {
     /// Active recovery override key per address string. Once set, this key (not the one
     /// the address was originally derived from) must produce transaction signatures for it.
     pub recovery_keys: HashMap<String, PublicKey>,
+    /// The signing key each staker holds, recorded when it stakes.
+    ///
+    /// An `Address` is a 160-bit truncation of a hash of the key, so it is one-way: nothing can
+    /// recover a key from an address. Every place a signature has to be checked therefore needs the
+    /// key delivered alongside it — which is why a 1952-byte ML-DSA key travels in every
+    /// `CommitSig` of every block, the same handful of keys repeated forever. At six validators
+    /// that is 11.7 KB of every 80 KB block, and it grows linearly with the set (40 KB at twenty).
+    ///
+    /// This is the registry that makes carrying them unnecessary. It is safe to key on the address
+    /// because consensus keys, unlike transaction keys, never rotate: `Vote::verify_signature` and
+    /// `CommitSig::verify` both require that the key derives the validator address, and social
+    /// recovery (`recovery_keys`) deliberately applies to transactions only.
+    ///
+    /// Populated from the staking transaction, whose own signature check has already proved the
+    /// key derives the sender — so nothing here is taken on trust that was not already required.
+    pub validator_keys: HashMap<String, PublicKey>,
     /// Runtime-adjustable protocol parameters — changed only via passed governance proposals.
     pub governance_params: GovernanceParams,
     /// Governance proposals by id, both pending and resolved.
@@ -493,6 +509,7 @@ impl ChainState {
             guardians: HashMap::new(),
             recovery_requests: HashMap::new(),
             recovery_keys: HashMap::new(),
+            validator_keys: HashMap::new(),
             governance_params: GovernanceParams::default(),
             proposals: HashMap::new(),
             next_proposal_id: 0,
@@ -891,6 +908,18 @@ impl ChainState {
         self.recovery_keys.insert(address.to_string(), key);
     }
 
+    /// The signing key `address` staked with, if it ever staked.
+    pub fn validator_key(&self, address: &Address) -> Option<&PublicKey> {
+        self.validator_keys.get(&address.to_string())
+    }
+
+    /// Record the key a staker signs with. Idempotent and write-once in effect: a consensus key
+    /// cannot change for an address, because every verification path requires it to derive that
+    /// address, so re-staking can only ever record the same key again.
+    pub fn set_validator_key(&mut self, address: &Address, key: PublicKey) {
+        self.validator_keys.insert(address.to_string(), key);
+    }
+
     /// Addresses that meet the minimum stake threshold — candidates for the next validator epoch.
     ///
     /// Sorted by address: `self.accounts` is a `HashMap`, whose iteration order depends on
@@ -1247,6 +1276,7 @@ impl ChainState {
             guardians: BTreeMap<&'a str, &'a GuardianSet>,
             recovery_requests: BTreeMap<&'a str, &'a RecoveryRequest>,
             recovery_keys: BTreeMap<&'a str, &'a PublicKey>,
+            validator_keys: BTreeMap<&'a str, &'a PublicKey>,
             governance_params: &'a GovernanceParams,
             proposals: BTreeMap<u64, CanonicalProposal<'a>>,
             next_proposal_id: u64,
@@ -1287,6 +1317,7 @@ impl ChainState {
             guardians: self.guardians.iter().map(|(k, v)| (k.as_str(), v)).collect(),
             recovery_requests: self.recovery_requests.iter().map(|(k, v)| (k.as_str(), v)).collect(),
             recovery_keys: self.recovery_keys.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            validator_keys: self.validator_keys.iter().map(|(k, v)| (k.as_str(), v)).collect(),
             governance_params: &self.governance_params,
             proposals: self
                 .proposals

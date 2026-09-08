@@ -1393,7 +1393,22 @@ impl BftEngine {
         }
         let mut seen: HashSet<String> = HashSet::new();
         for sig in last_commit {
-            sig.verify(height - 1, parent_hash)
+            // The key comes from the set, not from the block: `CommitSig` stopped carrying one
+            // because it was the same 1952 bytes per validator in every block forever. A signer
+            // the set does not know is refused here — an unknown key is never an accepted one.
+            let key = self
+                .validator_set
+                .get(&sig.validator)
+                .and_then(|v| v.public_key.as_ref())
+                .ok_or_else(|| ConsensusError::InvalidBlock {
+                    height,
+                    reason: format!(
+                        "last_commit carries a signature from {}, whose signing key this chain \
+                         does not know — it is not a staked validator here",
+                        sig.validator
+                    ),
+                })?;
+            sig.verify(key, height - 1, parent_hash)
                 .map_err(|e| ConsensusError::InvalidBlock {
                     height,
                     reason: format!("invalid last_commit signature from {}: {e}", sig.validator),
@@ -1808,7 +1823,6 @@ impl BftEngine {
             .iter()
             .map(|vote| helix_core::CommitSig {
                 validator: vote.validator.clone(),
-                public_key: vote.public_key.clone(),
                 crypto_version: vote.crypto_version,
                 round: vote.round,
                 signature: vote.signature.clone(),

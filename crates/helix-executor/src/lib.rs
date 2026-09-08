@@ -96,7 +96,17 @@ pub fn execute_block(
         .header
         .last_commit
         .iter()
-        .filter(|sig| sig.verify(height.saturating_sub(1), &block.header.prev_hash).is_ok())
+        // The signing key comes from the chain's own registry rather than from the block, which is
+        // what lets a `CommitSig` stop carrying 1952 bytes of it. A signature from an address the
+        // chain has never seen stake simply does not verify — it cannot be counted as
+        // participation, which is exactly the conservative direction for downtime accounting.
+        .filter(|sig| {
+            state
+                .validator_key(&sig.validator)
+                .is_some_and(|key| {
+                    sig.verify(key, height.saturating_sub(1), &block.header.prev_hash).is_ok()
+                })
+        })
         .map(|sig| sig.validator.clone())
         .collect();
     let newly_jailed = state.record_block_participation(&current_validators, &signers, height);
@@ -461,6 +471,11 @@ fn execute_stake(
         return Receipt::failure(tx_hash, "insufficient balance", 0, 0);
     }
 
+    // Record the key this address signs with, so its future `CommitSig`s need not carry it.
+    // `verify_tx_signature` has already proved that `tx.public_key` derives `tx.from`, so this
+    // stores nothing that was taken on trust — and a consensus key can never differ from the one
+    // the address derives, which is what makes the address a safe lookup handle.
+    state.set_validator_key(&tx.from, tx.public_key.clone());
     state.update_account(&tx.from, |acc| {
         acc.balance -= total_cost;
         acc.staked += tx.amount;

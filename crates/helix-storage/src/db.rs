@@ -17,6 +17,10 @@ const PERSONHOOD: TableDefinition<&str, &[u8]> = TableDefinition::new("personhoo
 const GUARDIANS: TableDefinition<&str, &[u8]> = TableDefinition::new("guardians");
 const RECOVERY_REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("recovery_requests");
 const RECOVERY_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("recovery_keys");
+/// The signing key each staker registered — see `ChainState::validator_keys`. Persisted for the
+/// same reason as everything else here: a block's `CommitSig`s no longer carry the key, so a node
+/// that cannot look one up after a restart could not verify a single commit certificate.
+const VALIDATOR_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("validator_keys");
 const PROPOSALS: TableDefinition<u64, &[u8]> = TableDefinition::new("proposals");
 const PERSONHOOD_COMMITMENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("personhood_commitments");
 /// "{validator}:{height}:{round}" → already-slashed double-sign incidents.
@@ -187,6 +191,7 @@ impl HelixDb {
         tx.open_table(GUARDIANS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(VALIDATOR_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -221,6 +226,7 @@ impl HelixDb {
             let mut guardians = tx.open_table(GUARDIANS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut recovery_requests = tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut recovery_keys = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut validator_keys = tx.open_table(VALIDATOR_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut proposals = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut personhood_commitments = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut slashed_double_sign_incidents = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -296,6 +302,12 @@ impl HelixDb {
                 let encoded = bincode::serialize(key)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 recovery_keys.insert(addr.as_str(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+            for (addr, key) in &state.validator_keys {
+                let encoded = bincode::serialize(key)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                validator_keys.insert(addr.as_str(), encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
             for (id, proposal) in &state.proposals {
@@ -537,6 +549,7 @@ impl HelixDb {
         let guardians_table = tx.open_table(GUARDIANS).map_err(|e| StorageError::Db(e.to_string()))?;
         let recovery_requests_table = tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let recovery_keys_table = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let validator_keys_table = tx.open_table(VALIDATOR_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         let proposals_table = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         let personhood_commitments_table = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let slashed_double_sign_incidents_table = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -604,6 +617,15 @@ impl HelixDb {
             let key = bincode::deserialize(v.value())
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             recovery_keys.insert(k.value().to_string(), key);
+        }
+
+        let mut validator_keys = std::collections::HashMap::new();
+        let mut validator_keys_iter = validator_keys_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
+        while let Some(entry) = validator_keys_iter.next() {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let key = bincode::deserialize(v.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            validator_keys.insert(k.value().to_string(), key);
         }
 
         let mut proposals = std::collections::HashMap::new();
@@ -795,6 +817,7 @@ impl HelixDb {
         let chain_id = self.get_block_by_height(0).map(|b| b.hash()).unwrap_or(Hash::ZERO);
 
         Ok(ChainState {
+            validator_keys,
             chain_id,
             accounts,
             applied_height,

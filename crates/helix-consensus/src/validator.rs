@@ -10,6 +10,18 @@ use crate::{Vote, VoteType};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Validator {
     pub address: Address,
+    /// The key this validator signs with, when the chain knows it.
+    ///
+    /// `Address` is a one-way truncation of a hash of the key, so a signature can never be checked
+    /// from an address alone — which is why a 1952-byte ML-DSA key used to travel inside every
+    /// `CommitSig` of every block, the same handful of keys repeated forever. Carrying it here
+    /// instead, resolved once from `ChainState::validator_keys`, is what lets a block stop
+    /// shipping them: 11.7 KB of every 80 KB block at six validators, and it grows with the set.
+    ///
+    /// `Option` because a `Validator` can be built in contexts that never verify a signature —
+    /// arithmetic over voting power, tests of the quorum rule. A `None` here can only ever make a
+    /// verification *fail*: there is no path that treats an unknown key as an accepted one.
+    pub public_key: Option<helix_crypto::PublicKey>,
     /// Staked HLX in nano-HLX
     pub stake: u64,
     /// Whether this validator has a verified Proof of Personhood identity.
@@ -42,6 +54,7 @@ impl Validator {
     pub fn new(address: Address, stake: u64, has_personhood: bool) -> Self {
         Validator {
             address,
+            public_key: None,
             stake,
             has_personhood,
             // Placeholder until this validator is placed in a `ValidatorSet` (audit B3). Effective
@@ -57,6 +70,16 @@ impl Validator {
 
     /// A validator in its probation epoch — in the set to sign (so its liveness is provable via
     /// `last_commit`) but with no voting power and no proposer turn. See `probationary`.
+    /// Same as `new`, with the signing key the chain has on record for this address.
+    pub fn with_key(
+        address: Address,
+        public_key: Option<helix_crypto::PublicKey>,
+        stake: u64,
+        has_personhood: bool,
+    ) -> Self {
+        Validator { public_key, ..Validator::new(address, stake, has_personhood) }
+    }
+
     pub fn new_probationary(address: Address, stake: u64, has_personhood: bool) -> Self {
         Validator {
             probationary: true,
