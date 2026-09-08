@@ -344,6 +344,17 @@ pub struct BftEngine {
     /// the log, while every transition — someone dropping out, someone coming back — is the line a
     /// later diagnosis actually needs and cannot reconstruct afterwards.
     last_reported_silent: Vec<Address>,
+    /// Rounds that timed out **while enough voting power had been heard from**. Counted rather
+    /// than only logged, because the two failure classes need telling apart over time and not just
+    /// in the line where they happen: missing votes are an availability problem and point at an
+    /// absent validator, while votes that arrived and still produced no prevote quorum mean the
+    /// prevotes went to *different values* — some to the block, some to nil, because the proposal
+    /// did not reach everyone inside the window. That is #176/#178's family, and at a fault budget
+    /// of zero there is no slack for it.
+    ///
+    /// Measured on the live chain 2026-09-04 within three minutes of this being deployed: one
+    /// round with 2e12 heard against a quorum of 1.667e12 and no prevote quorum (#192).
+    rounds_lost_with_quorum_power: u64,
     /// The precommit quorum certificate that finalized `current_height`, carried forward one
     /// height so the *next* block this engine proposes can attach it as `last_commit` — see
     /// `BlockHeader::last_commit`'s doc comment for why it travels one block late. Empty after
@@ -379,6 +390,7 @@ impl BftEngine {
             current_base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
             missed_rounds: HashMap::new(),
             last_reported_silent: Vec::new(),
+            rounds_lost_with_quorum_power: 0,
             peer_wait_ticks: 0,
             last_commit: Vec::new(),
         }
@@ -1729,6 +1741,9 @@ impl BftEngine {
             self.validator_set.quorum_threshold(),
             reached_prevote_quorum,
         );
+        if attendance.enough_power_heard() && !reached_prevote_quorum {
+            self.rounds_lost_with_quorum_power += 1;
+        }
         if attendance.silent != self.last_reported_silent {
             self.last_reported_silent = attendance.silent.clone();
             let names = |v: &[Address]| {
@@ -2052,6 +2067,16 @@ impl BftEngine {
 
     /// The round this engine would next act at for the pending height. Exposed so the node can
     /// report it and so tests can pin the resume behaviour.
+    /// How many rounds this node has lost while hearing enough voting power to close them.
+    ///
+    /// Zero on a healthy chain, and that is what makes it worth reading: any other number says the
+    /// votes are arriving and the round is failing anyway, which is a completely different problem
+    /// from a validator being absent and has a completely different fix. Monotonic for the life of
+    /// the process.
+    pub fn rounds_lost_with_quorum_power(&self) -> u64 {
+        self.rounds_lost_with_quorum_power
+    }
+
     pub fn pending_round(&self) -> u32 {
         self.pending_round
     }

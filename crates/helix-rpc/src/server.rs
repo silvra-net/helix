@@ -78,6 +78,9 @@ pub struct AppState {
     /// Highest tip any connected peer claims (backlog #154). Published for `/diagnostics` so that
     /// "this node is behind" is answerable from outside the process.
     pub highest_peer_tip: Arc<std::sync::atomic::AtomicU64>,
+    /// Rounds lost despite enough voting power being heard (#192), published by the production
+    /// loop so this route never has to ask consensus.
+    pub rounds_lost_with_quorum_power: Arc<std::sync::atomic::AtomicU64>,
     /// Path of the chain database, used only to measure it and the volume it sits on.
     ///
     /// **Never serialised.** `GET /diagnostics` reports the size and the free space, not where
@@ -1405,6 +1408,7 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
         is_syncing: state.syncing.load(Ordering::Relaxed),
         peer_count: state.peer_count.load(Ordering::Relaxed),
         validators_not_heard_from: state.silent_peer_validators.load(Ordering::Relaxed),
+        rounds_lost_with_quorum_power: state.rounds_lost_with_quorum_power.load(Ordering::Relaxed),
         peer_tip_height: match state.highest_peer_tip.load(Ordering::Relaxed) {
             0 => None,
             h => Some(h),
@@ -1776,6 +1780,7 @@ mod tests {
             started_at_unix: 0,
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rounds_lost_with_quorum_power: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             previous_run: None,
@@ -2426,6 +2431,32 @@ mod tests {
         );
     }
 
+    /// Zero is the interesting value here, and it has to be reported as a number rather than
+    /// omitted: "no round was ever lost this way" and "this node does not track it" look identical
+    /// to a reader who only sees a missing field, and they mean opposite things.
+    #[tokio::test]
+    async fn diagnostics_report_rounds_lost_while_enough_power_was_heard() {
+        let state = fresh_test_state();
+        let response = get_diagnostics(State(state.clone())).await.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let d: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            d["rounds_lost_with_quorum_power"].as_u64(),
+            Some(0),
+            "a healthy node reports zero, not nothing: {d}"
+        );
+
+        state.rounds_lost_with_quorum_power.store(7, std::sync::atomic::Ordering::Relaxed);
+        let response = get_diagnostics(State(state)).await.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let d: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            d["rounds_lost_with_quorum_power"].as_u64(),
+            Some(7),
+            "the count has to leave the process, or it is a number only a debugger can read: {d}"
+        );
+    }
+
     /// A node that has never co-signed must say so, rather than claiming height 0 — which reads
     /// as "co-signed the genesis block" and is the sort of small lie that costs an hour later.
     #[tokio::test]
@@ -2466,6 +2497,7 @@ mod tests {
             started_at_unix: 0,
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rounds_lost_with_quorum_power: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             previous_run: None,

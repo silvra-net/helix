@@ -116,6 +116,7 @@ deliberately **not** the node's log — see the note below on why.
   "peer_count": 2,
   "validators_not_heard_from": 1,
   "peer_tip_height": 36378,
+  "rounds_lost_with_quorum_power": 0,
   "last_cosigned_height": 36376,
   "last_cosigned_secs_ago": 5982,
   "rss_kb": 344328,
@@ -147,6 +148,15 @@ What each field is for:
   2026-09-04 that difference was a single block, lasted 6 h 20 min, and could not be read anywhere
   — the node's own health line reported the chain as stalled and advised checking the *other*
   validators. `null` while no peer has claimed a tip yet, which is not the same as being level.
+- **`rounds_lost_with_quorum_power`** — rounds this node lost *while it had heard enough voting
+  power to close them*. Zero on a healthy chain, and worth watching because it separates two
+  failures that look identical from outside. If votes are missing, the named validators in the
+  "Validator silent" lines are the reason. If this number is climbing, the votes are arriving and
+  the round is failing anyway — which means the prevotes went to different values, some for the
+  block and some for nil, because the proposal did not reach everyone inside its window. That is a
+  network-timing problem, not an availability one, and no amount of restarting the absent validator
+  fixes it. Measured on the live chain on 2026-09-04: one such round with 2e12 of power heard
+  against a quorum of 1.667e12.
 - **`rss_kb` / `machine_total_kb`** — an out-of-memory kill leaves nothing in the node's own log,
   because the kernel decides and the process never runs again. These two numbers are how that
   becomes visible instead of mysterious.

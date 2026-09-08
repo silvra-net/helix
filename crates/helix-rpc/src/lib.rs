@@ -361,6 +361,13 @@ pub struct NodeDiagnostics {
     /// visible anywhere — not in the log, not over RPC. The number was already in the process; it
     /// had no way out of it. `None` while no peer has claimed anything yet.
     pub peer_tip_height: Option<u64>,
+    /// Rounds this node lost while it *had* heard enough voting power to close them. Zero on a
+    /// healthy chain. Anything else means the votes arrived and the round failed anyway, so they
+    /// went to different values — some to the block, some to nil, because the proposal did not
+    /// reach everyone in time. Availability and agreement are different properties, and reading
+    /// "four of five voted" as "the round should have closed" put a wrong diagnosis into this
+    /// project's notes twice in one day (#192).
+    pub rounds_lost_with_quorum_power: u64,
     /// Height at which this node last co-signed, and how long ago. `None` on a node that has not
     /// co-signed during this run — including every non-validator.
     pub last_cosigned_height: Option<u64>,

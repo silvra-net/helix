@@ -639,6 +639,17 @@
       out.push(["", `<b>${diag.validators_not_heard_from} validator(s) whose votes are not arriving here.</b> ` +
         "That describes what this node can see, not proof they are offline."]);
     }
+    // Deliberately a separate alert from the one above, because it sends an operator somewhere
+    // else entirely. Missing votes point at an absent validator; rounds lost *while enough power
+    // was heard* mean the votes arrived and the round failed anyway — so the prevotes went to
+    // different values, some for the block and some for nil, because the proposal did not reach
+    // everyone in time. Restarting the validator named above fixes the first and does nothing at
+    // all for the second (#192).
+    if (diag && diag.rounds_lost_with_quorum_power > 0) {
+      out.push(["", `<b>${nf(diag.rounds_lost_with_quorum_power)} round(s) lost with enough voting power present.</b> ` +
+        "The votes arrived and the round still did not close, which means they went to different " +
+        "values — a proposal that did not reach everyone in time, not an absent validator."]);
+    }
     $("alerts").innerHTML = out.map(([k, h]) => `<div class="alert ${k}">${h}</div>`).join("");
   }
 

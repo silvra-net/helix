@@ -201,6 +201,11 @@ struct Sim {
     silent: HashSet<usize>,
     /// Off the network entirely for a window: no ticks, and messages in flight to it are lost.
     offline: Vec<(usize, Window)>,
+    /// Extra ticks every message needs to reach this node. The narrowest way to split a round:
+    /// slow enough and the proposal lands *after* the node has already prevoted nil, so it votes —
+    /// it is heard from, it counts toward the power in the room — but for a different value than
+    /// everyone else. No value reaches two thirds and the round dies with a full house.
+    slow: Vec<(usize, usize)>,
     /// Still running and still heard by everyone, but receives nothing. The one-way glitch, and
     /// the only fault that produces a *precisely* sized gap: a node that is deaf for k blocks is
     /// exactly k behind, which is what makes the recoverable-gap boundary measurable at all.
@@ -235,6 +240,7 @@ impl Sim {
             silent: HashSet::new(),
             offline: Vec::new(),
             deaf: Vec::new(),
+            slow: Vec::new(),
             partition: None,
             swallow_proposals: Vec::new(),
             roundsync: false,
@@ -248,6 +254,11 @@ impl Sim {
 
     fn offline(mut self, i: usize, from: usize, to: usize) -> Self {
         self.offline.push((i, Window { from, to }));
+        self
+    }
+
+    fn slow(mut self, i: usize, extra_ticks: usize) -> Self {
+        self.slow.push((i, extra_ticks));
         self
     }
 
@@ -277,6 +288,10 @@ impl Sim {
 
     fn is_offline(&self, i: usize, t: usize) -> bool {
         self.offline.iter().any(|(n, w)| *n == i && w.covers(t))
+    }
+
+    fn extra_latency(&self, to: usize) -> usize {
+        self.slow.iter().find(|(n, _)| *n == to).map(|(_, d)| *d).unwrap_or(0)
     }
 
     fn is_deaf(&self, i: usize, t: usize) -> bool {
@@ -318,7 +333,8 @@ impl Sim {
                 if to == from || !self.reachable(from, to, t) {
                     continue;
                 }
-                self.wire.push((t + self.latency, to, m.clone(), Transport::Gossip));
+                let at = t + self.latency + self.extra_latency(to);
+                self.wire.push((at, to, m.clone(), Transport::Gossip));
             }
         }
     }
@@ -343,13 +359,12 @@ impl Sim {
                 if proposal.is_none() && votes.is_empty() {
                     continue;
                 }
+                let at = t + self.latency + self.extra_latency(i);
                 if let Some(p) = proposal {
-                    self.wire
-                        .push((t + self.latency, i, Msg::Prop(Box::new(p)), Transport::Pull));
+                    self.wire.push((at, i, Msg::Prop(Box::new(p)), Transport::Pull));
                 }
                 for v in votes {
-                    self.wire
-                        .push((t + self.latency, i, Msg::Vote(Box::new(v)), Transport::Pull));
+                    self.wire.push((at, i, Msg::Vote(Box::new(v)), Transport::Pull));
                 }
                 break; // one peer per tick, as the node does
             }
@@ -394,6 +409,15 @@ impl Sim {
             self.step();
         }
         self
+    }
+
+    /// The highest count any node has of rounds it lost while hearing enough power to close them.
+    fn rounds_lost_with_quorum_power(&self) -> u64 {
+        self.nodes
+            .iter()
+            .map(|n| n.engine.rounds_lost_with_quorum_power())
+            .max()
+            .unwrap_or(0)
     }
 
     fn heights(&self) -> Vec<u64> {
@@ -710,4 +734,54 @@ fn a_split_with_no_quorum_on_either_side_stalls_without_forking() {
         sim.heights()
     );
     sim.assert_no_fork("after heal");
+}
+
+/// A round can fail with **every** validator heard from, and this is the shape that has cost this
+/// chain the most: the votes arrive, they just do not agree on a value.
+///
+/// Measured live on 2026-09-04, three minutes after the attendance line was deployed (#192): one
+/// round with 2e12 of power heard against a quorum of 1.667e12 and `reached_prevote_quorum=false`.
+/// Enough voting power in the room and no prevote quorum can only mean the prevotes went to
+/// different values — some to the block, some to nil, because the proposal did not reach everyone
+/// inside its window.
+///
+/// **Why it matters more than it sounds.** "Four of five voted" reads like the round should have
+/// closed, and that reading is what put a wrong diagnosis into this project's notes twice in one
+/// day. Availability and agreement are different properties; a validator that votes nil because it
+/// never saw the proposal is present, counted, and useless.
+///
+/// Constructed with one silent validator, so the fault budget is spent and the slow node's nil
+/// prevote is the difference between a round closing and dying — which is exactly the state
+/// production was in. The negative control is the point of the pair: a healthy set must never
+/// register one of these, or the counter measures something other than what its name says.
+#[test]
+#[ignore = "10 real BFT engines × 200 ticks of real ML-DSA — run with --release --ignored, or via scripts/build-all.sh"]
+fn a_proposal_that_arrives_too_late_splits_the_prevotes_and_kills_a_full_round() {
+    let mut healthy = Sim::new(5, 1);
+    healthy.run(200);
+    assert_eq!(
+        healthy.rounds_lost_with_quorum_power(),
+        0,
+        "a healthy set must never lose a round while hearing enough power — if it does, this \
+         counter is measuring something other than a split vote and every number below is noise"
+    );
+
+    // Node 3 receives everything six ticks late, which is past the proposal window, so it has
+    // already prevoted nil by the time the block reaches it. Node 4 is silent, so the budget of
+    // one is spent and the split is decisive rather than absorbed.
+    let mut split = Sim::new(5, 1).silent(4).slow(3, 6);
+    split.run(200);
+    let lost = split.rounds_lost_with_quorum_power();
+    println!(
+        "one silent, one six ticks late: heights={:?}, rounds lost with quorum power={lost}",
+        split.heights()
+    );
+    assert!(
+        lost > 0,
+        "the slow node votes — nil, for a proposal it had not yet seen — so the power in the room \
+         clears the quorum and the round still cannot close. Not seeing that here means the fault \
+         is not reaching the proposal window, and the live observation of 2026-09-04 has no \
+         regression test"
+    );
+    split.assert_no_fork("split prevotes");
 }

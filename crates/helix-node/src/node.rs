@@ -883,6 +883,7 @@ impl HelixNode {
         // asking consensus: `/diagnostics` is most useful exactly when the consensus path is
         // wedged, so it must never wait on a lock that path holds (same reasoning as #150).
         let silent_peer_validators = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds_lost_with_quorum_power = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let last_cosigned = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let last_cosigned_at_unix = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -900,6 +901,7 @@ impl HelixNode {
             tip_certificate: tip_certificate.clone(),
             started_at_unix: crate::run_record::now_unix(),
             silent_peer_validators: silent_peer_validators.clone(),
+            rounds_lost_with_quorum_power: rounds_lost_with_quorum_power.clone(),
             highest_peer_tip: self.highest_peer_tip.clone(),
             last_cosigned: last_cosigned.clone(),
             last_cosigned_at_unix: last_cosigned_at_unix.clone(),
@@ -1309,6 +1311,7 @@ impl HelixNode {
             tip_certificate,
             quorum_peers_missing,
             silent_peer_validators,
+            rounds_lost_with_quorum_power,
             production_ticks,
         ));
 
@@ -3531,6 +3534,10 @@ async fn block_production_loop(
     // health heartbeat so its advice matches what this loop already reports (backlog #150).
     quorum_peers_missing: Arc<std::sync::atomic::AtomicBool>,
     silent_peer_validators: Arc<std::sync::atomic::AtomicUsize>,
+    // Rounds lost while enough voting power *was* heard (#192). Published from here for the same
+    // reason as the two above: `/diagnostics` must never take a consensus lock, and this number is
+    // worth reading exactly when the consensus path is stuck.
+    rounds_lost_with_quorum_power: Arc<std::sync::atomic::AtomicU64>,
     // Incremented on every iteration, ahead of every gate — the health heartbeat watches it move
     // to tell a running loop from a dead one (backlog #151).
     production_ticks: Arc<std::sync::atomic::AtomicU64>,
@@ -3661,6 +3668,14 @@ async fn block_production_loop(
                 .store(needed > 0 && have < needed, std::sync::atomic::Ordering::Relaxed);
             silent_peer_validators.store(
                 engine.read().await.silent_peer_validators(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // Published for the same reason and by the same route: `/diagnostics` must never ask
+            // consensus, and this number is worth reading precisely when consensus is stuck. Zero
+            // on a healthy chain; anything else says votes are arriving and rounds are failing
+            // anyway, which is a different problem with a different fix (#192).
+            rounds_lost_with_quorum_power.store(
+                engine.read().await.rounds_lost_with_quorum_power(),
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
@@ -8675,6 +8690,7 @@ mod handle_p2p_event_tests {
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ticks.clone(),
         ));
 
@@ -8727,6 +8743,7 @@ mod handle_p2p_event_tests {
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
@@ -8827,6 +8844,7 @@ mod handle_p2p_event_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             silent.clone(),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -8901,6 +8919,7 @@ mod handle_p2p_event_tests {
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
