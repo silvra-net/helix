@@ -143,6 +143,16 @@ pub fn scheduled_block_reward(height: u64) -> u64 {
 
 pub struct GenesisConfig {
     pub validator: Address,
+    /// The genesis validator's signing key, registered in `ChainState::validator_keys` at build
+    /// time.
+    ///
+    /// Needed because this validator is the one that never sends a `Stake` transaction — its stake
+    /// is written directly here — so the registry that every other validator fills by staking would
+    /// have no entry for it, and its `CommitSig`s (which no longer carry a key) could be verified
+    /// by nobody. `None` is allowed and means "not recorded": a chain built that way still works
+    /// for everything that does not verify this validator's commit signatures, which is what keeps
+    /// the many test genesis configs from having to invent a keypair they never use.
+    pub validator_public_key: Option<PublicKey>,
     /// Liquid genesis balances (address, nano-HLX). Seeded from the `GENESIS_PREFUND` default
     /// for a chain launching fresh; a node joining an existing chain replaces it with that
     /// chain's real allocations from the peer's `GET /genesis`, exactly like `validator_stake`.
@@ -176,12 +186,19 @@ pub struct GenesisConfig {
 /// does not affect the comparison.
 pub fn rebuild_genesis_state(
     validator: Address,
+    // The genesis validator's signing key. A joining node has it without asking anyone: the
+    // genesis *block header* carries its proposer's key, and the genesis block's proposer is this
+    // validator. So the registry entry that makes its commit signatures verifiable needs no new
+    // field in `GET /genesis` and no second copy in the P2P payload — the two places the code
+    // warns must always be changed together.
+    validator_public_key: PublicKey,
     personhood_authorities: Vec<PublicKey>,
     validator_stake: u64,
     allocations: Vec<(Address, u64)>,
     governance_params: crate::governance::GovernanceParams,
 ) -> ChainState {
-    let mut cfg = GenesisConfig::devnet_with_personhood_authority(validator, personhood_authorities);
+    let mut cfg = GenesisConfig::devnet_with_personhood_authority(validator, personhood_authorities)
+        .with_validator_key(validator_public_key);
     cfg.validator_stake = validator_stake;
     cfg.allocations = allocations;
     let mut state = cfg.build_state();
@@ -212,9 +229,20 @@ impl GenesisConfig {
         GenesisConfig {
             allocations,
             validator,
+            // Not known from an address alone — the caller that holds the keypair sets it with
+            // `with_validator_key`. A devnet config built without one still works; only this
+            // validator's commit signatures become unverifiable, which no test exercises.
+            validator_public_key: None,
             personhood_authorities,
             validator_stake: VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX,
         }
+    }
+
+    /// Record the genesis validator's signing key, so the registry that every other validator
+    /// fills by staking also covers the one that never stakes.
+    pub fn with_validator_key(mut self, key: PublicKey) -> Self {
+        self.validator_public_key = Some(key);
+        self
     }
 
     /// Build the initial ChainState.
@@ -240,6 +268,9 @@ impl GenesisConfig {
         // Validator genesis stake — staked directly so it survives epoch 1 rotation
         let validator_stake = self.validator_stake;
         state.set_validator_stake(&self.validator, validator_stake);
+        if let Some(key) = &self.validator_public_key {
+            state.set_validator_key(&self.validator, key.clone());
+        }
         state.genesis_validator_stake = validator_stake;
         issued += validator_stake;
 

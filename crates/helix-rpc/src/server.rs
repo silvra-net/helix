@@ -583,6 +583,7 @@ async fn get_genesis(State(state): State<AppState>) -> impl IntoResponse {
     // chain look like now" (which has moved on since height 0).
     let genesis_state_hash = helix_executor::genesis::rebuild_genesis_state(
         block.header.validator.clone(),
+        block.header.public_key.clone(),
         cs.personhood_authorities.clone(),
         cs.genesis_validator_stake,
         cs.genesis_allocations.clone(),
@@ -2712,7 +2713,6 @@ mod tests {
         let kp = KeyPair::generate();
         let sig = helix_core::CommitSig {
             validator: Address::from_public_key(&kp.public),
-            public_key: kp.public.clone(),
             crypto_version: CryptoVersion::MlDsa,
             round: 3,
             signature: kp.sign(b"precommit").unwrap(),
@@ -2943,7 +2943,11 @@ mod tests {
     async fn get_genesis_reports_the_genesis_state_hash_not_todays() {
         let state = fresh_test_state();
         let validator = addr(7);
-        state.store.write().await.put_block(block(0, &validator, vec![])).unwrap();
+        // The genesis block's own header key is what a joining node rebuilds from — this
+        // validator never staked, so the key registry is seeded from here and nowhere else.
+        let genesis_block = block(0, &validator, vec![]);
+        let genesis_key = genesis_block.header.public_key.clone();
+        state.store.write().await.put_block(genesis_block).unwrap();
         {
             let mut cs = state.chain_state.write().await;
             cs.genesis_validator_stake = 100_000 * helix_executor::genesis::NANO_PER_HLX;
@@ -2962,6 +2966,7 @@ mod tests {
 
         let expected = helix_executor::genesis::rebuild_genesis_state(
             validator,
+            genesis_key,
             vec![],
             100_000 * helix_executor::genesis::NANO_PER_HLX,
             vec![],

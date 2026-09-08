@@ -3897,7 +3897,6 @@ mod tests {
         sig.round = 1;
         let commit_sig = helix_core::CommitSig {
             validator: sig.validator,
-            public_key: sig.public_key,
             crypto_version: sig.crypto_version,
             round: sig.round,
             signature: sig.signature,
@@ -3917,7 +3916,6 @@ mod tests {
         let vote = peer_vote(&v.peer_kp, VoteType::Precommit, 6, 0, parent_hash);
         let commit_sig = helix_core::CommitSig {
             validator: vote.validator,
-            public_key: vote.public_key,
             crypto_version: vote.crypto_version,
             round: vote.round,
             signature: vote.signature,

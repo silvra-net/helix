@@ -4997,7 +4997,6 @@ mod tests {
                 );
                 helix_core::CommitSig {
                     validator: Address::from_public_key(&kp.public),
-                    public_key: kp.public.clone(),
                     crypto_version: CryptoVersion::MlDsa,
                     round: 0,
                     signature: kp.sign(&bytes).expect("sign precommit"),
@@ -5024,6 +5023,10 @@ mod tests {
         for kp in &witnesses {
             let addr = Address::from_public_key(&kp.public);
             state.update_account(&addr, |acc| acc.staked = 1_000);
+            // A `CommitSig` no longer carries the signer's key, so participation can only be
+            // counted for a validator whose key the chain has on record. Staking registers it in
+            // production; a test that sets `staked` directly has to say so itself.
+            state.set_validator_key(&addr, kp.public.clone());
             state.active_validators.insert(addr);
         }
         state.update_account(&silent, |acc| acc.staked = 1_000);
@@ -5106,6 +5109,9 @@ mod tests {
         state.update_account(&proposer, |acc| acc.staked = 5_000);
         state.active_validators.insert(proposer.clone());
         state.update_account(&newcomer, |acc| acc.staked = 1_000);
+        // Same reason as the jailing test: a `CommitSig` carries no key any more, so a signature
+        // only proves liveness for a validator whose key the chain has on record.
+        state.set_validator_key(&newcomer, newcomer_kp.public.clone());
 
         let epoch = helix_consensus::EPOCH_LENGTH;
 

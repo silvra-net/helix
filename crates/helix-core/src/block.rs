@@ -486,7 +486,6 @@ mod tests {
         let bytes = precommit_signing_bytes(height, round, &block_hash, kp.scheme);
         CommitSig {
             validator: addr,
-            public_key: kp.public.clone(),
             crypto_version: kp.scheme,
             round,
             signature: kp.sign(&bytes).unwrap(),
@@ -499,7 +498,7 @@ mod tests {
         let kp = KeyPair::generate();
         let block_hash = Hash::digest(b"parent block");
         let sig = signed_commit_sig(&kp, 41, 0, block_hash);
-        assert!(sig.verify(41, &block_hash).is_ok());
+        assert!(sig.verify(&kp.public, 41, &block_hash).is_ok());
     }
 
     /// A `CommitSig` can't be reused for a different height/round/block than it actually
@@ -512,7 +511,7 @@ mod tests {
         let kp = KeyPair::generate();
         let block_hash = Hash::digest(b"parent block");
         let sig = signed_commit_sig(&kp, 41, 0, block_hash);
-        assert!(sig.verify(42, &block_hash).is_err());
+        assert!(sig.verify(&kp.public, 42, &block_hash).is_err());
     }
 
     #[test]
@@ -524,7 +523,13 @@ mod tests {
         let mut sig = signed_commit_sig(&signer, 41, 0, block_hash);
         // Claim to be a different validator than the one who actually signed.
         sig.validator = Address::from_public_key(&claimed.public);
-        assert!(sig.verify(41, &block_hash).is_err());
+        // The key now comes from the caller — the chain's registry — so the faithful version of
+        // this forgery is: the registry answers with the *claimed* validator's key, and the
+        // signature was made by somebody else. It must still fail.
+        assert!(sig.verify(&claimed.public, 41, &block_hash).is_err());
+        // And supplying the real signer's key does not rescue it either: that key does not derive
+        // the address the signature claims, which is the check that makes a lookup safe to trust.
+        assert!(sig.verify(&signer.public, 41, &block_hash).is_err());
     }
 
     /// A block's `last_commit` doesn't change what it commits to sign — `signing_hash` folds

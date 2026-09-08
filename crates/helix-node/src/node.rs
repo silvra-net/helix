@@ -551,7 +551,13 @@ impl HelixNode {
             info!("No personhood authorities configured — ProvePersonhood transactions will be rejected");
         }
 
-        let genesis_cfg = GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authorities);
+        // The genesis validator is this node, and it is the one validator that never sends a
+        // `Stake` transaction — so the key registry that staking fills has to be seeded here, or
+        // nothing could ever verify this validator's commit signatures (they no longer carry a
+        // key of their own).
+        let genesis_cfg =
+            GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authorities)
+                .with_validator_key(keypair.public.clone());
 
         // `sync_peer = "http://seed:8545"` in helix.toml, or HELIX_SYNC_PEER — resolved here
         // (rather than after genesis, as before) because a node with no local chain yet needs
@@ -616,6 +622,7 @@ impl HelixNode {
             // local prefund on top would mint HLX the real chain never issued.
             let state = helix_executor::genesis::rebuild_genesis_state(
                 genesis.header.validator.clone(),
+                genesis.header.public_key.clone(),
                 peer_genesis.personhood_authorities.clone(),
                 peer_genesis.validator_stake,
                 peer_genesis.allocations.clone(),
@@ -667,6 +674,7 @@ impl HelixNode {
 
             let state = helix_executor::genesis::rebuild_genesis_state(
                 genesis.header.validator.clone(),
+                genesis.header.public_key.clone(),
                 payload.personhood_authorities.clone(),
                 payload.validator_stake,
                 payload.allocations.clone(),
@@ -840,6 +848,7 @@ impl HelixNode {
         let shared_chain_state = Arc::new(RwLock::new(chain_state));
         let shared_tip_certificate = Arc::new(RwLock::new(TipCertificate::default()));
         let block_provider: Arc<dyn helix_p2p::BlockProvider> = Arc::new(StoreBlockProvider {
+            chain_state: shared_chain_state.clone(),
             store: shared_store.clone(),
             tip_certificate: shared_tip_certificate.clone(),
         });
@@ -1660,7 +1669,14 @@ async fn handle_p2p_event(
                             // its next block stamps a real last_commit rather than an empty one
                             // (#133, closing #114 for the RPC path). Empty on any failure, i.e. the
                             // unchanged pre-#133 behaviour; the engine re-verifies it regardless.
-                            let cert = fetch_tip_certificate(peer_url, new_height, new_hash).await;
+                            let keys = validator_key_snapshot(chain_state).await;
+                            let cert = fetch_tip_certificate(
+                                peer_url,
+                                new_height,
+                                new_hash,
+                                &key_from_snapshot(&keys),
+                            )
+                            .await;
                             engine.write().await.sync_to_externally_finalized_block(new_height, new_hash, cert);
                             // Mirror any validator rotation those synced blocks applied in chain
                             // state into the live engine — the finalize path that normally does
@@ -1780,7 +1796,7 @@ async fn handle_p2p_event(
             );
         }
         P2PEvent::PeerBehind { peer_tip } => {
-            serve_catchup_blocks(peer_tip, store, tip_certificate, p2p_tx).await;
+            serve_catchup_blocks(chain_state, peer_tip, store, tip_certificate, p2p_tx).await;
         }
         P2PEvent::BlocksSynced(batch, peer) => {
             apply_synced_batch(batch, peer, store, chain_state, engine, mempool, last_applied_height, tip_certificate, p2p_tx).await;
@@ -2000,6 +2016,7 @@ async fn apply_synced_batch(
 /// bounded twice — by `should_serve_catchup` before the event is emitted, and by
 /// [`MAX_CATCHUP_SERVE_BLOCKS`] again here.
 async fn serve_catchup_blocks(
+    chain_state: &Arc<RwLock<ChainState>>,
     peer_tip: u64,
     store: &Arc<RwLock<HelixDb>>,
     tip_certificate: &Arc<RwLock<TipCertificate>>,
@@ -2019,7 +2036,8 @@ async fn serve_catchup_blocks(
                 return;
             }
         };
-        let certificate = catchup_certificate(&block, our_tip, store, tip_certificate).await;
+        let certificate =
+            catchup_certificate(&block, our_tip, store, tip_certificate, chain_state).await;
         // Stop at the first block we cannot certify rather than skipping it. The receiver applies
         // the fast path strictly in sequence (anything above `our_height + 1` is a gap it cannot
         // fill without a `sync_peer`), so a hole makes every block after it useless — and sending
@@ -2189,6 +2207,9 @@ fn verify_block_batch(
 struct StoreBlockProvider {
     store: Arc<RwLock<HelixDb>>,
     tip_certificate: Arc<RwLock<TipCertificate>>,
+    /// Needed to rebuild a commit certificate: `CommitSig` no longer carries the signer's key, so
+    /// turning one back into a `Vote` means looking the key up in this chain's own registry.
+    chain_state: Arc<RwLock<ChainState>>,
 }
 
 /// Serves this node's genesis to peers joining over P2P (#139).
@@ -2226,6 +2247,7 @@ impl helix_p2p::GenesisProvider for StoreGenesisProvider {
             // which has moved on since height 0.
             let state_hash = helix_executor::genesis::rebuild_genesis_state(
                 block.header.validator.clone(),
+                block.header.public_key.clone(),
                 cs.personhood_authorities.clone(),
                 cs.genesis_validator_stake,
                 cs.genesis_allocations.clone(),
@@ -2310,8 +2332,14 @@ impl helix_p2p::BlockProvider for StoreBlockProvider {
             // one would leave a requester permanently stuck at that height. Everything below it is
             // still provable and still useful.
             while let Some(tip) = blocks.last() {
-                let certificate =
-                    catchup_certificate(tip, our_tip, &self.store, &self.tip_certificate).await;
+                let certificate = catchup_certificate(
+                    tip,
+                    our_tip,
+                    &self.store,
+                    &self.tip_certificate,
+                    &self.chain_state,
+                )
+                .await;
                 if !certificate.is_empty() {
                     return BlockSyncResponse { blocks, tip_certificate: certificate };
                 }
@@ -2334,6 +2362,7 @@ async fn catchup_certificate(
     our_tip: u64,
     store: &Arc<RwLock<HelixDb>>,
     tip_certificate: &Arc<RwLock<TipCertificate>>,
+    chain_state: &Arc<RwLock<ChainState>>,
 ) -> Vec<Vote> {
     let height = block.height();
     let block_hash = block.hash();
@@ -2341,7 +2370,14 @@ async fn catchup_certificate(
     if height < our_tip {
         return match store.read().await.get_block_by_height(height + 1) {
             Ok(successor) => {
-                commit_sigs_to_votes(successor.header.last_commit.clone(), height, block_hash)
+                let cs = chain_state.read().await;
+                let resolver = key_from_state(&cs);
+                commit_sigs_to_votes(
+                    successor.header.last_commit.clone(),
+                    height,
+                    block_hash,
+                    &resolver,
+                )
             }
             Err(_) => Vec::new(),
         };
@@ -2351,7 +2387,9 @@ async fn catchup_certificate(
     // for a different block is worse than none, and the receiver would reject it anyway.
     let cert = tip_certificate.read().await;
     if cert.height == height && cert.block_hash == block_hash.to_hex() {
-        commit_sigs_to_votes(cert.signatures.clone(), height, block_hash)
+        let cs = chain_state.read().await;
+        let resolver = key_from_state(&cs);
+        commit_sigs_to_votes(cert.signatures.clone(), height, block_hash, &resolver)
     } else {
         Vec::new()
     }
@@ -2660,6 +2698,7 @@ fn last_quorum_certified_index(blocks: &[Block], chain_state: &ChainState) -> Op
             blocks[i + 1].header.last_commit.clone(),
             blocks[i].height(),
             hash,
+            &key_from_state(chain_state),
         );
         set.precommits_reach_quorum(&certificate, blocks[i].height(), &hash)
     })
@@ -2695,6 +2734,22 @@ fn commit_sigs_to_votes(
         .collect()
 }
 
+
+/// A key resolver for tests: the signing keys of the validators a test actually built.
+///
+/// Production resolves from the chain's registry; a test that never staked anyone has no registry,
+/// so it hands over the keys it holds. Anything not listed resolves to `None`, which is what makes
+/// the "unknown signer is refused" paths reachable from a test at all.
+#[cfg(test)]
+fn key_from_pairs<'a>(pairs: &'a [&'a KeyPair]) -> impl Fn(&Address) -> Option<PublicKey> + 'a {
+    move |addr: &Address| {
+        pairs
+            .iter()
+            .find(|kp| Address::from_public_key(&kp.public) == *addr)
+            .map(|kp| kp.public.clone())
+    }
+}
+
 /// A key resolver backed by the validator set — the source every consensus path already holds.
 fn key_from_set(set: &ValidatorSet) -> impl Fn(&Address) -> Option<PublicKey> + '_ {
     move |addr: &Address| set.get(addr).and_then(|v| v.public_key.clone())
@@ -2703,6 +2758,25 @@ fn key_from_set(set: &ValidatorSet) -> impl Fn(&Address) -> Option<PublicKey> + 
 /// A key resolver backed by the chain's registry, for callers that hold state rather than a set.
 fn key_from_state(state: &ChainState) -> impl Fn(&Address) -> Option<PublicKey> + '_ {
     move |addr: &Address| state.validator_key(addr).cloned()
+}
+
+/// Every validator key the chain knows, copied out of the state.
+///
+/// A snapshot rather than a borrow, because the callers that need one are about to `await` — on a
+/// peer's HTTP answer, in one case. Holding the chain-state lock across that would make the future
+/// `!Send` and, far worse, block block production on a remote server's latency. The set is a
+/// handful of entries; copying them costs nothing next to what holding the lock would.
+async fn validator_key_snapshot(
+    chain_state: &Arc<RwLock<ChainState>>,
+) -> std::collections::HashMap<String, PublicKey> {
+    chain_state.read().await.validator_keys.clone()
+}
+
+/// A key resolver over a snapshot taken by `validator_key_snapshot`.
+fn key_from_snapshot(
+    keys: &std::collections::HashMap<String, PublicKey>,
+) -> impl Fn(&Address) -> Option<PublicKey> + '_ {
+    move |addr: &Address| keys.get(&addr.to_string()).cloned()
 }
 
 /// Snapshot the engine's current commit certificate — its `last_commit`, the precommits that
@@ -2805,7 +2879,14 @@ async fn load_persisted_tip_certificate(
 /// engine's `last_commit` stays empty for this tip, as it always did over RPC, and the next
 /// catch-up pass picks the certificate up once the peer's tip stops moving. The engine re-verifies
 /// every returned signature, so a lying peer buys nothing here.
-async fn fetch_tip_certificate(peer_url: &str, expected_height: u64, expected_hash: Hash) -> Vec<Vote> {
+async fn fetch_tip_certificate(
+    peer_url: &str,
+    expected_height: u64,
+    expected_hash: Hash,
+    // `Send + Sync`, because this resolver is held across the HTTP `await` below — without it the
+    // whole sync loop's future stops being `Send` and cannot be spawned.
+    key_for: &(dyn Fn(&Address) -> Option<PublicKey> + Send + Sync),
+) -> Vec<Vote> {
     let client = match peer_http_client(Duration::from_secs(10)) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -2821,7 +2902,7 @@ async fn fetch_tip_certificate(peer_url: &str, expected_height: u64, expected_ha
     if cert.height != expected_height || cert.block_hash != expected_hash.to_hex() {
         return Vec::new();
     }
-    commit_sigs_to_votes(cert.signatures, expected_height, expected_hash)
+    commit_sigs_to_votes(cert.signatures, expected_height, expected_hash, key_for)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4872,7 +4953,14 @@ async fn rpc_sync_loop(
                 // that activates and then catches up purely over RPC stamp a real last_commit on
                 // its first proposal instead of dropping the tip's participation record. Empty on
                 // any failure — the unchanged pre-#133 behaviour — and the engine re-verifies it.
-                let cert = fetch_tip_certificate(&peer_url, new_height, new_hash).await;
+                let keys = chain_state.read().await.validator_keys.clone();
+                let cert = fetch_tip_certificate(
+                    &peer_url,
+                    new_height,
+                    new_hash,
+                    &key_from_snapshot(&keys),
+                )
+                .await;
                 engine
                     .write()
                     .await
@@ -5183,7 +5271,14 @@ async fn sync_blocks_from_peer(
                     // hours, while the failure avoided by refusing is hypothetical and needs the
                     // operator's own configured sync peer to be hostile.
                     let set = ValidatorSet::new(validators_from_state(chain_state), h);
-                    let certificate = fetch_tip_certificate(peer_url, h, block.hash()).await;
+                    let keys = chain_state.validator_keys.clone();
+                    let certificate = fetch_tip_certificate(
+                        peer_url,
+                        h,
+                        block.hash(),
+                        &key_from_snapshot(&keys),
+                    )
+                    .await;
                     if !set.precommits_reach_quorum(&certificate, h, &block.hash()) {
                         warn!(
                             height = h,
@@ -5385,7 +5480,6 @@ mod sync_blocks_from_peer_tests {
         );
         CommitSig {
             validator: Address::from_public_key(&kp.public),
-            public_key: kp.public.clone(),
             crypto_version: helix_core::CryptoVersion::MlDsa,
             round: 0,
             signature: kp.sign(&bytes).unwrap(),
@@ -6253,6 +6347,7 @@ mod sync_blocks_from_peer_tests {
             [&a, &b].iter().map(|kp| commit_sig_for(kp, 5, &blocks[4].hash())).collect(),
             5,
             blocks[4].hash(),
+            &key_from_state(&chain_state),
         );
         assert_eq!(
             verify_block_batch(&blocks, &tip_certificate, 1, Hash::ZERO, &chain_state, &set),
@@ -6983,7 +7078,6 @@ mod handle_p2p_event_tests {
                 );
                 helix_core::CommitSig {
                     validator: Address::from_public_key(&s.public),
-                    public_key: s.public.clone(),
                     crypto_version: helix_core::CryptoVersion::MlDsa,
                     round: 0,
                     signature: s.sign(&bytes).unwrap(),
@@ -7009,7 +7103,6 @@ mod handle_p2p_event_tests {
                 );
                 CommitSig {
                     validator: Address::from_public_key(&s.public),
-                    public_key: s.public.clone(),
                     crypto_version: helix_core::CryptoVersion::MlDsa,
                     round: 0,
                     signature: s.sign(&bytes).unwrap(),
@@ -7056,7 +7149,12 @@ mod handle_p2p_event_tests {
 
         // The follower converts the CommitSigs back to precommit votes for the tip it just synced
         // to and hands them to the engine, exactly as the RPC catch-up paths now do.
-        let votes = commit_sigs_to_votes(received.signatures.clone(), tip_height, tip_hash);
+        let votes = commit_sigs_to_votes(
+            received.signatures.clone(),
+            tip_height,
+            tip_hash,
+            &key_from_pairs(&[&a, &b]),
+        );
         let mut follower = BftEngine::new(set.clone(), Address::from_public_key(&a.public), 0);
         follower.sync_to_externally_finalized_block(tip_height, tip_hash, votes);
         assert_eq!(
@@ -7070,7 +7168,12 @@ mod handle_p2p_event_tests {
         // block. A certificate that does not attest the synced tip can never seed a bogus
         // last_commit.
         let other = Hash::digest(b"not-the-tip");
-        let wrong = commit_sigs_to_votes(received.signatures, tip_height, other);
+        let wrong = commit_sigs_to_votes(
+            received.signatures,
+            tip_height,
+            other,
+            &key_from_pairs(&[&a, &b]),
+        );
         let mut follower2 = BftEngine::new(set, Address::from_public_key(&a.public), 0);
         follower2.sync_to_externally_finalized_block(tip_height, other, wrong);
         assert!(
@@ -7221,7 +7324,12 @@ mod handle_p2p_event_tests {
         // Quorum gate (audit A1): the block is adopted only with a certificate proving quorum.
         // A single-validator set reaches quorum on that validator's own precommit.
         let block_hash = block.hash();
-        let cert = commit_sigs_to_votes(tip_commit_sigs(1, block_hash, &[&validator_kp]), 1, block_hash);
+        let cert = commit_sigs_to_votes(
+            tip_commit_sigs(1, block_hash, &[&validator_kp]),
+            1,
+            block_hash,
+            &key_from_pairs(&[&validator_kp]),
+        );
 
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let peer_count = Arc::new(AtomicUsize::new(0));
@@ -7272,7 +7380,12 @@ mod handle_p2p_event_tests {
         let block = signed_block(&proposer_kp, 1, Hash::ZERO);
         let block_hash = block.hash();
         // Certificate with only the proposer's own precommit: 1 of 2, below quorum.
-        let lone_cert = commit_sigs_to_votes(tip_commit_sigs(1, block_hash, &[&proposer_kp]), 1, block_hash);
+        let lone_cert = commit_sigs_to_votes(
+            tip_commit_sigs(1, block_hash, &[&proposer_kp]),
+            1,
+            block_hash,
+            &key_from_pairs(&[&proposer_kp]),
+        );
 
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let peer_count = Arc::new(AtomicUsize::new(0));
@@ -7350,6 +7463,7 @@ mod handle_p2p_event_tests {
         peer_tip: u64,
         store: &Arc<RwLock<HelixDb>>,
         tip_certificate: &Arc<RwLock<TipCertificate>>,
+        signers: &[&KeyPair],
     ) -> Vec<(u64, usize)> {
         let (p2p_tx, mut p2p_rx) = mpsc::channel(64);
         let kp = KeyPair::generate();
@@ -7365,7 +7479,19 @@ mod handle_p2p_event_tests {
             &Arc::new(RwLock::new(Mempool::new())),
             &Arc::new(AtomicUsize::new(0)),
             store,
-            &Arc::new(RwLock::new(ChainState::new(0))),
+            // Rebuilding a certificate needs each signer's key, which a `CommitSig` no longer
+            // carries — the chain looks it up. A test that never staked anyone has to seed the
+            // registry with the keypairs it signed with.
+            &{
+                let mut cs = ChainState::new(0);
+                for signer in signers {
+                    cs.set_validator_key(
+                        &Address::from_public_key(&signer.public),
+                        signer.public.clone(),
+                    );
+                }
+                Arc::new(RwLock::new(cs))
+            },
             &engine,
             &kp,
             &p2p_tx,
@@ -7396,7 +7522,7 @@ mod handle_p2p_event_tests {
         let blocks = chained_blocks(&kp, &[1]);
         let (store, cell) = store_with_chain(&kp, &blocks).await;
 
-        let served = blocks_served_to_peer_at(0, &store, &cell).await;
+        let served = blocks_served_to_peer_at(0, &store, &cell, &[&kp]).await;
 
         assert_eq!(
             served,
@@ -7415,7 +7541,7 @@ mod handle_p2p_event_tests {
         let (store, _) = store_with_chain(&kp, &blocks).await;
         let empty_cell = Arc::new(RwLock::new(TipCertificate::default()));
 
-        let served = blocks_served_to_peer_at(0, &store, &empty_cell).await;
+        let served = blocks_served_to_peer_at(0, &store, &empty_cell, &[&kp]).await;
 
         assert!(served.is_empty(), "without a certificate there is nothing worth sending");
     }
@@ -7435,7 +7561,7 @@ mod handle_p2p_event_tests {
             signatures: tip_commit_sigs(1, wrong_hash, &[&kp]),
         }));
 
-        let served = blocks_served_to_peer_at(0, &store, &stale).await;
+        let served = blocks_served_to_peer_at(0, &store, &stale, &[&kp]).await;
 
         assert!(served.is_empty(), "a certificate for another block must not be served as ours");
     }
@@ -7457,7 +7583,7 @@ mod handle_p2p_event_tests {
         }
         let (store, cell) = store_with_chain(&kp, &blocks).await;
 
-        let served = blocks_served_to_peer_at(0, &store, &cell).await;
+        let served = blocks_served_to_peer_at(0, &store, &cell, &[&kp]).await;
 
         assert_eq!(
             served,
@@ -7475,7 +7601,7 @@ mod handle_p2p_event_tests {
         let blocks = chained_blocks(&kp, &[1, 2]);
         let (store, cell) = store_with_chain(&kp, &blocks).await;
 
-        let served = blocks_served_to_peer_at(0, &store, &cell).await;
+        let served = blocks_served_to_peer_at(0, &store, &cell, &[&kp]).await;
 
         assert!(
             served.is_empty(),
@@ -7493,8 +7619,8 @@ mod handle_p2p_event_tests {
         let blocks = chained_blocks(&kp, &[1]);
         let (store, cell) = store_with_chain(&kp, &blocks).await;
 
-        assert!(blocks_served_to_peer_at(1, &store, &cell).await.is_empty(), "level: nothing to send");
-        assert!(blocks_served_to_peer_at(9, &store, &cell).await.is_empty(), "ahead: nothing to send");
+        assert!(blocks_served_to_peer_at(1, &store, &cell, &[&kp]).await.is_empty(), "level: nothing to send");
+        assert!(blocks_served_to_peer_at(9, &store, &cell, &[&kp]).await.is_empty(), "ahead: nothing to send");
     }
 
     // ── P2P block sync (#138) ─────────────────────────────────────────────────
@@ -7575,6 +7701,7 @@ mod handle_p2p_event_tests {
                 tip_commit_sigs(tip.height(), tip.hash(), &[&kp]),
                 tip.height(),
                 tip.hash(),
+                &key_from_pairs(&[&kp]),
             ),
             blocks: blocks.clone(),
         };
@@ -7609,6 +7736,7 @@ mod handle_p2p_event_tests {
                 tip_commit_sigs(tip.height(), tip.hash(), &[&kp]),
                 tip.height(),
                 tip.hash(),
+                &key_from_pairs(&[&kp]),
             ),
             blocks,
         };
@@ -7636,6 +7764,7 @@ mod handle_p2p_event_tests {
                 tip_commit_sigs(wrong.height(), wrong.hash(), &[&kp]),
                 wrong.height(),
                 wrong.hash(),
+                &key_from_pairs(&[&kp]),
             ),
             blocks: blocks.clone(),
         };
@@ -7665,6 +7794,7 @@ mod handle_p2p_event_tests {
                 tip_commit_sigs(tip.height(), tip.hash(), &[&kp]),
                 tip.height(),
                 tip.hash(),
+                &key_from_pairs(&[&kp]),
             ),
             blocks: blocks.clone(),
         };
@@ -7689,6 +7819,7 @@ mod handle_p2p_event_tests {
                 tip_commit_sigs(tip.height(), tip.hash(), &[&kp]),
                 tip.height(),
                 tip.hash(),
+                &key_from_pairs(&[&kp]),
             ),
             blocks,
         };
@@ -7738,6 +7869,7 @@ mod handle_p2p_event_tests {
                 tip_commit_sigs(1, b1.hash(), &[&kp]),
                 1,
                 b1.hash(),
+                &key_from_pairs(&[&kp]),
             ),
             blocks: vec![b1],
         };
@@ -7766,6 +7898,7 @@ mod handle_p2p_event_tests {
                 tip_commit_sigs(2, b2.hash(), &[&kp]),
                 2,
                 b2.hash(),
+                &key_from_pairs(&[&kp]),
             ),
             blocks: vec![b1, b2],
         };
@@ -7790,6 +7923,7 @@ mod handle_p2p_event_tests {
                 tip_commit_sigs(tip.height(), tip.hash(), &[&kp]),
                 tip.height(),
                 tip.hash(),
+                &key_from_pairs(&[&kp]),
             ),
             blocks,
         };
@@ -7851,7 +7985,11 @@ mod handle_p2p_event_tests {
         let kp = KeyPair::generate();
         let blocks = chained_blocks(&kp, &[1, 2, 3]);
         let (store, cell) = store_with_chain(&kp, &blocks).await;
-        let provider = StoreBlockProvider { store, tip_certificate: cell };
+        let provider = StoreBlockProvider {
+            store,
+            tip_certificate: cell,
+            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+        };
 
         let served = provider.blocks(1, 3).await;
 
@@ -7870,7 +8008,11 @@ mod handle_p2p_event_tests {
         let kp = KeyPair::generate();
         let blocks = chained_blocks(&kp, &[1, 2]);
         let (store, cell) = store_with_chain(&kp, &blocks).await;
-        let provider = StoreBlockProvider { store, tip_certificate: cell };
+        let provider = StoreBlockProvider {
+            store,
+            tip_certificate: cell,
+            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+        };
 
         let served = provider.blocks(1, 50).await;
 
@@ -7884,7 +8026,11 @@ mod handle_p2p_event_tests {
         let kp = KeyPair::generate();
         let blocks = chained_blocks(&kp, &[1]);
         let (store, cell) = store_with_chain(&kp, &blocks).await;
-        let provider = StoreBlockProvider { store, tip_certificate: cell };
+        let provider = StoreBlockProvider {
+            store,
+            tip_certificate: cell,
+            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+        };
 
         let served = provider.blocks(9, 10).await;
 
@@ -7906,7 +8052,11 @@ mod handle_p2p_event_tests {
         let (store, _) = store_with_chain(&kp, &blocks).await;
         // Empty cell, so the tip (block 3) is uncertifiable too.
         let empty_cell = Arc::new(RwLock::new(TipCertificate::default()));
-        let provider = StoreBlockProvider { store, tip_certificate: empty_cell };
+        let provider = StoreBlockProvider {
+            store,
+            tip_certificate: empty_cell,
+            chain_state: Arc::new(RwLock::new(ChainState::new(0))),
+        };
 
         let served = provider.blocks(1, 3).await;
 
@@ -9218,6 +9368,7 @@ mod genesis_verification_tests {
     fn rebuilt(pg: &PeerGenesis) -> ChainState {
         helix_executor::genesis::rebuild_genesis_state(
             pg.block.header.validator.clone(),
+            pg.block.header.public_key.clone(),
             pg.personhood_authorities.clone(),
             pg.validator_stake,
             pg.allocations.clone(),
