@@ -893,6 +893,15 @@
         $("diskfree").title = fin(diag.disk_total_kb)
           ? `${gbText(diag.disk_free_kb)} free of ${gbText(diag.disk_total_kb)} — ${usedPct.toFixed(0)} % used`
           : "";
+        // Free space is a snapshot and says nothing about when it runs out. Both halves of the
+        // division were already on this board and nobody did it — the same blindness that let this
+        // node's memory climb from 374 MB to 3.2 GB over four days in plain sight (#193).
+        if (fin(diag.disk_days_remaining)) {
+          const d = diag.disk_days_remaining;
+          $("diskfree").innerHTML += `<small> ~${nf(d)} d at this rate</small>`;
+          if (d < 30) { dbar.className = "bad"; }
+          else if (d < 90 && dbar.className !== "bad") { dbar.className = "warn"; }
+        }
 
         // Load against cores: the same number means idle here and desperate on a single-core
         // box, so neither is shown without the other.

@@ -903,6 +903,7 @@ impl HelixNode {
             silent_peer_validators: silent_peer_validators.clone(),
             rounds_lost_with_quorum_power: rounds_lost_with_quorum_power.clone(),
             highest_peer_tip: self.highest_peer_tip.clone(),
+            block_time_ms: config::resolve_u64("HELIX_BLOCK_TIME_MS", None).unwrap_or(BLOCK_TIME_MS),
             last_cosigned: last_cosigned.clone(),
             last_cosigned_at_unix: last_cosigned_at_unix.clone(),
             previous_run: self.previous_run.clone(),

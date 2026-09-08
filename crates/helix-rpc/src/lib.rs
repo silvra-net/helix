@@ -372,6 +372,20 @@ pub struct NodeDiagnostics {
     /// co-signed during this run — including every non-validator.
     pub last_cosigned_height: Option<u64>,
     pub last_cosigned_secs_ago: Option<u64>,
+    /// Days of disk left at the rate this chain is actually growing: the database's own
+    /// bytes-per-block against the free space, at the configured block time. `null` before there
+    /// is anything to divide (an empty chain, or an unreadable volume).
+    ///
+    /// An extrapolation, not a promise — it assumes the current block cadence and the current mix
+    /// of traffic hold. It exists because the two numbers it is made of were both already served
+    /// here and nobody multiplied them: on 2026-09-08 this node's memory had grown from 374 MB to
+    /// 3.2 GB over four days, in plain sight, because RSS is read as a snapshot and never as a
+    /// trend (#193). Disk is the same shape of problem with a slower fuse.
+    pub disk_days_remaining: Option<u64>,
+    /// Bytes the database holds per block of chain, measured rather than estimated. Roughly half
+    /// of it is fixed cost that no amount of quiet traffic reduces — one ML-DSA public key and
+    /// signature per validator in every block's commit certificate.
+    pub chain_db_bytes_per_block: Option<u64>,
     /// This process's resident memory, and the machine's total, in KB. Zero where unreadable.
     /// Present because an out-of-memory kill leaves nothing in the node's own log and has cost
     /// this network a validator before.

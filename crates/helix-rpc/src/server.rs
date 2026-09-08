@@ -81,6 +81,9 @@ pub struct AppState {
     /// Rounds lost despite enough voting power being heard (#192), published by the production
     /// loop so this route never has to ask consensus.
     pub rounds_lost_with_quorum_power: Arc<std::sync::atomic::AtomicU64>,
+    /// Target milliseconds between blocks, from the node. Only used to turn "bytes per block" into
+    /// "days of disk left"; nothing here depends on it being exact.
+    pub block_time_ms: u64,
     /// Path of the chain database, used only to measure it and the volume it sits on.
     ///
     /// **Never serialised.** `GET /diagnostics` reports the size and the free space, not where
@@ -1382,6 +1385,37 @@ async fn get_mempool_info(State(state): State<AppState>) -> Json<Value> {
 /// See [`crate::NodeDiagnostics`] for why this enumerates fields instead of streaming log output.
 /// Everything here is either already public on the chain or describes this node in ways that do
 /// not help anyone reach it: no peer addresses, no filesystem paths, no identifiers.
+/// Bytes of database per block of chain. `None` while there is no chain to divide by, which is
+/// not the same as zero — a fresh node has no measurement, not a free one.
+fn chain_db_bytes_per_block(chain_db_kb: u64, height: u64) -> Option<u64> {
+    if height == 0 || chain_db_kb == 0 {
+        return None;
+    }
+    Some(chain_db_kb.saturating_mul(1024) / height)
+}
+
+/// Days of disk left at the rate this chain is growing.
+///
+/// Deliberately built from the node's *own* measured bytes-per-block rather than an estimate: the
+/// figure that matters is what this chain, with this validator set and this traffic, actually
+/// writes. On 2026-09-08 that was 79.5 KB per block against a 3.3 GB day — and roughly half of it
+/// was the commit certificate, which grows with the validator count and not with usage.
+///
+/// `None` when anything it needs is missing. An extrapolation that quietly reports a number it
+/// cannot support is worse than no number, because it will be believed.
+fn disk_runway_days(bytes_per_block: Option<u64>, disk_free_kb: u64, block_time_ms: u64) -> Option<u64> {
+    let per_block = bytes_per_block?;
+    if per_block == 0 || disk_free_kb == 0 || block_time_ms == 0 {
+        return None;
+    }
+    let blocks_per_day = 86_400_000u64 / block_time_ms;
+    let per_day = per_block.saturating_mul(blocks_per_day);
+    if per_day == 0 {
+        return None;
+    }
+    Some(disk_free_kb.saturating_mul(1024) / per_day)
+}
+
 async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
     use std::sync::atomic::Ordering;
 
@@ -1399,6 +1433,9 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
     let last_height = state.last_cosigned.load(Ordering::Relaxed);
     let last_at = state.last_cosigned_at_unix.load(Ordering::Relaxed);
     let (disk_free_kb, disk_total_kb) = disk_stats(state.data_path.as_deref());
+    let db_kb = chain_db_kb(state.data_path.as_deref());
+    let bytes_per_block = chain_db_bytes_per_block(db_kb, height);
+    let days_left = disk_runway_days(bytes_per_block, disk_free_kb, state.block_time_ms);
 
     Json(crate::NodeDiagnostics {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1418,7 +1455,9 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
         rss_kb: read_kb_field("/proc/self/status", "VmRSS:"),
         machine_total_kb: read_kb_field("/proc/meminfo", "MemTotal:"),
         mem_available_kb: read_kb_field("/proc/meminfo", "MemAvailable:"),
-        chain_db_kb: chain_db_kb(state.data_path.as_deref()),
+        chain_db_kb: db_kb,
+        chain_db_bytes_per_block: bytes_per_block,
+        disk_days_remaining: days_left,
         disk_free_kb,
         disk_total_kb,
         load_avg_1: read_load_avg_1(),
@@ -1781,6 +1820,7 @@ mod tests {
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rounds_lost_with_quorum_power: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            block_time_ms: 2_000,
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             previous_run: None,
@@ -2457,6 +2497,37 @@ mod tests {
         );
     }
 
+    /// The runway has to be `null` when it cannot be computed, never a comforting number.
+    ///
+    /// Both halves of this were already served here — `chain_db_kb` and `disk_free_kb` — and
+    /// nobody ever divided them. That is exactly how this node's memory grew from 374 MB to
+    /// 3.2 GB over four days in plain sight (#193): a value read only as a snapshot cannot show a
+    /// trend, and disk is the same shape of problem with a slower fuse.
+    #[test]
+    fn the_disk_runway_is_measured_or_absent_but_never_guessed() {
+        assert_eq!(chain_db_bytes_per_block(0, 100), None, "no database is not zero bytes a block");
+        assert_eq!(chain_db_bytes_per_block(1024, 0), None, "no chain is nothing to divide by");
+        assert_eq!(chain_db_bytes_per_block(1024, 8), Some(131_072));
+
+        // 80 KB a block at a 2s block time is 3.4 GB a day; 269 GB of free space is about 78 days.
+        let per_block = Some(80 * 1024);
+        let free_kb = 269 * 1024 * 1024;
+        let days = disk_runway_days(per_block, free_kb, 2_000).expect("computable");
+        assert!(
+            (70..=90).contains(&days),
+            "the live chain's own numbers on 2026-09-08 give roughly 80 days, got {days}"
+        );
+
+        // Halving the block time doubles the bytes per day and halves the runway. Asserted because
+        // getting this backwards would report the reassuring direction.
+        let faster = disk_runway_days(per_block, free_kb, 1_000).expect("computable");
+        assert!(faster < days, "faster blocks fill a disk sooner: {faster} against {days}");
+
+        assert_eq!(disk_runway_days(None, free_kb, 2_000), None);
+        assert_eq!(disk_runway_days(per_block, 0, 2_000), None, "an unreadable volume is unknown");
+        assert_eq!(disk_runway_days(per_block, free_kb, 0), None);
+    }
+
     /// A node that has never co-signed must say so, rather than claiming height 0 — which reads
     /// as "co-signed the genesis block" and is the sort of small lie that costs an hour later.
     #[tokio::test]
@@ -2498,6 +2569,7 @@ mod tests {
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rounds_lost_with_quorum_power: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            block_time_ms: 2_000,
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             previous_run: None,

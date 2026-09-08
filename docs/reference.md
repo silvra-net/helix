@@ -117,6 +117,8 @@ deliberately **not** the node's log — see the note below on why.
   "validators_not_heard_from": 1,
   "peer_tip_height": 36378,
   "rounds_lost_with_quorum_power": 0,
+  "chain_db_bytes_per_block": 81426,
+  "disk_days_remaining": 82,
   "last_cosigned_height": 36376,
   "last_cosigned_secs_ago": 5982,
   "rss_kb": 344328,
@@ -157,6 +159,14 @@ What each field is for:
   network-timing problem, not an availability one, and no amount of restarting the absent validator
   fixes it. Measured on the live chain on 2026-09-04: one such round with 2e12 of power heard
   against a quorum of 1.667e12.
+- **`chain_db_bytes_per_block` / `disk_days_remaining`** — what this chain actually costs to store,
+  and how long the volume lasts at that rate. Measured from the node's own database rather than
+  estimated, because the figure that matters is what *this* validator set writes: roughly half of
+  every block is its commit certificate, one ML-DSA public key and signature per validator, and
+  that half does not shrink when traffic does. On the live chain on 2026-09-08: 79.5 KB per block,
+  3.3 GB a day, about 80 days of headroom. The days figure is an extrapolation at the configured
+  block time, and `null` whenever anything it needs is missing — a runway that reports a number it
+  cannot support would be believed.
 - **`rss_kb` / `machine_total_kb`** — an out-of-memory kill leaves nothing in the node's own log,
   because the kernel decides and the process never runs again. These two numbers are how that
   becomes visible instead of mysterious.
