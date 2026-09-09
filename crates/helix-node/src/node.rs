@@ -481,6 +481,10 @@ pub struct HelixNode {
     /// [`P2PService`], which reads it on every announcement; written here at startup, after the
     /// initial sync, and by `publish_tip_certificate` at every commit.
     announced_tip_height: Arc<std::sync::atomic::AtomicU64>,
+    /// The lowest block this node still holds, announced on the same gossip (#194). Shared with
+    /// [`P2PService`]; kept fresh by the same 5-second loop that publishes the tip, so there is
+    /// one reader of this fact rather than two that can disagree.
+    announced_earliest_block: Arc<std::sync::atomic::AtomicU64>,
     /// Highest tip any connected peer claims, published by [`P2PService`] (backlog #154).
     ///
     /// Untrusted, and used only in the safe direction: to decide that a node held back after a
@@ -884,6 +888,10 @@ impl HelixNode {
             tip_certificate: shared_tip_certificate.clone(),
         });
         let highest_peer_tip = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // This node's own prune horizon, announced in peer exchange so peers do not ask it for
+        // history it dropped (#194). 0 until the announce loop reads it, which is what an
+        // archiving node reports anyway — so the startup value is not a claim to retract.
+        let announced_earliest_block = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (p2p_service, p2p_command_tx, p2p_event_rx) = P2PService::new(
             p2p_config,
             announced_tip_height.clone(),
@@ -902,6 +910,7 @@ impl HelixNode {
         let p2p_service = p2p_service
             .announcing_genesis(our_genesis_hash)
             .with_peer_tip_reporting(highest_peer_tip.clone())
+            .with_prune_horizon(announced_earliest_block.clone())
             // Every node serves its own genesis, so joining never depends on one particular
             // machine being up — the point of #139.
             .with_genesis_provider(Arc::new(StoreGenesisProvider {
@@ -940,6 +949,7 @@ impl HelixNode {
             syncing: Arc::new(std::sync::atomic::AtomicBool::new(has_sync_peer)),
             sync_target_height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             announced_tip_height,
+            announced_earliest_block,
             highest_peer_tip,
             tip_certificate: shared_tip_certificate,
             signing_state_path,
@@ -1113,14 +1123,23 @@ impl HelixNode {
         tokio::spawn({
             let store = self.store.clone();
             let announced_tip_height = self.announced_tip_height.clone();
+            let announced_earliest_block = self.announced_earliest_block.clone();
             let highest_peer_tip = self.highest_peer_tip.clone();
             let syncing = self.syncing.clone();
             async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     tick.tick().await;
-                    let tip = store.read().await.latest_height();
+                    let (tip, earliest) = {
+                        let db = store.read().await;
+                        (db.latest_height(), db.earliest_block_height().unwrap_or(0))
+                    };
                     announced_tip_height.store(tip, std::sync::atomic::Ordering::Relaxed);
+                    // Read here rather than published by the pruner, so there is one reader of
+                    // this fact and not two that can disagree (lesson 12) — and so a node that
+                    // pruned in a previous run announces its horizon from the first tick, before
+                    // any pruning has happened in this one.
+                    announced_earliest_block.store(earliest, std::sync::atomic::Ordering::Relaxed);
 
                     // Second release path for production held after a failed startup sync
                     // (backlog #154). #152 releases via the RPC catch-up, which ties resuming to

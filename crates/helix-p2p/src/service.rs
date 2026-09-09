@@ -213,6 +213,14 @@ pub struct P2PService {
     /// its own liveness and nothing else, and only while the RPC catch-up (the other, independent
     /// release path) also stays unavailable.
     highest_peer_tip: Option<Arc<AtomicU64>>,
+    /// Lowest block this node still holds, announced in peer exchange so peers do not ask it for
+    /// history it pruned away (#194).
+    ///
+    /// A shared counter for the same reason `tip_height` is one: the horizon moves while the
+    /// service runs, and a value cached at startup would be a claim that ages into a lie. `None`
+    /// — every node that does not prune, and every test in this crate — announces 0, which reads
+    /// as "everything since genesis" and is exactly true for them.
+    earliest_block: Option<Arc<AtomicU64>>,
 }
 
 impl P2PService {
@@ -234,6 +242,7 @@ impl P2PService {
                 genesis_provider: None,
                 round_provider: None,
                 highest_peer_tip: None,
+                earliest_block: None,
             },
             command_tx,
             event_rx,
@@ -244,6 +253,13 @@ impl P2PService {
     ///
     /// Opt-in rather than a constructor argument so the many call sites that do not care — every
     /// test in this crate among them — stay as they are.
+    /// Announce a prune horizon in peer exchange. Without this the service announces 0, which is
+    /// what an archiving node holds and is therefore not a claim it has to retract.
+    pub fn with_prune_horizon(mut self, slot: Arc<AtomicU64>) -> Self {
+        self.earliest_block = Some(slot);
+        self
+    }
+
     pub fn with_peer_tip_reporting(mut self, slot: Arc<AtomicU64>) -> Self {
         self.highest_peer_tip = Some(slot);
         self
@@ -284,6 +300,7 @@ impl P2PService {
         let mut command_rx = self.command_rx;
         let config = self.config;
         let tip_height = self.tip_height;
+        let earliest_block = self.earliest_block;
         let block_provider = self.block_provider;
         let genesis_provider = self.genesis_provider;
         let round_provider = self.round_provider;
@@ -385,7 +402,7 @@ impl P2PService {
         let mut peer_warnings = PeerWarnings::default();
         // Tip each peer last announced, so the block-sync driver below knows who to ask (#138).
         // Bounded by the connection limit and pruned on disconnect, so it cannot grow unbounded.
-        let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
+        let mut peer_tips: HashMap<PeerId, PeerRange> = HashMap::new();
         // Unreadable peer-exchange messages per peer (backlog #166). Lives beside `peer_tips`
         // because it is the same kind of thing: per-peer state the loop owns and the pure helpers
         // must not.
@@ -500,7 +517,7 @@ impl P2PService {
                                     tip_height.load(Ordering::Relaxed),
                                     &our_genesis,
                                 );
-                                if let Some(tip) = outcome.announced_tip {
+                                if let Some(range) = outcome.announced_range {
                                     // Credit the tip to whoever *wrote* the announcement, not to
                                     // whoever handed it to us. gossipsub floods, so
                                     // `propagation_source` is merely the last hop, and
@@ -525,7 +542,8 @@ impl P2PService {
                                         &mut peer_tips,
                                         &foreign_by_evidence,
                                         origin,
-                                        tip,
+                                        range.tip,
+                                        range.earliest,
                                         TipSource::PeerExchange,
                                     ) {
                                         publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
@@ -574,6 +592,9 @@ impl P2PService {
                                         &foreign_by_evidence,
                                         origin,
                                         height,
+                                        // A block says nothing about where its sender's history
+                                        // begins; `record_peer_tip` ignores this for gossip.
+                                        0,
                                         TipSource::GossipedBlock,
                                     ) {
                                         publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
@@ -849,6 +870,10 @@ impl P2PService {
                                 &known_addrs,
                                 tip_height.load(Ordering::Relaxed),
                                 &our_genesis,
+                                earliest_block
+                                    .as_ref()
+                                    .map(|e| e.load(Ordering::Relaxed))
+                                    .unwrap_or(0),
                             );
 
                             let _ = event_tx.send(P2PEvent::PeerConnected(peer_str)).await;
@@ -921,7 +946,7 @@ impl P2PService {
                         let best_claimed = peer_tips
                             .iter()
                             .filter(|(peer, _)| swarm.is_connected(peer))
-                            .map(|(_, tip)| *tip)
+                            .map(|(_, range)| range.tip)
                             .max();
                         if let Some(stall) = blocksync_stall_report(
                             our_tip,
@@ -953,6 +978,10 @@ impl P2PService {
                         &known_addrs,
                         tip_height.load(Ordering::Relaxed),
                         &our_genesis,
+                        earliest_block
+                            .as_ref()
+                            .map(|e| e.load(Ordering::Relaxed))
+                            .unwrap_or(0),
                     );
 
                     // Redial the seeds while this node has no connection at all.
@@ -1242,6 +1271,13 @@ struct PeerExchangeMsg {
     /// Empty from a node that has no genesis yet, which is not a lie worth acting on.
     #[serde(default)]
     genesis_hash: String,
+    /// The lowest block the sender still holds (#194). **0 means "everything since genesis"** —
+    /// what an archiving node reports, and what a build older than this field reports, since the
+    /// fallback decode below fills it in. Conflating those two is safe in the only direction that
+    /// matters: a peer wrongly believed to hold old blocks costs one empty answer and a cooldown,
+    /// the path that already exists.
+    #[serde(default)]
+    earliest_block: u64,
 }
 
 /// Whether a peer announcing `peer_tip` should be served the blocks it is missing, given our own
@@ -1359,9 +1395,10 @@ fn foreign_chain_warning(theirs: &str, ours: &str, warned: &mut HashSet<String>)
 struct PeerExchangeOutcome {
     /// The message was malformed — the sender should be charged a misbehavior strike.
     malformed: bool,
-    /// The tip the sender claims, whenever the message parsed at all. Recorded per peer so the
-    /// block-sync driver knows who is worth asking for blocks (#138).
-    announced_tip: Option<u64>,
+    /// The range of chain the sender claims, whenever the message parsed at all. Recorded per
+    /// peer so the block-sync driver knows who is worth asking for blocks (#138) — and, since
+    /// nodes may prune (#194), whether they can serve the part we actually need.
+    announced_range: Option<PeerRange>,
     /// The sender's announced tip, when it is behind us by a servable margin (#137). The caller
     /// turns this into a [`P2PEvent::PeerBehind`]; `None` means nothing to serve.
     serve_from_tip: Option<u64>,
@@ -1394,6 +1431,16 @@ struct PeerExchangeMsgV1 {
     tip_height: u64,
 }
 
+/// The shape before `earliest_block` (#194) — everything through the 0.14.x line.
+#[derive(Debug, Serialize, Deserialize)]
+struct PeerExchangeMsgV2 {
+    peers: Vec<String>,
+    version: String,
+    tip_height: u64,
+    #[serde(default)]
+    genesis_hash: String,
+}
+
 /// Decode a peer-exchange message, accepting the previous release's shape as well.
 ///
 /// The fallback is not leniency about malformed input — it is the difference between "older build"
@@ -1403,8 +1450,21 @@ struct PeerExchangeMsgV1 {
 /// three minutes and stalled a two-validator chain — while every test passed, because no test runs
 /// two different builds against each other.
 fn decode_peer_exchange(data: &[u8]) -> Option<PeerExchangeMsg> {
+    // Newest first, and that order is load-bearing: bincode ignores trailing bytes, so a *new*
+    // message also decodes cleanly as the older shapes — reading it as one would silently drop the
+    // field. The reverse does not happen; an older message is short and fails outright.
     if let Ok(msg) = bincode::deserialize::<PeerExchangeMsg>(data) {
         return Some(msg);
+    }
+    if let Ok(v2) = bincode::deserialize::<PeerExchangeMsgV2>(data) {
+        return Some(PeerExchangeMsg {
+            peers: v2.peers,
+            version: v2.version,
+            tip_height: v2.tip_height,
+            genesis_hash: v2.genesis_hash,
+            // A build that predates pruning keeps everything, so this is not a guess.
+            earliest_block: 0,
+        });
     }
     match bincode::deserialize::<PeerExchangeMsgV1>(data) {
         Ok(old) => Some(PeerExchangeMsg {
@@ -1414,6 +1474,7 @@ fn decode_peer_exchange(data: &[u8]) -> Option<PeerExchangeMsg> {
             // Not "no genesis" but "did not say" — `foreign_chain_warning` treats the two the same
             // and stays quiet, which is right: an older peer's chain is not knowable from here.
             genesis_hash: String::new(),
+            earliest_block: 0,
         }),
         Err(_) => None,
     }
@@ -1473,7 +1534,7 @@ fn handle_peer_exchange_message(
         None => {
             return PeerExchangeOutcome {
                 malformed: true,
-                announced_tip: None,
+                announced_range: None,
                 serve_from_tip: None,
             };
         }
@@ -1522,7 +1583,7 @@ fn tip_outcome(msg: &PeerExchangeMsg, our_tip: u64, our_genesis: &str) -> PeerEx
     if peer_chain(&msg.genesis_hash, our_genesis) == PeerChain::Foreign {
         return PeerExchangeOutcome {
             malformed: false,
-            announced_tip: None,
+            announced_range: None,
             serve_from_tip: None,
         };
     }
@@ -1541,7 +1602,10 @@ fn tip_outcome(msg: &PeerExchangeMsg, our_tip: u64, our_genesis: &str) -> PeerEx
 
     PeerExchangeOutcome {
         malformed: false,
-        announced_tip: Some(msg.tip_height),
+        announced_range: Some(PeerRange {
+            tip: msg.tip_height,
+            earliest: msg.earliest_block,
+        }),
         serve_from_tip: should_serve_catchup(msg.tip_height, our_tip).then_some(msg.tip_height),
     }
 }
@@ -1687,9 +1751,9 @@ impl FlapTracker {
 /// Publishes the highest tip any peer currently claims (backlog #154). Called wherever `peer_tips`
 /// changes, so a peer that leaves cannot leave its claim standing behind it — a stale high claim
 /// would hold a caught-up node out of block production indefinitely.
-fn publish_highest_peer_tip(slot: &Option<Arc<AtomicU64>>, peer_tips: &HashMap<PeerId, u64>) {
+fn publish_highest_peer_tip(slot: &Option<Arc<AtomicU64>>, peer_tips: &HashMap<PeerId, PeerRange>) {
     if let Some(slot) = slot {
-        slot.store(peer_tips.values().copied().max().unwrap_or(0), Ordering::Relaxed);
+        slot.store(peer_tips.values().map(|r| r.tip).max().unwrap_or(0), Ordering::Relaxed);
     }
 }
 
@@ -1749,11 +1813,41 @@ enum TipSource {
 /// gossiped proposal puts it right back. 49 proposal→request pairs in a single log, every gap
 /// exactly 1.0s. The evidence set held perfectly the whole time; it was simply asked at one of the
 /// two doors.
+/// What one peer claims about the range of chain it holds.
+///
+/// Two numbers rather than one because a node may now prune (#194): "I am at height N" stopped
+/// implying "I can serve you anything up to N". Without the second number a pruning peer wins
+/// every `best_blocksync_peer` choice — it is active, so its tip is high — answers empty, earns a
+/// cooldown, and is picked again ten seconds later. That is the #140 loop with a new cause.
+/// A peer that holds everything up to `tip` — what every test that is not about pruning wants.
+#[cfg(test)]
+fn at(tip: u64) -> PeerRange {
+    PeerRange { tip, earliest: 0 }
+}
+
+/// A peer that pruned: it holds `earliest..=tip` and nothing below.
+#[cfg(test)]
+fn holding(earliest: u64, tip: u64) -> PeerRange {
+    PeerRange { tip, earliest }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerRange {
+    /// Highest block this peer claims to hold.
+    tip: u64,
+    /// Lowest block it still holds. **0 means "ask me for anything"** — it is what an archiving
+    /// node reports and what a build older than this field reports, and conflating the two is
+    /// safe in the only direction that matters: being wrong here costs one empty answer and a
+    /// cooldown, which is the path that already exists for peers that cannot serve.
+    earliest: u64,
+}
+
 fn record_peer_tip(
-    peer_tips: &mut HashMap<PeerId, u64>,
+    peer_tips: &mut HashMap<PeerId, PeerRange>,
     foreign_by_evidence: &HashSet<PeerId>,
     origin: PeerId,
     height: u64,
+    earliest: u64,
     source: TipSource,
 ) -> bool {
     // A peer that has already served a batch off another history gets no say in what we sync,
@@ -1763,12 +1857,16 @@ fn record_peer_tip(
     }
     match source {
         TipSource::PeerExchange => {
-            peer_tips.insert(origin, height);
+            peer_tips.insert(origin, PeerRange { tip: height, earliest });
         }
         TipSource::GossipedBlock => {
-            let entry = peer_tips.entry(origin).or_insert(height);
-            if *entry < height {
-                *entry = height;
+            // A gossiped block says where this peer's chain *ends*, and nothing whatever about
+            // where it begins — so the horizon is left at whatever peer exchange last said, and
+            // set to 0 ("ask me for anything") only when this is the first we hear of the peer.
+            // Letting a block move it would let a proposal quietly widen a pruning node's claim.
+            let entry = peer_tips.entry(origin).or_insert(PeerRange { tip: height, earliest: 0 });
+            if entry.tip < height {
+                entry.tip = height;
             }
         }
     }
@@ -1776,18 +1874,24 @@ fn record_peer_tip(
 }
 
 fn best_blocksync_peer<F: Fn(&PeerId) -> bool>(
-    peer_tips: &HashMap<PeerId, u64>,
+    peer_tips: &HashMap<PeerId, PeerRange>,
     our_tip: u64,
     cooldown: &HashMap<PeerId, u32>,
     is_connected: F,
 ) -> Option<(PeerId, u64)> {
+    // The next block we need is `our_tip + 1`; a peer whose history starts above it cannot serve
+    // us however high its tip is (#194).
+    let need = our_tip.saturating_add(1);
     peer_tips
         .iter()
-        .filter(|(peer, &tip)| {
-            tip > our_tip && !cooldown.contains_key(*peer) && is_connected(peer)
+        .filter(|(peer, range)| {
+            range.tip > our_tip
+                && range.earliest <= need
+                && !cooldown.contains_key(*peer)
+                && is_connected(peer)
         })
-        .max_by_key(|(_, &tip)| tip)
-        .map(|(peer, &tip)| (*peer, tip))
+        .max_by_key(|(_, range)| range.tip)
+        .map(|(peer, range)| (*peer, range.tip))
 }
 
 /// Send one block-sync request if we are behind and a usable peer is available. Returns whether
@@ -1807,7 +1911,7 @@ fn best_blocksync_peer<F: Fn(&PeerId) -> bool>(
 /// learned from a gossiped block while nothing was in flight.
 fn request_blocks_if_behind(
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
-    peer_tips: &HashMap<PeerId, u64>,
+    peer_tips: &HashMap<PeerId, PeerRange>,
     cooldown: &HashMap<PeerId, u32>,
     our_tip: u64,
     in_flight: &mut bool,
@@ -1878,12 +1982,14 @@ fn broadcast_known_addrs(
     known_addrs: &HashSet<String>,
     tip_height: u64,
     genesis_hash: &str,
+    earliest_block: u64,
 ) {
     let msg = PeerExchangeMsg {
         peers: known_addrs.iter().cloned().collect(),
         version: OUR_VERSION.to_string(),
         tip_height,
         genesis_hash: genesis_hash.to_string(),
+        earliest_block,
     };
     if let Ok(data) = bincode::serialize(&msg) {
         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
@@ -1988,7 +2094,7 @@ async fn handle_app_message(
 
 #[cfg(test)]
 mod highest_peer_tip_tests {
-    use super::publish_highest_peer_tip;
+    use super::{at, publish_highest_peer_tip};
     use libp2p::PeerId;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1998,9 +2104,9 @@ mod highest_peer_tip_tests {
     fn the_highest_claim_wins() {
         let slot = Arc::new(AtomicU64::new(0));
         let mut tips = HashMap::new();
-        tips.insert(PeerId::random(), 10u64);
-        tips.insert(PeerId::random(), 900);
-        tips.insert(PeerId::random(), 42);
+        tips.insert(PeerId::random(), at(10));
+        tips.insert(PeerId::random(), at(900));
+        tips.insert(PeerId::random(), at(42));
 
         publish_highest_peer_tip(&Some(slot.clone()), &tips);
 
@@ -2016,8 +2122,8 @@ mod highest_peer_tip_tests {
         let staying = PeerId::random();
         let leaving = PeerId::random();
         let mut tips = HashMap::new();
-        tips.insert(staying, 100u64);
-        tips.insert(leaving, 5_000);
+        tips.insert(staying, at(100));
+        tips.insert(leaving, at(5_000));
 
         publish_highest_peer_tip(&Some(slot.clone()), &tips);
         assert_eq!(slot.load(Ordering::Relaxed), 5_000);
@@ -2040,7 +2146,7 @@ mod highest_peer_tip_tests {
     #[test]
     fn reporting_is_optional() {
         let mut tips = HashMap::new();
-        tips.insert(PeerId::random(), 1u64);
+        tips.insert(PeerId::random(), at(1));
         publish_highest_peer_tip(&None, &tips);
     }
 }
@@ -2205,12 +2311,60 @@ mod multiaddr_ip_tests {
 #[cfg(test)]
 mod peer_exchange_tests {
     use super::{
-        decode_peer_exchange, foreign_chain_warning, foreign_version_warning, peer_chain,
-        select_new_addrs, should_serve_catchup, tip_outcome, unreadable_peer_exchange, PeerChain,
-        PeerExchangeMsg, PeerExchangeMsgV1, MAX_CATCHUP_SERVE_BLOCKS, MAX_KNOWN_PEER_ADDRS,
-        OUR_VERSION, UNREADABLE_PEER_EXCHANGE_TOLERANCE,
+        at, decode_peer_exchange, foreign_chain_warning, foreign_version_warning, holding,
+        peer_chain, select_new_addrs, should_serve_catchup, tip_outcome, unreadable_peer_exchange,
+        PeerChain, PeerExchangeMsg, PeerExchangeMsgV1, PeerExchangeMsgV2, MAX_CATCHUP_SERVE_BLOCKS,
+        MAX_KNOWN_PEER_ADDRS, OUR_VERSION, UNREADABLE_PEER_EXCHANGE_TOLERANCE,
     };
     use std::collections::HashSet;
+
+    /// A peer on the release before pruning stays readable, and reads as an archive (#194).
+    ///
+    /// bincode is not self-describing, so `#[serde(default)]` cannot rescue a short payload — the
+    /// older message has to be decoded as the older struct. Getting this wrong is expensive: an
+    /// unreadable peer-exchange message charges a misbehavior strike, the message repeats every
+    /// 30 seconds, and five strikes ban the peer. Adding one field without this would ban a
+    /// healthy co-signing validator inside three minutes (#166).
+    #[test]
+    fn a_peer_from_before_pruning_is_understood_and_read_as_an_archive() {
+        let old = PeerExchangeMsgV2 {
+            peers: vec!["/ip4/10.0.0.1/tcp/8546".to_string()],
+            version: "0.14.2".to_string(),
+            tip_height: 166_000,
+            genesis_hash: "abc123".to_string(),
+        };
+        let bytes = bincode::serialize(&old).unwrap();
+
+        let decoded = decode_peer_exchange(&bytes).expect("the previous shape must stay readable");
+        assert_eq!(decoded.tip_height, 166_000);
+        assert_eq!(decoded.genesis_hash, "abc123", "and it must not lose the field it did carry");
+        assert_eq!(
+            decoded.earliest_block, 0,
+            "a build that predates pruning keeps everything — that is knowledge, not a guess",
+        );
+    }
+
+    /// The decode order is load-bearing. bincode ignores trailing bytes, so a *new* message also
+    /// decodes cleanly as the older shape — trying the older one first would silently drop the
+    /// horizon on every message and leave pruning peers looking like archives forever.
+    #[test]
+    fn a_current_message_is_not_silently_read_as_the_older_shape() {
+        let current = PeerExchangeMsg {
+            peers: vec![],
+            version: OUR_VERSION.to_string(),
+            tip_height: 166_000,
+            genesis_hash: "abc123".to_string(),
+            earliest_block: 150_000,
+        };
+        let bytes = bincode::serialize(&current).unwrap();
+
+        assert!(
+            bincode::deserialize::<PeerExchangeMsgV2>(&bytes).is_ok(),
+            "premise: the older struct accepts these bytes, which is why order matters",
+        );
+        let decoded = decode_peer_exchange(&bytes).expect("must decode");
+        assert_eq!(decoded.earliest_block, 150_000, "the horizon must survive the round trip");
+    }
 
     /// The production incident in one assertion (#137): a validator one block behind the rest of
     /// the set. Before this mechanism existed there was no way for it to ever obtain that block,
@@ -2378,9 +2532,9 @@ mod peer_exchange_tests {
     #[test]
     fn a_peer_on_cooldown_is_skipped_for_the_next_best_one() {
         let mut tips = std::collections::HashMap::new();
-        tips.insert(peer(1), 130); // the one that keeps failing us
-        tips.insert(peer(2), 129); // healthy, one block lower, previously never asked
-        tips.insert(peer(3), 90); // behind us — still must not be picked
+        tips.insert(peer(1), at(130)); // the one that keeps failing us
+        tips.insert(peer(2), at(129)); // healthy, one block lower, previously never asked
+        tips.insert(peer(3), at(90)); // behind us — still must not be picked
 
         let (chosen, _) = super::best_blocksync_peer(&tips, 100, &no_cooldown(), |_| true).unwrap();
         assert_eq!(chosen, peer(1), "precondition: the highest tip wins when nobody is penalised");
@@ -2398,8 +2552,8 @@ mod peer_exchange_tests {
     #[test]
     fn when_everyone_ahead_is_cooling_down_we_ask_nobody_this_tick() {
         let mut tips = std::collections::HashMap::new();
-        tips.insert(peer(1), 130);
-        tips.insert(peer(2), 129);
+        tips.insert(peer(1), at(130));
+        tips.insert(peer(2), at(129));
         let cooling: std::collections::HashMap<_, _> =
             [(peer(1), 5), (peer(2), 1)].into_iter().collect();
 
@@ -2416,17 +2570,17 @@ mod peer_exchange_tests {
     #[test]
     fn no_peer_ahead_means_no_request() {
         let mut tips = std::collections::HashMap::new();
-        tips.insert(peer(1), 100);
-        tips.insert(peer(2), 99);
+        tips.insert(peer(1), at(100));
+        tips.insert(peer(2), at(99));
         assert!(super::best_blocksync_peer(&tips, 100, &no_cooldown(), |_| true).is_none());
     }
 
     #[test]
     fn the_peer_with_the_highest_tip_is_chosen() {
         let mut tips = std::collections::HashMap::new();
-        tips.insert(peer(1), 105);
-        tips.insert(peer(2), 130);
-        tips.insert(peer(3), 90); // behind us — must not be picked
+        tips.insert(peer(1), at(105));
+        tips.insert(peer(2), at(130));
+        tips.insert(peer(3), at(90)); // behind us — must not be picked
         let (chosen, tip) = super::best_blocksync_peer(&tips, 100, &no_cooldown(), |_| true).unwrap();
         assert_eq!(chosen, peer(2));
         assert_eq!(tip, 130);
@@ -2533,6 +2687,7 @@ mod peer_exchange_tests {
             version: OUR_VERSION.to_string(),
             tip_height,
             genesis_hash: genesis_hash.to_string(),
+            earliest_block: 0,
         }
     }
 
@@ -2556,14 +2711,14 @@ mod peer_exchange_tests {
         let ours = "6860abda";
         let foreign = msg_announcing(36378, "ff271e4a");
         let outcome = tip_outcome(&foreign, 70, ours);
-        assert_eq!(outcome.announced_tip, None, "a foreign tip must not drive our sync");
+        assert_eq!(outcome.announced_range, None, "a foreign tip must not drive our sync");
         assert_eq!(outcome.serve_from_tip, None, "nor make us serve blocks it cannot use");
         assert!(!outcome.malformed, "it is a well-formed message from a peer on another chain");
 
         // Positive control: the identical message from a peer on our chain still counts. Without
         // this, the test above would pass just as well if tips had stopped working altogether.
         let outcome = tip_outcome(&msg_announcing(36378, ours), 70, ours);
-        assert_eq!(outcome.announced_tip, Some(36378));
+        assert_eq!(outcome.announced_range.map(|r| r.tip), Some(36378));
     }
 
     /// A peer that did not announce a genesis must still be listened to — the case that makes the
@@ -2571,7 +2726,7 @@ mod peer_exchange_tests {
     #[test]
     fn a_peer_that_announced_no_genesis_is_still_worth_asking_for_blocks() {
         let outcome = tip_outcome(&msg_announcing(500, ""), 70, "6860abda");
-        assert_eq!(outcome.announced_tip, Some(500));
+        assert_eq!(outcome.announced_range.map(|r| r.tip), Some(500));
     }
 
     /// Backlog #166: the first unreadable message explains itself, and does not cost a strike.
@@ -2639,6 +2794,7 @@ mod peer_exchange_tests {
             version: OUR_VERSION.to_string(),
             tip_height: 1,
             genesis_hash: "ff271e4a".to_string(),
+            earliest_block: 0,
         };
         let bytes = bincode::serialize(&msg).expect("serializes");
         assert_eq!(decode_peer_exchange(&bytes).unwrap().genesis_hash, "ff271e4a");
@@ -2863,7 +3019,7 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
 
 #[cfg(test)]
 mod blocksync_selection_tests {
-    use super::{best_blocksync_peer, BLOCKSYNC_PEER_COOLDOWN_TICKS};
+    use super::{at, best_blocksync_peer, holding, BLOCKSYNC_PEER_COOLDOWN_TICKS};
     use libp2p::PeerId;
     use std::collections::HashMap;
 
@@ -2887,8 +3043,8 @@ mod blocksync_selection_tests {
         let zombie = PeerId::random();
         let real = PeerId::random();
         let mut tips = HashMap::new();
-        tips.insert(zombie, 477_478);
-        tips.insert(real, 41_700);
+        tips.insert(zombie, at(477_478));
+        tips.insert(real, at(41_700));
 
         let chosen = best_blocksync_peer(&tips, 41_644, &no_cooldown(), |_| true);
         assert_eq!(
@@ -2913,8 +3069,8 @@ mod blocksync_selection_tests {
         let zombie = PeerId::random();
         let real = PeerId::random();
         let mut tips = HashMap::new();
-        tips.insert(zombie, 477_478);
-        tips.insert(real, 41_700);
+        tips.insert(zombie, at(477_478));
+        tips.insert(real, at(41_700));
 
         let mut cooling = HashMap::new();
         cooling.insert(zombie, BLOCKSYNC_PEER_COOLDOWN_TICKS);
@@ -2941,8 +3097,8 @@ mod blocksync_selection_tests {
         let unreachable = PeerId::random();
         let connected = PeerId::random();
         let mut tips = HashMap::new();
-        tips.insert(unreachable, 900);
-        tips.insert(connected, 400);
+        tips.insert(unreachable, at(900));
+        tips.insert(connected, at(400));
 
         let (chosen, tip) =
             best_blocksync_peer(&tips, 100, &no_cooldown(), |p| *p == connected).unwrap();
@@ -2951,13 +3107,58 @@ mod blocksync_selection_tests {
         assert_eq!(tip, 400);
     }
 
+    /// A pruning peer must not win a choice it cannot serve (#194).
+    ///
+    /// This is the #140 loop with a new cause, and a worse one: a pruning node is *active*, so its
+    /// tip is high and it wins on merit every time. It then answers empty, earns a ten-second
+    /// cooldown, and is picked again the moment that expires — while the archive node one block
+    /// lower is never asked. A node syncing from genesis would never finish.
+    #[test]
+    fn a_pruning_peer_is_not_asked_for_history_it_dropped() {
+        let pruner = PeerId::random();
+        let archive = PeerId::random();
+        let mut tips = HashMap::new();
+        tips.insert(pruner, holding(150_000, 166_000));
+        tips.insert(archive, at(165_900));
+
+        let (chosen, _) = best_blocksync_peer(&tips, 5_000, &no_cooldown(), |_| true).unwrap();
+        assert_eq!(
+            chosen, archive,
+            "the higher tip is useless when the peer dropped the blocks we need next"
+        );
+    }
+
+    /// The control, and the half that would be easy to lose: a pruning peer is a perfectly good
+    /// source for the blocks it *does* hold. Excluding it whenever it prunes at all would take the
+    /// most current node on the network out of every catch-up.
+    #[test]
+    fn a_pruning_peer_is_still_asked_for_blocks_it_kept() {
+        let pruner = PeerId::random();
+        let mut tips = HashMap::new();
+        tips.insert(pruner, holding(150_000, 166_000));
+
+        let (chosen, tip) = best_blocksync_peer(&tips, 165_000, &no_cooldown(), |_| true).unwrap();
+        assert_eq!(chosen, pruner, "we need 165_001 and it holds from 150_000");
+        assert_eq!(tip, 166_000);
+
+        // Exactly at the boundary: the next block we need is its earliest.
+        assert!(
+            best_blocksync_peer(&tips, 149_999, &no_cooldown(), |_| true).is_some(),
+            "needing exactly the peer's earliest block is still servable"
+        );
+        assert!(
+            best_blocksync_peer(&tips, 149_998, &no_cooldown(), |_| true).is_none(),
+            "one block below it is not"
+        );
+    }
+
     /// The single-peer case, which is the one a fresh node behind the tunnel is actually in: no
     /// request at all beats a request that can only fail.
     #[test]
     fn nobody_is_asked_when_every_peer_ahead_is_unreachable() {
         let unreachable = PeerId::random();
         let mut tips = HashMap::new();
-        tips.insert(unreachable, 900);
+        tips.insert(unreachable, at(900));
 
         assert!(best_blocksync_peer(&tips, 100, &no_cooldown(), |_| false).is_none());
     }
@@ -2968,7 +3169,7 @@ mod blocksync_selection_tests {
     fn being_connected_does_not_override_a_cooldown() {
         let cooling = PeerId::random();
         let mut tips = HashMap::new();
-        tips.insert(cooling, 900);
+        tips.insert(cooling, at(900));
         let mut cooldown = HashMap::new();
         cooldown.insert(cooling, BLOCKSYNC_PEER_COOLDOWN_TICKS);
 
@@ -3049,7 +3250,7 @@ mod observed_height_tests {
 
 #[cfg(test)]
 mod peer_tip_gate_tests {
-    use super::TipSource;
+    use super::{at, holding, PeerRange, TipSource};
     use libp2p::PeerId;
     use std::collections::{HashMap, HashSet};
 
@@ -3063,16 +3264,16 @@ mod peer_tip_gate_tests {
     #[test]
     fn a_peer_that_proved_another_history_cannot_walk_back_in_through_either_door() {
         let zombie = PeerId::random();
-        let mut tips: HashMap<PeerId, u64> = HashMap::new();
+        let mut tips: HashMap<PeerId, PeerRange> = HashMap::new();
         let mut foreign: HashSet<PeerId> = HashSet::new();
         foreign.insert(zombie);
 
         assert!(
-            !super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, TipSource::PeerExchange),
+            !super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, 0, TipSource::PeerExchange),
             "peer exchange from a peer on another history must not set a tip",
         );
         assert!(
-            !super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, TipSource::GossipedBlock),
+            !super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, 0, TipSource::GossipedBlock),
             "a gossiped block is the same claim through a different door — it must not set a tip \
              either, or the exclusion undoes itself on the peer's next proposal",
         );
@@ -3085,12 +3286,12 @@ mod peer_tip_gate_tests {
     fn an_excluded_peer_does_not_win_the_blocksync_choice_again_after_gossiping() {
         let zombie = PeerId::random();
         let honest = PeerId::random();
-        let mut tips: HashMap<PeerId, u64> = HashMap::new();
+        let mut tips: HashMap<PeerId, PeerRange> = HashMap::new();
         let mut foreign: HashSet<PeerId> = HashSet::new();
 
         // Both peers announce; the zombie claims the far higher tip, so it wins on merit.
-        super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, TipSource::PeerExchange);
-        super::record_peer_tip(&mut tips, &foreign, honest, 27_960, TipSource::PeerExchange);
+        super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, 0, TipSource::PeerExchange);
+        super::record_peer_tip(&mut tips, &foreign, honest, 27_960, 0, TipSource::PeerExchange);
         let (chosen, _) =
             super::best_blocksync_peer(&tips, 27_954, &no_cooldown(), |_| true).unwrap();
         assert_eq!(chosen, zombie, "positive control: the highest claimed tip wins");
@@ -3100,7 +3301,7 @@ mod peer_tip_gate_tests {
         tips.remove(&zombie);
 
         // Now it proposes a block, exactly as the real one did every couple of minutes.
-        super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, TipSource::GossipedBlock);
+        super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, 0, TipSource::GossipedBlock);
 
         let (chosen, _) =
             super::best_blocksync_peer(&tips, 27_954, &no_cooldown(), |_| true).unwrap();
@@ -3110,28 +3311,50 @@ mod peer_tip_gate_tests {
         );
     }
 
+    /// A gossiped block says where a peer's chain *ends* and nothing about where it begins, so it
+    /// must never move the horizon (#194). Otherwise a pruning node's own proposal would quietly
+    /// re-advertise it as an archive, and we would ask it for blocks it dropped — through exactly
+    /// the second door that #184 was about.
+    #[test]
+    fn a_gossiped_block_cannot_widen_a_pruning_peers_claim() {
+        let pruner = PeerId::random();
+        let mut tips: HashMap<PeerId, PeerRange> = HashMap::new();
+        let foreign: HashSet<PeerId> = HashSet::new();
+
+        super::record_peer_tip(&mut tips, &foreign, pruner, 166_000, 150_000, TipSource::PeerExchange);
+        assert_eq!(tips.get(&pruner), Some(&holding(150_000, 166_000)));
+
+        // Its next proposal arrives. Only the tip may move.
+        super::record_peer_tip(&mut tips, &foreign, pruner, 166_010, 0, TipSource::GossipedBlock);
+        assert_eq!(
+            tips.get(&pruner),
+            Some(&holding(150_000, 166_010)),
+            "the block moved the tip and must have left the horizon alone",
+        );
+    }
+
     /// The gate must not cost the reason the gossip path was added: a peer we have nothing against
     /// still teaches us its height, and raise-only still holds.
     #[test]
     fn an_ordinary_peer_still_teaches_its_tip_and_a_replayed_block_cannot_lower_it() {
         let peer = PeerId::random();
-        let mut tips: HashMap<PeerId, u64> = HashMap::new();
+        let mut tips: HashMap<PeerId, PeerRange> = HashMap::new();
         let foreign: HashSet<PeerId> = HashSet::new();
 
-        assert!(super::record_peer_tip(&mut tips, &foreign, peer, 100, TipSource::GossipedBlock));
-        assert_eq!(tips.get(&peer), Some(&100));
+        assert!(super::record_peer_tip(&mut tips, &foreign, peer, 100, 0, TipSource::GossipedBlock));
+        assert_eq!(tips.get(&peer), Some(&at(100)));
 
-        super::record_peer_tip(&mut tips, &foreign, peer, 90, TipSource::GossipedBlock);
+        super::record_peer_tip(&mut tips, &foreign, peer, 90, 0, TipSource::GossipedBlock);
         assert_eq!(
             tips.get(&peer),
-            Some(&100),
+            Some(&at(100)),
             "an old block replayed through the mesh must not move the tip",
         );
 
         assert!(
-            super::record_peer_tip(&mut tips, &foreign, peer, 90, TipSource::PeerExchange),
+            super::record_peer_tip(&mut tips, &foreign, peer, 90, 0, TipSource::PeerExchange),
             "peer exchange is the authority and must still be able to lower a tip (#175)",
         );
-        assert_eq!(tips.get(&peer), Some(&90));
+        assert_eq!(tips.get(&peer), Some(&at(90)));
     }
 }
