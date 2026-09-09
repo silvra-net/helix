@@ -1028,7 +1028,22 @@ mod tempdir {
 #[ignore = "spawns two real node processes and freezes one with SIGSTOP, twice (~60s wall-clock) — run explicitly with --ignored"]
 async fn a_node_frozen_until_it_falls_behind_catches_up_again_on_its_own() {
     let _serialized = NODE_TEST_LOCK.lock().await;
-    for gap in [10u64, 1u64] {
+    // **Two, not one, and that is a property of SIGSTOP rather than a preference.**
+    //
+    // SIGSTOP halts the process, not its socket: the kernel keeps accepting and buffering what the
+    // chain gossips at it. With a one-block lead, B has that block waiting when it is resumed and
+    // applies it before the test can read a height — it wakes level with A, the precondition is
+    // gone, and the run fails without anything being wrong with catch-up.
+    //
+    // Measured on 2026-09-09, and measured on the commit *before* that day's work too, so this is
+    // not a regression that arrived with it: at gap 1 B woke on 4 against A's 4, repeatably. At
+    // gap 2 it wakes on 3 and climbs to 5, three runs, identical numbers. The backlog note for
+    // #189 claims "3 → 4" for a one-block gap; that was true when it was written and is not now.
+    //
+    // Two blocks is still the production shape this exists for — a node a hair behind, not one
+    // that missed an epoch. Making it *exactly* one is not achievable with this instrument, and
+    // pretending otherwise would leave a test that fails for a reason unrelated to what it checks.
+    for gap in [10u64, 2u64] {
         catches_up_after_falling_behind(gap).await;
     }
 }
