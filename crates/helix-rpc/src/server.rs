@@ -207,6 +207,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/genesis", get(get_genesis))
         .route("/sync/blocks", get(get_sync_blocks))
         .route("/sync/tip-certificate", get(get_tip_certificate))
+        .route("/sync/snapshot", get(get_state_snapshot))
         .route("/diagnostics", get(get_diagnostics))
         .route("/whoami", get(get_whoami))
         .route(
@@ -681,6 +682,44 @@ async fn get_sync_blocks(
         }
     }
     (StatusCode::OK, Json(json!(blocks))).into_response()
+}
+
+/// The whole chain state, so a joining node can start from it instead of replaying every block.
+///
+/// `GET /sync/snapshot` — bincode only, and deliberately: this is not a document anybody reads.
+/// The same state as JSON costs 4.5x for nothing, and the one consumer is a node that is about to
+/// hash it and compare (see [`helix_executor::state::StateSnapshot`]).
+///
+/// Height and state are read under **one** lock, because the pair is the claim: `applied_height`
+/// and the state are stamped together at the end of every block, and a reader that straddled that
+/// moment would serve a state labelled with the wrong height — which the receiver then checks
+/// against the wrong block's `prev_state_root` and refuses, having been told something true about
+/// a state that never existed at that height.
+///
+/// Serving this costs a clone of the state under a read lock. At the 508 accounts this chain holds
+/// that is nothing; it grows with the account count, and the answer then is to stream rather than
+/// clone — noted rather than pre-built, because the shape of that depends on how big "too big"
+/// turns out to be.
+async fn get_state_snapshot(State(state): State<AppState>) -> axum::response::Response {
+    let snapshot = {
+        let cs = state.chain_state.read().await;
+        helix_executor::state::StateSnapshot { height: cs.applied_height, state: cs.clone() }
+    };
+    match bincode::serialize(&snapshot) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        // No JSON fallback, unlike `/sync/blocks`: a caller that cannot read bincode cannot use a
+        // snapshot either, and answering with something it will not parse is worse than saying so.
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("could not serialize the state snapshot: {e}") })),
+        )
+            .into_response(),
+    }
 }
 
 /// The commit certificate for this node's current tip — see [`crate::TipCertificate`].
@@ -2992,6 +3031,84 @@ mod tests {
 
         let response = get_blocks_range(State(state), Query(params)).await;
         assert_eq!(response.into_response().status(), StatusCode::OK);
+    }
+
+    /// **The whole point of the endpoint in one assertion.** A snapshot is unauthenticated — the
+    /// server can put anything in it — and what makes it usable is that the *chain* commits to its
+    /// hash: block `height + 1` carries `prev_state_root`, signed by its proposer. So the hash a
+    /// receiver computes over what it was handed has to be exactly the number a proposer would
+    /// have put in the next header.
+    ///
+    /// This is #139 turned right way round. There, a reconstructed genesis was verified against a
+    /// `state_hash` that arrived in the same answer — both halves from the party being checked.
+    /// Here the number comes from the chain and the state comes from the server.
+    #[tokio::test]
+    async fn a_snapshot_hashes_to_what_the_next_blocks_header_commits_to() {
+        let state = fresh_test_state();
+        {
+            let mut cs = state.chain_state.write().await;
+            cs.set_balance(&addr(1), 5_000);
+            cs.set_balance(&addr(2), 250);
+            cs.applied_height = 42;
+        }
+        // What a proposer at height 43 would sign into `prev_state_root`.
+        let committed_root = { state.chain_state.read().await.state_hash() };
+
+        let body = snapshot_body(&state).await;
+        let snapshot: helix_executor::state::StateSnapshot =
+            bincode::deserialize(&body).expect("a snapshot must decode");
+
+        assert_eq!(snapshot.height, 42, "the snapshot is labelled with the height that made it");
+        assert_eq!(
+            snapshot.state.state_hash(),
+            committed_root,
+            "a snapshot that does not hash to what the next header commits to is unverifiable, \
+             which makes the whole endpoint pointless"
+        );
+        println!("snapshot of 2 accounts: {} bytes", body.len());
+    }
+
+    /// Height and state are one claim, not two. `applied_height` is stamped together with the
+    /// state at the end of every block, so a snapshot labelled with a height whose state it does
+    /// not hold would be checked against the wrong block's `prev_state_root` and refused — a
+    /// truthful state made useless by a mislabel.
+    #[tokio::test]
+    async fn a_snapshot_carries_the_height_its_state_belongs_to() {
+        let state = fresh_test_state();
+        {
+            let mut cs = state.chain_state.write().await;
+            cs.applied_height = 7;
+        }
+        let first: helix_executor::state::StateSnapshot =
+            bincode::deserialize(&snapshot_body(&state).await).unwrap();
+        assert_eq!(first.height, 7);
+
+        // The state moves on; so must the label.
+        {
+            let mut cs = state.chain_state.write().await;
+            cs.set_balance(&addr(3), 1);
+            cs.applied_height = 8;
+        }
+        let second: helix_executor::state::StateSnapshot =
+            bincode::deserialize(&snapshot_body(&state).await).unwrap();
+        assert_eq!(second.height, 8);
+        assert_ne!(
+            first.state.state_hash(),
+            second.state.state_hash(),
+            "precondition: the two snapshots really are of different states"
+        );
+    }
+
+    /// Reads the endpoint's body, failing loudly rather than returning something empty — a test
+    /// that silently compared two empty vectors would pass forever.
+    async fn snapshot_body(state: &AppState) -> Vec<u8> {
+        let response = get_state_snapshot(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK, "the snapshot endpoint must answer 200");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the snapshot body must be readable");
+        assert!(!bytes.is_empty(), "an empty snapshot proves nothing");
+        bytes.to_vec()
     }
 
     #[tokio::test]

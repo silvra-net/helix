@@ -209,6 +209,31 @@ fn unset_chain_id() -> Hash {
     Hash::ZERO
 }
 
+/// A whole chain state plus the height it belongs to — what a joining node fetches instead of
+/// replaying every block (backlog #194, Masterplan stage 4).
+///
+/// **Why this is safe to accept from a stranger, and exactly how far that goes.** The state itself
+/// is unauthenticated: whoever serves it can put anything in it. What makes it usable is
+/// `BlockHeader::prev_state_root` — block `height + 1` commits, under the proposer's signature, to
+/// the hash of the state after `height`. So a receiver hashes what it was given and compares. It
+/// is the mistake #139 was caught making (a `state_hash` verified against a number from the same
+/// answer) turned right way round: the number now comes from the chain, not from the server.
+///
+/// **That shifts the trust question rather than answering it**, and the shift is the honest part.
+/// Verifying against block `height + 1` needs that block to be genuine, which needs its validator
+/// set, which comes from the state being verified. Every proof-of-stake chain hits this and every
+/// one answers it the same way: an out-of-band checkpoint the operator supplies (Ethereum calls it
+/// weak subjectivity). A light-client walk from genesis is not an alternative here — the validator
+/// set is derived from stakes in the state, and block headers carry nothing about it, so headers
+/// alone cannot carry the walk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    /// The height whose execution produced this state — `applied_height` at the moment it was
+    /// taken. Read together with the state under one lock, because the pair is the claim.
+    pub height: u64,
+    pub state: ChainState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainState {
     /// Which chain this state belongs to: the genesis block's hash. Set by whoever builds or loads
