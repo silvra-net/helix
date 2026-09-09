@@ -1753,6 +1753,7 @@ mod tests {
                 node_version: String::new(),
                 base_fee_per_byte: helix_core::fee::INITIAL_BASE_FEE_PER_BYTE,
                 last_commit: vec![],
+                prev_state_root: Hash::ZERO,
                 signature: Signature::from_bytes(vec![]),
             },
             transactions,

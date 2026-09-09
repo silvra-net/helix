@@ -126,10 +126,13 @@ impl Node {
         // In this model the two never drift — that is the point of the check, which exists for
         // the live node where the store and the consensus height can.
         let prev_height = self.engine.current_height();
+        // No executor behind these engines, so there is no state to hash: the state-root
+        // field is deliberately inert here (`Hash::ZERO` out, `None` in). These numbers are
+        // the baseline that shows the change left consensus dynamics alone.
         let produced = if stalled {
-            self.engine.advance_round(&self.kp, prev, prev_height, vec![])
+            self.engine.advance_round(&self.kp, prev, prev_height, Hash::ZERO, vec![])
         } else {
-            self.engine.produce_block(&self.kp, prev, prev_height, vec![])
+            self.engine.produce_block(&self.kp, prev, prev_height, Hash::ZERO, vec![])
         };
         if let Ok(block) = produced {
             self.note_commit(&block, t, out);
@@ -144,7 +147,7 @@ impl Node {
         match msg {
             Msg::Prop(p) => {
                 if let Ok(Some(block)) =
-                    self.engine.receive_proposal(&self.kp, (**p).clone())
+                    self.engine.receive_proposal(&self.kp, (**p).clone(), None)
                 {
                     self.note_commit(&block, t, out);
                 }

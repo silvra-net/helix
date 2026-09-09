@@ -1535,7 +1535,19 @@ async fn apply_peer_proposal(
     signing_guard: &Arc<std::sync::Mutex<SigningGuard>>,
     tip_certificate: &Arc<RwLock<TipCertificate>>,
 ) {
-    let result = { engine.write().await.receive_proposal(keypair, proposal) };
+    // What this node's own execution produced for the block below the proposed one — the number
+    // the proposer has to agree with (#194). `None` whenever this node cannot say, which is not a
+    // rare corner: a node that is behind, or one whose store has moved past its executed state,
+    // holds no comparable root and must not refuse blocks over it. Read as a pair under one lock,
+    // because `applied_height` and the state are stamped together and a reader that straddled
+    // that moment would compare a root against the wrong height.
+    let expected_prev_state_root = {
+        let cs = chain_state.read().await;
+        (cs.applied_height + 1 == proposal.block.height()).then(|| cs.state_hash())
+    };
+
+    let result =
+        { engine.write().await.receive_proposal(keypair, proposal, expected_prev_state_root) };
 
     // receive_proposal() may have cast our prevote (and possibly a
     // follow-up precommit) for the received proposal — broadcast
@@ -4195,10 +4207,31 @@ async fn block_production_loop(
             (s.latest_hash(), s.latest_height())
         };
 
+        // The state this block will build on, and the height that state belongs to. Read as a
+        // pair under one lock for the same reason `prev_hash`/`prev_height` are: `applied_height`
+        // and the state itself are stamped together by `apply_finalized_block`, and a reader that
+        // straddled that moment would sign a root for a height it does not describe.
+        let (prev_state_root, state_height) = {
+            let cs = chain_state.read().await;
+            (cs.state_hash(), cs.applied_height)
+        };
+        // The two locks are separate, so they can disagree for the moment between a block being
+        // stored and its execution being stamped. Proposing then would commit to a state root one
+        // height off — every honest validator would refuse the block, and the round would be lost
+        // for a reason nothing logs. Skipping the turn costs the same round and says why.
+        if state_height != prev_height {
+            debug!(
+                prev_height,
+                state_height,
+                "Not proposing: this node's state has not caught up with its own store yet"
+            );
+            continue;
+        }
+
         let produced = if stalled {
-            engine.write().await.advance_round(&keypair, prev_hash, prev_height, txs)
+            engine.write().await.advance_round(&keypair, prev_hash, prev_height, prev_state_root, txs)
         } else {
-            engine.write().await.produce_block(&keypair, prev_hash, prev_height, txs)
+            engine.write().await.produce_block(&keypair, prev_hash, prev_height, prev_state_root, txs)
         };
         match produced {
             Ok(block) => {
@@ -9312,7 +9345,7 @@ mod handle_p2p_event_tests {
                 while !eng.note_round_tick(&kp) {}
                 eng.take_outbound_votes();
                 let h = eng.current_height();
-                let _ = eng.advance_round(&kp, Hash::digest(b"genesis"), h, vec![]);
+                let _ = eng.advance_round(&kp, Hash::digest(b"genesis"), h, Hash::ZERO, vec![]);
                 eng.take_outbound_votes();
             }
             assert!(
@@ -9791,9 +9824,16 @@ mod round_sync_tests {
         let (proposer_kp, waiting_kp, set) = two_validators();
         let waiting_addr = Address::from_public_key(&waiting_kp.public);
 
+        // The state both nodes are on. The proposer has to commit to it (#194), and this test
+        // found out why the hard way: an empty `ChainState` does not hash to `Hash::ZERO`, so a
+        // proposal carrying zero is a proposal built on a state nobody has — correctly refused,
+        // and the pull then looked broken.
+        let chain_state = ChainState::new(0);
+        let parent_state_root = chain_state.state_hash();
+
         // The proposer builds a real round-0 proposal for height 1.
         let mut proposer_engine = BftEngine::new(set.clone(), Address::from_public_key(&proposer_kp.public), 0);
-        let _ = proposer_engine.produce_block(&proposer_kp, Hash::ZERO, proposer_engine.current_height(), vec![]);
+        let _ = proposer_engine.produce_block(&proposer_kp, Hash::ZERO, proposer_engine.current_height(), parent_state_root, vec![]);
         let (proposal, votes) = proposer_engine.round_evidence(1);
         let proposal = proposal.expect("the proposer holds its own proposal");
 
@@ -9813,7 +9853,7 @@ mod round_sync_tests {
             &Arc::new(RwLock::new(Mempool::new())),
             &Arc::new(AtomicUsize::new(1)),
             &Arc::new(RwLock::new(fresh_store())),
-            &Arc::new(RwLock::new(ChainState::new(0))),
+            &Arc::new(RwLock::new(chain_state)),
             &engine,
             &waiting_kp,
             &p2p_tx,
@@ -9881,7 +9921,7 @@ mod round_sync_tests {
             0,
         )));
         let h = engine.read().await.current_height();
-        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, h, vec![]);
+        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, h, Hash::ZERO, vec![]);
         engine.write().await.take_outbound_votes();
 
         for _ in 0..proposal_timeout_ticks(0) + 5 {
@@ -9911,7 +9951,7 @@ mod round_sync_tests {
             0,
         )));
         let h = engine.read().await.current_height();
-        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, h, vec![]);
+        let _ = engine.write().await.produce_block(&proposer_kp, Hash::ZERO, h, Hash::ZERO, vec![]);
         engine.write().await.take_outbound_votes();
 
         let provider = EngineRoundProvider { engine: engine.clone() };

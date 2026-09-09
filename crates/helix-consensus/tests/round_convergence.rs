@@ -73,10 +73,14 @@ impl Node {
         // In this model the two never drift — that is the point of the check, which exists for
         // the live node where the store and the consensus height can.
         let prev_height = self.engine.current_height();
+        // No state root in this harness: it drives real engines but no executor, so there is no
+        // state to hash. Proposing `Hash::ZERO` and checking `None` keeps the new field inert
+        // here on purpose — these numbers are the baseline that proves the change did nothing to
+        // consensus dynamics, and a synthetic root would make them incomparable.
         let produced = if stalled {
-            self.engine.advance_round(&self.kp, prev, prev_height, vec![])
+            self.engine.advance_round(&self.kp, prev, prev_height, Hash::ZERO, vec![])
         } else {
-            self.engine.produce_block(&self.kp, prev, prev_height, vec![])
+            self.engine.produce_block(&self.kp, prev, prev_height, Hash::ZERO, vec![])
         };
         if let Ok(block) = produced {
             self.note_commit(&block);
@@ -89,7 +93,7 @@ impl Node {
 
     fn deliver(&mut self, msg: &Msg, out: &mut Vec<Msg>) {
         let finalized = match msg {
-            Msg::Prop(p) => self.engine.receive_proposal(&self.kp, (**p).clone()).ok().flatten(),
+            Msg::Prop(p) => self.engine.receive_proposal(&self.kp, (**p).clone(), None).ok().flatten(),
             Msg::Vote(v) => self.engine.add_vote(&self.kp, (**v).clone()).ok().flatten(),
         };
         if let Some(block) = finalized {

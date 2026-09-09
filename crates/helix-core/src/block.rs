@@ -133,6 +133,40 @@ pub struct BlockHeader {
     /// quorum without needing to prove it to anyone). Feeds downtime-jailing in
     /// `helix-executor::ChainState` — see `CommitSig`'s doc comment for the trust model.
     pub last_commit: Vec<CommitSig>,
+    /// Hash of the whole chain state **after the parent block was applied** — the state this
+    /// block builds on (backlog #194).
+    ///
+    /// **Carried one block late, and that is forced rather than chosen.** A block's own resulting
+    /// state does not exist when its header is signed: execution happens after the block is
+    /// committed, so a proposer could only commit to a state it has not computed. Committing to
+    /// the *parent's* state is the same trick Cosmos plays with `app_hash`, and it costs nothing —
+    /// every validator has already applied the parent by the time it validates this block, so the
+    /// check is a comparison against a number it already holds.
+    ///
+    /// **What this closes.** Until now a state divergence was invisible to consensus. The node
+    /// layer said so in its own comment — "a state fork, undetectable by anything CONSENSUS-LEVEL,
+    /// since BlockHeader still carries no state_root" — and `ChainState::state_hash` existed only
+    /// as an operator-facing diagnostic that somebody had to think to compare across machines.
+    /// Backlog #145 was exactly this: an interrupted sync executed one block twice, minting its
+    /// reward twice, and nothing rejected the blocks built on top of the wrong balance. With this
+    /// field, the next proposer's header disagrees with every honest validator and is refused.
+    ///
+    /// **And it is what makes a state snapshot verifiable at all.** A joining node that is handed
+    /// a snapshot at height N can hash it and compare against block N+1's header — a signed,
+    /// quorum-certified number — instead of trusting the server that sent both halves, which is
+    /// the mistake #139 was found making with the genesis reconstruction.
+    ///
+    /// `Hash::ZERO` in the genesis block: there is no parent, so there is no prior state.
+    ///
+    /// **The known limit, stated rather than discovered later.** `ChainState::state_hash` rebuilds
+    /// a sorted view of every account and serializes the whole thing on each call, and this field
+    /// makes that a per-block cost on both the proposing and the validating side rather than the
+    /// diagnostic it used to be. At the 508 accounts this chain holds that is nothing; it grows
+    /// with the account count, and the answer real chains reach for is an incremental Merkle tree
+    /// whose root updates with the accounts a block actually touched. Deliberately not built yet —
+    /// it is a different piece of work, and building it before the cost is measurable would be
+    /// guessing at the shape of a problem nobody has.
+    pub prev_state_root: Hash,
     /// Signature over the canonical signing hash (excludes `signature` itself)
     pub signature: Signature,
 }
@@ -168,6 +202,8 @@ impl BlockHeader {
             node_version_hash.as_bytes(),
             &self.base_fee_per_byte.to_le_bytes(),
             last_commit_hash.as_bytes(),
+            // Fixed length, so the single-parse argument above is unaffected.
+            self.prev_state_root.as_bytes(),
         ])
     }
 
@@ -302,6 +338,8 @@ pub fn genesis_block(
         node_version: env!("CARGO_PKG_VERSION").to_string(),
         base_fee_per_byte: crate::fee::INITIAL_BASE_FEE_PER_BYTE,
         last_commit: vec![],
+        // No parent, so no prior state to commit to.
+        prev_state_root: Hash::ZERO,
         signature,
     };
     Block {
@@ -355,6 +393,7 @@ mod tests {
                 node_version: String::new(),
                 base_fee_per_byte: crate::fee::INITIAL_BASE_FEE_PER_BYTE,
                 last_commit: vec![],
+                prev_state_root: Hash::ZERO,
                 signature: Sig::from_bytes(vec![]),
             },
             transactions,
@@ -552,6 +591,23 @@ mod tests {
 
     /// `node_version` (#128) is a signed header field: it must move the signing hash, or a proposer
     /// could stamp any version it liked and still present a validly signed block — exactly the
+    /// The state root is signed like every other header field, so a proposer can no more claim
+    /// its neighbour's state than its neighbour's signature. Without this the field would be a
+    /// hint rather than a commitment — swappable in flight by anyone relaying the block.
+    #[test]
+    fn signing_hash_changes_when_the_state_root_changes() {
+        use helix_crypto::KeyPair;
+        let proposer = KeyPair::generate();
+        let mut block = signed_test_block(&proposer);
+        let before = block.header.signing_hash();
+        block.header.prev_state_root = Hash::digest(b"a different state entirely");
+        assert_ne!(
+            before,
+            block.header.signing_hash(),
+            "a header that commits to a state root must not sign the same bytes for another one"
+        );
+    }
+
     /// "which build is this validator really running" question the field exists to answer honestly.
     #[test]
     fn signing_hash_changes_when_node_version_changes() {

@@ -680,6 +680,7 @@ impl BftEngine {
         keypair: &KeyPair,
         prev_hash: Hash,
         prev_height: u64,
+        prev_state_root: Hash,
         transactions: Vec<Transaction>,
     ) -> ConsensusResult<Block> {
         let height = self.current_height + 1;
@@ -708,7 +709,7 @@ impl BftEngine {
             });
         }
 
-        self.propose(keypair, height, round_num, prev_hash, prev_height, transactions)
+        self.propose(keypair, height, round_num, prev_hash, prev_height, prev_state_root, transactions)
     }
 
     /// Called once per block-production tick while this height is unfinalized. Drives both
@@ -865,6 +866,7 @@ impl BftEngine {
         keypair: &KeyPair,
         prev_hash: Hash,
         prev_height: u64,
+        prev_state_root: Hash,
         transactions: Vec<Transaction>,
     ) -> ConsensusResult<Block> {
         let height = self.current_height + 1;
@@ -884,7 +886,7 @@ impl BftEngine {
             return Err(ConsensusError::NotProposer { height, round: round_num });
         }
 
-        self.propose(keypair, height, round_num, prev_hash, prev_height, transactions)
+        self.propose(keypair, height, round_num, prev_hash, prev_height, prev_state_root, transactions)
     }
 
     /// Build a signed block, start a fresh round for it, cast this node's own
@@ -900,6 +902,7 @@ impl BftEngine {
         round_num: u32,
         prev_hash: Hash,
         prev_height: u64,
+        prev_state_root: Hash,
         transactions: Vec<Transaction>,
     ) -> ConsensusResult<Block> {
         // The parent has to be the block directly below the one being built. `prev_hash` comes
@@ -928,7 +931,7 @@ impl BftEngine {
         let (block, valid_round, pol) = match (self.locked_round, self.locked_block.clone()) {
             (Some(lr), Some(locked_block)) => (locked_block, Some(lr), self.locked_pol.clone()),
             _ => (
-                self.build_signed_block(keypair, height, prev_hash, transactions)?,
+                self.build_signed_block(keypair, height, prev_hash, prev_state_root, transactions)?,
                 None,
                 Vec::new(),
             ),
@@ -1144,7 +1147,14 @@ impl BftEngine {
     /// older than one we're already tracking (or have already advanced past
     /// via `advance_round`) is stale and ignored rather than clobbering
     /// newer round state.
-    pub fn receive_proposal(&mut self, keypair: &KeyPair, proposal: Proposal) -> ConsensusResult<Option<Block>> {
+    /// `expected_prev_state_root` is what *this* node's own execution produced for the block
+    /// below the one being proposed, or `None` when it cannot say — see `validate_block`.
+    pub fn receive_proposal(
+        &mut self,
+        keypair: &KeyPair,
+        proposal: Proposal,
+        expected_prev_state_root: Option<Hash>,
+    ) -> ConsensusResult<Option<Block>> {
         let Proposal { round: round_num, valid_round, block, pol } = proposal;
 
         // Proposing on the height we are deciding is participation, so it clears the proposer's
@@ -1160,7 +1170,7 @@ impl BftEngine {
         }
 
         self.assert_is_validator()?;
-        self.validate_block(&block, round_num, valid_round, &pol)?;
+        self.validate_block(&block, round_num, valid_round, &pol, expected_prev_state_root)?;
 
         let height = block.height();
 
@@ -1460,14 +1470,42 @@ impl BftEngine {
     /// still carries that round's proposer's signature), so the proposer is checked against
     /// `valid_round` instead — and the POL certificate is verified to prove the network really
     /// reached a prevote-quorum on this value there.
+    /// `expected_prev_state_root` is this node's own state root for the parent height, or `None`
+    /// when this node cannot say — it has not applied the parent, or has moved past it. **`None`
+    /// must mean "do not check", never "accept anything as correct"**: a node that is behind sees
+    /// proposals for heights whose parents it has not executed, and rejecting those would turn a
+    /// temporary lag into a node that refuses every block it is shown.
     pub fn validate_block(
         &self,
         block: &Block,
         round: u32,
         valid_round: Option<u32>,
         pol: &[Vote],
+        expected_prev_state_root: Option<Hash>,
     ) -> ConsensusResult<()> {
         let h = block.height();
+
+        // A proposer that built on a different state than ours produces blocks whose every
+        // consequence — balances, rewards, the validator set — diverges from what this node
+        // computed, while every signature on them is perfectly valid. Until this field existed
+        // the disagreement was invisible to consensus and the node layer said so in its own
+        // comment; #145 was one instance, an interrupted sync that executed a block twice and
+        // minted its reward twice with nothing on top of it ever objecting.
+        if let Some(expected) = expected_prev_state_root {
+            if block.header.prev_state_root != expected {
+                return Err(ConsensusError::InvalidBlock {
+                    height: h,
+                    reason: format!(
+                        "state root mismatch: the proposer built on {} where this node computed \
+                         {} for height {}. One of the two executed the chain differently — this \
+                         is a state fork, not a stale block.",
+                        block.header.prev_state_root.to_hex(),
+                        expected.to_hex(),
+                        h.saturating_sub(1),
+                    ),
+                });
+            }
+        }
 
         if h != self.current_height + 1 {
             return Err(ConsensusError::InvalidBlock {
@@ -1837,6 +1875,7 @@ impl BftEngine {
         keypair: &KeyPair,
         height: u64,
         prev_hash: Hash,
+        prev_state_root: Hash,
         transactions: Vec<Transaction>,
     ) -> ConsensusResult<Block> {
         let timestamp = SystemTime::now()
@@ -1873,6 +1912,7 @@ impl BftEngine {
             node_version: env!("CARGO_PKG_VERSION").to_string(),
             base_fee_per_byte: self.current_base_fee_per_byte,
             last_commit,
+            prev_state_root,
             signature: Signature::from_bytes(vec![]),
         };
 
@@ -2315,11 +2355,11 @@ mod tests {
         // It is on the right height, but building on a tip that is not ours: the state of any
         // node whose turn arrives while it is still catching up.
         let mut stale = BftEngine::new(v.validator_set.clone(), b_addr, height - 1);
-        let _ = stale.produce_block(&v.b_kp, Hash::digest(b"a tip nobody else has"), stale.current_height(), vec![]);
+        let _ = stale.produce_block(&v.b_kp, Hash::digest(b"a tip nobody else has"), stale.current_height(), Hash::ZERO, vec![]);
         let bad_block = stale.pending_proposal().unwrap().clone();
 
         // Rejected — the block does not chain from our tip.
-        let rejected = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, bad_block));
+        let rejected = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, bad_block), None);
         assert!(rejected.is_err(), "precondition: the stale proposal must be refused");
 
         // Now run the round clock out, exactly as `block_production_loop` does.
@@ -2340,7 +2380,7 @@ mod tests {
         // continues rather than waiting forever on a proposer that cannot produce a valid block.
         let mut advanced_to = None;
         for _ in 0..v.validator_set.len() {
-            match engine.advance_round(&v.self_kp, our_tip, engine.current_height(), vec![]) {
+            match engine.advance_round(&v.self_kp, our_tip, engine.current_height(), Hash::ZERO, vec![]) {
                 Ok(block) => {
                     advanced_to = Some(block.height());
                     break;
@@ -2426,7 +2466,7 @@ mod tests {
 
         let mut engine = engine_at_off_slot(set, full_addr.clone());
         let block = engine
-            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), Hash::ZERO, vec![])
             .expect("the sole full-power validator reaches quorum on its own precommit");
         assert_eq!(
             engine.current_height(),
@@ -2524,7 +2564,7 @@ mod tests {
         let (full_kp, full_addr, _p_kp, _p_addr, set) = full_power_plus_probationer();
         let mut engine = engine_at_off_slot(set, full_addr.clone());
         let block = engine
-            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), Hash::ZERO, vec![])
             .expect("finalizes alone");
         assert!(
             engine.commit_certificate().iter().any(|v| v.validator == full_addr),
@@ -2553,7 +2593,7 @@ mod tests {
         let (full_kp, full_addr, _phantom_kp, phantom_addr, set) = full_power_plus_probationer();
         let mut engine = engine_at_off_slot(set, full_addr);
         engine
-            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), Hash::ZERO, vec![])
             .expect("finalizes alone");
 
         assert!(
@@ -2570,7 +2610,7 @@ mod tests {
             full_power_plus_probationer();
         let mut engine = engine_at_off_slot(set, full_addr);
         engine
-            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), Hash::ZERO, vec![])
             .expect("finalizes alone");
 
         let wrong = peer_vote(
@@ -2594,7 +2634,7 @@ mod tests {
         let (full_kp, full_addr, _p_kp, _p_addr, set) = full_power_plus_probationer();
         let mut engine = engine_at_off_slot(set, full_addr);
         let block = engine
-            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), Hash::ZERO, vec![])
             .expect("finalizes alone");
 
         let outsider_kp = KeyPair::generate();
@@ -2616,7 +2656,7 @@ mod tests {
             full_power_plus_probationer();
         let mut engine = engine_at_off_slot(set, full_addr);
         let block = engine
-            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), vec![])
+            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), Hash::ZERO, vec![])
             .expect("finalizes alone");
 
         let vote = peer_vote(&probationer_kp, VoteType::Precommit, OFF_SLOT_PARENT + 1, 0, block.hash());
@@ -2690,7 +2730,7 @@ mod tests {
         // Time out of round 0 onto round 1, where self isn't the proposer: this leaves
         // self.round = None with pending_round = 1 — the exact state the block loop then
         // calls produce_block in.
-        let advanced = engine.advance_round(&v.self_kp, prev, engine.current_height(), vec![]);
+        let advanced = engine.advance_round(&v.self_kp, prev, engine.current_height(), Hash::ZERO, vec![]);
         assert!(
             matches!(advanced, Err(ConsensusError::NotProposer { height: 1, round: 1 })),
             "advance_round should leave us waiting on round 1's proposer: {advanced:?}"
@@ -2698,7 +2738,7 @@ mod tests {
 
         // The bug: produce_block hardcoded round 0, and self IS the round-0 proposer, so it
         // would build a round-0 block — a regression from round 1.
-        let produced = engine.produce_block(&v.self_kp, prev, engine.current_height(), vec![]);
+        let produced = engine.produce_block(&v.self_kp, prev, engine.current_height(), Hash::ZERO, vec![]);
         assert!(
             matches!(produced, Err(ConsensusError::NotProposer { height: 1, round: 1 })),
             "produce_block must respect pending_round (1), not regress to round 0: {produced:?}"
@@ -2733,7 +2773,7 @@ mod tests {
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
 
         // The honest case first, so the refusal below cannot be mistaken for "this never proposes".
-        let ok = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), 0, vec![]);
+        let ok = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), 0, Hash::ZERO, vec![]);
         assert!(
             !matches!(ok, Err(ConsensusError::ProposerBehind { .. })),
             "a proposer whose tip is the parent of the height it decides must be allowed to \
@@ -2744,7 +2784,7 @@ mod tests {
         // ((5 + 0) % 4 == 1), so the turn is genuinely ours and the refusal below is about the
         // parent and nothing else — the proposer check runs first and would otherwise mask it.
         let mut behind = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 4);
-        let refused = behind.produce_block(&v.self_kp, Hash::digest(b"a stale tip"), 3, vec![]);
+        let refused = behind.produce_block(&v.self_kp, Hash::digest(b"a stale tip"), 3, Hash::ZERO, vec![]);
         assert!(
             matches!(refused, Err(ConsensusError::ProposerBehind { height: 5, tip: 3 })),
             "a node deciding height 5 whose chain ends at 3 must refuse, not build on 3: {refused:?}"
@@ -2785,7 +2825,7 @@ mod tests {
             "the tick loop must be told to advance now, not at ROUND_TIMEOUT_TICKS"
         );
         // Round 1's proposer is c ((2 + 1) % 4 == 3), so self defers rather than proposing.
-        let err = engine.advance_round(&v.self_kp, Hash::digest(b"tip-1"), engine.current_height(), vec![]).unwrap_err();
+        let err = engine.advance_round(&v.self_kp, Hash::digest(b"tip-1"), engine.current_height(), Hash::ZERO, vec![]).unwrap_err();
         assert!(matches!(err, ConsensusError::NotProposer { height: 2, round: 1 }), "{err:?}");
     }
 
@@ -2798,7 +2838,7 @@ mod tests {
         let v = four_validators();
         let b_addr = Address::from_public_key(&v.b_kp.public);
         let mut proposer = BftEngine::new(v.validator_set.clone(), b_addr, 1);
-        let _ = proposer.produce_block(&v.b_kp, Hash::digest(b"tip-1"), proposer.current_height(), vec![]);
+        let _ = proposer.produce_block(&v.b_kp, Hash::digest(b"tip-1"), proposer.current_height(), Hash::ZERO, vec![]);
         let late_block = proposer.pending_proposal().unwrap().clone();
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
@@ -2808,7 +2848,7 @@ mod tests {
         assert_eq!(engine.take_outbound_votes().len(), 1, "nil prevote is cast");
 
         // b's proposal finally arrives — slow, not malicious.
-        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, late_block)).unwrap();
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, late_block), None).unwrap();
 
         assert!(
             engine.take_outbound_votes().is_empty(),
@@ -2828,7 +2868,7 @@ mod tests {
         let v = four_validators();
         let b_addr = Address::from_public_key(&v.b_kp.public);
         let mut proposer = BftEngine::new(v.validator_set.clone(), b_addr, 1);
-        let _ = proposer.produce_block(&v.b_kp, Hash::digest(b"tip-1"), proposer.current_height(), vec![]);
+        let _ = proposer.produce_block(&v.b_kp, Hash::digest(b"tip-1"), proposer.current_height(), Hash::ZERO, vec![]);
         let block_hash = proposer.pending_proposal().unwrap().hash();
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
@@ -2877,12 +2917,12 @@ mod tests {
         let v = four_validators();
         let b_addr = Address::from_public_key(&v.b_kp.public);
         let mut proposer = BftEngine::new(v.validator_set.clone(), b_addr, 1);
-        let _ = proposer.produce_block(&v.b_kp, Hash::digest(b"tip-1"), proposer.current_height(), vec![]);
+        let _ = proposer.produce_block(&v.b_kp, Hash::digest(b"tip-1"), proposer.current_height(), Hash::ZERO, vec![]);
         let block = proposer.pending_proposal().unwrap().clone();
         let block_hash = block.hash();
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None).unwrap();
         let prevote = engine.take_outbound_votes();
         assert_eq!(prevote[0].block_hash, block_hash, "prevoted the real value");
 
@@ -2907,7 +2947,7 @@ mod tests {
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 0);
 
         let err = engine
-            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![])
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         assert!(matches!(err, ConsensusError::AwaitingVotes { height: 1, round: 0 }));
 
@@ -2963,7 +3003,7 @@ mod tests {
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 0);
 
         let err = engine
-            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![])
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         assert!(matches!(err, ConsensusError::AwaitingVotes { height: 1, round: 0 }));
         engine.take_outbound_votes();
@@ -3012,7 +3052,7 @@ mod tests {
         let mut proposer_engine =
             BftEngine::new(v.validator_set.clone(), Address::from_public_key(&v.b_kp.public), 1);
         proposer_engine
-            .produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), vec![])
+            .produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         let block = proposer_engine.pending_proposal().unwrap().clone();
         let block_hash = block.hash();
@@ -3029,7 +3069,7 @@ mod tests {
 
         // Now the proposal arrives: the round starts, this node casts its own prevote,
         // and the buffered a-prevote is replayed — giving 2 of 4 (self + a).
-        assert_eq!(engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap(), None);
+        assert_eq!(engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None).unwrap(), None);
 
         // b's prevote is the third (self + a[buffered] + b) → prevote quorum, which
         // makes this node cast its own precommit. That precommit only appears if the
@@ -3055,12 +3095,12 @@ mod tests {
         // b proposes height 2; this node joins the round and prevotes.
         let mut proposer_engine =
             BftEngine::new(v.validator_set.clone(), Address::from_public_key(&v.b_kp.public), 1);
-        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), vec![]);
+        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), Hash::ZERO, vec![]);
         let block = proposer_engine.pending_proposal().unwrap().clone();
         let block_hash = block.hash();
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None).unwrap();
         // Prevote quorum makes this node cast its own precommit...
         engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
         engine.add_vote(&v.self_kp, peer_vote(&v.a_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
@@ -3147,12 +3187,12 @@ mod tests {
         let v = four_validators();
         let mut proposer_engine =
             BftEngine::new(v.validator_set.clone(), Address::from_public_key(&v.b_kp.public), 1);
-        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), vec![]);
+        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), Hash::ZERO, vec![]);
         let block = proposer_engine.pending_proposal().unwrap().clone();
         let block_hash = block.hash();
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None).unwrap();
         engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
         engine.add_vote(&v.self_kp, peer_vote(&v.a_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
         engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Precommit, 2, 0, block_hash)).unwrap();
@@ -3194,12 +3234,12 @@ mod tests {
 
         let mut proposer_engine =
             BftEngine::new(v.validator_set.clone(), Address::from_public_key(&v.b_kp.public), 1);
-        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), vec![]);
+        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), Hash::ZERO, vec![]);
         let block = proposer_engine.pending_proposal().unwrap().clone();
         let block_hash = block.hash();
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
+        engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None).unwrap();
         engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
         engine.add_vote(&v.self_kp, peer_vote(&v.a_kp, VoteType::Prevote, 2, 0, block_hash)).unwrap();
         engine.add_vote(&v.self_kp, peer_vote(&v.b_kp, VoteType::Precommit, 2, 0, block_hash)).unwrap();
@@ -3231,7 +3271,7 @@ mod tests {
             1,
         );
         let err = proposer_engine
-            .produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), vec![])
+            .produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         assert!(matches!(err, ConsensusError::AwaitingVotes { height: 2, round: 0 }));
         let block = proposer_engine.pending_proposal().unwrap().clone();
@@ -3239,7 +3279,7 @@ mod tests {
         let b_prevote = proposer_engine.take_outbound_votes().into_iter().next().unwrap();
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        let result = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap();
+        let result = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None).unwrap();
         assert_eq!(result, None, "a single prevote shouldn't reach quorum yet");
         let outbound = engine.take_outbound_votes();
         assert_eq!(outbound.len(), 1, "receiving the proposal casts our own prevote");
@@ -3292,10 +3332,10 @@ mod tests {
 
         // c is the proposer for height 3, round 0 ((3 + 0) % 4 == 3, c's index).
         let mut proposer_engine = BftEngine::new(v.validator_set.clone(), v.c_addr.clone(), 2);
-        let _ = proposer_engine.produce_block(&v.c_kp, Hash::digest(b"a-different-sibling"), proposer_engine.current_height(), vec![]);
+        let _ = proposer_engine.produce_block(&v.c_kp, Hash::digest(b"a-different-sibling"), proposer_engine.current_height(), Hash::ZERO, vec![]);
         let block = proposer_engine.pending_proposal().unwrap().clone();
 
-        let result = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block));
+        let result = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None);
         assert!(
             matches!(
                 &result,
@@ -3313,12 +3353,12 @@ mod tests {
     fn receive_proposal_for_already_finalized_height_is_ignored() {
         let v = four_validators();
         let mut producer = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
-        let _ = producer.produce_block(&v.self_kp, Hash::digest(b"genesis"), producer.current_height(), vec![]);
+        let _ = producer.produce_block(&v.self_kp, Hash::digest(b"genesis"), producer.current_height(), Hash::ZERO, vec![]);
         let block = producer.pending_proposal().unwrap().clone();
 
         // Already past height 1.
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        assert_eq!(engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap(), None);
+        assert_eq!(engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None).unwrap(), None);
         assert!(!engine.has_active_round());
     }
 
@@ -3344,11 +3384,11 @@ mod tests {
 
         // c is the proposer for height 3, round 0 ((3 + 0) % 4 == 3, c's index).
         let mut proposer_engine = BftEngine::new(v.validator_set.clone(), v.c_addr.clone(), 2);
-        let _ = proposer_engine.produce_block(&v.c_kp, Hash::digest(b"block-2"), proposer_engine.current_height(), vec![]);
+        let _ = proposer_engine.produce_block(&v.c_kp, Hash::digest(b"block-2"), proposer_engine.current_height(), Hash::ZERO, vec![]);
         let block = proposer_engine.pending_proposal().unwrap().clone();
 
         // Before the fix this failed with InvalidBlock { reason: "expected height 2, got 3" }.
-        let result = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block));
+        let result = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None);
         assert!(result.is_ok(), "the next real proposal must not be rejected: {result:?}");
     }
 
@@ -3363,12 +3403,12 @@ mod tests {
             Address::from_public_key(&v.b_kp.public),
             1,
         );
-        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), vec![]);
+        let _ = proposer_engine.produce_block(&v.b_kp, Hash::digest(b"block-1"), proposer_engine.current_height(), Hash::ZERO, vec![]);
         let mut block = proposer_engine.pending_proposal().unwrap().clone();
         block.header.validator = Address::from_public_key(&v.a_kp.public);
 
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 1);
-        let err = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block)).unwrap_err();
+        let err = engine.receive_proposal(&v.self_kp, Proposal::fresh(0, block), None).unwrap_err();
         assert!(matches!(err, ConsensusError::InvalidBlock { height: 2, .. }));
     }
 
@@ -3382,7 +3422,7 @@ mod tests {
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 0);
 
         let err = engine
-            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![])
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         assert!(matches!(err, ConsensusError::AwaitingVotes { height: 1, round: 0 }));
         engine.take_outbound_votes();
@@ -3394,7 +3434,7 @@ mod tests {
         assert!(engine.note_round_tick(&v.self_kp), "must time out after ROUND_TIMEOUT_TICKS");
 
         let err = engine
-            .advance_round(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![])
+            .advance_round(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         assert!(matches!(err, ConsensusError::NotProposer { height: 1, round: 1 }));
         assert!(!engine.has_active_round(), "stalled round is dropped either way");
@@ -3411,14 +3451,14 @@ mod tests {
         let v = four_validators();
 
         let mut self_engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
-        let _ = self_engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), vec![]);
+        let _ = self_engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), Hash::ZERO, vec![]);
         let round0_block = self_engine.pending_proposal().unwrap().clone();
         self_engine.take_outbound_votes();
         for _ in 0..ROUND_TIMEOUT_TICKS {
             self_engine.note_round_tick(&v.self_kp);
         }
         let err = self_engine
-            .advance_round(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), vec![])
+            .advance_round(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         assert!(matches!(err, ConsensusError::NotProposer { height: 1, round: 1 }));
 
@@ -3427,13 +3467,13 @@ mod tests {
         // re-proposes with a fresh block.
         let b_addr = Address::from_public_key(&v.b_kp.public);
         let mut b_engine = BftEngine::new(v.validator_set.clone(), b_addr, 0);
-        b_engine.receive_proposal(&v.b_kp, Proposal::fresh(0, round0_block)).unwrap();
+        b_engine.receive_proposal(&v.b_kp, Proposal::fresh(0, round0_block), None).unwrap();
         b_engine.take_outbound_votes();
         for _ in 0..ROUND_TIMEOUT_TICKS {
             b_engine.note_round_tick(&v.b_kp);
         }
         let err = b_engine
-            .advance_round(&v.b_kp, Hash::digest(b"genesis"), b_engine.current_height(), vec![])
+            .advance_round(&v.b_kp, Hash::digest(b"genesis"), b_engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         assert!(matches!(err, ConsensusError::AwaitingVotes { height: 1, round: 1 }));
         let round1_block = b_engine.pending_proposal().unwrap().clone();
@@ -3443,7 +3483,7 @@ mod tests {
 
         // self picks up b's round-1 proposal, joins the round, and votes it
         // to finality exactly like any ordinary (non-timed-out) round.
-        let result = self_engine.receive_proposal(&v.self_kp, Proposal::fresh(1, round1_block)).unwrap();
+        let result = self_engine.receive_proposal(&v.self_kp, Proposal::fresh(1, round1_block), None).unwrap();
         assert_eq!(result, None);
         let outbound = self_engine.take_outbound_votes();
         assert_eq!(outbound.len(), 1);
@@ -3480,33 +3520,33 @@ mod tests {
         let v = four_validators();
 
         let mut self_engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
-        let _ = self_engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), vec![]);
+        let _ = self_engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), Hash::ZERO, vec![]);
         let round0_block = self_engine.pending_proposal().unwrap().clone();
         self_engine.take_outbound_votes();
         for _ in 0..ROUND_TIMEOUT_TICKS {
             self_engine.note_round_tick(&v.self_kp);
         }
         self_engine
-            .advance_round(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), vec![])
+            .advance_round(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
 
         let b_addr = Address::from_public_key(&v.b_kp.public);
         let mut b_engine = BftEngine::new(v.validator_set, b_addr, 0);
-        b_engine.receive_proposal(&v.b_kp, Proposal::fresh(0, round0_block.clone())).unwrap();
+        b_engine.receive_proposal(&v.b_kp, Proposal::fresh(0, round0_block.clone()), None).unwrap();
         for _ in 0..ROUND_TIMEOUT_TICKS {
             b_engine.note_round_tick(&v.b_kp);
         }
         b_engine
-            .advance_round(&v.b_kp, Hash::digest(b"genesis"), b_engine.current_height(), vec![])
+            .advance_round(&v.b_kp, Hash::digest(b"genesis"), b_engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         let round1_block = b_engine.pending_proposal().unwrap().clone();
 
-        self_engine.receive_proposal(&v.self_kp, Proposal::fresh(1, round1_block)).unwrap();
+        self_engine.receive_proposal(&v.self_kp, Proposal::fresh(1, round1_block), None).unwrap();
         self_engine.take_outbound_votes();
         assert_eq!(self_engine.pending_proposal().map(|b| b.height()), Some(1));
 
         // Re-deliver the stale round-0 proposal.
-        let result = self_engine.receive_proposal(&v.self_kp, Proposal::fresh(0, round0_block)).unwrap();
+        let result = self_engine.receive_proposal(&v.self_kp, Proposal::fresh(0, round0_block), None).unwrap();
         assert_eq!(result, None);
         assert_eq!(
             self_engine.take_outbound_votes().len(),
@@ -3531,7 +3571,7 @@ mod tests {
     fn locked_self_engine(v: &FourValidators) -> (BftEngine, Block, Hash) {
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
         engine
-            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![])
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         engine.take_outbound_votes();
         let block = engine.pending_proposal().unwrap().clone();
@@ -3559,7 +3599,7 @@ mod tests {
         // self ((1 + 0) % 4 == 1) is round 0's proposer — build its block first.
         let mut self_engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
         self_engine
-            .produce_block(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), vec![])
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), self_engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         let round0 = self_engine.pending_proposal().unwrap().clone();
 
@@ -3568,14 +3608,14 @@ mod tests {
         let b_addr = Address::from_public_key(&v.b_kp.public);
         let mut b_engine = BftEngine::new(v.validator_set.clone(), b_addr, 0);
         b_engine
-            .receive_proposal(&v.b_kp, Proposal::fresh(0, round0))
+            .receive_proposal(&v.b_kp, Proposal::fresh(0, round0), None)
             .unwrap();
         b_engine.take_outbound_votes();
         for _ in 0..ROUND_TIMEOUT_TICKS {
             b_engine.note_round_tick(&v.b_kp);
         }
         b_engine
-            .advance_round(&v.b_kp, Hash::digest(b"genesis"), b_engine.current_height(), vec![])
+            .advance_round(&v.b_kp, Hash::digest(b"genesis"), b_engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         b_engine.pending_proposal().unwrap().clone()
     }
@@ -3594,7 +3634,7 @@ mod tests {
         // Produced by this node, so every other property (height, signature, base fee, chaining)
         // is correct and size is the only thing left to reject it on.
         engine
-            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![])
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         let mut block = engine.pending_proposal().unwrap().clone();
 
@@ -3605,12 +3645,71 @@ mod tests {
         let mut verifier = BftEngine::new(v.validator_set.clone(), v.c_addr.clone(), 0);
         verifier.seed_last_committed(Hash::digest(b"genesis"));
         let err = verifier
-            .validate_block(&block, 0, None, &[])
+            .validate_block(&block, 0, None, &[], None)
             .expect_err("an oversized proposal must not be votable");
         assert!(
             format!("{err}").contains("over the"),
             "expected a size rejection, got: {err}"
         );
+    }
+
+    /// A state fork is signed, valid, and — until this check — invisible (#194).
+    ///
+    /// Two nodes that executed the chain differently produce different balances, rewards and
+    /// validator sets while every signature on every block stays perfectly verifiable. The node
+    /// layer said so in its own comment: "a state fork, undetectable by anything CONSENSUS-LEVEL,
+    /// since BlockHeader still carries no state_root". #145 was one instance — an interrupted sync
+    /// executed a block twice, minted its reward twice, and nothing built on top of the wrong
+    /// balance ever objected.
+    #[test]
+    fn a_proposal_built_on_a_different_state_is_refused_as_the_fork_it_is() {
+        let v = four_validators();
+        let agreed = Hash::digest(b"the state both nodes computed");
+        let mut proposer = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        proposer
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), 0, agreed, vec![])
+            .unwrap_err();
+        let block = proposer.pending_proposal().unwrap().clone();
+
+        let mut verifier = BftEngine::new(v.validator_set.clone(), v.c_addr.clone(), 0);
+        verifier.seed_last_committed(Hash::digest(b"genesis"));
+
+        // Positive control, and it has to come first: without it a rejection below could equally
+        // well mean this block was never votable for some unrelated reason.
+        verifier
+            .validate_block(&block, 0, None, &[], Some(agreed))
+            .expect("a proposer that agrees with us about the parent state must be accepted");
+
+        let err = verifier
+            .validate_block(&block, 0, None, &[], Some(Hash::digest(b"what this node computed")))
+            .expect_err("a proposer that built on another state must not be voted for");
+        assert!(
+            format!("{err}").contains("state root mismatch"),
+            "the rejection has to name what it is — a state fork, not a stale block: {err}"
+        );
+    }
+
+    /// **`None` means "cannot say", and must never mean "reject".**
+    ///
+    /// A node that is behind sees proposals for heights whose parents it has not executed, and one
+    /// whose store moved past its executed state holds no comparable root either. Refusing those
+    /// would turn an ordinary, temporary lag into a node that votes against every block it is
+    /// shown — the failure mode is not a missed check, it is a validator that takes itself out of
+    /// the quorum and cannot get back in.
+    #[test]
+    fn a_node_that_cannot_compute_the_parent_state_does_not_refuse_over_it() {
+        let v = four_validators();
+        let mut proposer = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
+        proposer
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), 0, Hash::digest(b"some state"), vec![])
+            .unwrap_err();
+        let block = proposer.pending_proposal().unwrap().clone();
+
+        let mut verifier = BftEngine::new(v.validator_set.clone(), v.c_addr.clone(), 0);
+        verifier.seed_last_committed(Hash::digest(b"genesis"));
+        verifier
+            .validate_block(&block, 0, None, &[], None)
+            .expect("a node with no comparable state root must not reject over one");
     }
 
     /// The control. The same block under the limit has to pass, or the rule is a liveness bug
@@ -3621,7 +3720,7 @@ mod tests {
         let v = four_validators();
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
         engine
-            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![])
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         let block = engine.pending_proposal().unwrap().clone();
 
@@ -3629,7 +3728,7 @@ mod tests {
         verifier.seed_last_committed(Hash::digest(b"genesis"));
         // May still fail for unrelated reasons in other tests' setups; here it must simply not be
         // the size that stops it.
-        if let Err(e) = verifier.validate_block(&block, 0, None, &[]) {
+        if let Err(e) = verifier.validate_block(&block, 0, None, &[], None) {
             assert!(!format!("{e}").contains("over the"), "rejected for size: {e}");
         }
     }
@@ -3712,7 +3811,7 @@ mod tests {
         // b's round-1 proposal is fresh (valid_round = None). self is locked on A,
         // so it must abstain — join the round to tally peers, but cast no prevote.
         let result = engine
-            .receive_proposal(&v.self_kp, Proposal::fresh(1, block_b.clone()))
+            .receive_proposal(&v.self_kp, Proposal::fresh(1, block_b.clone()), None)
             .unwrap();
         assert_eq!(result, None);
         assert!(
@@ -3747,7 +3846,7 @@ mod tests {
         // c re-proposes B in round 2 carrying B's round-1 POL. self, locked on A
         // from round 0, must unlock (1 >= 0) and prevote B.
         let proposal = Proposal::reproposal(2, 1, block_b.clone(), pol);
-        let result = engine.receive_proposal(&v.self_kp, proposal).unwrap();
+        let result = engine.receive_proposal(&v.self_kp, proposal, None).unwrap();
         assert_eq!(result, None);
 
         let outbound = engine.take_outbound_votes();
@@ -3776,7 +3875,7 @@ mod tests {
 
         // And the same shortfall makes the whole re-proposal fail validation.
         let err = engine
-            .validate_block(&block_b, 2, Some(1), &pol)
+            .validate_block(&block_b, 2, Some(1), &pol, None)
             .unwrap_err();
         assert!(matches!(err, ConsensusError::InsufficientVotingPower { .. }));
     }
@@ -3792,7 +3891,7 @@ mod tests {
         // self is the proposer for round 4 too ((1 + 4) % 4 == 1). Proposing there
         // while locked must re-propose A, not build a fresh block.
         let err = engine
-            .propose(&v.self_kp, 1, 4, Hash::digest(b"genesis"), 0, vec![])
+            .propose(&v.self_kp, 1, 4, Hash::digest(b"genesis"), 0, Hash::ZERO, vec![])
             .unwrap_err();
         assert!(matches!(err, ConsensusError::AwaitingVotes { round: 4, .. }));
 
@@ -3824,7 +3923,7 @@ mod tests {
 
         // The round-0 proposer is dead — no proposal ever arrives. Time out and advance.
         let err = engine
-            .advance_round(&v.self_kp, Hash::digest(b"tip-3"), engine.current_height(), vec![])
+            .advance_round(&v.self_kp, Hash::digest(b"tip-3"), engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         assert!(
             matches!(err, ConsensusError::AwaitingVotes { height: 4, round: 1 }),
@@ -3845,7 +3944,7 @@ mod tests {
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 1);
 
         let err = engine
-            .advance_round(&v.self_kp, Hash::digest(b"tip-1"), engine.current_height(), vec![])
+            .advance_round(&v.self_kp, Hash::digest(b"tip-1"), engine.current_height(), Hash::ZERO, vec![])
             .unwrap_err();
         assert!(
             matches!(err, ConsensusError::NotProposer { height: 2, round: 1 }),
@@ -3857,11 +3956,11 @@ mod tests {
         // restart the abandoned round. b is height-2 round-0's proposer ((2+0)%4==2).
         let b_addr = Address::from_public_key(&v.b_kp.public);
         let mut b_engine = BftEngine::new(v.validator_set, b_addr, 1);
-        b_engine.produce_block(&v.b_kp, Hash::digest(b"tip-1"), b_engine.current_height(), vec![]).unwrap_err();
+        b_engine.produce_block(&v.b_kp, Hash::digest(b"tip-1"), b_engine.current_height(), Hash::ZERO, vec![]).unwrap_err();
         let stale_round0 = b_engine.pending_proposal().unwrap().clone();
 
         assert_eq!(
-            engine.receive_proposal(&v.self_kp, Proposal::fresh(0, stale_round0)).unwrap(),
+            engine.receive_proposal(&v.self_kp, Proposal::fresh(0, stale_round0), None).unwrap(),
             None,
             "a proposal for the round we already advanced past must be ignored"
         );
@@ -3905,7 +4004,7 @@ mod tests {
             }
         }
         engine.take_outbound_votes();
-        let _ = engine.advance_round(kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.advance_round(kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
         engine.take_outbound_votes();
     }
 
@@ -4058,8 +4157,8 @@ mod tests {
         let mut theirs = BftEngine::new(v.validator_set.clone(), peer_addr, 0);
 
         // Each proposes its own block for height 1 and hears nothing back, ever.
-        let _ = ours.produce_block(&v.self_kp, Hash::digest(b"genesis"), ours.current_height(), vec![]);
-        let _ = theirs.produce_block(&v.peer_kp, Hash::digest(b"genesis"), theirs.current_height(), vec![]);
+        let _ = ours.produce_block(&v.self_kp, Hash::digest(b"genesis"), ours.current_height(), Hash::ZERO, vec![]);
+        let _ = theirs.produce_block(&v.peer_kp, Hash::digest(b"genesis"), theirs.current_height(), Hash::ZERO, vec![]);
         for _ in 0..SILENT_ROUNDS {
             tick_to_timeout_and_advance(&mut ours, &v.self_kp);
             tick_to_timeout_and_advance(&mut theirs, &v.peer_kp);
@@ -4099,7 +4198,7 @@ mod tests {
         );
         let mut engine = BftEngine::new(set, v.self_addr.clone(), 0);
 
-        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
         for _ in 0..SILENT_ROUNDS {
             tick_to_timeout_and_advance(&mut engine, &v.self_kp);
         }
@@ -4178,7 +4277,7 @@ mod tests {
         let quorum = v.validator_set.quorum_threshold();
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
 
-        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
         for _ in 0..SILENT_ROUNDS {
             tick_to_timeout_and_advance(&mut engine, &v.self_kp);
         }
@@ -4207,7 +4306,7 @@ mod tests {
     fn a_validator_is_not_counted_as_silent_after_one_missed_round() {
         let v = two_validators();
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
-        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
 
         tick_to_timeout_and_advance(&mut engine, &v.self_kp);
         assert_eq!(
@@ -4236,7 +4335,7 @@ mod tests {
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
         let peer_addr = Address::from_public_key(&v.peer_kp.public);
 
-        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
         for _ in 0..SILENT_ROUNDS {
             tick_to_timeout_and_advance(&mut engine, &v.self_kp);
         }
@@ -4276,7 +4375,7 @@ mod tests {
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 10);
         let peer_addr = Address::from_public_key(&v.peer_kp.public);
 
-        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
         for _ in 0..SILENT_ROUNDS {
             let stale = peer_vote(
                 &v.peer_kp,
@@ -4310,7 +4409,7 @@ mod tests {
         let peer_addr = Address::from_public_key(&v.peer_kp.public);
         let mut engine = BftEngine::new(v.validator_set, v.self_addr.clone(), 0);
 
-        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
         engine.take_outbound_votes();
 
         // Build up a few rounds of silence to have something that could carry over.
@@ -4356,7 +4455,7 @@ mod tests {
             }
         }
         engine.take_outbound_votes();
-        let _ = engine.advance_round(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.advance_round(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
         engine.take_outbound_votes();
         assert_eq!(
             engine.missed_rounds.get(&peer_addr).copied().unwrap_or(0),
@@ -4411,7 +4510,7 @@ mod tests {
 
         // …and the proposal it then makes carries exactly one prevote, its own, uncontested.
         engine
-            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![])
+            .produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![])
             .expect_err("a two-validator set awaits the peer's vote");
         let after = engine.take_outbound_votes();
         assert_eq!(after.len(), 1, "exactly one prevote for the proposed block");
@@ -4526,7 +4625,7 @@ mod tests {
         // Round 0 of height 1 belongs to `self_addr` (see `two_validators`), so start at round 1,
         // where this node is *not* the proposer and has to wait for one.
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
-        let _ = engine.advance_round(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.advance_round(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
         engine.take_outbound_votes();
         assert_eq!(engine.pending_round(), 1);
 
@@ -4582,7 +4681,7 @@ mod tests {
     fn round_evidence_serves_the_pending_proposal_and_stays_empty_for_other_heights() {
         let v = two_validators();
         let mut engine = BftEngine::new(v.validator_set.clone(), v.self_addr.clone(), 0);
-        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), vec![]);
+        let _ = engine.produce_block(&v.self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
         engine.take_outbound_votes();
 
         let (proposal, votes) = engine.round_evidence(1);
@@ -4635,7 +4734,7 @@ mod tests {
         // the network locked this value in round 1; A's header names round 0's proposer
         // because that is who built it, and no rule says those have to be the same validator.
         engine
-            .validate_block(&block_a, 2, Some(1), &pol_round_1)
+            .validate_block(&block_a, 2, Some(1), &pol_round_1, None)
             .expect("a re-proposal backed by a genuine POL must be accepted");
     }
 
@@ -4657,10 +4756,10 @@ mod tests {
             peer_vote(&v.b_kp, VoteType::Prevote, 1, 1, hash_a.clone()),
             peer_vote(&v.c_kp, VoteType::Prevote, 1, 1, hash_a.clone()),
         ];
-        engine.validate_block(&block_a, 2, Some(1), &pol).expect("round 2 > lock round 1 is fine");
+        engine.validate_block(&block_a, 2, Some(1), &pol, None).expect("round 2 > lock round 1 is fine");
 
         for claimed in [1u32, 0] {
-            let err = engine.validate_block(&block_a, claimed, Some(1), &pol).unwrap_err();
+            let err = engine.validate_block(&block_a, claimed, Some(1), &pol, None).unwrap_err();
             match err {
                 ConsensusError::InvalidBlock { reason, .. } => assert!(
                     reason.contains("a lock can only come from a round already past"),

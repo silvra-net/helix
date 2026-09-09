@@ -207,10 +207,13 @@ impl Net {
         // These engines share one `prev`, so their heights never drift — which is precisely the
         // condition the live node cannot assume (#178/#192).
         let prev_height = self.engines[i].current_height();
+        // No executor behind these engines, so there is no state to hash: the new root field is
+        // deliberately inert here (`Hash::ZERO` out, `None` in). These numbers are the baseline
+        // that shows the change left consensus dynamics alone.
         let produced = if stalled {
-            self.engines[i].advance_round(&self.kps[i], prev, prev_height, vec![])
+            self.engines[i].advance_round(&self.kps[i], prev, prev_height, Hash::ZERO, vec![])
         } else {
-            self.engines[i].produce_block(&self.kps[i], prev, prev_height, vec![])
+            self.engines[i].produce_block(&self.kps[i], prev, prev_height, Hash::ZERO, vec![])
         };
         if let Ok(block) = produced {
             self.prev = block.hash();
@@ -225,7 +228,7 @@ impl Net {
     fn deliver(&mut self, to: usize, msg: &Msg, out: &mut Vec<(usize, Msg)>) {
         let finalized = match msg {
             Msg::Prop(p) => {
-                self.engines[to].receive_proposal(&self.kps[to], (**p).clone()).ok().flatten()
+                self.engines[to].receive_proposal(&self.kps[to], (**p).clone(), None).ok().flatten()
             }
             Msg::Vote(v) => self.engines[to].add_vote(&self.kps[to], (**v).clone()).ok().flatten(),
         };
