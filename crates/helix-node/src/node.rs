@@ -2173,6 +2173,36 @@ fn verify_block_batch(
         ));
     }
 
+    // The state the first block claims to build on has to be the state this node actually holds
+    // (#194). Only the first block is checkable here — this function verifies, it does not
+    // execute, so the intermediate states inside the batch do not exist yet. That is enough: the
+    // blocks are chained by `prev_hash` below, so once the starting state agrees, every state
+    // after it is determined by execution, and a batch that disagrees later is caught as the first
+    // block of the next one.
+    //
+    // **The failure this catches is usually ours, not the peer's.** #145 was an interrupted sync
+    // that executed a block twice and minted its reward twice; from then on this node's state was
+    // wrong and nothing said so, because every block it received afterwards was perfectly valid.
+    // A peer serving another history is caught too, but that already had `prev_hash` to fail on.
+    //
+    // Skipped whenever the parent height is not the one this node has executed — the store can sit
+    // ahead of the executed state for the moment between writing a block and stamping it.
+    if chain_state.applied_height + 1 == expected_first_height {
+        let ours = chain_state.state_hash();
+        if first.header.prev_state_root != ours {
+            return Err(format!(
+                "block {} was built on state {} but this node computed {} for height {}. \
+                 Either this node executed the chain wrongly — in which case no peer can serve it \
+                 and it needs its data rebuilt — or this peer is on another history. Both are \
+                 reasons to apply nothing.",
+                first.height(),
+                first.header.prev_state_root,
+                ours,
+                chain_state.applied_height,
+            ));
+        }
+    }
+
     let mut expected_prev = expected_prev_hash;
     for (i, block) in blocks.iter().enumerate() {
         let expected_height = expected_first_height + i as u64;
@@ -5664,6 +5694,41 @@ mod sync_blocks_from_peer_tests {
         chained_blocks_certified_by(kp, &[kp], heights)
     }
 
+    /// `chained_blocks_certified_by`, but the **first** block declares `parent_state_root` as the
+    /// state it was built on (#194).
+    ///
+    /// Only the first one needs it: `verify_block_batch` verifies and does not execute, so the
+    /// states between the blocks in a batch do not exist yet and cannot be checked there. The rest
+    /// keep the zero root the other fixtures use.
+    fn chained_blocks_on_state(
+        proposer: &KeyPair,
+        certifiers: &[&KeyPair],
+        heights: &[u64],
+        parent_state_root: Hash,
+    ) -> Vec<Block> {
+        let mut blocks = Vec::new();
+        let mut prev_hash = Hash::ZERO;
+        let mut prev_height: Option<u64> = None;
+        for (i, &h) in heights.iter().enumerate() {
+            let mut block = signed_block(proposer, h, prev_hash);
+            if i == 0 {
+                block.header.prev_state_root = parent_state_root;
+            }
+            if let Some(ph) = prev_height {
+                block.header.last_commit = certifiers
+                    .iter()
+                    .map(|c| commit_sig_for(c, ph, &prev_hash))
+                    .collect();
+            }
+            let sig = proposer.sign(block.header.signing_hash().as_bytes()).unwrap();
+            block.header.signature = sig;
+            prev_hash = block.hash();
+            prev_height = Some(h);
+            blocks.push(block);
+        }
+        blocks
+    }
+
     /// Like `chained_blocks`, but the commit certificates are signed by `certifiers` — needed
     /// wherever the state has more than one active validator, since one precommit out of two is
     /// short of a quorum and the sync path now checks that (#136).
@@ -6511,7 +6576,10 @@ mod sync_blocks_from_peer_tests {
         stake_validator(&mut chain_state, &b);
         let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
 
-        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3, 4, 5]);
+        // Built on the state this node actually holds — a batch that claims another one is
+        // refused before anything else is looked at (#194), which is the point of that check.
+        let blocks =
+            chained_blocks_on_state(&a, &[&a, &b], &[1, 2, 3, 4, 5], chain_state.state_hash());
 
         let proven = verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set)
             .expect("a batch that certifies four of its own blocks is not a refusal");
@@ -6534,6 +6602,72 @@ mod sync_blocks_from_peer_tests {
         );
     }
 
+    /// **#145, caught this time.** An interrupted sync executed one block twice and minted its
+    /// reward twice; from that moment this node's state was wrong, and nothing ever said so —
+    /// every block it received afterwards was signed, chained and valid. A block declares the
+    /// state it was built on now, so the first one that does not match is refused and nothing
+    /// lands on top of the wrong balance.
+    ///
+    /// The same check catches a peer serving another history, but that one already had `prev_hash`
+    /// to fail on. The failure it is really for is *ours*.
+    #[test]
+    fn a_batch_built_on_a_state_this_node_does_not_hold_is_refused() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &a);
+        stake_validator(&mut chain_state, &b);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+
+        // Positive control: the same blocks on the right state are accepted. Without it, the
+        // refusal below could just as well mean the batch was malformed some other way.
+        let good = chained_blocks_on_state(&a, &[&a, &b], &[1, 2, 3], chain_state.state_hash());
+        verify_block_batch(&good, &[], 1, Hash::ZERO, &chain_state, &set)
+            .expect("a batch built on our state must be accepted");
+
+        let wrong = chained_blocks_on_state(
+            &a,
+            &[&a, &b],
+            &[1, 2, 3],
+            Hash::digest(b"a state this node never computed"),
+        );
+        let err = verify_block_batch(&wrong, &[], 1, Hash::ZERO, &chain_state, &set)
+            .expect_err("a batch built on another state must not be applied");
+        assert!(
+            err.contains("built on state") && err.contains("this node computed"),
+            "the error has to name both sides, because the operator cannot tell from outside \
+             which of the two is wrong: {err}"
+        );
+    }
+
+    /// **A node that has not executed the parent must not refuse over the state.**
+    ///
+    /// The store can sit ahead of the executed state for the moment between writing a block and
+    /// stamping its execution, and a node catching up is behind by construction. Refusing there
+    /// would be a node that rejects every batch it is offered — it would stop catching up exactly
+    /// when catching up is the only thing that helps it.
+    #[test]
+    fn a_batch_whose_parent_this_node_has_not_executed_is_not_refused_over_the_state() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &a);
+        stake_validator(&mut chain_state, &b);
+        // This node has executed up to height 7; the batch below starts at 1, so its parent is a
+        // height whose state this node no longer holds.
+        chain_state.applied_height = 7;
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+
+        let blocks = chained_blocks_on_state(
+            &a,
+            &[&a, &b],
+            &[1, 2, 3],
+            Hash::digest(b"whatever the state was back then"),
+        );
+        verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set)
+            .expect("a state root for a height this node cannot recompute is not a reason to refuse");
+    }
+
     /// The security property is unchanged: a batch nothing in it can prove is still refused whole.
     #[test]
     fn a_batch_with_no_quorum_anywhere_is_refused_whole() {
@@ -6544,7 +6678,13 @@ mod sync_blocks_from_peer_tests {
         stake_validator(&mut chain_state, &honest);
         let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
 
-        let blocks = chained_blocks_certified_by(&attacker, &[&attacker], &[1, 2, 3]);
+        // On the right state, so what is refused below is the missing quorum and nothing else.
+        let blocks = chained_blocks_on_state(
+            &attacker,
+            &[&attacker],
+            &[1, 2, 3],
+            chain_state.state_hash(),
+        );
 
         let err = verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set)
             .expect_err("one validator's own signature is not a quorum, anywhere in the batch");
@@ -7648,11 +7788,24 @@ mod handle_p2p_event_tests {
 
     /// Blocks that properly chain from `Hash::ZERO` (a fresh store's tip) through each other.
     fn chained_blocks(kp: &KeyPair, heights: &[u64]) -> Vec<Block> {
+        chained_blocks_on_state(kp, heights, Hash::ZERO)
+    }
+
+    /// `chained_blocks`, but the **first** block declares the state it was built on (#194). Only
+    /// the first one is checkable: `verify_block_batch` verifies without executing, so the states
+    /// between blocks in a batch do not exist there.
+    fn chained_blocks_on_state(kp: &KeyPair, heights: &[u64], parent_state_root: Hash) -> Vec<Block> {
         let mut prev_hash = Hash::ZERO;
         heights
             .iter()
-            .map(|&h| {
-                let block = signed_block(kp, h, prev_hash);
+            .enumerate()
+            .map(|(i, &h)| {
+                let mut block = signed_block(kp, h, prev_hash);
+                if i == 0 {
+                    block.header.prev_state_root = parent_state_root;
+                    block.header.signature =
+                        kp.sign(block.header.signing_hash().as_bytes()).unwrap();
+                }
                 prev_hash = block.hash();
                 block
             })
@@ -7914,7 +8067,9 @@ mod handle_p2p_event_tests {
     async fn a_verifiable_batch_is_applied_and_advances_our_tip() {
         let kp = KeyPair::generate();
         let (store, chain_state, engine, cell) = blocksync_fixture(&kp).await;
-        let blocks = chained_blocks(&kp, &[1, 2, 3]);
+        // Built on the state this node holds, as a real proposer's block is (#194).
+        let root = chain_state.read().await.state_hash();
+        let blocks = chained_blocks_on_state(&kp, &[1, 2, 3], root);
         let tip = blocks.last().unwrap();
         let batch = BlockSyncResponse {
             tip_certificate: commit_sigs_to_votes(
@@ -8179,7 +8334,10 @@ mod handle_p2p_event_tests {
             0,
         )));
         let cell = Arc::new(RwLock::new(TipCertificate::default()));
-        let blocks = chained_blocks(&kp, &[1, 2]);
+        // Built on the state this node holds (#194) — the bootstrap window relaxes the *quorum*
+        // requirement, not the requirement that a block describe a chain this node is on.
+        let root = chain_state.read().await.state_hash();
+        let blocks = chained_blocks_on_state(&kp, &[1, 2], root);
 
         deliver_batch(
             BlockSyncResponse { blocks, tip_certificate: vec![] },
