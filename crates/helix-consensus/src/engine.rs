@@ -1433,20 +1433,25 @@ impl BftEngine {
         let mut seen: HashSet<String> = HashSet::new();
         for sig in last_commit {
             // The key comes from the set, not from the block: `CommitSig` stopped carrying one
-            // because it was the same 1952 bytes per validator in every block forever. A signer
-            // the set does not know is refused here — an unknown key is never an accepted one.
-            let key = self
-                .validator_set
-                .get(&sig.validator)
-                .and_then(|v| v.public_key.as_ref())
-                .ok_or_else(|| ConsensusError::InvalidBlock {
-                    height,
-                    reason: format!(
-                        "last_commit carries a signature from {}, whose signing key this chain \
-                         does not know — it is not a staked validator here",
-                        sig.validator
-                    ),
-                })?;
+            // because it was the same 1952 bytes per validator in every block forever (#194).
+            //
+            // **A signer the current set does not know is skipped, never a reason to refuse the
+            // block** — the rule the doc comment above has always stated, and the one that got
+            // lost when the key moved out of `CommitSig`. `last_commit` attests the parent
+            // height, whose set can legitimately differ from this one: at an epoch rotation it
+            // *does*. Refusing there stops the chain at every boundary, which is exactly what
+            // happened — measured on 2026-09-09 in the three-validator harness, height 300,
+            // `Validator set rotated epoch=3` one line above 97 rejections of height 301.
+            //
+            // Skipping is safe in the direction that matters. An unverifiable signature simply
+            // does not count: it cannot shield its validator from a downtime miss, which is the
+            // only thing `last_commit` feeds. What a proposer must not be able to do is have an
+            // *invented* signature counted, and that is unchanged — every signature that is
+            // counted is verified against a key this chain knows.
+            let Some(key) = self.validator_set.get(&sig.validator).and_then(|v| v.public_key.as_ref())
+            else {
+                continue;
+            };
             sig.verify(key, height - 1, parent_hash)
                 .map_err(|e| ConsensusError::InvalidBlock {
                     height,
@@ -3984,10 +3989,13 @@ mod tests {
         let peer_addr = Address::from_public_key(&peer_kp.public);
         // self_addr at index 1 so it's the proposer for height 1, round 0
         // (proposer_for_round uses (height + round) % len).
+        // With keys, as a set built from chain state always is (`consensus_validator_set`).
+        // Without them `verify_last_commit` cannot check a signature at all and skips it, and
+        // the tests below that exist to prove a forgery is caught would quietly prove nothing.
         let validator_set = ValidatorSet::new(
             vec![
-                Validator::new(peer_addr, 1_000, true),
-                Validator::new(self_addr.clone(), 1_000, true),
+                Validator::with_key(peer_addr, Some(peer_kp.public.clone()), 1_000, true),
+                Validator::with_key(self_addr.clone(), Some(self_kp.public.clone()), 1_000, true),
             ],
             0,
         );
@@ -4032,6 +4040,37 @@ mod tests {
 
         let err = engine.verify_last_commit(&[commit_sig], 6, &parent_hash).unwrap_err();
         assert!(matches!(err, ConsensusError::InvalidBlock { .. }));
+    }
+
+    /// **The epoch boundary, which is where this broke.** `last_commit` attests the *parent*
+    /// height, and the parent's validator set is not always this one: at a rotation it is not.
+    /// A signature from an address the current set does not know is stale, not forged, and must
+    /// be skipped rather than refuse the block.
+    ///
+    /// Measured on 2026-09-09, three real node processes: `Validator set rotated epoch=3` at
+    /// height 300, then 97 rejections of height 301 and a chain that never moved again. Every one
+    /// of 814 unit tests was green — none of them crosses a rotation, which is exactly why the
+    /// multi-node harness is not optional (lesson 4).
+    #[test]
+    fn verify_last_commit_skips_a_signer_the_current_set_does_not_know() {
+        let v = two_validators();
+        let engine = BftEngine::new(v.validator_set, v.self_addr, 5);
+        let parent_hash = Hash::digest(b"parent");
+
+        // Somebody who signed the parent and is no longer in the set — a validator that unstaked,
+        // was jailed, or simply belonged to the previous epoch's set.
+        let departed = KeyPair::generate();
+        let vote = peer_vote(&departed, VoteType::Precommit, 5, 0, parent_hash);
+        let stale = helix_core::CommitSig {
+            validator: vote.validator,
+            crypto_version: vote.crypto_version,
+            round: vote.round,
+            signature: vote.signature,
+        };
+
+        engine
+            .verify_last_commit(&[stale], 6, &parent_hash)
+            .expect("a signature from outside the current set is stale, not a reason to refuse");
     }
 
     /// The same validator can't be counted twice toward participation by repeating its
