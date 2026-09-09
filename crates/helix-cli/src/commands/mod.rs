@@ -29,6 +29,70 @@ use serde_json::Value;
 // field reads as a perfectly good reply.
 // ---------------------------------------------------------------------------------------------
 
+/// The most a CLI command may read out of one HTTP reply.
+///
+/// Derived, not picked, and derived the same way the node's `JSON_BODY_CAP` is: the largest
+/// document any of these routes can legitimately return is a single block, and `serde_json`
+/// renders every byte of ML-DSA material as a decimal number — measured at 4.5× on 2026-08-27.
+/// Eight is that, doubled, so an honest answer cannot reach the ceiling.
+///
+/// The node's first version of this bound was a flat "8 MB looks like plenty" and it would have
+/// rejected a full genesis block. That is the failure mode worth avoiding here too: **a bound
+/// that refuses honest traffic is an outage, not a defence** — and in a wallet the outage lands
+/// on somebody trying to send their own money.
+const BODY_CAP: usize = helix_core::fee::MAX_BLOCK_BYTES as usize * 8;
+
+/// Read a response body, refusing anything past [`BODY_CAP`] bytes.
+///
+/// `reqwest::Response::text()` and `::json()` read until the peer stops sending, with no upper
+/// bound — and this client is built with `gzip`, so what it reads is what the peer's payload
+/// *decompresses to*. A few hundred kilobytes on the wire become gigabytes in this process, and
+/// the wallet dies to the OOM killer. The node closed this on 2026-09-04; the CLI kept it, at
+/// five call sites (backlog #191 counted three — it missed both `.json()` calls, which have the
+/// same unbounded read behind a different spelling).
+///
+/// The endpoint does not have to be hostile for this to fire: it is whatever `--node` says, and
+/// the default is one hard-coded host behind a tunnel that answers with somebody else's error
+/// page often enough that this whole section exists.
+///
+/// **Deliberately its own copy of the node's `read_body_capped`, rather than a shared crate.**
+/// What the two have in common is an eight-line loop; what differs is everything that carries the
+/// judgement — the cap (a wallet reads documents, the node reads block batches), the error text,
+/// and which failures are fatal. Sharing the loop would mean `reqwest` in `helix-core`, a
+/// dependency the consensus core, the mobile bindings and the Tauri wallet all inherit, to
+/// deduplicate a `while let`. The lesson-12 risk is real but it is in the *cap*, so the
+/// derivation above is written out rather than referenced.
+pub(crate) async fn read_body_capped(response: reqwest::Response) -> Result<String> {
+    read_body_within(response, BODY_CAP).await
+}
+
+/// [`read_body_capped`] with the bound spelled out, so a test can prove the refusal without
+/// pushing sixteen megabytes through a socket to do it. The node's equivalent has no test at
+/// all, which is how an untested safety net stays untested: nobody wants to write the version
+/// that takes ten seconds.
+async fn read_body_within(mut response: reqwest::Response, cap: usize) -> Result<String> {
+    let url = response.url().to_string();
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("could not read the response body from {url}"))?
+    {
+        if out.len() + chunk.len() > cap {
+            bail!(
+                "{url} sent more than {cap} bytes — refusing to keep reading. A reply this \
+                 large is either a misconfigured endpoint or a decompression bomb; neither is \
+                 worth running this machine out of memory for."
+            );
+        }
+        out.extend_from_slice(&chunk);
+    }
+    // Lossy for the same reason `text()` is: the body is about to be parsed as JSON or quoted
+    // back in an error, and a broken encoding surfaces as either a parse failure or a mangled
+    // quote — both better than refusing to show the operator what arrived.
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
 /// GET a document that may legitimately not exist.
 ///
 /// `Ok(None)` means the node answered 404 — the account, name or proposal really is not there.
@@ -41,7 +105,7 @@ pub(crate) async fn get_optional(node: &str, path: &str, what: &str) -> Result<O
         .with_context(|| format!("could not reach the node at {} to {}", node, what))?;
 
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = read_body_capped(response).await.unwrap_or_default();
     let parsed = serde_json::from_str::<Value>(&body).ok();
 
     if status.is_success() {
@@ -167,7 +231,7 @@ pub(crate) async fn submit_tx(tx: &Transaction, node: &str) -> Result<Value> {
         .with_context(|| format!("could not reach the node at {} to submit the transaction", node))?;
 
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = read_body_capped(response).await.unwrap_or_default();
     let parsed = serde_json::from_str::<Value>(&body).ok();
 
     if !status.is_success() {
@@ -258,6 +322,67 @@ mod node_reply_tests {
     use axum::{http::header, response::IntoResponse, Router};
     use helix_core::TxType;
     use helix_crypto::{Address, KeyPair, Signature};
+
+    // ── Bounded body reads (#191) ────────────────────────────────────────────
+
+    /// Serves `len` bytes to any path, so the refusal is exercised through the same reqwest path
+    /// production uses — `chunk()`, gzip decoding and all.
+    async fn mock_flood(len: usize) -> String {
+        let app = Router::new().fallback(move || async move {
+            (StatusCode::OK, "x".repeat(len)).into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    /// `text()` and `json()` read until the peer stops sending. With `gzip` on the client that is
+    /// the *decompressed* size, so a few hundred kilobytes on the wire can be gigabytes here and
+    /// the wallet dies to the OOM killer with nothing in its output. The endpoint does not have to
+    /// be hostile — it is whatever `--node` says.
+    #[tokio::test]
+    async fn a_reply_that_keeps_coming_is_cut_off_instead_of_read_into_memory() {
+        let node = mock_flood(64 * 1024).await;
+        let resp = reqwest::get(&node).await.unwrap();
+        let err = super::read_body_within(resp, 1024)
+            .await
+            .expect_err("a body past the cap must not be read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to keep reading"),
+            "the error must say what it refused and why, got: {msg}"
+        );
+    }
+
+    /// Positive control. Without it the test above only proves that *something* failed — a
+    /// bound that refuses honest traffic would pass it just as happily, and that failure mode is
+    /// worse than the one being defended against: it lands on somebody sending their own money.
+    #[tokio::test]
+    async fn an_honest_reply_under_the_cap_arrives_whole() {
+        let node = mock_flood(4096).await;
+        let resp = reqwest::get(&node).await.unwrap();
+        let body = super::read_body_within(resp, 1024 * 1024)
+            .await
+            .expect("a reply well under the cap must be read");
+        assert_eq!(body.len(), 4096, "and it must arrive complete, not truncated");
+    }
+
+    /// The bound has to clear the largest document these routes can legitimately return, or it is
+    /// an outage waiting for a big block. The node's first attempt at this constant was a flat
+    /// 8 MB and would have rejected a full genesis block; this pins the derivation instead of the
+    /// number, so it grows with the protocol rather than against it.
+    #[test]
+    fn the_cap_leaves_room_for_the_largest_document_the_chain_can_produce() {
+        let block = helix_core::fee::MAX_BLOCK_BYTES as usize;
+        // 4.5x is the measured JSON inflation of ML-DSA material (2026-08-27), rounded up.
+        let biggest_honest_reply = block * 9 / 2;
+        assert!(
+            super::BODY_CAP > biggest_honest_reply,
+            "cap {} must clear a full block rendered as JSON ({biggest_honest_reply} bytes)",
+            super::BODY_CAP
+        );
+    }
 
     /// Answers every path with one canned reply, so these run through the same reqwest path
     /// production uses — status code, headers and body included. A hand-stubbed transport would

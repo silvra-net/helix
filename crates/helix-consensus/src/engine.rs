@@ -62,7 +62,36 @@ pub const ROUND_TIMEOUT_TICKS: u32 = 8;
 /// backstop was spent. At 4 it gets three attempts, and the only thing it costs is four extra
 /// seconds before a genuinely dead proposer is routed around — in a set of two or three, not even
 /// that, since nil quorum is unreachable there without the proposer anyway.
-pub const PROPOSAL_TIMEOUT_TICKS: u32 = 4;
+///
+/// **4 to 6 on 2026-09-09, for #195: the deadline that matters is now the link, not the proposer.**
+/// A proposal takes roughly `4·S / 500 KB` seconds just to fan out, because every validator's
+/// traffic crosses one 226 KB/s tunnel — so a proposal can be sent promptly, be perfectly valid,
+/// and still miss a window that was sized for a healthy network. Whoever does not have it in time
+/// prevotes nil, no value reaches two thirds, and the round dies with a full house.
+///
+/// The backlog carried "4 → 8 → 12" as the fix, sourced from a harness run and never re-measured.
+/// **It is wrong, and the measurement is the reason this is 6 and not 8.** 8 does not fit under
+/// `ROUND_TIMEOUT_TICKS` at all (the assert below), so taking it drags the backstop from 8 to 12 —
+/// and the backstop was *lowered* from 15 to 8 on 2026-08-27 precisely because every lost round
+/// costs it in full. Measured today across both harnesses, 8/12 against 4/8:
+///
+/// * a single silent validator falls from **12 committed blocks to 8** (cadence 15.73 → 22.43)
+/// * the round-sync pull carries **5 blocks instead of 7**
+/// * two fault-injection tests fail outright
+/// * lost rounds land on **1**, not the 0 the note promised
+///
+/// 6/8 keeps the backstop where it was measured to belong and buys the window from the only place
+/// that was free — the gap between "give up on the proposal" and "give up on the round":
+///
+/// * healthy: **unchanged**, 66 blocks at a 3.00-tick cadence — a healthy round never waits
+/// * a proposal 6 ticks late: **1 committed block → 3**, lost rounds **2 → 1**
+/// * `round_convergence` at latency 3 / skew 2: **7 commits → 12**, and the other nine shapes
+///   are unchanged. Nothing regressed anywhere, which is the half that mattered on 2026-08-27 too
+/// * a silent validator commits the same heights; only the mean interval moves, 15.73 → 16.09
+///
+/// The pull now gets five attempts instead of three, which is the second reason: the answer only
+/// helps if it arrives before nil closes the round.
+pub const PROPOSAL_TIMEOUT_TICKS: u32 = 6;
 
 /// The nil prevote has to be cast strictly before the round it belongs to can time out,
 /// otherwise the backstop fires first and no nil quorum ever forms — the dead-proposer latency

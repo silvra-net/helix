@@ -10,6 +10,16 @@ use thiserror::Error;
 pub enum StorageError {
     #[error("Block not found at height {0}")]
     BlockNotFound(u64),
+    /// The block existed and this node no longer keeps it: it is below the node's prune horizon
+    /// (backlog #194). Distinguished from [`Self::BlockNotFound`] because the two mean opposite
+    /// things to whoever asked — "the chain never had this" versus "ask an archive node" — and
+    /// collapsing that distinction is a mistake this project has now made twice in the client
+    /// (#156, #167).
+    #[error(
+        "Block {0} is below this node's prune horizon ({1}) — it was dropped to bound disk \
+         growth, not missing from the chain. Ask a node that keeps full history."
+    )]
+    BlockPruned(u64, u64),
     #[error("Block hash not found: {0}")]
     HashNotFound(String),
     #[error("Database error: {0}")]

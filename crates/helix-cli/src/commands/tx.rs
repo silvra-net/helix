@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
@@ -501,7 +501,10 @@ async fn tx_status(hash: String, node: &str) -> Result<()> {
     // "Not found: insufficient balance" for a transaction it had just located, denying the
     // transfer existed while quoting why it was rejected.
     let found = response.status().is_success();
-    let res: serde_json::Value = response.json().await?;
+    let body = super::read_body_capped(response).await?;
+    let res: serde_json::Value = serde_json::from_str(&body).with_context(|| {
+        format!("the node at {node} did not answer the receipt lookup with JSON")
+    })?;
     if !found {
         // "Expired" and "never seen" are both 404s — the transaction is genuinely not on the
         // chain either way — but they mean opposite things to a sender, and only one of them

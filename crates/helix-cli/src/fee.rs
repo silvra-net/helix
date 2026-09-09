@@ -63,7 +63,7 @@ pub async fn fetch_base_fee_per_byte(node: &str) -> Result<u64> {
     // version problem that did not exist; say what actually happened and how to get past it.
     let http = resp.status();
     if !http.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::commands::read_body_capped(resp).await.unwrap_or_default();
         let detail = body.trim();
         bail!(
             "the node refused the fee lookup with HTTP {}{} — the node is not too old, the request \
@@ -74,9 +74,8 @@ pub async fn fetch_base_fee_per_byte(node: &str) -> Result<u64> {
         );
     }
 
-    let status: serde_json::Value = resp
-        .json()
-        .await
+    let body = crate::commands::read_body_capped(resp).await?;
+    let status: serde_json::Value = serde_json::from_str(&body)
         .context("the node's /status was not valid JSON — cannot read the current fee")?;
     status
         .get("base_fee_per_byte")

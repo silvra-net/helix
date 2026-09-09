@@ -327,6 +327,46 @@ fn resolved_max_proposal_bytes(raw: Option<u64>) -> u64 {
         .unwrap_or(DEFAULT_MAX_PROPOSAL_BYTES)
         .min(helix_core::fee::MAX_BLOCK_BYTES)
 }
+/// Blocks a pruning node keeps below its own tip, at minimum, whatever `HELIX_KEEP_BLOCKS` says.
+///
+/// A node that keeps almost nothing still runs consensus fine — Helix finalises instantly and
+/// never reorganises, so the engine needs the tip and not a history. What breaks is everyone
+/// *else*: a peer that fell an hour behind catches up by asking someone for those blocks, and a
+/// set where every node kept fifty would have nowhere to ask. 1000 blocks is a bit over half an
+/// hour at the 2 s cadence, which covers every short outage this chain has actually had — the
+/// 09-04 stall being the outlier at 6.5 hours, and one that no keep-window would have helped
+/// because the chain was not producing.
+const MIN_KEEP_BLOCKS: u64 = 1000;
+
+/// How often the pruner runs, and how many blocks one batch drops.
+///
+/// The batch is small because this node is also a validator: a write transaction holding the
+/// database is a write transaction `put_block` is waiting behind. A node switching a 166k-block
+/// chain to a 10k horizon has 156k blocks to drop, so the loop does up to `PRUNE_BATCHES_PER_TICK`
+/// of them per tick with a yield in between — the backlog clears in minutes without any single
+/// transaction being longer than an ordinary commit. In the steady state the first batch of a
+/// tick is already the last.
+const PRUNE_INTERVAL_SECS: u64 = 10;
+const PRUNE_BATCH_BLOCKS: u64 = 500;
+const PRUNE_BATCHES_PER_TICK: u32 = 10;
+
+/// The height below which blocks may be dropped, or `None` when this node keeps everything.
+///
+/// `keep == 0` — the default, and what an unset or unparseable `HELIX_KEEP_BLOCKS` resolves to —
+/// means archive, deliberately. **Somebody has to keep the history**, and a default that quietly
+/// discarded it would decide that question for a whole network by way of a config default. An
+/// operator who prunes has said so.
+///
+/// Clamped up to `MIN_KEEP_BLOCKS` rather than obeyed, for the same reason
+/// `resolved_max_proposal_bytes` clamps down: a knob must not be a way to make this node useless
+/// to its peers by typing a small number.
+fn prune_horizon(tip: u64, keep: u64) -> Option<u64> {
+    if keep == 0 {
+        return None;
+    }
+    tip.checked_sub(keep.max(MIN_KEEP_BLOCKS)).filter(|h| *h > 0)
+}
+
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
 /// Validator health heartbeat cadence and thresholds (see `validator_health_loop`).
 const VALIDATOR_HEALTH_SECS: u64 = 60;
@@ -441,6 +481,10 @@ pub struct HelixNode {
     /// [`P2PService`], which reads it on every announcement; written here at startup, after the
     /// initial sync, and by `publish_tip_certificate` at every commit.
     announced_tip_height: Arc<std::sync::atomic::AtomicU64>,
+    /// The lowest block this node still holds, announced on the same gossip (#194). Shared with
+    /// [`P2PService`]; kept fresh by the same 5-second loop that publishes the tip, so there is
+    /// one reader of this fact rather than two that can disagree.
+    announced_earliest_block: Arc<std::sync::atomic::AtomicU64>,
     /// Highest tip any connected peer claims, published by [`P2PService`] (backlog #154).
     ///
     /// Untrusted, and used only in the safe direction: to decide that a node held back after a
@@ -853,6 +897,10 @@ impl HelixNode {
             tip_certificate: shared_tip_certificate.clone(),
         });
         let highest_peer_tip = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // This node's own prune horizon, announced in peer exchange so peers do not ask it for
+        // history it dropped (#194). 0 until the announce loop reads it, which is what an
+        // archiving node reports anyway — so the startup value is not a claim to retract.
+        let announced_earliest_block = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (p2p_service, p2p_command_tx, p2p_event_rx) = P2PService::new(
             p2p_config,
             announced_tip_height.clone(),
@@ -871,6 +919,7 @@ impl HelixNode {
         let p2p_service = p2p_service
             .announcing_genesis(our_genesis_hash)
             .with_peer_tip_reporting(highest_peer_tip.clone())
+            .with_prune_horizon(announced_earliest_block.clone())
             // Every node serves its own genesis, so joining never depends on one particular
             // machine being up — the point of #139.
             .with_genesis_provider(Arc::new(StoreGenesisProvider {
@@ -909,6 +958,7 @@ impl HelixNode {
             syncing: Arc::new(std::sync::atomic::AtomicBool::new(has_sync_peer)),
             sync_target_height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             announced_tip_height,
+            announced_earliest_block,
             highest_peer_tip,
             tip_certificate: shared_tip_certificate,
             signing_state_path,
@@ -1082,14 +1132,23 @@ impl HelixNode {
         tokio::spawn({
             let store = self.store.clone();
             let announced_tip_height = self.announced_tip_height.clone();
+            let announced_earliest_block = self.announced_earliest_block.clone();
             let highest_peer_tip = self.highest_peer_tip.clone();
             let syncing = self.syncing.clone();
             async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     tick.tick().await;
-                    let tip = store.read().await.latest_height();
+                    let (tip, earliest) = {
+                        let db = store.read().await;
+                        (db.latest_height(), db.earliest_block_height().unwrap_or(0))
+                    };
                     announced_tip_height.store(tip, std::sync::atomic::Ordering::Relaxed);
+                    // Read here rather than published by the pruner, so there is one reader of
+                    // this fact and not two that can disagree (lesson 12) — and so a node that
+                    // pruned in a previous run announces its horizon from the first tick, before
+                    // any pruning has happened in this one.
+                    announced_earliest_block.store(earliest, std::sync::atomic::Ordering::Relaxed);
 
                     // Second release path for production held after a failed startup sync
                     // (backlog #154). #152 releases via the RPC catch-up, which ties resuming to
@@ -1332,6 +1391,13 @@ impl HelixNode {
                 ));
             }
             (None, None) => {}
+        }
+
+        // Prune old blocks, if this operator asked for it. Off by default: somebody has to keep
+        // the history, and a config default must not be what decides that for a network (#194).
+        let keep_blocks = config::resolve_u64("HELIX_KEEP_BLOCKS", None).unwrap_or(0);
+        if keep_blocks > 0 {
+            tokio::spawn(prune_loop(self.store.clone(), keep_blocks, self.syncing.clone()));
         }
 
         tokio::spawn(validator_health_loop(
@@ -3434,6 +3500,75 @@ fn not_validating_advice(
 /// but it wasn't." This loop runs on its own timer, independent of the consensus loop, so it
 /// keeps reporting even when that loop has stalled.
 ///
+/// Drops blocks below this node's keep-window, a batch at a time (backlog #194).
+///
+/// Only runs at all when the operator set `HELIX_KEEP_BLOCKS`; the default keeps everything.
+///
+/// **This does not shrink the database file.** redb never returns space to the filesystem and
+/// `compact()` gave nothing back when measured — what pruning buys is that the *next* blocks land
+/// in the freed pages instead of extending the file. Measured in `helix-storage`'s pruning probe:
+/// writing 46 MB after pruning 46 MB grew the file by 11 MB, where the same writes without a prune
+/// cost 75 MB. So `ls` will keep reporting the size it reached, and disk growth stops. An operator
+/// who expects the first and not the second will think this is broken, which is why the log line
+/// says which one happened.
+async fn prune_loop(store: Arc<RwLock<HelixDb>>, keep_blocks: u64, syncing: Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    let mut ticker = tokio::time::interval(Duration::from_secs(PRUNE_INTERVAL_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut announced = false;
+
+    loop {
+        ticker.tick().await;
+        // Not while catching up. The horizon would be computed against a tip that is still
+        // climbing, and a node that is busy applying batches has better uses for its write lock.
+        if syncing.load(Ordering::Relaxed) {
+            continue;
+        }
+        let tip = { store.read().await.latest_height() };
+        let Some(horizon) = prune_horizon(tip, keep_blocks) else {
+            continue;
+        };
+
+        let mut removed_this_tick = 0u64;
+        let mut earliest = 0u64;
+        for _ in 0..PRUNE_BATCHES_PER_TICK {
+            let outcome = {
+                let db = store.write().await;
+                db.prune_blocks_below(horizon, PRUNE_BATCH_BLOCKS)
+            };
+            match outcome {
+                Ok(o) => {
+                    removed_this_tick += o.removed;
+                    earliest = o.earliest;
+                    if o.done {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(err = %e, "Could not prune old blocks — will try again");
+                    break;
+                }
+            }
+            // Hand the write lock back between batches so block production and the RPC get their
+            // turn; without this a large backlog would be one long stall wearing a loop's clothes.
+            tokio::task::yield_now().await;
+        }
+
+        if removed_this_tick > 0 && !announced {
+            announced = true;
+            info!(
+                keep_blocks,
+                earliest,
+                tip,
+                "Pruning old blocks to bound disk growth. The database file will not shrink — \
+                 freed space is reused by later blocks instead"
+            );
+        } else if removed_this_tick > 0 {
+            debug!(removed = removed_this_tick, earliest, "Pruned old blocks");
+        }
+    }
+}
+
 /// Purely observational: it reads state and logs, never mutates consensus or the chain.
 #[allow(clippy::too_many_arguments)]
 async fn validator_health_loop(
@@ -6929,6 +7064,47 @@ mod body_cap_tests {
         assert!(
             DEFAULT_MAX_PROPOSAL_BYTES < helix_core::fee::MAX_BLOCK_BYTES,
             "the default has to actually restrain something, or it is decoration"
+        );
+    }
+
+    /// **Archiving is the default, and it has to be a decision somebody made.** Somebody on a
+    /// network has to keep the history; a config default that quietly discarded it would settle
+    /// that question for everyone by way of an unset environment variable.
+    #[test]
+    fn a_node_keeps_everything_until_its_operator_says_otherwise() {
+        assert_eq!(prune_horizon(500_000, 0), None, "unset means archive");
+    }
+
+    /// Small keep-windows clamp up rather than being obeyed, mirroring the proposal budget
+    /// clamping down: a knob must not be a way to make this node useless to its peers. Consensus
+    /// itself would survive — Helix finalises instantly and never reorganises, so the engine needs
+    /// a tip and not a history — but a peer an hour behind catches up by asking somebody, and a
+    /// set where everyone kept fifty blocks has nobody left to ask.
+    #[test]
+    fn a_keep_window_too_small_to_help_a_peer_is_widened_not_obeyed() {
+        assert_eq!(
+            prune_horizon(500_000, 50),
+            Some(500_000 - MIN_KEEP_BLOCKS),
+            "50 blocks is 100 seconds of history — clamp to the floor"
+        );
+        assert_eq!(
+            prune_horizon(500_000, 100_000),
+            Some(400_000),
+            "a window above the floor is the operator's call and is taken as given"
+        );
+    }
+
+    /// A chain younger than the keep-window has nothing to drop, and the subtraction that decides
+    /// it must not wrap into a horizon near u64::MAX — which would be an instruction to delete
+    /// everything, genesis excepted.
+    #[test]
+    fn a_chain_younger_than_the_window_prunes_nothing() {
+        assert_eq!(prune_horizon(10, 100_000), None);
+        assert_eq!(prune_horizon(0, 100_000), None, "and an empty store certainly not");
+        assert_eq!(
+            prune_horizon(MIN_KEEP_BLOCKS, MIN_KEEP_BLOCKS),
+            None,
+            "exactly at the window the horizon would be 0, which is nothing to do"
         );
     }
 

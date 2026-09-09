@@ -14,12 +14,20 @@ Helix uses Tendermint-style BFT finality on top of a Proof-of-Stake validator se
 **Block time:** 2 seconds.
 
 **When a proposer is offline,** the chain routes around it rather than halting. A validator that
-receives no proposal within 2 ticks (~4s) prevotes **nil** — "nothing reached me" — and once 2/3+
+receives no proposal within 6 ticks (~12s) prevotes **nil** — "nothing reached me" — and once 2/3+
 of the voting power has said the same, every validator moves to the next round-robin proposer
 together. Because that hand-off is agreed by quorum rather than decided by each node's own clock,
-validators can't drift onto different rounds, which is what lets the wait be short. A 15-tick
+validators can't drift onto different rounds, which is what lets the wait be bounded. An 8-tick
 round timeout remains as a backstop for the case where even nil never reaches quorum (e.g. too
-much of the validator set is down to form any majority).
+much of the validator set is down to form any majority). Both windows grow with the round number
+(Tendermint's `base + round · delta`, capped at 8 rounds), which is what lets two validators whose
+clocks are offset converge instead of preserving the offset forever.
+
+The nil window is deliberately wider than the time a healthy proposal needs, because it is also
+the deadline for the round-sync *pull*: a validator that is missing the proposal asks a peer for
+it, and an answer arriving after nil has been cast can no longer be used. It is sized against the
+slowest link in the set rather than the fastest — a proposal that is sent promptly and is
+perfectly valid still loses its round if it does not fan out in time.
 
 Nil is only ever a prevote. Helix never *precommits* nil, so "precommit quorum" keeps meaning
 exactly one thing: a real block is final.
