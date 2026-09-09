@@ -434,6 +434,13 @@ impl P2PService {
         // but both have to stop costing us the catch-up. A cooldown is the smallest thing that
         // turns "always the same peer" into "work through the peers that are ahead of us".
         let mut blocksync_cooldown: HashMap<PeerId, u32> = HashMap::new();
+        // Catch-up progress, so the driver can notice that it is *not* making any (backlog #190).
+        // The tip this node held at the last driver tick, how many ticks it has sat there, and
+        // whether the operator has already been told. Reset by any forward movement, which is why
+        // a healthy bulk sync — one applied batch after another — never reaches the threshold.
+        let mut blocksync_progress_tip: u64 = 0;
+        let mut blocksync_stall_ticks: u32 = 0;
+        let mut blocksync_stall_reported = false;
         if let Some(addr) = &config.public_addr {
             known_addrs.insert(addr.clone());
         }
@@ -890,13 +897,53 @@ impl P2PService {
                         *ticks -= 1;
                         *ticks > 0
                     });
+                    let our_tip = tip_height.load(Ordering::Relaxed);
                     request_blocks_if_behind(
                         &mut swarm,
                         &peer_tips,
                         &blocksync_cooldown,
-                        tip_height.load(Ordering::Relaxed),
+                        our_tip,
                         &mut blocksync_in_flight,
                     );
+
+                    // Report a catch-up that is not happening (backlog #190). Read *after* the
+                    // request above, so `blocksync_in_flight` answers the question the line is for:
+                    // is this node asking at all, or asking and getting nothing?
+                    if our_tip > blocksync_progress_tip {
+                        blocksync_progress_tip = our_tip;
+                        blocksync_stall_ticks = 0;
+                        if blocksync_stall_reported {
+                            blocksync_stall_reported = false;
+                            info!(height = our_tip, "Block sync is moving again");
+                        }
+                    } else {
+                        blocksync_stall_ticks = blocksync_stall_ticks.saturating_add(1);
+                        let best_claimed = peer_tips
+                            .iter()
+                            .filter(|(peer, _)| swarm.is_connected(peer))
+                            .map(|(_, tip)| *tip)
+                            .max();
+                        if let Some(stall) = blocksync_stall_report(
+                            our_tip,
+                            best_claimed,
+                            blocksync_in_flight,
+                            blocksync_stall_ticks,
+                        ) {
+                            blocksync_stall_reported = true;
+                            // States the two facts and not a cause. Which of them it is — a defect
+                            // here, peers that will not serve, or a link that drops the answers —
+                            // is what `requesting` and `cooling` let the reader decide.
+                            warn!(
+                                height = our_tip,
+                                behind = stall.behind,
+                                secs = stall.ticks as u64 * BLOCKSYNC_TICK_SECS,
+                                requesting = stall.requesting,
+                                peers = peer_tips.len(),
+                                cooling = blocksync_cooldown.len(),
+                                "Not catching up: peers claim a higher tip and this node's height has not moved"
+                            );
+                        }
+                    }
                 }
 
                 _ = peer_exchange_interval.tick() => {
@@ -1514,6 +1561,78 @@ fn tip_outcome(msg: &PeerExchangeMsg, our_tip: u64, our_genesis: &str) -> PeerEx
 /// not a ban — neither failure proves misbehaviour, and the goal here is to keep catching up, not
 /// to punish.
 const BLOCKSYNC_PEER_COOLDOWN_TICKS: u32 = 5;
+
+/// Driver ticks of no progress before the block-sync driver says out loud that this node is not
+/// catching up, and how often it repeats while that lasts (backlog #190).
+///
+/// **The whole driver logs at `debug!`**, and that is what made the 2026-09-04 stall undiagnosable
+/// for six and a half hours: `Requesting missing blocks`, `claimed to be ahead but served nothing`
+/// and `request failed` are all `debug!`, and only the success case is `info!`. A node that never
+/// asked looked exactly like one that asked and got nothing — the two have opposite causes and
+/// opposite fixes, and the log could not tell them apart.
+///
+/// Raising those three lines is not the answer: during a genuine bulk sync the request line fires
+/// every two seconds and would bury the log. The line that is worth `warn!` is the *state* — this
+/// node is behind what its peers claim **and its own height has not moved for a while** — because
+/// a healthy catch-up resets the counter on every applied batch and so never reaches the threshold.
+///
+/// 120 s before the first line: comfortably above the slowest legitimate quiet stretch (a
+/// `MAX_BLOCKSYNC_BATCH` batch that is still being verified and applied), and far below the hours
+/// an operator would otherwise stare at silence. Then every 5 minutes, so the duration is readable
+/// from the log without one line per tick.
+const BLOCKSYNC_STALL_TICKS: u32 = 60;
+const BLOCKSYNC_STALL_REPEAT_TICKS: u32 = 150;
+
+/// Seconds per driver tick, for turning tick counts into something an operator can read.
+const BLOCKSYNC_TICK_SECS: u64 = 2;
+
+/// The verdict of [`blocksync_stall_report`]: this node is behind and standing still.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlocksyncStall {
+    /// How far below the highest tip any connected peer claims this node sits. A *claim*, not a
+    /// measurement — peer tips are unauthenticated, and one lying peer moves this number. It is
+    /// reported as such for the same reason the health line says "BEHIND what its peers claim".
+    behind: u64,
+    /// Whether a request is outstanding right now. **This is the field the line exists for.**
+    /// `false` means this node is not asking anybody — a defect on our side, or every peer that is
+    /// ahead sitting out a cooldown. `true` means it is asking and nothing is coming back, which
+    /// points at the peers or the link. Nothing in the log separated these two before.
+    requesting: bool,
+    /// Ticks since this node's own height last moved.
+    ticks: u32,
+}
+
+/// Decide whether this driver tick should report a stalled catch-up, and what it says.
+///
+/// Pure, and separated from the loop for the reason `round_attendance` and `liveness_verdict` are:
+/// a rule that only ever shows up in a log line is a rule nobody tests, and this one has three
+/// edges worth pinning — that it stays silent while there is nothing above us, that it stays
+/// silent below the threshold, and that it repeats on a period instead of every tick.
+fn blocksync_stall_report(
+    our_tip: u64,
+    best_claimed_tip: Option<u64>,
+    requesting: bool,
+    ticks_without_progress: u32,
+) -> Option<BlocksyncStall> {
+    // No peer claiming anything above us is not evidence of being behind, so there is nothing to
+    // report here. That case — the chain standing still with nobody ahead — belongs to the health
+    // line, which owns it; duplicating it here would be a second author for one statement.
+    let behind = best_claimed_tip?.checked_sub(our_tip)?;
+    if behind == 0 {
+        return None;
+    }
+    if ticks_without_progress < BLOCKSYNC_STALL_TICKS {
+        return None;
+    }
+    if (ticks_without_progress - BLOCKSYNC_STALL_TICKS) % BLOCKSYNC_STALL_REPEAT_TICKS != 0 {
+        return None;
+    }
+    Some(BlocksyncStall {
+        behind,
+        requesting,
+        ticks: ticks_without_progress,
+    })
+}
 
 /// How long a window the flap detector counts reconnects over, and how many it tolerates in one
 /// (backlog #149).
@@ -2142,6 +2261,101 @@ mod peer_exchange_tests {
     #[test]
     fn two_nodes_at_genesis_do_not_serve_each_other() {
         assert!(!should_serve_catchup(0, 0));
+    }
+
+    // ── Block-sync stall reporting (#190) ────────────────────────────────────
+
+    /// The threshold exists so a *healthy* catch-up never speaks: every applied batch moves the
+    /// tip and resets the counter, so a bulk sync — the one case where the request line fires
+    /// every two seconds — stays silent. Without it, raising the driver's logging would flood
+    /// exactly the log an operator needs to read afterwards.
+    #[test]
+    fn the_line_waits_out_the_threshold_before_it_speaks() {
+        assert_eq!(
+            super::blocksync_stall_report(100, Some(140), true, super::BLOCKSYNC_STALL_TICKS - 1),
+            None,
+            "a quiet stretch shorter than the threshold is a slow batch, not a stall"
+        );
+        let stall = super::blocksync_stall_report(100, Some(140), true, super::BLOCKSYNC_STALL_TICKS)
+            .expect("at the threshold it must speak");
+        assert_eq!(stall.behind, 40);
+        assert_eq!(stall.ticks, super::BLOCKSYNC_STALL_TICKS);
+    }
+
+    /// **The reason this line exists.** For six and a half hours on 2026-09-04 the log could not
+    /// say whether this node was asking for blocks and getting none, or not asking at all — every
+    /// driver line is `debug!`, and the two cases look identical from the outside while having
+    /// opposite causes. The report carries that bit through untouched.
+    #[test]
+    fn the_report_says_whether_this_node_is_asking_at_all() {
+        let asking = super::blocksync_stall_report(100, Some(140), true, super::BLOCKSYNC_STALL_TICKS)
+            .expect("behind and stalled");
+        let silent = super::blocksync_stall_report(100, Some(140), false, super::BLOCKSYNC_STALL_TICKS)
+            .expect("behind and stalled");
+        assert!(asking.requesting, "a request is outstanding — the peers or the link are the suspects");
+        assert!(!silent.requesting, "nobody is being asked — the suspect is this node");
+        assert_ne!(
+            asking, silent,
+            "the two situations must not produce the same line"
+        );
+    }
+
+    /// A node that is level with — or ahead of — everything it can see is not behind, whatever its
+    /// own height has been doing. A chain that stands still with nobody ahead is a different fault
+    /// with a different owner: the health line reports it, and saying it twice from two places is
+    /// how the two statements drift apart (lesson 12).
+    #[test]
+    fn nothing_is_reported_while_no_peer_claims_to_be_ahead() {
+        // A tick on which the line *would* speak, deliberately: at the first draft this was an
+        // arbitrary "long time" that happened to land inside the repeat period, so the assertions
+        // below held whatever the rule under test did. It stayed green through a mutation that
+        // read a missing claim as an infinite backlog — the period clause was carrying it, not the
+        // rule it is named after (lesson 3).
+        let long_stall = super::BLOCKSYNC_STALL_TICKS + super::BLOCKSYNC_STALL_REPEAT_TICKS;
+        assert!(
+            super::blocksync_stall_report(100, Some(140), false, long_stall).is_some(),
+            "positive control: on this tick a genuine backlog is reported"
+        );
+        assert_eq!(
+            super::blocksync_stall_report(100, None, false, long_stall),
+            None,
+            "no claim above us is not evidence of being behind"
+        );
+        assert_eq!(
+            super::blocksync_stall_report(100, Some(100), false, long_stall),
+            None,
+            "level with the best claim is not behind"
+        );
+        assert_eq!(
+            super::blocksync_stall_report(100, Some(80), false, long_stall),
+            None,
+            "ahead of every claim is certainly not behind"
+        );
+    }
+
+    /// Once it is speaking it must not speak every tick: a stall that lasts hours would otherwise
+    /// write one line every two seconds, which is the same unreadable log by a different route.
+    /// Repeating on a period instead keeps the *duration* visible — the number an operator
+    /// actually needs — at a few lines an hour.
+    #[test]
+    fn it_repeats_on_a_period_and_not_on_every_tick() {
+        let t = super::BLOCKSYNC_STALL_TICKS;
+        let repeat = super::BLOCKSYNC_STALL_REPEAT_TICKS;
+        assert!(super::blocksync_stall_report(100, Some(140), true, t).is_some());
+        for tick in (t + 1)..(t + repeat) {
+            assert_eq!(
+                super::blocksync_stall_report(100, Some(140), true, tick),
+                None,
+                "tick {tick} is inside the quiet period and must not repeat the line"
+            );
+        }
+        let again = super::blocksync_stall_report(100, Some(140), true, t + repeat)
+            .expect("the period elapsed, so it repeats");
+        assert_eq!(
+            again.ticks,
+            t + repeat,
+            "and it carries the elapsed time, not the threshold"
+        );
     }
 
     // ── Block-sync driver (#138) ──────────────────────────────────────────────
