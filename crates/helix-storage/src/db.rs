@@ -107,6 +107,14 @@ const META_GENESIS_VALIDATOR_STAKE: &str = "genesis_validator_stake";
 /// Height of the block whose execution produced the persisted state — see
 /// `ChainState::applied_height`. Written in the same transaction as the state itself.
 const META_APPLIED_HEIGHT: &str = "applied_height";
+
+/// Lowest block height this node still holds (backlog #194). Absent on a node that has never
+/// pruned, which is the same thing as 0 and is stored as such the first time a prune runs.
+///
+/// Kept in `META` rather than derived by scanning `HEIGHT_IDX`: the read path consults it on
+/// every block miss to tell "pruned away" from "never existed", and a scan of the index would
+/// turn a lookup into a walk of the whole chain.
+const META_EARLIEST_BLOCK: &str = "earliest_block";
 /// Opaque serialized tip commit certificate (#134). The tip's certificate lives only in the live
 /// engine until block tip+1 is produced, so it is the one certificate a restarted node cannot
 /// reconstruct from stored blocks. Mirroring it here on every commit lets the node reload it at
@@ -947,6 +955,96 @@ fn receipt_succeeded(
     })
 }
 
+/// What one call to [`HelixDb::prune_blocks_below`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneOutcome {
+    /// Blocks dropped by this call.
+    pub removed: u64,
+    /// Lowest height still held afterwards.
+    pub earliest: u64,
+    /// Whether the horizon has been reached, so there is nothing left for the next call.
+    pub done: bool,
+}
+
+impl HelixDb {
+    /// Lowest block height this node still holds. 0 on a node that has never pruned.
+    pub fn earliest_block_height(&self) -> StorageResult<u64> {
+        let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
+        let meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
+        Ok(meta
+            .get(META_EARLIEST_BLOCK)
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .and_then(|v| {
+                let b: [u8; 8] = v.value().try_into().ok()?;
+                // Little-endian, matching every other u64 in this table. Mixing byte orders
+                // inside one table is the kind of thing that reads back as a plausible number.
+                Some(u64::from_le_bytes(b))
+            })
+            .unwrap_or(0))
+    }
+
+    /// Drop blocks below `horizon`, at most `max_blocks` of them, and report where that leaves us.
+    ///
+    /// **Bounded per call on purpose.** A node switching a 166k-block chain to a 10k-block horizon
+    /// has 156k blocks to drop; doing that in one write transaction would hold the database for
+    /// minutes, and on this network the node doing the pruning is also carrying consensus. The
+    /// caller runs this on a schedule and it walks forward a batch at a time, so no single
+    /// transaction is longer than an ordinary block commit.
+    ///
+    /// **Genesis is never dropped, whatever the horizon says.** Block 0 is the trust anchor a
+    /// joining node checks its own genesis against (`check-genesis-pin.sh`, `/blocks/height/0`),
+    /// and it is one block — keeping it costs nothing and losing it makes this node useless to
+    /// anyone bootstrapping.
+    ///
+    /// Deleting frees no disk: redb never returns space to the filesystem and `compact()` gave
+    /// nothing back when measured. What it does is let the *next* blocks land in the freed pages
+    /// instead of growing the file — measured in `pruning_probe`: writing 46 MB after pruning 46 MB
+    /// grew the file by 11 MB, where the same writes without pruning cost 75 MB. Bounded growth,
+    /// not a smaller file, and the operator docs must say so or the first person to run it will
+    /// watch `ls` and conclude it is broken.
+    pub fn prune_blocks_below(&self, horizon: u64, max_blocks: u64) -> StorageResult<PruneOutcome> {
+        let start = self.earliest_block_height()?;
+        // Never touch genesis, so the first prunable height is 1.
+        let from = start.max(1);
+        if horizon <= from || max_blocks == 0 {
+            return Ok(PruneOutcome { removed: 0, earliest: start, done: horizon <= from });
+        }
+        let upto = horizon.min(from + max_blocks);
+
+        let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut removed = 0u64;
+        {
+            let mut blocks = tx.open_table(BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut heights = tx.open_table(HEIGHT_IDX).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
+
+            for height in from..upto {
+                // A height with no entry is not an error: a node that pruned, restarted and
+                // pruned again walks over its own gaps, and so does one that synced a range it
+                // already had.
+                let hash = heights
+                    .get(height)
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .map(|h| h.value().to_vec());
+                if let Some(hash) = hash {
+                    blocks
+                        .remove(hash.as_slice())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                    heights.remove(height).map_err(|e| StorageError::Db(e.to_string()))?;
+                    removed += 1;
+                }
+            }
+            // Written even when nothing was removed, so the horizon advances over gaps rather
+            // than re-walking them on every call.
+            meta.insert(META_EARLIEST_BLOCK, upto.to_le_bytes().as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
+
+        Ok(PruneOutcome { removed, earliest: upto, done: upto >= horizon })
+    }
+}
+
 impl BlockStore for HelixDb {
     fn get_block_by_hash(&self, hash: &Hash) -> StorageResult<Block> {
         let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
@@ -967,7 +1065,17 @@ impl BlockStore for HelixDb {
                 arr.copy_from_slice(hash_bytes.value());
                 self.get_block_by_hash(&Hash::from_bytes(arr))
             }
-            None => Err(StorageError::BlockNotFound(height)),
+            None => {
+                // "Never existed" and "dropped to bound disk growth" are opposite answers for
+                // whoever asked — the second one says *ask someone else* — and only this branch
+                // knows which it is.
+                let earliest = self.earliest_block_height().unwrap_or(0);
+                if height < earliest {
+                    Err(StorageError::BlockPruned(height, earliest))
+                } else {
+                    Err(StorageError::BlockNotFound(height))
+                }
+            }
         }
     }
 
@@ -1117,6 +1225,173 @@ impl BlockStore for HelixDb {
                 }
             })
             .unwrap_or(Hash::ZERO)
+    }
+}
+
+#[cfg(test)]
+mod pruning_probe {
+    //! What redb does with the space a delete frees — the measurement the pruning design rests on
+    //! (backlog #194).
+    //!
+    //! The chain grows 3.3 GB a day and a block costs 79 KB of database for 82 KB of block, so
+    //! `BLOCKS` is not *a* place the disk goes, it is essentially the only one. Deleting old
+    //! blocks is therefore the whole lever — but only if redb either hands the space back to the
+    //! filesystem or reuses it for the blocks that come next. If it does neither, pruning buys
+    //! nothing and the design has to be a different one.
+    //!
+    //! Ignored because it writes about a hundred megabytes: run it with
+    //! `cargo test -p helix-storage --release -- --ignored --nocapture`.
+
+    use redb::{Database, ReadableTableMetadata, TableDefinition};
+
+    const PROBE: TableDefinition<u64, &[u8]> = TableDefinition::new("probe");
+
+    /// Roughly one production block, so the numbers below are readable as blocks.
+    const BLOCK_BYTES: usize = 80 * 1024;
+    const BLOCKS: u64 = 1200;
+
+    fn write_range(db: &Database, from: u64, to: u64) {
+        let payload = vec![0xABu8; BLOCK_BYTES];
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(PROBE).unwrap();
+            for h in from..to {
+                t.insert(h, payload.as_slice()).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    fn delete_range(db: &Database, from: u64, to: u64) {
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(PROBE).unwrap();
+            for h in from..to {
+                t.remove(h).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    /// Apparent length, in MB. What `ls` and `/diagnostics` report.
+    fn mb(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).unwrap().len() / (1024 * 1024)
+    }
+
+    /// Blocks actually allocated, in MB — what the *disk* loses. The two differ whenever a file
+    /// is sparse, and reading the wrong one is how a design gets built on a factor of two and a
+    /// half that was never there (R2). Prod's own gap is 2%, so `/diagnostics` reporting the
+    /// apparent length is fine; a freshly grown database is where they come apart.
+    fn used_mb(path: &std::path::Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().blocks() * 512 / (1024 * 1024)
+    }
+
+    #[test]
+    #[ignore = "writes ~100 MB of database; run it explicitly"]
+    fn deleting_old_blocks_bounds_the_file_even_without_compaction() {
+        let path = std::env::temp_dir().join(format!("helix-prune-probe-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).unwrap();
+
+        let payload_mb = (BLOCKS as usize * BLOCK_BYTES / (1024 * 1024)) as u64;
+
+        write_range(&db, 0, BLOCKS);
+        let (fill_len, fill_used) = (mb(&path), used_mb(&path));
+
+        // Prune the older half, the way a node keeping the last N blocks would.
+        delete_range(&db, 0, BLOCKS / 2);
+        let (del_len, del_used) = (mb(&path), used_mb(&path));
+
+        // redb cannot hand a page back while a read transaction might still be looking at it, so
+        // freed pages are reclaimed by a *later* commit, not by the one that deleted them. Two
+        // empty commits give it that chance; without them this probe measures the reclaim delay
+        // and calls it a design constraint.
+        for _ in 0..2 {
+            db.begin_write().unwrap().commit().unwrap();
+        }
+        let (settled_len, settled_used) = (mb(&path), used_mb(&path));
+
+        // The question the design turns on: does the next half's worth of blocks land in the
+        // space that was just freed, or on top of it?
+        write_range(&db, BLOCKS, BLOCKS + BLOCKS / 2);
+        let (refill_len, refill_used) = (mb(&path), used_mb(&path));
+
+        // compact() reports whether it moved anything; one call can leave more to do.
+        let mut rounds = 0;
+        while db.compact().unwrap() && rounds < 5 {
+            rounds += 1;
+        }
+        let (comp_len, comp_used) = (mb(&path), used_mb(&path));
+        let compacted = rounds;
+
+        println!("payload of {BLOCKS} blocks: {payload_mb} MB          (len / used on disk)");
+        println!("  after fill                : {fill_len} / {fill_used} MB");
+        println!("  after deleting half       : {del_len} / {del_used} MB");
+        println!("  after two empty commits   : {settled_len} / {settled_used} MB");
+        println!("  after writing half again  : {refill_len} / {refill_used} MB");
+        println!("  after compact({compacted})       : {comp_len} / {comp_used} MB");
+
+        let live = {
+            let tx = db.begin_read().unwrap();
+            let t = tx.open_table(PROBE).unwrap();
+            t.len().unwrap()
+        };
+        assert_eq!(live, BLOCKS, "the probe must end holding exactly what it kept");
+
+        // The assertion that carries the design: after deleting half and writing half again, the
+        // file must not have grown as though nothing was deleted. Anything else means pruning
+        // cannot bound growth and the answer has to be compaction (which rewrites the whole
+        // database) or a different storage layout entirely.
+        let written_mb = payload_mb / 2;
+        let grew_by = refill_used - fill_used;
+        assert!(
+            grew_by * 2 < written_mb,
+            "refilling after a prune must reuse the freed space, not append to it: writing \
+             {written_mb} MB after pruning {written_mb} MB grew the file by {grew_by} MB"
+        );
+        assert!(
+            comp_used >= refill_used,
+            "compact() is expected to give nothing back here — if that ever changes, this \
+             design should use it (measured 2026-09-09: {refill_used} MB -> {comp_used} MB \
+             over {compacted} rounds)"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The control. Without it the test above only shows that redb is economical with space —
+    /// it would pass just as happily if `delete_range` did nothing at all, which is exactly the
+    /// tautology lesson 3 is about. Here nothing is pruned, so the same writes must cost the
+    /// disk the full amount.
+    #[test]
+    #[ignore = "writes ~100 MB of database; run it explicitly"]
+    fn without_pruning_the_same_writes_cost_the_full_space() {
+        let path = std::env::temp_dir()
+            .join(format!("helix-prune-control-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::create(&path).unwrap();
+
+        write_range(&db, 0, BLOCKS);
+        let before = used_mb(&path);
+        for _ in 0..2 {
+            db.begin_write().unwrap().commit().unwrap();
+        }
+        write_range(&db, BLOCKS, BLOCKS + BLOCKS / 2);
+        let after = used_mb(&path);
+
+        let written_mb = (BLOCKS as usize / 2 * BLOCK_BYTES / (1024 * 1024)) as u64;
+        let grew_by = after - before;
+        println!("no pruning: {before} -> {after} MB used for {written_mb} MB written");
+        assert!(
+            grew_by * 2 > written_mb,
+            "without a prune the disk must pay for what is written: {written_mb} MB written \
+             grew the file by only {grew_by} MB"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -1277,6 +1552,120 @@ mod tests {
             Some(&b"hello".to_vec())
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── Pruning (#194) ───────────────────────────────────────────────────────
+
+    /// A chain of `n` blocks, heights 0..n, in a database of its own.
+    fn db_with_blocks(n: u64) -> (HelixDb, std::path::PathBuf, Address) {
+        let (mut db, path) = fresh_db();
+        let validator = addr(9);
+        for h in 0..n {
+            db.put_block(block_with_txs(h, &validator, vec![])).unwrap();
+        }
+        (db, path, validator)
+    }
+
+    /// Block 0 is the trust anchor a joining node checks its own genesis against, and
+    /// `check-genesis-pin.sh` reads it after every reset. It is one block; dropping it would save
+    /// nothing and make this node useless to anyone bootstrapping.
+    #[test]
+    fn pruning_never_drops_genesis_whatever_the_horizon_says() {
+        let (db, path, _) = db_with_blocks(10);
+        let out = db.prune_blocks_below(10, 1000).unwrap();
+        assert!(out.done);
+        assert_eq!(out.removed, 9, "heights 1..10 go, genesis stays");
+        assert!(
+            db.get_block_by_height(0).is_ok(),
+            "genesis must survive a horizon that covers it"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// "Never existed" and "dropped to bound disk growth" are opposite answers — the second one
+    /// tells the caller to ask somebody else. The control matters as much as the case: a height
+    /// *above* the tip must still read as missing, or this just renames every failure.
+    #[test]
+    fn a_pruned_height_says_pruned_and_an_unknown_one_still_says_missing() {
+        let (db, path, _) = db_with_blocks(10);
+        db.prune_blocks_below(5, 1000).unwrap();
+
+        match db.get_block_by_height(3) {
+            Err(StorageError::BlockPruned(h, earliest)) => {
+                assert_eq!(h, 3);
+                assert_eq!(earliest, 5, "and it names where this node's history begins");
+            }
+            other => panic!("a pruned height must report itself as pruned, got {other:?}"),
+        }
+        match db.get_block_by_height(999) {
+            Err(StorageError::BlockNotFound(999)) => {}
+            other => panic!("a height the chain never reached is missing, not pruned: {other:?}"),
+        }
+        assert!(db.get_block_by_height(7).is_ok(), "and what was kept is still readable");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A node moving a 166k-block chain to a 10k horizon has 156k blocks to drop. In one write
+    /// transaction that holds the database for minutes — on this network the node doing the
+    /// pruning is also carrying consensus, so the work has to arrive in ordinary-sized pieces.
+    #[test]
+    fn pruning_walks_forward_in_batches_rather_than_one_long_transaction() {
+        let (db, path, _) = db_with_blocks(20);
+
+        let first = db.prune_blocks_below(15, 5).unwrap();
+        assert_eq!(first.removed, 5, "a batch is a batch");
+        assert_eq!(first.earliest, 6, "genesis is skipped, so 1..6 went");
+        assert!(!first.done, "and it must say there is more to do");
+
+        let mut guard = 0;
+        let mut out = first;
+        while !out.done && guard < 10 {
+            out = db.prune_blocks_below(15, 5).unwrap();
+            guard += 1;
+        }
+        assert!(out.done, "successive calls must reach the horizon");
+        assert_eq!(db.earliest_block_height().unwrap(), 15);
+        assert!(db.get_block_by_height(15).is_ok(), "the horizon itself is kept");
+        assert!(matches!(db.get_block_by_height(14), Err(StorageError::BlockPruned(..))));
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Running it again with the same horizon must be free, and running it over a range that is
+    /// already gone must not stall: a node that pruned, restarted and pruned again walks its own
+    /// gaps, and so does one that re-synced a range it already held.
+    #[test]
+    fn pruning_is_idempotent_and_walks_over_gaps() {
+        let (db, path, _) = db_with_blocks(10);
+        db.prune_blocks_below(5, 1000).unwrap();
+
+        let again = db.prune_blocks_below(5, 1000).unwrap();
+        assert_eq!(again.removed, 0);
+        assert!(again.done);
+        // Read back from the database, not from the return value: the first draft asserted on
+        // `again.earliest`, which is computed in the same expression that decides what to store,
+        // so it held green through every mutation including one that persisted the wrong height
+        // entirely (lesson 3).
+        assert_eq!(
+            db.earliest_block_height().unwrap(),
+            5,
+            "the stored horizon must be where pruning actually stopped"
+        );
+
+        // And a horizon *below* what is already gone must not walk it backwards — a node whose
+        // keep-window is widened has less history, not more, and re-serving heights it dropped
+        // would mean answering with blocks it does not have.
+        let lower = db.prune_blocks_below(2, 1000).unwrap();
+        assert_eq!(lower.removed, 0);
+        assert_eq!(
+            db.earliest_block_height().unwrap(),
+            5,
+            "a lower horizon must leave the stored one alone"
+        );
+        drop(db);
         let _ = std::fs::remove_file(&path);
     }
 
