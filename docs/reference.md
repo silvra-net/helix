@@ -118,6 +118,7 @@ deliberately **not** the node's log — see the note below on why.
   "peer_tip_height": 36378,
   "rounds_lost_with_quorum_power": 0,
   "chain_db_bytes_per_block": 81426,
+  "earliest_block": null,
   "disk_days_remaining": 82,
   "last_cosigned_height": 36376,
   "last_cosigned_secs_ago": 5982,
@@ -159,6 +160,12 @@ What each field is for:
   network-timing problem, not an availability one, and no amount of restarting the absent validator
   fixes it. Measured on the live chain on 2026-09-04: one such round with 2e12 of power heard
   against a quorum of 1.667e12.
+- **`earliest_block`** — the lowest height this node still holds, or `null` when it keeps
+  everything. A node run with `HELIX_KEEP_BLOCKS` drops older blocks to bound disk growth, and
+  below this height it can answer neither a block query nor a wallet's history lookup — not because
+  the chain lacks them, but because this node does. `null` rather than `0`, for the same reason
+  `peer_tip_height` uses it: "I keep it all" and "my horizon happens to sit at genesis" are
+  different claims, and only one of them means *ask me for any block*.
 - **`chain_db_bytes_per_block` / `disk_days_remaining`** — what this chain actually costs to store,
   and how long the volume lasts at that rate. Measured from the node's own database rather than
   estimated, because the figure that matters is what *this* validator set writes: roughly half of

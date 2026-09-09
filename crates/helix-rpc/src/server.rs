@@ -1424,10 +1424,12 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let (height, state_height) = {
+    let (height, state_height, earliest_block) = {
         let store = state.store.read().await;
         let chain = state.chain_state.read().await;
-        (store.latest_height(), chain.applied_height)
+        // 0 means "has never pruned", which is not a horizon — see the field's doc comment.
+        let earliest = store.earliest_block_height().ok().filter(|h| *h > 0);
+        (store.latest_height(), chain.applied_height, earliest)
     };
 
     let last_height = state.last_cosigned.load(Ordering::Relaxed);
@@ -1456,6 +1458,7 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
         machine_total_kb: read_kb_field("/proc/meminfo", "MemTotal:"),
         mem_available_kb: read_kb_field("/proc/meminfo", "MemAvailable:"),
         chain_db_kb: db_kb,
+        earliest_block,
         chain_db_bytes_per_block: bytes_per_block,
         disk_days_remaining: days_left,
         disk_free_kb,

@@ -399,6 +399,13 @@ pub struct NodeDiagnostics {
     /// says how much a chain costs to hold, the path describes the operator's machine. See the
     /// note on this struct.
     pub chain_db_kb: u64,
+    /// Lowest block height this node still holds, when it prunes; `None` when it keeps everything
+    /// (backlog #194).
+    ///
+    /// `None` rather than 0, for the reason `peer_tip_height` is: an archiving node and a node
+    /// whose horizon happens to sit at genesis are different claims, and only one of them means
+    /// "ask me for any block". A client deciding where to fetch history from reads this.
+    pub earliest_block: Option<u64>,
     /// Free and total space on the volume holding that database, in KB. Zero where unreadable.
     ///
     /// The pair that answers the question a chain database raises and cannot answer alone: it
