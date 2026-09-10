@@ -211,6 +211,7 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         .route("/sync/blocks", get(get_sync_blocks))
         .route("/sync/tip-certificate", get(get_tip_certificate))
         .route("/sync/snapshot", get(get_state_snapshot))
+        .route("/sync/checkpoint", get(get_sync_checkpoint))
         .route("/diagnostics", get(get_diagnostics))
         .route("/whoami", get(get_whoami))
         .route(
@@ -703,6 +704,61 @@ async fn get_sync_blocks(
 /// that is nothing; it grows with the account count, and the answer then is to stream rather than
 /// clone — noted rather than pre-built, because the shape of that depends on how big "too big"
 /// turns out to be.
+/// `GET /sync/checkpoint` — a height and block hash a joining node can anchor to, in the exact
+/// form `HELIX_TRUSTED_CHECKPOINT` takes.
+///
+/// **This is an answer, not a proof, and the distinction is the whole point.** A checkpoint taken
+/// from the node you are about to sync from checks nothing: it is the same party vouching for
+/// itself, which is the trap `verify_genesis_reconstruction` was already caught in once (#139).
+/// It becomes worth something when it is *compared* — ask two or three independent nodes and see
+/// whether they say the same thing. That is why this lives on every node rather than only on a
+/// page we publish: one source is a claim, three that agree are hard to fake without controlling
+/// all of them.
+///
+/// Reports the newest height where a joiner would actually succeed, which is narrower than "the
+/// newest snapshot": it needs the stored snapshot, the block at that height, *and* the block above
+/// it, because the proof runs snapshot -> prev_state_root of the block above -> the anchor hash.
+/// Naming a height where any of those is missing would hand out a checkpoint that fails on use.
+async fn get_sync_checkpoint(State(state): State<AppState>) -> impl IntoResponse {
+    let store = state.store.read().await;
+    let tip = store.latest_height();
+    let heights = store.state_snapshot_heights().unwrap_or_default();
+
+    for height in heights.into_iter().rev() {
+        // Both blocks have to be here: the anchor, and the one above whose `prev_state_root`
+        // proves the snapshot. Asking the store is the whole test — an earlier version also
+        // compared against the tip, and a red run showed that check could never fail on its own,
+        // because a block that exists is a block at or below the tip. Two conditions for one
+        // question is one too many, and the redundant one is the one that quietly stops meaning
+        // anything.
+        let Ok(block) = store.get_block_by_height(height) else { continue };
+        if store.get_block_by_height(height + 1).is_err() {
+            continue;
+        }
+        let hash = block.hash().to_hex();
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "height": height,
+                "block_hash": hash,
+                "checkpoint": format!("{height}:{hash}"),
+                "advice": "Compare this against the same endpoint on other nodes before trusting \
+                           it. A checkpoint from the node you are about to sync from proves \
+                           nothing on its own.",
+            })),
+        );
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "this node has no usable checkpoint yet — it needs a stored state snapshot \
+                      with the block above it still on disk",
+            "tip": tip,
+        })),
+    )
+}
+
 async fn get_state_snapshot(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -2735,6 +2791,71 @@ mod tests {
             "positive control: the row that is still held is still shown — otherwise the count \
              above could just mean the whole route broke"
         );
+    }
+
+    /// A checkpoint must name a height where a joiner would actually get through — which needs
+    /// three things present at once, not just a stored snapshot. Handing out a height whose block
+    /// above is missing produces a checkpoint that fails on use, and the operator who copied it
+    /// has no way to tell that from a hostile peer.
+    #[tokio::test]
+    async fn a_checkpoint_names_only_a_height_a_joiner_could_actually_use() {
+        let state = fresh_test_state();
+        let kp = helix_crypto::KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+
+        let mk = |h: u64| {
+            let mut b = helix_core::genesis_block(
+                addr.clone(),
+                kp.public.clone(),
+                helix_crypto::Signature::from_bytes(vec![]),
+                0,
+            );
+            b.header.height = h;
+            b
+        };
+
+        {
+            let mut db = state.store.write().await;
+            let mut cs = helix_executor::ChainState::new(1_000_000);
+            for h in 0..=3u64 {
+                db.put_block(mk(h)).unwrap();
+            }
+            // Snapshots at 2 and 3. Only 2 is usable: height 3 is the tip, so there is no block
+            // above it to prove it with.
+            for h in [2u64, 3] {
+                cs.applied_height = h;
+                db.put_state_snapshot(h, &cs).unwrap();
+            }
+        }
+
+        let response = get_sync_checkpoint(State(state.clone())).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            v["height"], 2,
+            "3 is a stored snapshot but sits at the tip — nothing above it to prove it with: {v}"
+        );
+        let expected = {
+            let db = state.store.read().await;
+            db.get_block_by_height(2).unwrap().hash().to_hex()
+        };
+        assert_eq!(v["block_hash"], expected, "and the hash is this node's own block 2");
+        assert_eq!(
+            v["checkpoint"], format!("2:{expected}"),
+            "handed over in the exact shape HELIX_TRUSTED_CHECKPOINT takes, so nobody has to \
+             assemble it by hand"
+        );
+    }
+
+    /// A node with nothing to anchor to must say so rather than inventing a height. A checkpoint
+    /// that does not work is worse than none: the operator cannot tell it apart from an attack.
+    #[tokio::test]
+    async fn a_node_without_a_usable_snapshot_refuses_to_name_a_checkpoint() {
+        let state = fresh_test_state();
+        let response = get_sync_checkpoint(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// A pruning node's growth is not a line, so extrapolating one names a day that never comes.

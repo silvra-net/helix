@@ -394,6 +394,17 @@
         <div class="tile">
           <span class="k">Chain on disk</span><span class="v" id="chainsize">—</span>
         </div>
+        <!--
+          A joining node can skip replaying the chain if it is given a height and block hash to
+          anchor to. Published here so it is one copy away — but a checkpoint taken from the node
+          you are about to sync from proves nothing on its own, which is why the note under it
+          says to compare. The same endpoint answers on every node, so comparing is cheap.
+        -->
+        <div class="tile" id="cp-tile" hidden>
+          <span class="k">Sync checkpoint</span>
+          <span class="v mono" id="checkpoint" style="font-size:.75rem;word-break:break-all">—</span>
+          <small id="cp-note"></small>
+        </div>
         <div class="tile">
           <span class="k">Disk free</span><span class="v" id="diskfree">—</span>
           <span class="meter"><i id="disk-bar" style="width:0"></i></span>
@@ -844,7 +855,20 @@
   async function refresh() {
     let height = null;
     try {
-      const [status, diag] = await Promise.all([get("/status"), get("/diagnostics").catch(() => null)]);
+      const [status, diag, cp] = await Promise.all([
+        get("/status"),
+        get("/diagnostics").catch(() => null),
+        // 404 while this node has no usable snapshot yet — a normal state on a young chain, not
+        // an error worth showing.
+        get("/sync/checkpoint").catch(() => null),
+      ]);
+      if (cp && fin(cp.height)) {
+        $("cp-tile").hidden = false;
+        $("checkpoint").textContent = cp.checkpoint;
+        $("cp-note").textContent =
+          "HELIX_TRUSTED_CHECKPOINT — lets a new node start here instead of replaying the chain. " +
+          "Check it against another node before you trust it.";
+      }
       height = status.height;
 
       $("version").textContent = "v" + status.version;
