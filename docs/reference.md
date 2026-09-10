@@ -121,6 +121,7 @@ deliberately **not** the node's log — see the note below on why.
   "chain_db_bytes_per_block": 81426,
   "earliest_block": null,
   "disk_days_remaining": 82,
+  "chain_db_plateau_kb": null,
   "last_cosigned_height": 36376,
   "last_cosigned_secs_ago": 5982,
   "rss_kb": 344328,
@@ -167,6 +168,16 @@ What each field is for:
   the chain lacks them, but because this node does. `null` rather than `0`, for the same reason
   `peer_tip_height` uses it: "I keep it all" and "my horizon happens to sit at genesis" are
   different claims, and only one of them means *ask me for any block*.
+- **`chain_db_plateau_kb`** — the size the database levels off at when this node bounds its
+  history (`HELIX_KEEP_BLOCKS`); `null` on an archive node, which has no ceiling. When it is set
+  and fits the volume, **`disk_days_remaining` is `null`** — a pruning node's growth is not a line,
+  and extrapolating one names a day that never arrives. A plateau *larger* than the disk still
+  fills it, just later, so that case keeps its countdown.
+- **`/accounts/:address/transactions` gained `history_starts_at_block` and
+  `omitted_below_horizon`** — a pruning node cannot show a transaction whose block it dropped, and
+  "you have none" is the wrong thing to tell somebody looking for a payment they did receive. The
+  count says how many rows on this page are missing; the floor says where to look instead. Balances
+  are unaffected either way: they live in the state, not in the blocks.
 - **`chain_db_bytes_per_block` / `disk_days_remaining`** — what this chain actually costs to store,
   and how long the volume lasts at that rate. Measured from the node's own database rather than
   estimated, because the figure that matters is what *this* validator set writes: roughly half of

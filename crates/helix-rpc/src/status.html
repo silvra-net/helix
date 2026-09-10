@@ -901,6 +901,14 @@
           $("diskfree").innerHTML += `<small> ~${nf(d)} d at this rate</small>`;
           if (d < 30) { dbar.className = "bad"; }
           else if (d < 90 && dbar.className !== "bad") { dbar.className = "warn"; }
+        } else if (fin(diag.chain_db_plateau_kb)) {
+          // A pruning node stops growing, so there is no day to count down to — and the node
+          // says so by sending no date. Showing the ceiling instead is the honest replacement:
+          // it is the number that decides whether this disk is big enough, which a countdown
+          // that never arrives does not.
+          const gb = diag.chain_db_plateau_kb / 1024 / 1024;
+          $("diskfree").innerHTML +=
+            `<small> bounded — levels off near ${gb.toFixed(0)} GB</small>`;
         }
 
         // Load against cores: the same number means idle here and desperate on a single-core

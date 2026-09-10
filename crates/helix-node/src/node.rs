@@ -116,6 +116,16 @@ impl GenesisCheckpoint {
 /// is the only error a genuinely empty directory produces. Everything else — a block that will
 /// not deserialize, one below a prune horizon, a database-level failure — says the chain is there
 /// and this build cannot see it, which is the opposite conclusion.
+/// How many recent blocks this node keeps: `HELIX_KEEP_BLOCKS`, or 0 for an archive node.
+///
+/// One definition because two callers need the answer — the pruning loop, which acts on it, and
+/// the diagnostics, which report whether the database has a ceiling at all. Two `config::resolve`
+/// calls would be two places for the default to drift, and the drift would show up as a node
+/// reporting a plateau it is not enforcing (Lehre 12).
+fn configured_keep_blocks() -> u64 {
+    config::resolve_u64("HELIX_KEEP_BLOCKS", None).unwrap_or(0)
+}
+
 fn empty_data_directory(e: &helix_storage::StorageError) -> bool {
     matches!(e, helix_storage::StorageError::BlockNotFound(_))
 }
@@ -1053,6 +1063,7 @@ impl HelixNode {
             rounds_lost_with_quorum_power: rounds_lost_with_quorum_power.clone(),
             highest_peer_tip: self.highest_peer_tip.clone(),
             block_time_ms: config::resolve_u64("HELIX_BLOCK_TIME_MS", None).unwrap_or(BLOCK_TIME_MS),
+            keep_blocks: configured_keep_blocks(),
             last_cosigned: last_cosigned.clone(),
             last_cosigned_at_unix: last_cosigned_at_unix.clone(),
             previous_run: self.previous_run.clone(),
@@ -1485,7 +1496,7 @@ impl HelixNode {
 
         // Prune old blocks, if this operator asked for it. Off by default: somebody has to keep
         // the history, and a config default must not be what decides that for a network (#194).
-        let keep_blocks = config::resolve_u64("HELIX_KEEP_BLOCKS", None).unwrap_or(0);
+        let keep_blocks = configured_keep_blocks();
         if keep_blocks > 0 {
             tokio::spawn(prune_loop(self.store.clone(), keep_blocks, self.syncing.clone()));
         }

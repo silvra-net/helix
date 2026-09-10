@@ -381,7 +381,16 @@ pub struct NodeDiagnostics {
     /// here and nobody multiplied them: on 2026-09-08 this node's memory had grown from 374 MB to
     /// 3.2 GB over four days, in plain sight, because RSS is read as a snapshot and never as a
     /// trend (#193). Disk is the same shape of problem with a slower fuse.
+    /// `null` carries two meanings, told apart by `chain_db_plateau_kb`: with a plateau, this
+    /// database stops growing before the disk fills and there is no date to give; without one,
+    /// there was nothing to divide yet.
     pub disk_days_remaining: Option<u64>,
+    /// The size this database levels off at, in KB, when the node bounds its history
+    /// (`HELIX_KEEP_BLOCKS`). `null` on an archive node, which has no ceiling.
+    ///
+    /// Read together with `disk_free_kb`: a plateau larger than the volume still fills it, just
+    /// later — which is exactly the case `disk_days_remaining` keeps answering for.
+    pub chain_db_plateau_kb: Option<u64>,
     /// Bytes the database holds per block of chain, measured rather than estimated. Roughly half
     /// of it is fixed cost that no amount of quiet traffic reduces — one ML-DSA public key and
     /// signature per validator in every block's commit certificate.

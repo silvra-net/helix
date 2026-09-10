@@ -31,6 +31,9 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<RwLock<HelixDb>>,
+    /// `HELIX_KEEP_BLOCKS`: how many recent blocks this node keeps, or 0 for an archive node.
+    /// Read here only to say whether the database has a ceiling — see `disk_runway_days`.
+    pub keep_blocks: u64,
     pub mempool: Arc<RwLock<Mempool>>,
     pub chain_state: Arc<RwLock<ChainState>>,
     pub node_address: String,
@@ -1437,9 +1440,22 @@ async fn get_account_transactions(
         }
     };
 
+    // A row the index knows about but this node can no longer show, because the block holding it
+    // is below the prune horizon. Counted rather than silently dropped: "you have no older
+    // transactions" and "this node no longer keeps them" are opposite statements, and the caller
+    // is often somebody looking for a payment they are sure they received. The same conflation
+    // cost this project #156 and #167; here it lands on a wallet.
+    let mut omitted_below_horizon = 0u64;
     let mut history = Vec::with_capacity(refs.len());
     for (height, tx_index) in refs {
-        let Ok(block) = store.get_block_by_height(height) else { continue };
+        let block = match store.get_block_by_height(height) {
+            Ok(b) => b,
+            Err(helix_storage::StorageError::BlockPruned(_, _)) => {
+                omitted_below_horizon += 1;
+                continue;
+            }
+            Err(_) => continue,
+        };
         let Some(tx) = block.transactions.get(tx_index as usize) else { continue };
         let hash = tx.hash();
         // Skip an occurrence that is not the one this hash resolves to (see the doc comment).
@@ -1454,9 +1470,18 @@ async fn get_account_transactions(
         history.push(tx_history_entry(&block, tx, outcome));
     }
 
+    // `history_starts_at_block` is null on an archive node, where the list is simply complete.
+    // On a pruning node it names the floor, so a client can say where to look instead — the
+    // number is useless as a warning and useful as an address.
+    let earliest = store.earliest_block_height().ok().filter(|h| *h > 0);
     (
         StatusCode::OK,
-        Json(json!({ "address": address_str, "transactions": history })),
+        Json(json!({
+            "address": address_str,
+            "transactions": history,
+            "history_starts_at_block": earliest,
+            "omitted_below_horizon": omitted_below_horizon,
+        })),
     )
 }
 
@@ -1491,10 +1516,45 @@ fn chain_db_bytes_per_block(chain_db_kb: u64, height: u64) -> Option<u64> {
 ///
 /// `None` when anything it needs is missing. An extrapolation that quietly reports a number it
 /// cannot support is worse than no number, because it will be believed.
-fn disk_runway_days(bytes_per_block: Option<u64>, disk_free_kb: u64, block_time_ms: u64) -> Option<u64> {
+/// The size this database stops growing at, in KB, when the node bounds its history.
+///
+/// `None` means it does not: an archive node's database grows for as long as the chain does, and
+/// there is no plateau to name. An estimate either way — `bytes_per_block` moves with the size of
+/// the validator set, since every commit certificate carries a signature per validator.
+fn chain_db_plateau_kb(bytes_per_block: Option<u64>, keep_blocks: u64) -> Option<u64> {
+    if keep_blocks == 0 {
+        return None;
+    }
+    let per_block = bytes_per_block?;
+    Some(per_block.saturating_mul(keep_blocks) / 1024)
+}
+
+/// Days of disk left at the rate this chain is growing — or `None` when it will stop growing
+/// before the disk runs out.
+///
+/// The second case is why this takes a plateau at all. A pruning node's growth is not a line, and
+/// extrapolating one gives a date that never arrives: on 2026-09-10 this node reported 193 days
+/// left an hour after pruning had been switched on, which is a number that would have had somebody
+/// clearing space for nothing. A measurement that answers the wrong question confidently is worse
+/// than one that says nothing (R2) — so when the plateau fits in what the disk can hold, this
+/// reports `None` and `chain_db_plateau_kb` says why.
+fn disk_runway_days(
+    bytes_per_block: Option<u64>,
+    disk_free_kb: u64,
+    block_time_ms: u64,
+    plateau_kb: Option<u64>,
+    db_kb: u64,
+) -> Option<u64> {
     let per_block = bytes_per_block?;
     if per_block == 0 || disk_free_kb == 0 || block_time_ms == 0 {
         return None;
+    }
+    // What the database may still claim before the volume is full, against where it levels off.
+    // `db_kb` is on the left because the plateau is a total size, not an increment.
+    if let Some(plateau) = plateau_kb {
+        if plateau <= db_kb.saturating_add(disk_free_kb) {
+            return None;
+        }
     }
     let blocks_per_day = 86_400_000u64 / block_time_ms;
     let per_day = per_block.saturating_mul(blocks_per_day);
@@ -1525,7 +1585,9 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
     let (disk_free_kb, disk_total_kb) = disk_stats(state.data_path.as_deref());
     let db_kb = chain_db_kb(state.data_path.as_deref());
     let bytes_per_block = chain_db_bytes_per_block(db_kb, height);
-    let days_left = disk_runway_days(bytes_per_block, disk_free_kb, state.block_time_ms);
+    let plateau_kb = chain_db_plateau_kb(bytes_per_block, state.keep_blocks);
+    let days_left =
+        disk_runway_days(bytes_per_block, disk_free_kb, state.block_time_ms, plateau_kb, db_kb);
 
     Json(crate::NodeDiagnostics {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1548,6 +1610,7 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
         chain_db_kb: db_kb,
         earliest_block,
         chain_db_bytes_per_block: bytes_per_block,
+        chain_db_plateau_kb: plateau_kb,
         disk_days_remaining: days_left,
         disk_free_kb,
         disk_total_kb,
@@ -1897,6 +1960,7 @@ mod tests {
         let store = HelixDb::open(&path).unwrap();
         let (p2p_command_tx, _p2p_command_rx) = mpsc::channel(8);
         let state = AppState {
+            keep_blocks: 0,
             store: Arc::new(RwLock::new(store)),
             mempool: Arc::new(RwLock::new(Mempool::new())),
             chain_state: Arc::new(RwLock::new(ChainState::new(0))),
@@ -2604,7 +2668,7 @@ mod tests {
         // 80 KB a block at a 2s block time is 3.4 GB a day; 269 GB of free space is about 78 days.
         let per_block = Some(80 * 1024);
         let free_kb = 269 * 1024 * 1024;
-        let days = disk_runway_days(per_block, free_kb, 2_000).expect("computable");
+        let days = disk_runway_days(per_block, free_kb, 2_000, None, 0).expect("computable");
         assert!(
             (70..=90).contains(&days),
             "the live chain's own numbers on 2026-09-08 give roughly 80 days, got {days}"
@@ -2612,12 +2676,102 @@ mod tests {
 
         // Halving the block time doubles the bytes per day and halves the runway. Asserted because
         // getting this backwards would report the reassuring direction.
-        let faster = disk_runway_days(per_block, free_kb, 1_000).expect("computable");
+        let faster = disk_runway_days(per_block, free_kb, 1_000, None, 0).expect("computable");
         assert!(faster < days, "faster blocks fill a disk sooner: {faster} against {days}");
 
-        assert_eq!(disk_runway_days(None, free_kb, 2_000), None);
-        assert_eq!(disk_runway_days(per_block, 0, 2_000), None, "an unreadable volume is unknown");
-        assert_eq!(disk_runway_days(per_block, free_kb, 0), None);
+        assert_eq!(disk_runway_days(None, free_kb, 2_000, None, 0), None);
+        assert_eq!(disk_runway_days(per_block, 0, 2_000, None, 0), None, "an unreadable volume is unknown");
+        assert_eq!(disk_runway_days(per_block, free_kb, 0, None, 0), None);
+    }
+
+    /// "You have no older transactions" and "this node no longer keeps them" are opposite
+    /// statements, and a wallet showing the first for the second sends somebody looking for a
+    /// payment they really did receive. A pruned row must be counted and the floor named.
+    #[tokio::test]
+    async fn history_says_when_it_is_missing_rows_rather_than_showing_a_short_list() {
+        let state = fresh_test_state();
+        let kp = helix_crypto::KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+
+        // Two blocks touching this address, then everything below height 2 is pruned away.
+        {
+            let mut db = state.store.write().await;
+            for h in [1u64, 2] {
+                let mut block = helix_core::genesis_block(
+                    addr.clone(),
+                    kp.public.clone(),
+                    helix_crypto::Signature::from_bytes(vec![]),
+                    0,
+                );
+                block.header.height = h;
+                block.transactions.push(tx(&addr, &addr, 10, h));
+                db.put_block(block).unwrap();
+            }
+            db.prune_blocks_below(2, 100).unwrap();
+        }
+
+        let response = get_account_transactions(
+            State(state.clone()),
+            Path(addr.to_string()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            v["omitted_below_horizon"], 1,
+            "the row whose block was pruned is counted, not quietly dropped: {v}"
+        );
+        assert_eq!(
+            v["history_starts_at_block"], 2,
+            "and the answer names where this node's history begins, so a client knows where to \
+             look instead"
+        );
+        assert_eq!(
+            v["transactions"].as_array().unwrap().len(),
+            1,
+            "positive control: the row that is still held is still shown — otherwise the count \
+             above could just mean the whole route broke"
+        );
+    }
+
+    /// A pruning node's growth is not a line, so extrapolating one names a day that never comes.
+    /// An hour after pruning was switched on, this node still reported 193 days left — a number
+    /// somebody would have cleared space for. When the plateau fits, there is no date to give.
+    #[test]
+    fn a_bounded_database_reports_no_date_once_its_plateau_fits() {
+        let per_block = Some(64_500u64);
+        let free_kb = 269 * 1024 * 1024; // 269 GB
+        let db_kb = 250_000u64;
+
+        let none = chain_db_plateau_kb(per_block, 0);
+        assert_eq!(none, None, "an archive node has no ceiling to name");
+        assert!(
+            disk_runway_days(per_block, free_kb, 2_000, none, db_kb).is_some(),
+            "positive control: without a plateau there is still a date — and it is exactly this \
+             date the bounded case has to suppress"
+        );
+
+        let plateau = chain_db_plateau_kb(per_block, 500_000).expect("a bounded node has one");
+        assert!(
+            (29..=32).contains(&(plateau / 1024 / 1024)),
+            "500k blocks at 64.5 KB is about 30 GB, got {} GB",
+            plateau / 1024 / 1024
+        );
+        assert_eq!(
+            disk_runway_days(per_block, free_kb, 2_000, Some(plateau), db_kb),
+            None,
+            "it levels off well inside the disk, so there is no day to count down to"
+        );
+
+        // A ceiling above the volume still fills it, just later. That case keeps its date, or
+        // bounding the history would mute the very warning it was supposed to earn.
+        assert!(
+            disk_runway_days(per_block, 4 * 1024 * 1024, 2_000, Some(plateau), db_kb).is_some(),
+            "a plateau larger than the disk is not a reason to stop counting"
+        );
     }
 
     /// A node that has never co-signed must say so, rather than claiming height 0 — which reads
@@ -2646,6 +2800,7 @@ mod tests {
         let store = HelixDb::open(&path).unwrap();
         let (p2p_command_tx, _p2p_command_rx) = mpsc::channel(8);
         AppState {
+            keep_blocks: 0,
             store: Arc::new(RwLock::new(store)),
             mempool: Arc::new(RwLock::new(Mempool::new())),
             chain_state: Arc::new(RwLock::new(ChainState::new(0))),
