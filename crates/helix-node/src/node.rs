@@ -1116,7 +1116,50 @@ impl HelixNode {
                     self.sync_target_height.store(tip, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            let local_tip = self.store.read().await.latest_height();
+            let mut local_tip = self.store.read().await.latest_height();
+
+            // A node with no history yet may skip straight to a verified state — but only if the
+            // operator supplied an anchor from outside the network. Deliberately not attempted
+            // once this node holds blocks of its own: adopting a foreign state on top of a chain
+            // it already has is a fork with extra steps, and the cost of *not* taking the
+            // shortcut is only time.
+            if local_tip == 0 {
+                if let Some(raw) = config::resolve("HELIX_TRUSTED_CHECKPOINT", &None) {
+                    match parse_trusted_checkpoint(&raw) {
+                        Some(cp) if cp.height > 0 => {
+                            let chain_id = self.chain_state.read().await.chain_id;
+                            info!(
+                                height = cp.height,
+                                "Trying a state snapshot at the configured checkpoint instead of \
+                                 replaying the chain"
+                            );
+                            match snapshot_sync_from_peer(
+                                &peer_url,
+                                &cp,
+                                chain_id,
+                                &self.store,
+                                &self.chain_state,
+                            )
+                            .await
+                            {
+                                Ok(h) => local_tip = h,
+                                // Never fatal: the full sync is always correct, just slower. What
+                                // would be fatal is continuing on a state that failed its proof.
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "Snapshot sync refused — falling back to replaying the chain"
+                                ),
+                            }
+                        }
+                        _ => warn!(
+                            value = %raw,
+                            "HELIX_TRUSTED_CHECKPOINT is not `<height>:<block hash>` — ignoring it \
+                             and replaying the chain"
+                        ),
+                    }
+                }
+            }
+
             info!(peer = %peer_url, local_tip, "Syncing blocks from peer");
             // No lock taken here any more: `sync_blocks_from_peer` acquires the store and
             // chain state per batch and lets go in between, so the RPC can answer `is_syncing`
@@ -5317,6 +5360,164 @@ async fn fetch_sync_blocks(
     fetch_json(client, &base).await
 }
 
+/// A height and the hash of the block at it, supplied by the operator from outside the network.
+///
+/// This is the anchor that makes starting from a state snapshot safe, and there is no way to
+/// derive it from the network itself: a joiner has no validator set until it has a state, and the
+/// state is the thing being checked. Ethereum calls the same requirement weak subjectivity;
+/// Cosmos ships it as trusted-height/trusted-hash. Absent means no snapshot sync — the node
+/// replays from genesis, which needs no anchor beyond the compiled-in genesis hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedCheckpoint {
+    height: u64,
+    block_hash: Hash,
+}
+
+/// Parse `HELIX_TRUSTED_CHECKPOINT`, format `<height>:<block hash hex>`.
+///
+/// Pure, because every rejection here is a node that will *not* take the shortcut — and silently
+/// accepting a malformed anchor is the one outcome that must be impossible. A partially-parsed
+/// checkpoint is worse than none: none falls back to the full sync, which is always correct.
+fn parse_trusted_checkpoint(raw: &str) -> Option<TrustedCheckpoint> {
+    let (h, hash) = raw.trim().split_once(':')?;
+    let height: u64 = h.trim().parse().ok()?;
+    let block_hash = Hash::from_hex(hash.trim()).ok()?;
+    Some(TrustedCheckpoint { height, block_hash })
+}
+
+/// A state snapshot is the whole account set at once. 256 MB is roughly a million accounts —
+/// past that, a node small enough to want the shortcut is not large enough to hold the answer,
+/// and failing on the read beats being OOM-killed with nothing in the log (#118/#172).
+const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Start from a peer's state snapshot instead of replaying the chain, and prove it before
+/// keeping any of it.
+///
+/// The proof chain, in the order it has to hold:
+///   1. The snapshot's `chain_id` is the genesis hash this binary was built with. Same statement
+///      as checking the genesis block, without needing the block — `chain_id` *is* that hash.
+///   2. The block at the checkpoint height hashes to the hash the operator supplied. This is the
+///      only step whose input does not come from the peer, so it is the only one that makes the
+///      others mean anything.
+///   3. The next block names that block as its parent, chaining to the anchor.
+///   4. That next block's `prev_state_root` equals the hash of the snapshot we were handed —
+///      which is what binds the state to a block the operator vouched for, rather than to the
+///      server that served it. Nothing here would work before 0.15.0: there was no signed state
+///      commitment to compare against, so a snapshot was only ever the claim of whoever sent it.
+///
+/// Returns the height the node now holds. On any failure the caller falls back to the ordinary
+/// sync — a shortcut that cannot be proven is simply not taken, never taken on faith.
+async fn snapshot_sync_from_peer(
+    peer_url: &str,
+    checkpoint: &TrustedCheckpoint,
+    expected_chain_id: Hash,
+    store: &Arc<RwLock<HelixDb>>,
+    chain_state: &Arc<RwLock<ChainState>>,
+) -> Result<u64> {
+    let client = peer_http_client(Duration::from_secs(60))?;
+    let url = format!(
+        "{}/sync/snapshot?height={}",
+        peer_url.trim_end_matches('/'),
+        checkpoint.height
+    );
+    let resp = client.get(&url).send().await.with_context(|| format!("{url} is unreachable"))?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "{url} answered HTTP {} — this peer has no stored snapshot at that height",
+        resp.status()
+    );
+    let bytes = read_body_capped(resp, MAX_SNAPSHOT_BYTES, &url).await?;
+    let snapshot: helix_executor::state::StateSnapshot = bincode::deserialize(&bytes)
+        .with_context(|| format!("{url} did not answer with a state snapshot"))?;
+
+    // The peer serves the newest snapshot at or below what was asked. Anything below the
+    // checkpoint is a state the operator's anchor cannot vouch for, and closing that gap would
+    // mean verifying every block between — at which point the shortcut has stopped being one.
+    anyhow::ensure!(
+        snapshot.height == checkpoint.height,
+        "the peer's nearest stored snapshot is at height {} but the checkpoint names {} — \
+         a checkpoint has to fall on a height the network actually snapshots \
+         (HELIX_SNAPSHOT_INTERVAL, default every 10000)",
+        snapshot.height,
+        checkpoint.height
+    );
+    // `state_hash` covers the accounts, not the height — so `prev_state_root` proves *which
+    // state* this is and says nothing about *when* it is. Found by the test below, which changed
+    // only `applied_height` and watched the proof pass anyway. Left unchecked, a peer could serve
+    // a genuine state under a wrong height and the node would carry on believing it had executed
+    // blocks it never saw.
+    anyhow::ensure!(
+        snapshot.state.applied_height == snapshot.height,
+        "the snapshot says it is at height {} but the state inside it has applied {} — the pair \
+         is the claim, and these two do not agree",
+        snapshot.height,
+        snapshot.state.applied_height
+    );
+    anyhow::ensure!(
+        snapshot.state.chain_id == expected_chain_id,
+        "the snapshot belongs to chain {} but this binary is built for {} — this is a different \
+         network, not a different height",
+        snapshot.state.chain_id.to_hex(),
+        expected_chain_id.to_hex()
+    );
+
+    let mut binary = true;
+    let blocks = fetch_sync_blocks(&client, peer_url, checkpoint.height, &mut binary).await?;
+    anyhow::ensure!(
+        blocks.len() >= 2,
+        "the peer served {} block(s) from height {}; the checkpoint block and the one above it \
+         are both needed to prove the snapshot",
+        blocks.len(),
+        checkpoint.height
+    );
+    let anchor = &blocks[0];
+    let above = &blocks[1];
+
+    anyhow::ensure!(
+        anchor.header.height == checkpoint.height && anchor.hash() == checkpoint.block_hash,
+        "the block this peer serves at height {} hashes to {}, but the checkpoint says {} — \
+         either this peer is on another history or the checkpoint is wrong. Refusing both.",
+        checkpoint.height,
+        anchor.hash().to_hex(),
+        checkpoint.block_hash.to_hex()
+    );
+    anyhow::ensure!(
+        above.header.prev_hash == checkpoint.block_hash,
+        "the block above the checkpoint names parent {}, not the checkpoint block",
+        above.header.prev_hash.to_hex()
+    );
+    let snapshot_root = snapshot.state.state_hash();
+    anyhow::ensure!(
+        above.header.prev_state_root == snapshot_root,
+        "the snapshot hashes to {} but block {} commits to {} as the state above the checkpoint \
+         — this state is not the one the chain agreed on",
+        snapshot_root.to_hex(),
+        above.header.height,
+        above.header.prev_state_root.to_hex()
+    );
+
+    // Proven. Keep the state and the anchor block; the ordinary sync takes it from there. The
+    // block above is deliberately *not* stored — it has not been executed, and a stored block
+    // ahead of the state is the shape of the bug `prev_state_root` exists to catch (#145).
+    {
+        let mut cs = chain_state.write().await;
+        *cs = snapshot.state;
+        let mut db = store.write().await;
+        db.put_block(anchor.clone())?;
+        db.save_chain_state(&cs)?;
+        // Without this, a read of block 0 answers `BlockNotFound` and the next startup concludes
+        // the directory is empty — then writes a genesis over a chain that starts at the
+        // checkpoint. `BlockPruned` is the honest answer and the one that stops it.
+        db.mark_history_starts_at(checkpoint.height)?;
+    }
+    info!(
+        height = checkpoint.height,
+        accounts = chain_state.read().await.accounts.len(),
+        "Started from a verified state snapshot instead of replaying the chain"
+    );
+    Ok(checkpoint.height)
+}
+
 async fn sync_blocks_from_peer(
     peer_url: &str,
     local_tip: u64,
@@ -5883,6 +6084,237 @@ mod sync_blocks_from_peer_tests {
                 block
             })
             .collect()
+    }
+
+    /// A peer that answers both halves of a snapshot sync: the stored snapshot at a height, and
+    /// the blocks from there on.
+    async fn serve_snapshot_and_blocks(
+        snapshot: helix_executor::state::StateSnapshot,
+        blocks: Vec<Block>,
+    ) -> String {
+        let blocks = Arc::new(blocks);
+        let snapshot = Arc::new(snapshot);
+        let app = Router::new()
+            .route(
+                "/sync/snapshot",
+                get(move |Query(params): Query<HashMap<String, String>>| {
+                    let snapshot = snapshot.clone();
+                    async move {
+                        let asked: u64 =
+                            params.get("height").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        if asked < snapshot.height {
+                            return (axum::http::StatusCode::NOT_FOUND, Vec::new()).into_response();
+                        }
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            bincode::serialize(&*snapshot).unwrap(),
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/sync/blocks",
+                get(move |Query(params): Query<HashMap<String, String>>| {
+                    let blocks = blocks.clone();
+                    async move {
+                        let from: u64 =
+                            params.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let page: Vec<Block> =
+                            blocks.iter().filter(|b| b.height() >= from).cloned().collect();
+                        Json(page)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    /// Builds the honest case: a state, the block at the checkpoint height, and the block above it
+    /// committing to that state through `prev_state_root`.
+    fn snapshot_fixture(
+        kp: &KeyPair,
+        height: u64,
+        chain_id: Hash,
+    ) -> (helix_executor::state::StateSnapshot, Vec<Block>, TrustedCheckpoint) {
+        let mut state = ChainState::new(1_000_000);
+        state.chain_id = chain_id;
+        state.applied_height = height;
+        let root = state.state_hash();
+
+        let anchor = signed_block(kp, height, Hash::from_bytes([7u8; 32]));
+        let mut above = signed_block(kp, height + 1, anchor.hash());
+        above.header.prev_state_root = root;
+
+        let cp = TrustedCheckpoint { height, block_hash: anchor.hash() };
+        (
+            helix_executor::state::StateSnapshot { height, state },
+            vec![anchor, above],
+            cp,
+        )
+    }
+
+    async fn fresh_store_and_state() -> (Arc<RwLock<HelixDb>>, Arc<RwLock<ChainState>>, PathBuf) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "helix-snapsync-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(RwLock::new(HelixDb::open(&path).unwrap()));
+        let state = Arc::new(RwLock::new(ChainState::new(1_000_000)));
+        (store, state, path)
+    }
+
+    /// The honest path, end to end: the state is adopted, the anchor block is stored, and the node
+    /// records that its history begins at the checkpoint — which is what stops the next startup
+    /// from reading the missing block 0 as an empty directory.
+    #[tokio::test]
+    async fn a_snapshot_that_proves_itself_is_adopted() {
+        let kp = KeyPair::generate();
+        let chain_id = Hash::from_bytes([3u8; 32]);
+        let (snapshot, blocks, cp) = snapshot_fixture(&kp, 10_000, chain_id);
+        let peer = serve_snapshot_and_blocks(snapshot, blocks).await;
+        let (store, state, path) = fresh_store_and_state().await;
+
+        let height = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state)
+            .await
+            .expect("an honest snapshot must be accepted");
+
+        assert_eq!(height, 10_000);
+        assert_eq!(state.read().await.applied_height, 10_000, "the state is the peer's");
+        let db = store.read().await;
+        assert_eq!(db.latest_height(), 10_000, "and the anchor block is stored");
+        assert_eq!(
+            db.earliest_block_height().unwrap(),
+            10_000,
+            "history starts at the checkpoint — without this, a later start reads the absent \
+             block 0 as an empty directory and writes a genesis over this chain"
+        );
+        assert!(
+            matches!(db.get_block_by_height(0), Err(helix_storage::StorageError::BlockPruned(0, 10_000))),
+            "and block 0 reports itself as pruned rather than missing, which is what the \
+             startup guard reads"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every way the proof can fail has to end in a refusal, because the fallback — replaying the
+    /// chain — is always correct and only costs time. These are the four inputs an attacker
+    /// controls; the honest test above is the control that says the fixture can pass at all.
+    #[tokio::test]
+    async fn a_snapshot_that_cannot_prove_itself_is_refused() {
+        let kp = KeyPair::generate();
+        let chain_id = Hash::from_bytes([3u8; 32]);
+
+        // 1. The anchor block is not the one the checkpoint names.
+        let (snapshot, blocks, mut cp) = snapshot_fixture(&kp, 10_000, chain_id);
+        cp.block_hash = Hash::from_bytes([9u8; 32]);
+        let peer = serve_snapshot_and_blocks(snapshot, blocks).await;
+        let (store, state, path) = fresh_store_and_state().await;
+        let err = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state).await.unwrap_err();
+        assert!(
+            err.to_string().contains("the checkpoint says"),
+            "a block that does not match the anchor must be refused, got: {err}"
+        );
+        assert_eq!(store.read().await.latest_height(), 0, "and nothing is kept");
+        let _ = std::fs::remove_file(&path);
+
+        // 2. The state does not hash to what the block above commits to. Note this has to change
+        //    an *account* — `state_hash` covers the accounts and not the height, which is a
+        //    distinction this test discovered by getting it wrong.
+        let (mut snapshot, blocks, cp) = snapshot_fixture(&kp, 10_000, chain_id);
+        let intruder = Address::from_public_key(&KeyPair::generate().public);
+        snapshot
+            .state
+            .accounts
+            .insert(intruder.to_string(), helix_executor::state::AccountState::new(&intruder));
+        let peer = serve_snapshot_and_blocks(snapshot, blocks).await;
+        let (store, state, path) = fresh_store_and_state().await;
+        let err = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not the one the chain agreed on"),
+            "a state the chain never committed to must be refused, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // 3. A snapshot from a different chain.
+        let (snapshot, blocks, cp) = snapshot_fixture(&kp, 10_000, Hash::from_bytes([4u8; 32]));
+        let peer = serve_snapshot_and_blocks(snapshot, blocks).await;
+        let (store, state, path) = fresh_store_and_state().await;
+        let err = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state).await.unwrap_err();
+        assert!(
+            err.to_string().contains("different network"),
+            "a snapshot of another chain must be refused, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // 4. The peer's nearest snapshot sits below the checkpoint, so the anchor cannot vouch
+        //    for it — the peer is honest here, which is exactly why the check has to be ours.
+        let (snapshot, blocks, mut cp) = snapshot_fixture(&kp, 10_000, chain_id);
+        cp.height = 20_000;
+        let peer = serve_snapshot_and_blocks(snapshot, blocks).await;
+        let (store, state, path) = fresh_store_and_state().await;
+        let err = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state).await.unwrap_err();
+        assert!(
+            err.to_string().contains("has to fall on a height the network actually snapshots"),
+            "a snapshot below the checkpoint must be refused, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // 5. The state inside disagrees with the height the snapshot claims. `state_hash` covers
+        //    the accounts and not the height, so `prev_state_root` cannot catch this one — it is
+        //    the reason the client checks the pair itself.
+        let (mut snapshot, blocks, cp) = snapshot_fixture(&kp, 10_000, chain_id);
+        snapshot.state.applied_height = 9_000;
+        let peer = serve_snapshot_and_blocks(snapshot, blocks).await;
+        let (store, state, path) = fresh_store_and_state().await;
+        let err = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state).await.unwrap_err();
+        assert!(
+            err.to_string().contains("the pair is the claim"),
+            "a state whose height disagrees with the snapshot's must be refused, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A malformed anchor must parse to nothing, never to something partial: the fallback is the
+    /// full sync, which is always correct, while a half-read checkpoint would anchor the node to
+    /// a height or hash the operator did not write.
+    #[test]
+    fn a_checkpoint_parses_only_when_both_halves_are_whole() {
+        let hash = Hash::from_bytes([1u8; 32]);
+        let good = format!("175000:{}", hash.to_hex());
+        assert_eq!(
+            parse_trusted_checkpoint(&good),
+            Some(TrustedCheckpoint { height: 175_000, block_hash: hash.clone() })
+        );
+        assert_eq!(
+            parse_trusted_checkpoint(&format!("  175000 : {}  ", hash.to_hex())),
+            Some(TrustedCheckpoint { height: 175_000, block_hash: hash }),
+            "whitespace around either half is the operator's copy-paste, not a different value"
+        );
+
+        for bad in [
+            "175000",
+            "175000:",
+            ":abc",
+            "175000:nothex",
+            "notanumber:00",
+            "",
+            "175000:00ff",
+        ] {
+            assert!(
+                parse_trusted_checkpoint(bad).is_none(),
+                "{bad:?} must not parse — a partial checkpoint is worse than none"
+            );
+        }
     }
 
     async fn serve_blocks(blocks: Vec<Block>) -> String {

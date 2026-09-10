@@ -1151,6 +1151,25 @@ pub struct PruneOutcome {
 
 impl HelixDb {
     /// Lowest block height this node still holds. 0 on a node that has never pruned.
+    /// Record that this node's history starts at `height` — it holds nothing below that and never
+    /// will.
+    ///
+    /// Pruning sets this as it drops blocks. A node that started from a state snapshot sets it
+    /// too, and for that case it is load-bearing rather than informational: with it, a read of
+    /// block 0 answers `BlockPruned` instead of `BlockNotFound`, which is what stops the startup
+    /// path from concluding the directory is empty and writing a genesis over a chain that begins
+    /// somewhere else (see `empty_data_directory` in helix-node).
+    pub fn mark_history_starts_at(&self, height: u64) -> StorageResult<()> {
+        let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
+        {
+            let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
+            meta.insert(META_EARLIEST_BLOCK, height.to_le_bytes().as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn earliest_block_height(&self) -> StorageResult<u64> {
         let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
         let meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
