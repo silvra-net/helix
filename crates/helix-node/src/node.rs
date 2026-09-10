@@ -362,6 +362,13 @@ const PRUNE_INTERVAL_SECS: u64 = 10;
 const PRUNE_BATCH_BLOCKS: u64 = 500;
 const PRUNE_BATCHES_PER_TICK: u32 = 10;
 
+/// How many state snapshots survive pruning no matter how high the horizon climbs.
+///
+/// Three rather than one: a joiner's checkpoint names a height, and the newest snapshot may sit
+/// above it. Keeping a short run means the answer to "the state at or below N" stays available
+/// for the range of checkpoints in circulation, instead of only for the most recent one.
+const KEEP_STATE_SNAPSHOTS: usize = 3;
+
 /// The height below which blocks may be dropped, or `None` when this node keeps everything.
 ///
 /// `keep == 0` — the default, and what an unset or unparseable `HELIX_KEEP_BLOCKS` resolves to —
@@ -3634,6 +3641,19 @@ async fn prune_loop(store: Arc<RwLock<HelixDb>>, keep_blocks: u64, syncing: Arc<
             // Hand the write lock back between batches so block production and the RPC get their
             // turn; without this a large backlog would be one long stall wearing a loop's clothes.
             tokio::task::yield_now().await;
+        }
+
+        // Snapshots age out with the blocks they sit among, but never all of them: they are the
+        // only thing that makes a pruned node useful to somebody joining, and a node that dropped
+        // its last one would have neither the history nor a way to skip it. The floor costs a few
+        // megabytes and buys the whole bootstrap path.
+        {
+            let db = store.write().await;
+            match db.prune_state_snapshots_below(horizon, KEEP_STATE_SNAPSHOTS) {
+                Ok(n) if n > 0 => debug!(dropped = n, horizon, "Pruned old state snapshots"),
+                Ok(_) => {}
+                Err(e) => warn!(err = %e, "Could not prune old state snapshots"),
+            }
         }
 
         if removed_this_tick > 0 && !announced {

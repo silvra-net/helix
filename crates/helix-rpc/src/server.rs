@@ -700,7 +700,55 @@ async fn get_sync_blocks(
 /// that is nothing; it grows with the account count, and the answer then is to stream rather than
 /// clone — noted rather than pre-built, because the shape of that depends on how big "too big"
 /// turns out to be.
-async fn get_state_snapshot(State(state): State<AppState>) -> axum::response::Response {
+async fn get_state_snapshot(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    // `?height=N` asks for a *fixed point* — the newest stored snapshot at or below N — while no
+    // parameter means "whatever you hold right now". The difference is the whole reason stored
+    // snapshots exist: a joiner verifies a snapshot against the `prev_state_root` of the block
+    // above it, and it can only do that for a height that stands still. The live tip moves while
+    // the joiner is checking it, so it can never be named by a checkpoint.
+    let asked: Option<u64> = params.get("height").and_then(|v| v.trim().parse().ok());
+    if let Some(h) = asked {
+        let stored = { state.store.read().await.state_snapshot_at_or_before(h) };
+        return match stored {
+            Ok(Some((height, chain_state))) => {
+                let snapshot =
+                    helix_executor::state::StateSnapshot { height, state: chain_state };
+                match bincode::serialize(&snapshot) {
+                    Ok(bytes) => (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                        bytes,
+                    )
+                        .into_response(),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": format!("could not serialize the state snapshot: {e}") })),
+                    )
+                        .into_response(),
+                }
+            }
+            // 404 rather than falling back to the live state: silently answering with a height
+            // the caller did not ask for is how a joiner ends up verifying the wrong thing.
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": format!(
+                        "this node has no state snapshot at or below height {h}"
+                    )
+                })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("could not read the state snapshot: {e}") })),
+            )
+                .into_response(),
+        };
+    }
+
     let snapshot = {
         let cs = state.chain_state.read().await;
         helix_executor::state::StateSnapshot { height: cs.applied_height, state: cs.clone() }
@@ -3099,10 +3147,52 @@ mod tests {
         );
     }
 
+    /// `?height=N` must answer with a *stored* snapshot at or below N — a fixed point a joiner's
+    /// checkpoint can name — and must refuse rather than quietly substitute the live tip. The
+    /// substitution is the dangerous failure: the caller would verify a state against a block
+    /// that does not describe it, and every check would pass on the wrong pair.
+    #[tokio::test]
+    async fn asking_for_a_height_answers_with_a_stored_snapshot_or_refuses() {
+        let state = fresh_test_state();
+        {
+            let mut cs = state.chain_state.write().await;
+            cs.applied_height = 500;
+            state.store.read().await.put_state_snapshot(500, &cs).unwrap();
+            cs.applied_height = 900; // the live tip has moved on since
+        }
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("height".to_string(), "742".to_string());
+        let response = get_state_snapshot(State(state.clone()), Query(params)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let snap: helix_executor::state::StateSnapshot = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(
+            snap.height, 500,
+            "the stored fixed point below the asked height — not the live tip at 900, which no \
+             checkpoint can name"
+        );
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("height".to_string(), "100".to_string());
+        let response = get_state_snapshot(State(state.clone()), Query(params)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "below every stored snapshot the honest answer is 'I cannot', never a later state"
+        );
+
+        // Positive control: without the parameter the endpoint still serves the live tip, so the
+        // two answers above are the new path working rather than the old one being broken.
+        let snap: helix_executor::state::StateSnapshot =
+            bincode::deserialize(&snapshot_body(&state).await).unwrap();
+        assert_eq!(snap.height, 900);
+    }
+
     /// Reads the endpoint's body, failing loudly rather than returning something empty — a test
     /// that silently compared two empty vectors would pass forever.
     async fn snapshot_body(state: &AppState) -> Vec<u8> {
-        let response = get_state_snapshot(State(state.clone())).await;
+        let response = get_state_snapshot(State(state.clone()), Query(Default::default())).await;
         assert_eq!(response.status(), StatusCode::OK, "the snapshot endpoint must answer 200");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

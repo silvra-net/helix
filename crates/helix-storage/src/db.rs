@@ -99,6 +99,39 @@ const TX_HASH_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tx_ha
 /// why. See `BlockStore::put_receipts`. Absent for blocks written before this table existed,
 /// which is why the RPC has an `unknown` status rather than defaulting to success.
 const RECEIPTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("receipts");
+/// height → bincode(`ChainState`): the execution state as it stood after that height, kept for a
+/// handful of heights so a joining node can start from one instead of replaying the chain.
+///
+/// Why this has to be stored rather than served on demand: a node holds exactly one state, the
+/// current one. Without these it can only ever offer a snapshot at its own tip, and a tip moves
+/// while the joiner is verifying it — there is nothing for a checkpoint to name. These are the
+/// fixed points that make the state addressable at all.
+///
+/// Small: ~1 KB per account, so the whole set costs a few MB against the gigabytes of blocks it
+/// replaces. Pruned from the front like blocks are.
+const STATE_SNAPSHOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("state_snapshots");
+
+/// How often a state snapshot is taken, in heights. `HELIX_SNAPSHOT_INTERVAL` overrides it; `0`
+/// turns it off.
+///
+/// 10_000 is about six hours at this chain's cadence, so a joiner's checkpoint is never more than
+/// that far from a fixed point, and the whole set costs single-digit megabytes.
+const DEFAULT_SNAPSHOT_INTERVAL: u64 = 10_000;
+
+fn configured_snapshot_interval() -> u64 {
+    snapshot_interval_from(std::env::var("HELIX_SNAPSHOT_INTERVAL").ok().as_deref())
+}
+
+/// Split out so the parsing rules are testable without an environment: anything that is not a
+/// number this node can act on falls back to the default, and only an explicit `0` disables
+/// snapshots. Getting that backwards would silently turn a typo into a node that cannot help
+/// anyone bootstrap — and nothing would say so until somebody tried.
+fn snapshot_interval_from(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim) {
+        None | Some("") => DEFAULT_SNAPSHOT_INTERVAL,
+        Some(v) => v.parse::<u64>().unwrap_or(DEFAULT_SNAPSHOT_INTERVAL),
+    }
+}
 
 const META_HEIGHT: &str = "latest_height";
 const META_HASH: &str = "latest_hash";
@@ -171,9 +204,26 @@ fn configured_cache_bytes() -> usize {
 
 pub struct HelixDb {
     db: Database,
+    /// Take a state snapshot every this many heights; 0 disables it.
+    ///
+    /// It lives here rather than at the ten call sites of `save_chain_state` because that is what
+    /// the ten call sites are: ten. A hook added next to each of them is a duplicated invariant
+    /// waiting to drift, and the one that gets missed is the one that matters (Lehre 12).
+    snapshot_interval: u64,
 }
 
 impl HelixDb {
+    /// Open with an explicit snapshot interval instead of the configured one.
+    ///
+    /// Exists so the interval can be exercised without reaching into the process environment —
+    /// env vars are global, and a test that sets one is a test that can break another one running
+    /// beside it.
+    pub fn open_with_snapshot_interval(path: &Path, interval: u64) -> StorageResult<Self> {
+        let mut db = Self::open(path)?;
+        db.snapshot_interval = interval;
+        Ok(db)
+    }
+
     pub fn open(path: &Path) -> StorageResult<Self> {
         let db = Database::builder()
             .set_cache_size(configured_cache_bytes())
@@ -219,15 +269,125 @@ impl HelixDb {
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(RECEIPTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(STATE_SNAPSHOTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
-        Ok(HelixDb { db })
+        Ok(HelixDb { db, snapshot_interval: configured_snapshot_interval() })
+    }
+
+    // ── State snapshots ──────────────────────────────────────────────────────
+
+    /// Store the state as it stood after `height`.
+    ///
+    /// The pair is the claim, so it is written as one: a snapshot whose height is off by one
+    /// names a `prev_state_root` that will never match, and the joiner rejects it — loudly, which
+    /// is the right failure, but it makes the node useless to anyone bootstrapping.
+    pub fn put_state_snapshot(&self, height: u64, state: &ChainState) -> StorageResult<()> {
+        let bytes = bincode::serialize(state)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
+        {
+            let mut table =
+                tx.open_table(STATE_SNAPSHOTS).map_err(|e| StorageError::Db(e.to_string()))?;
+            table
+                .insert(height, bytes.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The newest stored snapshot at or below `height`, with the height it belongs to.
+    ///
+    /// "At or below" rather than "exactly at": a caller asking for a checkpoint height wants the
+    /// state it can verify against, and being handed nothing because the interval moved is a
+    /// worse answer than being handed an older one it can still check.
+    pub fn state_snapshot_at_or_before(
+        &self,
+        height: u64,
+    ) -> StorageResult<Option<(u64, ChainState)>> {
+        let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
+        let table =
+            tx.open_table(STATE_SNAPSHOTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut range =
+            table.range(..=height).map_err(|e| StorageError::Db(e.to_string()))?;
+        match range.next_back() {
+            Some(entry) => {
+                let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+                let state: ChainState = bincode::deserialize(v.value())
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                Ok(Some((k.value(), state)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Which heights this node can serve a state snapshot for, oldest first.
+    pub fn state_snapshot_heights(&self) -> StorageResult<Vec<u64>> {
+        let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
+        let table =
+            tx.open_table(STATE_SNAPSHOTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(|e| StorageError::Db(e.to_string()))? {
+            let (k, _) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            out.push(k.value());
+        }
+        Ok(out)
+    }
+
+    /// Drop snapshots below `horizon`, keeping at least `keep_at_least` of the newest ones.
+    ///
+    /// The floor is the point: snapshots are what makes a pruned node useful to a joiner, so a
+    /// horizon that swept them all would leave a node that has neither the blocks nor a way to
+    /// skip them. Cheap to keep — a handful of megabytes.
+    pub fn prune_state_snapshots_below(
+        &self,
+        horizon: u64,
+        keep_at_least: usize,
+    ) -> StorageResult<usize> {
+        let heights = self.state_snapshot_heights()?;
+        let keep_from = heights.len().saturating_sub(keep_at_least);
+        let doomed: Vec<u64> =
+            heights.into_iter().take(keep_from).filter(|h| *h < horizon).collect();
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
+        {
+            let mut table =
+                tx.open_table(STATE_SNAPSHOTS).map_err(|e| StorageError::Db(e.to_string()))?;
+            for h in &doomed {
+                table.remove(*h).map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+        tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
+        Ok(doomed.len())
     }
 
     // ── Account state ────────────────────────────────────────────────────────
 
     pub fn save_chain_state(&self, state: &ChainState) -> StorageResult<()> {
+        // Written inside the same transaction as the state it describes. A snapshot that survives
+        // a crash the state did not — or the other way round — is a snapshot whose height lies
+        // about its contents, and the joiner it lies to has no way to tell.
+        let snapshot_now = self.snapshot_interval > 0
+            && state.applied_height % self.snapshot_interval == 0;
+        let snapshot_bytes = if snapshot_now {
+            Some(
+                bincode::serialize(state)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
         {
+            if let Some(bytes) = &snapshot_bytes {
+                let mut snapshots =
+                    tx.open_table(STATE_SNAPSHOTS).map_err(|e| StorageError::Db(e.to_string()))?;
+                snapshots
+                    .insert(state.applied_height, bytes.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
             let mut accounts = tx.open_table(ACCOUNTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut names = tx.open_table(NAMES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut personhood = tx.open_table(PERSONHOOD).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1628,6 +1788,122 @@ mod tests {
             other => panic!("a height the chain never reached is missing, not pruned: {other:?}"),
         }
         assert!(db.get_block_by_height(7).is_ok(), "and what was kept is still readable");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The wiring, not the rule: saving the state at a height on the interval must actually leave
+    /// a snapshot behind, and saving at any other height must not. Without this the interval is a
+    /// constant nobody reads — `save_chain_state` has ten callers and every one of them has to hit
+    /// this path for free.
+    #[test]
+    fn saving_the_state_on_the_interval_leaves_a_snapshot_and_off_it_leaves_none() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "helix-db-snapshot-hook-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = HelixDb::open_with_snapshot_interval(&path, 100).unwrap();
+
+        let mut state = helix_executor::ChainState::new(1_000_000);
+        for h in [98u64, 99, 100, 101, 200] {
+            state.applied_height = h;
+            db.save_chain_state(&state).unwrap();
+        }
+
+        assert_eq!(
+            db.state_snapshot_heights().unwrap(),
+            vec![100, 200],
+            "only the heights on the interval, and every one of them"
+        );
+        let (h, snap) = db.state_snapshot_at_or_before(150).unwrap().unwrap();
+        assert_eq!((h, snap.applied_height), (100, 100), "and it holds the state of its own height");
+
+        drop(db);
+        let db = HelixDb::open_with_snapshot_interval(&path, 0).unwrap();
+        state.applied_height = 300;
+        db.save_chain_state(&state).unwrap();
+        assert_eq!(
+            db.state_snapshot_heights().unwrap(),
+            vec![100, 200],
+            "positive control: with the interval off, a height that would have qualified adds \
+             nothing — so the two above are the hook firing, not something else writing them"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A typo in `HELIX_SNAPSHOT_INTERVAL` must not silently turn off the thing that lets other
+    /// nodes bootstrap. Only an explicit 0 does that — everything unusable falls back.
+    #[test]
+    fn an_unusable_snapshot_interval_falls_back_instead_of_disabling_snapshots() {
+        assert_eq!(snapshot_interval_from(None), DEFAULT_SNAPSHOT_INTERVAL, "unset");
+        assert_eq!(snapshot_interval_from(Some("")), DEFAULT_SNAPSHOT_INTERVAL, "empty");
+        assert_eq!(snapshot_interval_from(Some("often")), DEFAULT_SNAPSHOT_INTERVAL, "not a number");
+        assert_eq!(snapshot_interval_from(Some("-5")), DEFAULT_SNAPSHOT_INTERVAL, "negative");
+        assert_eq!(snapshot_interval_from(Some("  500 ")), 500, "whitespace is trimmed");
+        assert_eq!(
+            snapshot_interval_from(Some("0")),
+            0,
+            "an explicit zero is the one way to turn it off — a deliberate instruction, unlike \
+             every case above"
+        );
+    }
+
+    /// A joiner asks for the state at the height its checkpoint names. It must get the newest
+    /// snapshot at or below that — never a later one (which the checkpoint cannot vouch for) and
+    /// never nothing just because the interval did not land on that exact height.
+    #[test]
+    fn a_snapshot_lookup_returns_the_newest_one_at_or_below_the_asked_height() {
+        let (db, path, _) = db_with_blocks(1);
+        let mut state = helix_executor::ChainState::new(1_000_000);
+
+        for h in [100u64, 200, 300] {
+            state.applied_height = h;
+            db.put_state_snapshot(h, &state).unwrap();
+        }
+
+        let (h, s) = db.state_snapshot_at_or_before(250).unwrap().expect("200 is at or below 250");
+        assert_eq!(h, 200, "the newest one that is not above the asked height");
+        assert_eq!(s.applied_height, 200, "and the state that goes with it, not another one");
+
+        let (h, _) = db.state_snapshot_at_or_before(300).unwrap().expect("exact hits count");
+        assert_eq!(h, 300);
+
+        assert!(
+            db.state_snapshot_at_or_before(99).unwrap().is_none(),
+            "below every snapshot there is nothing to hand out — and saying so is the honest \
+             answer, because a *later* snapshot is one the caller's checkpoint cannot vouch for"
+        );
+        assert_eq!(db.state_snapshot_heights().unwrap(), vec![100, 200, 300]);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Pruning snapshots has a floor, and the floor is the whole point: they are what lets a
+    /// pruned node still be useful to somebody joining. A horizon that swept them all would
+    /// leave a node with neither the blocks nor a way to skip them.
+    #[test]
+    fn pruning_snapshots_keeps_a_floor_however_high_the_horizon() {
+        let (db, path, _) = db_with_blocks(1);
+        let mut state = helix_executor::ChainState::new(1_000_000);
+        for h in [10u64, 20, 30, 40, 50] {
+            state.applied_height = h;
+            db.put_state_snapshot(h, &state).unwrap();
+        }
+
+        let removed = db.prune_state_snapshots_below(u64::MAX, 2).unwrap();
+        assert_eq!(removed, 3, "everything below the floor goes");
+        assert_eq!(
+            db.state_snapshot_heights().unwrap(),
+            vec![40, 50],
+            "and the newest two survive a horizon that covers every one of them"
+        );
+
+        let removed = db.prune_state_snapshots_below(20, 2).unwrap();
+        assert_eq!(removed, 0, "a second pass over the floor removes nothing");
         drop(db);
         let _ = std::fs::remove_file(&path);
     }
