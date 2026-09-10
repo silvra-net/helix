@@ -1632,6 +1632,48 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A stored block this build cannot decode must report itself as a *serialization* failure,
+    /// never as `BlockNotFound`. The node layer's whole startup guard rests on that difference:
+    /// `BlockNotFound` on height 0 is its licence to write a fresh genesis, so if an undecodable
+    /// block arrived under that name the node would overwrite a populated chain — which is
+    /// exactly what happened on 2026-09-10, when a build whose `BlockHeader` had gained a field
+    /// met a 175677-block database and reset it to genesis.
+    ///
+    /// This test pins the assumption rather than the guard: the guard is a `matches!`, and a
+    /// `matches!` against the wrong variant is still green.
+    #[test]
+    fn a_block_that_will_not_decode_is_not_reported_as_missing() {
+        let (db, path, _) = db_with_blocks(3);
+        let genesis_hash = db.get_block_by_height(0).unwrap().hash();
+
+        // Same key, bytes that are not a block — the shape a wire-format change leaves behind.
+        {
+            let tx = db.db.begin_write().unwrap();
+            {
+                let mut table = tx.open_table(BLOCKS).unwrap();
+                table
+                    .insert(genesis_hash.as_bytes().as_slice(), &b"not a block at all"[..])
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        match db.get_block_by_height(0) {
+            Err(StorageError::Serialization(_)) => {}
+            other => panic!(
+                "an undecodable block must say so; anything that reads as 'missing' licenses \
+                 the node to write over it. Got {other:?}"
+            ),
+        }
+        assert!(
+            db.get_block_by_height(1).is_ok(),
+            "positive control: the rest of the chain is untouched, so the failure above is \
+             about those bytes and not about the database being broken"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A node moving a 166k-block chain to a 10k horizon has 156k blocks to drop. In one write
     /// transaction that holds the database for minutes — on this network the node doing the
     /// pruning is also carrying consensus, so the work has to arrive in ordinary-sized pieces.

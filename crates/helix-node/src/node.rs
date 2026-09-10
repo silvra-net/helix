@@ -108,6 +108,18 @@ impl GenesisCheckpoint {
     }
 }
 
+/// Whether a failed read of block 0 means "this data directory is empty" — the only answer that
+/// permits writing a fresh genesis into it.
+///
+/// A pure function because the whole safety argument is which errors are *excluded*, and that
+/// list is one `|` away from turning a startup refusal back into silent data loss. `BlockNotFound`
+/// is the only error a genuinely empty directory produces. Everything else — a block that will
+/// not deserialize, one below a prune horizon, a database-level failure — says the chain is there
+/// and this build cannot see it, which is the opposite conclusion.
+fn empty_data_directory(e: &helix_storage::StorageError) -> bool {
+    matches!(e, helix_storage::StorageError::BlockNotFound(_))
+}
+
 /// The genesis hash this node should insist on: the operator's if they set one, otherwise the
 /// compiled-in default — but only when joining the public chain the default describes.
 ///
@@ -630,7 +642,35 @@ impl HelixNode {
             }
         });
 
-        let chain_state = if store.get_block_by_height(0).is_ok() {
+        // "There is no block 0" and "there is a block 0 this build cannot read" are opposite
+        // states, and the branch below used to collapse them into one `is_ok()`. The failure is
+        // not academic: on 2026-09-10 this node was restarted onto a build whose `BlockHeader`
+        // had gained a field, block 0 no longer decoded, and the else-branch wrote a fresh
+        // genesis *over* a database holding 175677 blocks — then reset the state to match. On
+        // INFO, without a question, in the one situation where the data was still all there.
+        // A wire-format change is exactly what a release does, so this is every operator's first
+        // restart after one, not a corner case. Refusing to start costs a stalled node; guessing
+        // costs the chain, and the operator finds out afterwards. `BlockNotFound` alone means
+        // "no chain here" — a pruned or unreadable block never does.
+        let genesis_probe = store.get_block_by_height(0);
+        if let Err(e) = &genesis_probe {
+            if !empty_data_directory(e) {
+                anyhow::bail!(
+                    "{} holds a block 0 this build cannot read: {e}\n\
+                     That is NOT an empty data directory, so this node refuses to start rather \
+                     than write a new genesis over the chain that is already there.\n\
+                     The usual cause is a release that changed the block format — the data is \
+                     intact, this binary simply speaks a different one.\n\
+                     To join the new chain: rename the data directory (do NOT delete it, e.g. \
+                     `mv {0} {0}.pre-upgrade.bak`, and the peer file beside it) and start again \
+                     — this node will then fetch the genesis from the network.\n\
+                     To keep reading the old chain: run the version that wrote it.",
+                    db_path.display()
+                );
+            }
+        }
+
+        let chain_state = if genesis_probe.is_ok() {
             info!("Loaded existing chain state from {}", db_path.display());
             store.load_chain_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX)?
         } else if let Some(peer_url) = &sync_peer {
@@ -5558,9 +5598,40 @@ async fn sync_blocks_from_peer(
 #[cfg(test)]
 mod genesis_join_tests {
     use super::{
-        expected_genesis_hash, joins_over_p2p, GenesisCheckpoint, DEFAULT_GENESIS_HASH,
-        DEFAULT_SEED_PEER,
+        empty_data_directory, expected_genesis_hash, joins_over_p2p, GenesisCheckpoint,
+        DEFAULT_GENESIS_HASH, DEFAULT_SEED_PEER,
     };
+    use helix_storage::StorageError;
+
+    /// Writing a genesis is destructive — it lands on top of whatever height 0 already holds, and
+    /// the state goes with it. So the licence to do it comes from exactly one error, and every
+    /// other failure to read block 0 has to withhold it.
+    ///
+    /// The costly case is `Serialization`: on 2026-09-10 a build whose `BlockHeader` had gained a
+    /// field could not decode block 0, the startup path read that as "empty directory", and a
+    /// 175677-block chain was overwritten with a fresh genesis on INFO. `BlockPruned` is here for
+    /// the same reason in the other direction — a pruning node keeps genesis by construction, so
+    /// if that ever changes, this refuses to start instead of silently re-genesising the node.
+    #[test]
+    fn only_a_genuinely_missing_block_zero_licenses_writing_a_new_genesis() {
+        assert!(
+            empty_data_directory(&StorageError::BlockNotFound(0)),
+            "an empty data directory is the one case that may be given a fresh genesis"
+        );
+
+        for refused in [
+            StorageError::Serialization("invalid value: integer `1952`".into()),
+            StorageError::BlockPruned(0, 1000),
+            StorageError::Db("redb went away".into()),
+            StorageError::HashNotFound("deadbeef".into()),
+        ] {
+            assert!(
+                !empty_data_directory(&refused),
+                "a chain that is present but unreadable must stop the node, not be written \
+                 over: {refused:?}"
+            );
+        }
+    }
 
     /// Joining the public chain is verified without the operator configuring anything — Bitcoin's
     /// model, where the genesis is compiled in and nobody is asked. Before this, the default was to
