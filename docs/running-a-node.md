@@ -226,6 +226,11 @@ This has happened, and it turned a recoverable outage into a 21-hour one.
 
 Read the node's own health line first — it distinguishes the two cases:
 
+- **"This node has NO peers, so it cannot see the chain"** — your node is cut off, and the chain
+  may well be running without it: the other validators keep finalizing if they still hold a
+  quorum, and a validator that stays away long enough is jailed (it then needs `helix tx unjail`).
+  The node redials its seeds and every peer address it remembers every 30 seconds by itself, so
+  if this line persists, look at this machine's network path — firewall, tunnel, proxy.
 - **"the chain is waiting for other validators to reconnect"** — your node is fine. Nothing you do
   locally will help; the chain resumes when enough validators are back. Restarting is harmless but
   pointless, and it restarts the internal wait timers.

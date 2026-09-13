@@ -3574,6 +3574,22 @@ fn production_stall_beats(current_ticks: u64, previous_ticks: u64, beats_so_far:
     }
 }
 
+/// The chain part of the "NOT validating" health line.
+///
+/// A frozen local height is a statement about the chain only while this node has peers to hear it
+/// from. With none, it is a statement about this node — on 2026-09-13 "chain STALLED at #127943"
+/// was printed for 7 h 36 min while the chain ran eleven thousand blocks further without it
+/// (backlog #196).
+fn chain_clause(height: u64, stalled_secs: Option<u64>, peers: usize) -> String {
+    match stalled_secs {
+        Some(secs) if peers == 0 => {
+            format!("this node's height unchanged at #{height} for {secs}s — with no peers to hear from")
+        }
+        Some(secs) => format!("chain STALLED at #{height} for {secs}s"),
+        None => format!("height {height}"),
+    }
+}
+
 /// What to tell an operator whose node is active but not co-signing (backlog #150).
 ///
 /// Separated out and tested because operators act on this sentence, and for months it said the
@@ -3587,11 +3603,28 @@ fn production_stall_beats(current_ticks: u64, previous_ticks: u64, beats_so_far:
 /// recoverable outage into a 21-hour stall (#147). Hence the explicit line about the data
 /// directory: the mistake that actually cost the time was not the restart.
 fn not_validating_advice(
+    no_peers: bool,
     behind_the_tip: bool,
     quorum_peers_missing: bool,
     silent_peer_validators: usize,
 ) -> &'static str {
-    if behind_the_tip {
+    if no_peers {
+        // Ahead of everything, because every branch below is a reading of what peers say or
+        // send, and a node with none has nothing to read (backlog #196).
+        //
+        // On 2026-09-13 the production node lost its only peer to a 45-second network outage and
+        // printed "the chain is waiting for other validators to reconnect, and restarting will not
+        // speed that up" 456 times over 7 h 36 min. The chain was not waiting for anyone: the
+        // other three validators finalized every block without it, and it was jailed. With zero
+        // peers "the chain is stalled" and "the chain moved on without this node" look identical
+        // from here, and the second one is the one that costs a validator its seat.
+        "This node has NO peers, so it cannot see the chain: it cannot tell a stalled chain from \
+         one that is finalizing without it — and if the other validators are up, it is the \
+         second, and this validator is jailed after enough missed blocks. It redials its seeds and \
+         every peer address it knows every 30s on its own; if this line keeps appearing, check \
+         this machine's network path (firewall, tunnel, proxy). Restarting is safe; do NOT delete \
+         its chain data."
+    } else if behind_the_tip {
         // First, because it is the only branch that is a statement about *this* node, and the
         // three below all send the operator to look at somebody else's.
         //
@@ -3900,10 +3933,7 @@ async fn validator_health_loop(
                     Some(signed_h) => format!("last co-signed #{}", signed_h),
                     None => format!("no block co-signed in the last {}", HEALTH_SIGN_WINDOW),
                 };
-                let chain = match st {
-                    Some(secs) => format!("chain STALLED at #{} for {}s", height, secs),
-                    None => format!("height {}", height),
-                };
+                let chain = chain_clause(height, st, peers);
                 // The clause that was missing on 2026-09-04. Without it "chain STALLED at #114115"
                 // reads as a statement about the network, when the network was on #114116 and
                 // only this node was not.
@@ -3943,7 +3973,8 @@ async fn validator_health_loop(
                 // 2026-09-04 added the case that outranks all three: a node *below the tip*. The
                 // warning was accurate about the chain and wrong about who had to act, for 6 h
                 // 20 min.
-                let advice = not_validating_advice(blocks_behind > 0, quorum_missing, silent_peers);
+                let advice =
+                    not_validating_advice(peers == 0, blocks_behind > 0, quorum_missing, silent_peers);
                 warn!(
                     "Health: ⚠ NOT validating — this node is an active validator but is not \
                      co-signing ({}, {}{}, peers {}). {}",
@@ -7501,7 +7532,7 @@ mod validator_health_tests {
     /// perfectly fine while the chain waits for absent validators.
     #[test]
     fn a_node_held_up_by_missing_validators_is_not_told_to_restart() {
-        let advice = not_validating_advice(false, true, 0);
+        let advice = not_validating_advice(false, false, true, 0);
         assert!(
             advice.contains("will not speed that up"),
             "must say plainly that restarting does not help: {advice}"
@@ -7516,7 +7547,7 @@ mod validator_health_tests {
     /// chain database, which pinned that node at height 1 (#147). The restart was survivable.
     #[test]
     fn the_waiting_advice_warns_against_deleting_chain_data() {
-        let advice = not_validating_advice(false, true, 0);
+        let advice = not_validating_advice(false, false, true, 0);
         assert!(
             advice.contains("Do NOT delete"),
             "must warn against wiping the data directory: {advice}"
@@ -7603,7 +7634,7 @@ mod validator_health_tests {
     /// above and leave a genuinely wedged validator with nothing to do.
     #[test]
     fn a_node_that_is_itself_stuck_is_still_told_to_restart() {
-        let advice = not_validating_advice(false, false, 0);
+        let advice = not_validating_advice(false, false, false, 0);
         assert!(
             advice.contains("re-establishes its round"),
             "a genuinely stuck node must still be told to restart: {advice}"
@@ -7620,7 +7651,7 @@ mod validator_health_tests {
     /// one that had stopped.
     #[test]
     fn a_node_waiting_on_a_silent_peer_is_not_told_to_restart_either() {
-        let advice = not_validating_advice(false, false, 1);
+        let advice = not_validating_advice(false, false, false, 1);
         assert!(
             advice.contains("will not help"),
             "must say plainly that restarting this node is not the answer: {advice}"
@@ -7641,7 +7672,7 @@ mod validator_health_tests {
     /// happened 596 times in one outage on 2026-07-29.
     #[test]
     fn the_advice_does_not_claim_the_other_validator_is_down() {
-        let advice = not_validating_advice(false, false, 2).to_lowercase();
+        let advice = not_validating_advice(false, false, false, 2).to_lowercase();
         assert!(
             advice.contains("not arriving here"),
             "must describe what this node observes, not what the peer is doing: {advice}"
@@ -7659,7 +7690,7 @@ mod validator_health_tests {
     /// decides which line an operator reads.
     #[test]
     fn disconnected_peers_keep_their_own_more_specific_advice() {
-        let advice = not_validating_advice(false, true, 3);
+        let advice = not_validating_advice(false, false, true, 3);
         assert!(advice.contains("waiting for other validators to reconnect"), "{advice}");
     }
 
@@ -7673,7 +7704,7 @@ mod validator_health_tests {
     /// reproduces that outage exactly.
     #[test]
     fn a_node_below_the_tip_is_told_it_is_the_one_that_is_behind() {
-        let advice = not_validating_advice(true, true, 3);
+        let advice = not_validating_advice(false, true, true, 3);
         assert!(
             advice.contains("BEHIND the tip"),
             "a node below the tip must be told so before anything else — got: {advice}"
@@ -7694,12 +7725,60 @@ mod validator_health_tests {
     /// with its peers must still get the diagnosis that points outward.
     #[test]
     fn a_node_level_with_its_peers_still_gets_the_outward_diagnosis() {
-        let advice = not_validating_advice(false, false, 1);
+        let advice = not_validating_advice(false, false, false, 1);
         assert!(
             !advice.contains("BEHIND the tip"),
             "a node that is not behind must never be told it is: {advice}"
         );
         assert!(advice.contains("not arriving here"), "{advice}");
+    }
+
+    /// Backlog #196, with every flag set the way they were on 2026-09-13: no peers, so quorum peers
+    /// are missing too, and every other validator looks silent. The line printed 456 times said the
+    /// chain was waiting for the others and this node was healthy — while the others finalized
+    /// without it and it was jailed. With no peers, that is the one thing this node cannot know.
+    #[test]
+    fn a_node_with_no_peers_is_not_told_the_chain_is_waiting_for_others() {
+        let advice = not_validating_advice(true, false, true, 3);
+        assert!(advice.contains("NO peers"), "{advice}");
+        assert!(
+            advice.contains("cannot tell a stalled chain from"),
+            "must say that both readings are open: {advice}"
+        );
+        for forbidden in ["waiting for other validators", "is healthy", "will not speed that up"] {
+            assert!(
+                !advice.contains(forbidden),
+                "must not assert what a node without peers cannot observe ({forbidden}): {advice}"
+            );
+        }
+        assert!(advice.contains("do NOT delete its chain data"), "{advice}");
+    }
+
+    /// Precedence over "behind", too: `highest_peer_tip` is the last claim heard *before* the peers
+    /// went away, so with none left it is stale, and the no-peers line is the more basic fact.
+    #[test]
+    fn having_no_peers_outranks_being_behind() {
+        let advice = not_validating_advice(true, true, true, 3);
+        assert!(advice.contains("NO peers"), "{advice}");
+        assert!(!advice.contains("BEHIND the tip"), "{advice}");
+    }
+
+    /// The control: one peer is enough to read the chain again, and the existing diagnoses must be
+    /// untouched — a `no_peers` branch that swallowed them would pass the two tests above.
+    #[test]
+    fn a_node_with_peers_keeps_the_existing_diagnoses() {
+        assert!(not_validating_advice(false, false, true, 0).contains("waiting for other validators"));
+        assert!(not_validating_advice(false, true, true, 3).contains("BEHIND the tip"));
+    }
+
+    /// The same distinction in the first half of the line, which is what an operator reads first.
+    #[test]
+    fn a_frozen_height_is_only_called_a_stalled_chain_while_peers_are_there_to_confirm_it() {
+        let isolated = chain_clause(127_943, Some(59), 0);
+        assert!(!isolated.contains("chain STALLED"), "{isolated}");
+        assert!(isolated.contains("no peers"), "{isolated}");
+        assert_eq!(chain_clause(127_943, Some(59), 3), "chain STALLED at #127943 for 59s");
+        assert_eq!(chain_clause(127_943, None, 0), "height 127943");
     }
 }
 

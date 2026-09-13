@@ -147,3 +147,121 @@ async fn without_the_remembered_peers_the_same_node_finds_nobody() {
          some other discovery path is active and the positive test proves nothing"
     );
 }
+
+/// Wait for a connection to any peer *other than* `not`, or give up; returns its id.
+///
+/// The identity filter is load-bearing, and was found by the first version of the test below being
+/// green for the wrong reason. At startup the redial tick fires immediately and dials the remembered
+/// address a second time; that duplicate connection races the host going away, and its
+/// `PeerConnected` for the *old* host sat in the channel while the test slept. A waiter that took any
+/// `PeerConnected` read it as the reconnection — after 2.0 s, faster than the 30 s tick allows. The
+/// returning host is a new process with a new identity, so only a different id proves it was reached.
+async fn connected_to_a_peer_other_than(
+    events: &mut tokio::sync::mpsc::Receiver<P2PEvent>,
+    not: Option<&str>,
+    secs: u64,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Some(P2PEvent::PeerConnected(peer))) if Some(peer.as_str()) != not => return Some(peer),
+            Ok(Some(_)) => continue,
+            Ok(None) => return None,
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// Wait for `peer` to disconnect, or give up.
+async fn disconnected_within(
+    events: &mut tokio::sync::mpsc::Receiver<P2PEvent>,
+    peer: &str,
+    secs: u64,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Some(P2PEvent::PeerDisconnected(p))) if p == peer => return true,
+            Ok(Some(_)) => continue,
+            Ok(None) => return false,
+            Err(_) => continue,
+        }
+    }
+    false
+}
+
+/// A running host that can be taken away again, which `spawn` cannot do.
+fn spawn_host(port: u16) -> tokio::task::JoinHandle<()> {
+    let (handle, mut events) = spawn_with_handle(config_announcing(port, vec![], None));
+    tokio::spawn(async move { while events.recv().await.is_some() {} });
+    handle
+}
+
+fn spawn_with_handle(
+    cfg: P2PConfig,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<P2PEvent>) {
+    let (service, _cmd, events) = P2PService::new(cfg, Arc::new(AtomicU64::new(0)), Arc::new(NoBlocks));
+    let handle = tokio::spawn(async move {
+        let _ = service.run().await;
+    });
+    (handle, events)
+}
+
+/// Backlog #196, reproduced with real services: a node with **no seeds** loses its only peer, the
+/// peer comes back, and nothing but this node can restore the link.
+///
+/// That is the shape of 2026-09-13. The production node has no seeds (it is the seed), a
+/// 45-second network outage dropped its one peer, and the other validators — connected to each
+/// other — had no reason to redial it. The redial at zero connections dialed only seeds, which it
+/// does not have, so it sat at 0 peers for 7 h 36 min and was jailed.
+///
+/// The returning host has no seeds and no peer store, and mDNS is off everywhere, so it cannot find
+/// the node on its own: a reconnection here can only come from the node's own redial. The first
+/// connection comes from the remembered-peer dial at startup, which already worked before the fix —
+/// the assertion that matters is the second one, and it only counts the *new* host's identity.
+#[tokio::test]
+async fn a_node_without_seeds_redials_the_peer_it_lost_once_that_peer_is_back() {
+    let dir = std::env::temp_dir().join(format!("helix-peer-redial-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("peers.txt");
+    let host_addr = "/ip4/127.0.0.1/tcp/19731".to_string();
+    helix_p2p::peer_store::save(&store, &[host_addr].into_iter().collect());
+
+    let started = tokio::time::Instant::now();
+    let host = spawn_host(19_731);
+    let (_node, mut node_events) = spawn_with_handle(config(19_732, vec![], Some(store.clone())));
+    let first_host = connected_to_a_peer_other_than(&mut node_events, None, 30)
+        .await
+        .expect("precondition: the node must reach the host through its remembered address at all");
+
+    // The outage: the host goes away entirely, taking its listener and connections with it.
+    host.abort();
+    assert!(
+        disconnected_within(&mut node_events, &first_host, 30).await,
+        "precondition: the node must notice that its only peer is gone"
+    );
+    // Let the old listener release the port before the host comes back on it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _host_again = spawn_host(19_731);
+    let host_back = started.elapsed();
+
+    // The redial tick is 30 s, so one full interval plus slack.
+    let reconnected = connected_to_a_peer_other_than(&mut node_events, Some(&first_host), 75).await;
+    // Printed, because the timing is evidence of *which* path reconnected: the redial runs on the
+    // 30-second peer-exchange tick, so a reconnection far faster than the tick allows points at some
+    // other mechanism and deserves a look before this test is believed.
+    eprintln!(
+        "host back after {:.1}s, reconnected to the new host: {} after {:.1}s",
+        host_back.as_secs_f64(),
+        reconnected.is_some(),
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        reconnected.is_some(),
+        "a node with no seeds must redial the addresses it knows once it has no connection left — \
+         otherwise a single dropped peer is permanent until someone restarts a node"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -478,6 +478,8 @@ impl P2PService {
         // always exists, so "who does my node know?" has an answer on disk rather than only in a
         // running process — which is the state this whole mechanism was missing.
         let mut saved_addr_count = 0;
+        // Which slice of the known addresses the next redial tick dials (see `redial_targets`).
+        let mut redial_rotation: usize = 0;
 
         // Re-announce periodically, not just on connect — a message published right as a
         // connection is established can be lost before gossipsub's mesh for the topic has
@@ -984,7 +986,8 @@ impl P2PService {
                             .unwrap_or(0),
                     );
 
-                    // Redial the seeds while this node has no connection at all.
+                    // Redial while this node has no connection at all — the seeds and, since
+                    // 2026-09-13, every address it knows (`redial_targets`, backlog #196).
                     //
                     // Every other way back into the network needs a connection this node no
                     // longer has: peer exchange is gossip (nobody is listening), and mDNS only
@@ -997,8 +1000,9 @@ impl P2PService {
                     // its node reported itself healthy.
                     //
                     // Only while fully disconnected, so a node with a working mesh never dials on
-                    // a timer; one attempt per seed per interval, so a seed that stays down costs
-                    // one connection attempt every 30s and nothing else.
+                    // a timer; one attempt per seed and at most `MAX_KNOWN_REDIALS_PER_TICK` known
+                    // addresses per interval, so an address that stays down costs one connection
+                    // attempt per rotation and nothing else.
                     // `info!`, not `debug!`: an operator staring at `peer_count: 0` needs to see
                     // that the node is trying, and how often — the silent-wait failure mode from
                     // the peer/liveness windows is exactly what made this class of problem so
@@ -1013,10 +1017,27 @@ impl P2PService {
                         }
                     }
 
-                    if swarm.connected_peers().next().is_none() && !seed_addrs.is_empty() {
-                        info!(seeds = seed_addrs.len(), "No peers connected — redialing seed peers");
-                        for addr in &seed_addrs {
-                            let _ = swarm.dial(addr.clone());
+                    if swarm.connected_peers().next().is_none() {
+                        // Both of this node's own addresses: the configured one stays in the
+                        // remembered file even after a probe replaced it, and dialing either would
+                        // only reach this node again (through the proxy, for a tunnel address).
+                        let own: Vec<&str> = config
+                            .public_addr
+                            .as_deref()
+                            .into_iter()
+                            .chain(announced_self.as_deref())
+                            .collect();
+                        let targets = redial_targets(&seed_addrs, &known_addrs, &own, redial_rotation);
+                        redial_rotation = redial_rotation.wrapping_add(1);
+                        if !targets.is_empty() {
+                            info!(
+                                seeds = seed_addrs.len(),
+                                dialing = targets.len(),
+                                "No peers connected — redialing seed peers and known addresses"
+                            );
+                            for addr in targets {
+                                let _ = swarm.dial(addr);
+                            }
                         }
                     }
                 }
@@ -1313,6 +1334,64 @@ fn select_new_addrs(
         }
     }
     new_addrs
+}
+
+/// How many known (non-seed) addresses one redial tick dials at most (backlog #196).
+///
+/// A dial here has no timeout of its own — libp2p's TCP transport waits out the kernel's SYN
+/// retries, ~2 minutes, against an address that silently drops packets — and the tick fires every
+/// 30 s. Dialing all of up to `MAX_KNOWN_PEER_ADDRS` each tick could therefore stack several
+/// hundred half-open sockets on a node that is offline, exactly while nobody is looking. A bounded
+/// slice that rotates reaches every address within a few minutes, and a node that knows only a
+/// handful (the production node knew seven) still dials all of them on every tick.
+const MAX_KNOWN_REDIALS_PER_TICK: usize = 16;
+
+/// Everything to dial on one tick while this node has no connection at all (backlog #196): every
+/// configured seed, then a rotating slice of the addresses it knows — remembered from an earlier run
+/// or learned through peer exchange — never including its own announcements. `rotation` is the
+/// caller's tick counter; it selects which slice of the known addresses this tick gets.
+///
+/// Seeds alone were the rule until 2026-09-13, and a node with no seeds therefore never redialed at
+/// all. That is precisely the production node: it *is* the network's seed, so it has none, and it
+/// owes every connection to others dialing in. A 45-second network outage on its machine dropped its
+/// only peer; the other validators stayed connected to each other and so never redialed it either
+/// (they, too, only redial at zero connections). It sat at 0 peers for 7 h 36 min with seven
+/// addresses on disk, one of them reachable, until the downtime jail removed it from the validator
+/// set. Nothing was broken except that nobody dialed.
+///
+/// Why the known addresses are safe to dial here, although startup keeps them out of the seeds'
+/// role: the concern there is a peer that gossips enough addresses to decide who this node talks
+/// to. At zero connections there is nobody to displace — any connection is strictly more than none
+/// — and every one of these addresses was already dialed once, when it was learned or at startup.
+fn redial_targets(
+    seeds: &[Multiaddr],
+    known: &HashSet<String>,
+    own: &[&str],
+    rotation: usize,
+) -> Vec<Multiaddr> {
+    let own: HashSet<Multiaddr> = own.iter().filter_map(|a| a.parse().ok()).collect();
+    let mut targets: Vec<Multiaddr> = Vec::new();
+    for addr in seeds {
+        if !own.contains(addr) && !targets.contains(addr) {
+            targets.push(addr.clone());
+        }
+    }
+    // Sorted so the rotation walks a stable order: `HashSet` iteration depends on a per-process
+    // seed, and a slice taken from it would repeat some addresses and starve others.
+    let mut rest: Vec<Multiaddr> = known
+        .iter()
+        .filter_map(|a| a.parse::<Multiaddr>().ok())
+        .filter(|a| !own.contains(a) && !targets.contains(a))
+        .collect();
+    rest.sort_by_key(|a| a.to_string());
+    rest.dedup();
+    if rest.len() <= MAX_KNOWN_REDIALS_PER_TICK {
+        targets.extend(rest);
+    } else {
+        let start = (rotation * MAX_KNOWN_REDIALS_PER_TICK) % rest.len();
+        targets.extend(rest.iter().cycle().skip(start).take(MAX_KNOWN_REDIALS_PER_TICK).cloned());
+    }
+    targets
 }
 
 /// The warning text for a peer running a different version than ours, or `None` when it matches
@@ -3356,5 +3435,84 @@ mod peer_tip_gate_tests {
             "peer exchange is the authority and must still be able to lower a tip (#175)",
         );
         assert_eq!(tips.get(&peer), Some(&at(90)));
+    }
+}
+
+#[cfg(test)]
+mod redial_target_tests {
+    use super::{redial_targets, MAX_KNOWN_REDIALS_PER_TICK};
+    use libp2p::Multiaddr;
+    use std::collections::HashSet;
+
+    fn ma(port: u16) -> Multiaddr {
+        format!("/ip4/10.0.0.1/tcp/{port}").parse().unwrap()
+    }
+
+    fn known(ports: &[u16]) -> HashSet<String> {
+        ports.iter().map(|p| ma(*p).to_string()).collect()
+    }
+
+    /// Backlog #196, the whole incident in one assertion. The production node has no seeds — it is
+    /// the seed — and redialed nobody for 7 h 36 min while seven addresses sat in its peer file.
+    #[test]
+    fn a_node_without_seeds_still_redials_the_addresses_it_knows() {
+        let targets = redial_targets(&[], &known(&[8546, 8547]), &[], 0);
+        assert_eq!(targets.len(), 2, "every known address must be dialed: {targets:?}");
+        assert!(targets.contains(&ma(8546)) && targets.contains(&ma(8547)));
+    }
+
+    /// Dialing its own announcement only reaches this node again — through the proxy, for a tunnel
+    /// address. The configured one lingers in the remembered file even after a probe replaced it,
+    /// so both must be filtered, and a seed that happens to be this node is no exception.
+    #[test]
+    fn the_nodes_own_addresses_are_never_dialed() {
+        let own_configured = ma(443).to_string();
+        let own_probed = ma(8548).to_string();
+        let targets = redial_targets(
+            &[ma(443)],
+            &known(&[443, 8546, 8548]),
+            &[own_configured.as_str(), own_probed.as_str()],
+            0,
+        );
+        assert_eq!(targets, vec![ma(8546)], "only the foreign address may be dialed");
+    }
+
+    /// The seeds keep their precedence and are not dialed twice when they are also remembered —
+    /// which is the normal case, since every seed lands in `known_addrs` at startup.
+    #[test]
+    fn seeds_come_first_and_are_not_repeated() {
+        let targets = redial_targets(&[ma(9000)], &known(&[9000, 8546]), &[], 0);
+        assert_eq!(targets, vec![ma(9000), ma(8546)]);
+    }
+
+    #[test]
+    fn addresses_that_do_not_parse_are_skipped_rather_than_fatal() {
+        let mut book = known(&[8546]);
+        book.insert("not a multiaddr".to_string());
+        assert_eq!(redial_targets(&[], &book, &[], 0), vec![ma(8546)]);
+    }
+
+    /// A dial has no timeout of its own, so a full address book dialed every 30 s would stack
+    /// half-open sockets on an offline node. Each tick must stay within the cap, the seeds must be
+    /// in every tick regardless, and the rotation must still reach every address — a cap that
+    /// starved part of the book would reintroduce the incident for whoever sits in that part.
+    #[test]
+    fn a_large_address_book_is_dialed_in_bounded_slices_that_reach_every_address() {
+        let ports: Vec<u16> = (20_000..20_050).collect();
+        let book = known(&ports);
+        let seed = ma(9000);
+        let mut reached: HashSet<Multiaddr> = HashSet::new();
+        let ticks = ports.len().div_ceil(MAX_KNOWN_REDIALS_PER_TICK);
+        for tick in 0..ticks {
+            let targets = redial_targets(std::slice::from_ref(&seed), &book, &[], tick);
+            assert_eq!(targets[0], seed, "the seed is dialed on every tick");
+            assert!(
+                targets.len() <= 1 + MAX_KNOWN_REDIALS_PER_TICK,
+                "tick {tick} dials {} addresses",
+                targets.len()
+            );
+            reached.extend(targets.into_iter().skip(1));
+        }
+        assert_eq!(reached.len(), ports.len(), "the rotation must reach every known address");
     }
 }
