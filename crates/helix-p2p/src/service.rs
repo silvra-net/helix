@@ -503,6 +503,9 @@ impl P2PService {
         // Peer count the redial line last spoke for, so a node sitting below the target reports
         // each change instead of repeating itself every 30 s (see `redial_verdict`).
         let mut redial_logged_for: Option<usize> = None;
+        // The last proposal this node got *out* to at least one peer, so the per-tick re-offer
+        // stops repeating a broadcast that has already succeeded (see `BroadcastProposal`).
+        let mut proposal_on_the_wire: Option<helix_crypto::Hash> = None;
 
         // Re-announce periodically, not just on connect — a message published right as a
         // connection is established can be lost before gossipsub's mesh for the topic has
@@ -1084,6 +1087,29 @@ impl P2PService {
                     match cmd {
                         P2PCommand::BroadcastProposal(proposal) => {
                             if let Ok(data) = bincode::serialize(&proposal) {
+                                // The proposer re-offers its pending proposal every tick, and
+                                // gossipsub refuses identical bytes for a minute — so on a healthy
+                                // chain every repeat after the first is rejected, and libp2p logs
+                                // each one at WARN. Measured on production over 44 hours to
+                                // 2026-09-18: 61935 of those lines, 97 % of every warning the node
+                                // produced. A warning that frequent is how an operator learns to
+                                // skip the warnings that matter.
+                                //
+                                // Skipping the repeat once it has *succeeded* is behaviour-neutral,
+                                // and the distinction is exactly the one gossipsub itself draws:
+                                // `publish` returns `InsufficientPeers` **before** inserting into
+                                // its duplicate cache (behaviour.rs:698 in 0.47), so a proposal
+                                // broadcast while no peer was connected is not cached and its
+                                // re-offer does go out. That is the cold-start case the re-offer
+                                // exists for, and it still works — only the repeat that provably
+                                // could never leave the node is gone.
+                                //
+                                // Keyed on the bytes, so a new proposal (new round, new timestamp)
+                                // is always published; a full hash rather than a cheap one because
+                                // a collision here would silently drop a proposal, which costs a
+                                // round.
+                                let id = helix_crypto::Hash::digest(&data);
+                                if proposal_on_the_wire.as_ref() != Some(&id) {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
                                     .publish(block_topic.clone(), data)
                                 {
@@ -1106,6 +1132,12 @@ impl P2PService {
                                     } else {
                                         warn!(error = %e, "Proposal broadcast failed — this round cannot reach a quorum");
                                     }
+                                    if proposal_reached_the_network(&Err(e)) {
+                                        proposal_on_the_wire = Some(id);
+                                    }
+                                } else {
+                                    proposal_on_the_wire = Some(id);
+                                }
                                 }
                             }
                         }
@@ -1350,9 +1382,9 @@ fn should_serve_catchup(peer_tip: u64, our_tip: u64) -> bool {
     peer_tip < our_tip && our_tip - peer_tip <= MAX_CATCHUP_SERVE_BLOCKS
 }
 
-/// Merges `incoming` into `known`, skipping our own address and anything already known, and
-/// stopping as soon as `known` reaches `MAX_KNOWN_PEER_ADDRS`. Returns only the addresses that
-/// were actually new, for the caller to dial. Pure and side-effect-free apart from mutating
+/// Merges `incoming` into `known`, skipping our own address, anything already known, and anything
+/// that could never be dialed (`peer_store::is_dialable`), and stopping as soon as `known` reaches
+/// `MAX_KNOWN_PEER_ADDRS`. Returns only the addresses that were actually new, for the caller to dial. Pure and side-effect-free apart from mutating
 /// `known` — kept separate from the actual dialing so it's testable without a real `Swarm`.
 fn select_new_addrs(
     known: &mut HashSet<String>,
@@ -1365,6 +1397,12 @@ fn select_new_addrs(
             break;
         }
         if Some(addr.as_str()) == self_addr {
+            continue;
+        }
+        // These come from other peers, and the set is capped: a slot spent on an address no
+        // resolver can answer is a slot not holding one that would. The production peer file
+        // carried such an entry for weeks — see `peer_store::is_dialable`.
+        if !crate::peer_store::is_dialable(addr) {
             continue;
         }
         if known.insert(addr.clone()) {
@@ -1382,6 +1420,8 @@ fn select_new_addrs(
 /// hundred half-open sockets on a node that is offline, exactly while nobody is looking. A bounded
 /// slice that rotates reaches every address within a few minutes, and a node that knows only a
 /// handful (the production node knew seven) still dials all of them on every tick.
+const MAX_KNOWN_REDIALS_PER_TICK: usize = 16;
+
 /// How many peers this node wants before it stops looking for more.
 ///
 /// The redial below used to ask for *no* connections rather than *too few*, and on
@@ -1396,7 +1436,7 @@ fn select_new_addrs(
 /// Three, not more: a node one disconnect away from being alone is the case that hurt, and a
 /// target the network cannot satisfy makes every node dial forever for nothing. Small networks
 /// are the norm here — six validators — so this is deliberately a floor, not a fan-out target.
-const MIN_HEALTHY_PEERS: usize = 3;
+pub const MIN_HEALTHY_PEERS: usize = 3;
 
 /// Whether to dial for more peers this tick, and whether to say so.
 ///
@@ -1413,13 +1453,29 @@ fn redial_verdict(connected: usize, last_logged_for: Option<usize>) -> RedialVer
     RedialVerdict { dial, log }
 }
 
+/// Is this proposal now beyond the reach of a retry — either sent, or sitting in gossipsub's
+/// duplicate cache where every further attempt is refused?
+///
+/// This is the whole of the re-offer question, and getting it backwards costs a round. gossipsub
+/// returns `InsufficientPeers` **before** it inserts into that cache (behaviour.rs:698 in 0.47),
+/// so a proposal broadcast while no peer was connected is *not* remembered by it — and the
+/// per-tick re-offer, which exists for exactly that cold-start case, must still go out. Anything
+/// that is not `Ok` or `Duplicate` therefore has to read as "try again".
+fn proposal_reached_the_network(
+    result: &Result<gossipsub::MessageId, gossipsub::PublishError>,
+) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(gossipsub::PublishError::Duplicate) => true,
+        Err(_) => false,
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct RedialVerdict {
     dial: bool,
     log: bool,
 }
-
-const MAX_KNOWN_REDIALS_PER_TICK: usize = 16;
 
 /// Everything to dial on one tick while this node has no connection at all (backlog #196): every
 /// configured seed, then a rotating slice of the addresses it knows — remembered from an earlier run
@@ -3143,34 +3199,61 @@ mod peer_exchange_tests {
         );
     }
 
+    /// Real multiaddrs, not `addr-a`/`addr-b` placeholders. They were placeholders until
+    /// 2026-09-18, when `select_new_addrs` began refusing what could never be dialed and both of
+    /// these went red — a fixture built from inputs production never produces (the same shape as
+    /// the key-less validator set in #194). Green against impossible input proves nothing.
     #[test]
     fn returns_only_genuinely_new_addresses() {
-        let mut known: HashSet<String> = ["addr-a".to_string()].into_iter().collect();
-        let incoming = vec!["addr-a".to_string(), "addr-b".to_string()];
+        let a = "/ip4/10.0.0.1/tcp/8546".to_string();
+        let b = "/ip4/10.0.0.2/tcp/8546".to_string();
+        let mut known: HashSet<String> = [a.clone()].into_iter().collect();
+        let incoming = vec![a, b.clone()];
 
         let new_addrs = select_new_addrs(&mut known, &incoming, None);
 
-        assert_eq!(new_addrs, vec!["addr-b".to_string()]);
-        assert!(known.contains("addr-b"));
+        assert_eq!(new_addrs, vec![b.clone()]);
+        assert!(known.contains(&b));
     }
 
     #[test]
     fn skips_our_own_address() {
+        let mine = "/ip4/10.0.0.9/tcp/8546";
+        let other = "/ip4/10.0.0.8/tcp/8546".to_string();
         let mut known = HashSet::new();
-        let incoming = vec!["addr-self".to_string(), "addr-other".to_string()];
+        let incoming = vec![mine.to_string(), other.clone()];
 
-        let new_addrs = select_new_addrs(&mut known, &incoming, Some("addr-self"));
+        let new_addrs = select_new_addrs(&mut known, &incoming, Some(mine));
 
-        assert_eq!(new_addrs, vec!["addr-other".to_string()]);
-        assert!(!known.contains("addr-self"));
+        assert_eq!(new_addrs, vec![other]);
+        assert!(!known.contains(mine));
+    }
+
+    /// The filter itself, at the place it actually guards: peer exchange is where a peer gets to
+    /// say what this node should dial, and the production peer file carried one of these for weeks.
+    #[test]
+    fn an_address_that_could_never_be_dialed_is_not_taken_from_a_peer() {
+        let mut known = HashSet::new();
+        let good = "/ip4/101.33.68.38/tcp/8546".to_string();
+        let incoming = vec![
+            "/dns4/43.133.224.33:8546/tcp/8546".to_string(),
+            String::new(),
+            "not an address".to_string(),
+            good.clone(),
+        ];
+
+        let new_addrs = select_new_addrs(&mut known, &incoming, None);
+
+        assert_eq!(new_addrs, vec![good], "only the dialable one may be kept");
+        assert_eq!(known.len(), 1, "junk must not occupy a slot in the capped set");
     }
 
     #[test]
     fn stops_once_the_cap_is_reached() {
         let mut known: HashSet<String> = (0..MAX_KNOWN_PEER_ADDRS)
-            .map(|i| format!("addr-{i}"))
+            .map(|i| format!("/ip4/10.1.{}.{}/tcp/8546", i / 256, i % 256))
             .collect();
-        let incoming = vec!["addr-overflow".to_string()];
+        let incoming = vec!["/ip4/10.9.9.9/tcp/8546".to_string()];
 
         let new_addrs = select_new_addrs(&mut known, &incoming, None);
 
@@ -3857,5 +3940,33 @@ mod redial_target_tests {
             ports.len(),
             "the rotation must reach every known address"
         );
+    }
+}
+
+#[cfg(test)]
+mod proposal_reoffer_tests {
+    use super::proposal_reached_the_network;
+    use libp2p::gossipsub::{MessageId, PublishError};
+
+    /// The half that suppresses the noise: once the bytes are out, or gossipsub is holding them in
+    /// its duplicate cache, every further attempt is refused and only produces a WARN line.
+    #[test]
+    fn a_sent_or_already_cached_proposal_is_not_offered_again() {
+        assert!(proposal_reached_the_network(&Ok(MessageId::from("m"))));
+        assert!(proposal_reached_the_network(&Err(PublishError::Duplicate)));
+    }
+
+    /// The half that must not break, and the reason this is a function rather than a `matches!`
+    /// at the call site: gossipsub returns `InsufficientPeers` *before* it inserts into that
+    /// cache, so a proposal broadcast with nobody connected was never remembered by it — the
+    /// per-tick re-offer is the only thing that gets it out once a peer arrives. Treating this
+    /// like a success would silently cost the cold-start round the re-offer exists for.
+    #[test]
+    fn a_proposal_that_reached_nobody_must_be_offered_again() {
+        assert!(!proposal_reached_the_network(&Err(PublishError::InsufficientPeers)));
+        assert!(!proposal_reached_the_network(&Err(PublishError::MessageTooLarge)));
+        assert!(!proposal_reached_the_network(&Err(PublishError::TransformFailed(
+            std::io::Error::other("transform"),
+        ))));
     }
 }

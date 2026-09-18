@@ -83,10 +83,49 @@ fn parse(contents: &str) -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter(|line| line.parse::<Multiaddr>().is_ok())
+        .filter(|line| is_dialable(line))
         .map(str::to_string)
         .take(MAX_PERSISTED_ADDRS)
         .collect()
+}
+
+/// Could this address ever be dialed, or is it junk that will fail forever?
+///
+/// Parsing as a `Multiaddr` is not enough, and the production node proves it: its peer file held
+/// `/dns4/43.133.224.33:8546/tcp/8546`, which parses cleanly because `dns4` accepts any string,
+/// and which no resolver will ever answer — a hostname cannot contain a colon (RFC 1123). It was
+/// dialed on every redial tick and never once connected.
+///
+/// These addresses come from other peers, so this is input validation, not tidiness. A peer can
+/// announce whatever it likes, the set is capped at `MAX_PERSISTED_ADDRS`, and every slot spent on
+/// something undialable is a slot not holding a peer that would answer — with the redial now
+/// running whenever this node is under-connected rather than only at zero peers, that junk is
+/// dialed far more often than it used to be.
+///
+/// Deliberately narrow: it rejects only what *cannot* resolve, never what merely looks unusual.
+/// An address this node cannot reach today may be reachable tomorrow — that is a different thing
+/// from an address no resolver can parse, and only the second is safe to drop.
+pub fn is_dialable(addr: &str) -> bool {
+    let Ok(parsed) = addr.parse::<Multiaddr>() else {
+        return false;
+    };
+    // The empty string parses into a `Multiaddr` with no protocols at all, and every check below
+    // is a search for something bad — so an address with nothing in it passed them all. Found by
+    // the test, not by reading: `parse` here already drops empty lines, but `select_new_addrs`
+    // takes its input straight from peer exchange and did not.
+    if parsed.iter().next().is_none() {
+        return false;
+    }
+    !parsed.iter().any(|p| {
+        let name = match &p {
+            libp2p::multiaddr::Protocol::Dns(n)
+            | libp2p::multiaddr::Protocol::Dns4(n)
+            | libp2p::multiaddr::Protocol::Dns6(n)
+            | libp2p::multiaddr::Protocol::Dnsaddr(n) => n.as_ref(),
+            _ => return false,
+        };
+        name.is_empty() || name.contains(':')
+    })
 }
 
 /// One address per line, sorted, with a header explaining what the file is.
@@ -200,5 +239,41 @@ mod tests {
 
         assert!(load(&path).is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod dialable_tests {
+    use super::is_dialable;
+
+    /// The entry that sat in the production peer file: a host:port pair put where a hostname
+    /// belongs. It parses as a `Multiaddr` — `dns4` takes any string — and resolves never.
+    #[test]
+    fn a_hostname_carrying_a_port_is_not_dialable() {
+        assert!(!is_dialable("/dns4/43.133.224.33:8546/tcp/8546"));
+        assert!(!is_dialable("/dns4//tcp/8546"));
+    }
+
+    /// The control, and the half that matters more: everything real must survive. A validator
+    /// dropped for looking unusual is worse than a junk address dialed forever.
+    #[test]
+    fn real_addresses_are_kept() {
+        for addr in [
+            "/ip4/101.33.68.38/tcp/8546",
+            "/ip4/127.0.0.1/tcp/19731",
+            "/dns4/p2p.silvra.net/tcp/443/tls/ws",
+            "/dns4/sta-rack-server.tail11322f.ts.net/tcp/443",
+            "/ip6/::1/tcp/8546",
+            "/dns/example.com/tcp/443/wss",
+        ] {
+            assert!(is_dialable(addr), "{addr} must stay dialable");
+        }
+    }
+
+    #[test]
+    fn something_that_is_not_a_multiaddr_at_all_is_refused() {
+        assert!(!is_dialable("43.133.224.33:8546"));
+        assert!(!is_dialable("not an address"));
+        assert!(!is_dialable(""));
     }
 }

@@ -3603,12 +3603,12 @@ fn chain_clause(height: u64, stalled_secs: Option<u64>, peers: usize) -> String 
 /// recoverable outage into a 21-hour stall (#147). Hence the explicit line about the data
 /// directory: the mistake that actually cost the time was not the restart.
 fn not_validating_advice(
-    no_peers: bool,
+    peers: usize,
     behind_the_tip: bool,
     quorum_peers_missing: bool,
     silent_peer_validators: usize,
 ) -> &'static str {
-    if no_peers {
+    if peers == 0 {
         // Ahead of everything, because every branch below is a reading of what peers say or
         // send, and a node with none has nothing to read (backlog #196).
         //
@@ -3624,9 +3624,31 @@ fn not_validating_advice(
          every peer address it knows every 30s on its own; if this line keeps appearing, check \
          this machine's network path (firewall, tunnel, proxy). Restarting is safe; do NOT delete \
          its chain data."
+    } else if peers < helix_p2p::MIN_HEALTHY_PEERS && quorum_peers_missing {
+        // Second, right after "no peers at all", because it is the same failure one notch weaker
+        // and it reads as somebody else's fault from here.
+        //
+        // On 2026-09-17 and 2026-09-18 this node's tunnel dropped every peer within 1.5 s; exactly
+        // one came back on its own, and it then held that single peer for 5 h 22 min and 3 h 21 min
+        // while the chain stood. Both times this line said "the chain is waiting for other
+        // validators to reconnect, and restarting will not speed that up" — 525 times in 44 hours.
+        // The chain was indeed waiting, but for a link this node could have rebuilt: an operator
+        // who had opened port 8546 was sitting in its own `helix-peers.txt` the whole time.
+        //
+        // Deliberately conditioned on `quorum_peers_missing` as well, not on the peer count alone.
+        // Six validators is the whole network here and gossip relays through whoever is connected,
+        // so two peers can be perfectly sufficient — being under-connected is only a *finding*
+        // when this node also cannot reach quorum. The combination is the evidence; either half
+        // on its own is a false alarm waiting to happen (R2).
+        "This node has FEWER PEERS than it wants and cannot reach quorum — so the votes it is \
+         missing may simply have no path to it, rather than not existing. It redials its seeds and \
+         every peer address it knows every 30s on its own, so give it a minute before acting; if \
+         this line keeps appearing, the problem is this machine's network path (firewall, tunnel, \
+         proxy) or the other validators are not reachable from it. Restarting is safe; do NOT \
+         delete its chain data."
     } else if behind_the_tip {
-        // First, because it is the only branch that is a statement about *this* node, and the
-        // three below all send the operator to look at somebody else's.
+        // Third, because it is the only remaining branch that is a statement about *this* node,
+        // and the two below both send the operator to look at somebody else's.
         //
         // On 2026-09-04 this node sat one block below the tip for 6 h 20 min and printed the
         // "check the other validators" advice 377 times. It was wrong every time: block 114116
@@ -3974,7 +3996,7 @@ async fn validator_health_loop(
                 // warning was accurate about the chain and wrong about who had to act, for 6 h
                 // 20 min.
                 let advice =
-                    not_validating_advice(peers == 0, blocks_behind > 0, quorum_missing, silent_peers);
+                    not_validating_advice(peers, blocks_behind > 0, quorum_missing, silent_peers);
                 warn!(
                     "Health: ⚠ NOT validating — this node is an active validator but is not \
                      co-signing ({}, {}{}, peers {}). {}",
@@ -7532,7 +7554,7 @@ mod validator_health_tests {
     /// perfectly fine while the chain waits for absent validators.
     #[test]
     fn a_node_held_up_by_missing_validators_is_not_told_to_restart() {
-        let advice = not_validating_advice(false, false, true, 0);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 0);
         assert!(
             advice.contains("will not speed that up"),
             "must say plainly that restarting does not help: {advice}"
@@ -7547,7 +7569,7 @@ mod validator_health_tests {
     /// chain database, which pinned that node at height 1 (#147). The restart was survivable.
     #[test]
     fn the_waiting_advice_warns_against_deleting_chain_data() {
-        let advice = not_validating_advice(false, false, true, 0);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 0);
         assert!(
             advice.contains("Do NOT delete"),
             "must warn against wiping the data directory: {advice}"
@@ -7634,7 +7656,7 @@ mod validator_health_tests {
     /// above and leave a genuinely wedged validator with nothing to do.
     #[test]
     fn a_node_that_is_itself_stuck_is_still_told_to_restart() {
-        let advice = not_validating_advice(false, false, false, 0);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 0);
         assert!(
             advice.contains("re-establishes its round"),
             "a genuinely stuck node must still be told to restart: {advice}"
@@ -7651,7 +7673,7 @@ mod validator_health_tests {
     /// one that had stopped.
     #[test]
     fn a_node_waiting_on_a_silent_peer_is_not_told_to_restart_either() {
-        let advice = not_validating_advice(false, false, false, 1);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 1);
         assert!(
             advice.contains("will not help"),
             "must say plainly that restarting this node is not the answer: {advice}"
@@ -7672,7 +7694,7 @@ mod validator_health_tests {
     /// happened 596 times in one outage on 2026-07-29.
     #[test]
     fn the_advice_does_not_claim_the_other_validator_is_down() {
-        let advice = not_validating_advice(false, false, false, 2).to_lowercase();
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 2).to_lowercase();
         assert!(
             advice.contains("not arriving here"),
             "must describe what this node observes, not what the peer is doing: {advice}"
@@ -7690,7 +7712,7 @@ mod validator_health_tests {
     /// decides which line an operator reads.
     #[test]
     fn disconnected_peers_keep_their_own_more_specific_advice() {
-        let advice = not_validating_advice(false, false, true, 3);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 3);
         assert!(advice.contains("waiting for other validators to reconnect"), "{advice}");
     }
 
@@ -7704,7 +7726,7 @@ mod validator_health_tests {
     /// reproduces that outage exactly.
     #[test]
     fn a_node_below_the_tip_is_told_it_is_the_one_that_is_behind() {
-        let advice = not_validating_advice(false, true, true, 3);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, true, true, 3);
         assert!(
             advice.contains("BEHIND the tip"),
             "a node below the tip must be told so before anything else — got: {advice}"
@@ -7725,7 +7747,7 @@ mod validator_health_tests {
     /// with its peers must still get the diagnosis that points outward.
     #[test]
     fn a_node_level_with_its_peers_still_gets_the_outward_diagnosis() {
-        let advice = not_validating_advice(false, false, false, 1);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 1);
         assert!(
             !advice.contains("BEHIND the tip"),
             "a node that is not behind must never be told it is: {advice}"
@@ -7739,7 +7761,7 @@ mod validator_health_tests {
     /// without it and it was jailed. With no peers, that is the one thing this node cannot know.
     #[test]
     fn a_node_with_no_peers_is_not_told_the_chain_is_waiting_for_others() {
-        let advice = not_validating_advice(true, false, true, 3);
+        let advice = not_validating_advice(0, false, true, 3);
         assert!(advice.contains("NO peers"), "{advice}");
         assert!(
             advice.contains("cannot tell a stalled chain from"),
@@ -7758,17 +7780,55 @@ mod validator_health_tests {
     /// went away, so with none left it is stale, and the no-peers line is the more basic fact.
     #[test]
     fn having_no_peers_outranks_being_behind() {
-        let advice = not_validating_advice(true, true, true, 3);
+        let advice = not_validating_advice(0, true, true, 3);
         assert!(advice.contains("NO peers"), "{advice}");
         assert!(!advice.contains("BEHIND the tip"), "{advice}");
     }
 
-    /// The control: one peer is enough to read the chain again, and the existing diagnoses must be
-    /// untouched — a `no_peers` branch that swallowed them would pass the two tests above.
+    /// The production failure of 2026-09-17/18: this node held exactly one peer for 5 h 22 min and
+    /// 3 h 21 min while the chain stood, and was told 525 times that it was healthy and the chain
+    /// was waiting for others. It was under-connected, and an operator with port 8546 open sat in
+    /// its own peer file the whole time.
+    #[test]
+    fn a_node_holding_too_few_peers_is_told_that_before_it_is_sent_to_blame_others() {
+        let advice = not_validating_advice(1, false, true, 3);
+        assert!(advice.contains("FEWER PEERS"), "{advice}");
+        for forbidden in ["waiting for other validators", "is healthy", "will not speed that up"] {
+            assert!(
+                !advice.contains(forbidden),
+                "a node that cannot see its peers must not be told the fault is elsewhere \
+                 ({forbidden}): {advice}"
+            );
+        }
+    }
+
+    /// Being under-connected is only a finding when this node also cannot reach quorum. Six
+    /// validators is the whole network and gossip relays, so two peers can be entirely sufficient —
+    /// warning on the count alone would fire on a chain that is finalizing normally (R2).
+    #[test]
+    fn too_few_peers_alone_is_not_a_finding_while_quorum_is_reachable() {
+        let advice = not_validating_advice(1, false, false, 1);
+        assert!(
+            !advice.contains("FEWER PEERS"),
+            "a connected-but-silent-peer diagnosis must survive a low peer count: {advice}"
+        );
+        assert!(advice.contains("not arriving here"), "{advice}");
+    }
+
+    /// Precedence, both directions: no peers at all outranks too few, and too few outranks the
+    /// branches that send the operator to somebody else's machine.
+    #[test]
+    fn no_peers_outranks_too_few_peers() {
+        assert!(not_validating_advice(0, false, true, 3).contains("NO peers"));
+        assert!(!not_validating_advice(0, false, true, 3).contains("FEWER PEERS"));
+    }
+
+    /// The control: a node at the target reads the chain fine, and the existing diagnoses must be
+    /// untouched — a peer-count branch that swallowed them would pass the tests above.
     #[test]
     fn a_node_with_peers_keeps_the_existing_diagnoses() {
-        assert!(not_validating_advice(false, false, true, 0).contains("waiting for other validators"));
-        assert!(not_validating_advice(false, true, true, 3).contains("BEHIND the tip"));
+        assert!(not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 0).contains("waiting for other validators"));
+        assert!(not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, true, true, 3).contains("BEHIND the tip"));
     }
 
     /// The same distinction in the first half of the line, which is what an operator reads first.

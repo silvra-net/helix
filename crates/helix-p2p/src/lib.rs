@@ -1,12 +1,12 @@
 pub mod blocksync;
 pub mod config;
+mod conn_limits;
 pub mod genesis_bootstrap;
 pub mod genesis_sync;
-mod conn_limits;
 mod net_addr;
+pub mod peer_store;
 pub mod reputation;
 pub mod roundsync;
-pub mod peer_store;
 pub mod service;
 
 pub use blocksync::{
@@ -21,7 +21,7 @@ pub use reputation::PeerReputation;
 pub use roundsync::{
     RoundProvider, RoundSyncRequest, RoundSyncResponse, MAX_ROUNDSYNC_VOTES, ROUNDSYNC_PROTOCOL,
 };
-pub use service::{P2PCommand, P2PEvent, P2PService, MAX_CATCHUP_SERVE_BLOCKS};
+pub use service::{P2PCommand, P2PEvent, P2PService, MAX_CATCHUP_SERVE_BLOCKS, MIN_HEALTHY_PEERS};
 
 use thiserror::Error;
 
