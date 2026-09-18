@@ -396,6 +396,71 @@ fn prune_horizon(tip: u64, keep: u64) -> Option<u64> {
     tip.checked_sub(keep.max(MIN_KEEP_BLOCKS)).filter(|h| *h > 0)
 }
 
+/// How many blocks fit in a disk budget, from what this database is actually costing per block.
+///
+/// **Why a byte budget exists at all.** `HELIX_KEEP_BLOCKS` counts blocks, and a block is not a
+/// unit of disk: measured on 2026-09-18, one costs `3309 B × validators + 4896 B × transactions`.
+/// The same 500 000-block window is 16 GB on today's near-empty chain, 119 GB at the 256 KB the
+/// proposer currently volunteers to stay under, and 887 GB at the 2 MB the protocol actually
+/// allows. So the window promises a plateau it can only keep while nobody fills a block — and
+/// what stops them is `HELIX_MAX_PROPOSAL_BYTES`, which is each proposer's own setting. A disk
+/// guarantee resting on other operators' restraint is not one.
+///
+/// Measured rather than assumed, and re-measured every tick: `db_bytes / retained` is this node's
+/// own cost per block, including the commit certificate that grows with the validator set and the
+/// transactions that grow with use. A chain that starts filling shrinks its own window without
+/// anyone editing a config.
+///
+/// Predictive, not reactive — that distinction is the whole design. redb never returns space to
+/// the filesystem, so "the file got too big, prune harder" arrives after the damage: the file
+/// stays at its high-water mark forever. Keeping only what fits means the mark is never reached.
+///
+/// Returns `None` while there is nothing to divide by, so the caller keeps its existing window
+/// rather than acting on a guess.
+fn keep_blocks_for_budget(db_bytes: u64, retained_blocks: u64, budget_bytes: u64) -> Option<u64> {
+    if budget_bytes == 0 || retained_blocks == 0 || db_bytes == 0 {
+        return None;
+    }
+    let per_block = (db_bytes / retained_blocks).max(1);
+    // `MIN_KEEP_BLOCKS` wins over the budget, deliberately. A node that kept fifty blocks would
+    // still run consensus fine and be useless to everyone else — the same reason the block window
+    // is clamped up rather than obeyed. If the budget cannot hold even that, the operator has a
+    // disk problem this loop cannot solve by making the node a worse peer.
+    Some((budget_bytes / per_block).max(MIN_KEEP_BLOCKS))
+}
+
+/// `HELIX_KEEP_BYTES` — a disk budget for the chain database, e.g. `120G`, `4096M`, or plain bytes.
+///
+/// **What the number means, precisely: it budgets the content, and the file lands on the next
+/// power of two above it.** redb extends its file in doubling steps and never returns space, so a
+/// database holding just over 64 GB occupies 128. Measured end to end on 2026-09-18: an 80 MB
+/// budget settled at a 129 MB file, having pruned down from 1764 blocks to 1099. So `120G` is the
+/// right way to ask for "never more than 128 GB", and `128G` is not — it leaves the content free
+/// to cross 128 and take the file to 256.
+///
+/// Unset is 0, meaning "no byte budget": the node then obeys `HELIX_KEEP_BLOCKS` exactly as before.
+/// Unparseable is also 0 rather than some default, for the reason `HELIX_DB_CACHE_MB` does the
+/// same — a typo must not silently switch on a limit the operator did not choose, nor switch off
+/// one they did.
+fn configured_keep_bytes() -> u64 {
+    let Ok(raw) = std::env::var("HELIX_KEEP_BYTES") else {
+        return 0;
+    };
+    parse_byte_budget(&raw)
+}
+
+/// Parse `120G` / `500M` / `1024K` / plain bytes. Case-insensitive, `B` suffix tolerated.
+fn parse_byte_budget(raw: &str) -> u64 {
+    let raw = raw.trim().trim_end_matches(['b', 'B']);
+    let (digits, scale) = match raw.chars().last() {
+        Some(c @ ('g' | 'G')) => (&raw[..raw.len() - c.len_utf8()], 1024 * 1024 * 1024),
+        Some(c @ ('m' | 'M')) => (&raw[..raw.len() - c.len_utf8()], 1024 * 1024),
+        Some(c @ ('k' | 'K')) => (&raw[..raw.len() - c.len_utf8()], 1024),
+        _ => (raw, 1),
+    };
+    digits.trim().parse::<u64>().ok().map_or(0, |n| n.saturating_mul(scale))
+}
+
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
 /// Validator health heartbeat cadence and thresholds (see `validator_health_loop`).
 const VALIDATOR_HEALTH_SECS: u64 = 60;
@@ -1497,8 +1562,15 @@ impl HelixNode {
         // Prune old blocks, if this operator asked for it. Off by default: somebody has to keep
         // the history, and a config default must not be what decides that for a network (#194).
         let keep_blocks = configured_keep_blocks();
-        if keep_blocks > 0 {
-            tokio::spawn(prune_loop(self.store.clone(), keep_blocks, self.syncing.clone()));
+        let keep_bytes = configured_keep_bytes();
+        if keep_blocks > 0 || keep_bytes > 0 {
+            tokio::spawn(prune_loop(
+                self.store.clone(),
+                keep_blocks,
+                keep_bytes,
+                std::path::PathBuf::from(CHAIN_DB_FILE),
+                self.syncing.clone(),
+            ));
         }
 
         tokio::spawn(validator_health_loop(
@@ -3709,11 +3781,18 @@ fn not_validating_advice(
 /// cost 75 MB. So `ls` will keep reporting the size it reached, and disk growth stops. An operator
 /// who expects the first and not the second will think this is broken, which is why the log line
 /// says which one happened.
-async fn prune_loop(store: Arc<RwLock<HelixDb>>, keep_blocks: u64, syncing: Arc<std::sync::atomic::AtomicBool>) {
+async fn prune_loop(
+    store: Arc<RwLock<HelixDb>>,
+    keep_blocks: u64,
+    budget_bytes: u64,
+    db_path: std::path::PathBuf,
+    syncing: Arc<std::sync::atomic::AtomicBool>,
+) {
     use std::sync::atomic::Ordering;
     let mut ticker = tokio::time::interval(Duration::from_secs(PRUNE_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut announced = false;
+    let mut announced_window = 0u64;
 
     loop {
         ticker.tick().await;
@@ -3723,6 +3802,42 @@ async fn prune_loop(store: Arc<RwLock<HelixDb>>, keep_blocks: u64, syncing: Arc<
             continue;
         }
         let tip = { store.read().await.latest_height() };
+
+        // Re-derived every tick, not once at startup: the cost of a block moves with the validator
+        // set and with how full the blocks are, and a window fixed at boot would be wrong by the
+        // time it mattered. `earliest_block` is what this node still holds, so `tip - earliest` is
+        // the span those bytes actually paid for.
+        let keep_blocks = if budget_bytes > 0 {
+            let db_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+            let earliest = { store.read().await.earliest_block_height().unwrap_or(0) };
+            let retained = tip.saturating_sub(earliest).saturating_add(1);
+            match keep_blocks_for_budget(db_bytes, retained, budget_bytes) {
+                Some(from_budget) => {
+                    // The tighter of the two wins: an operator who set both meant both, and the
+                    // budget must not be a way to *widen* a window they deliberately narrowed.
+                    let window = if keep_blocks > 0 { from_budget.min(keep_blocks) } else { from_budget };
+                    // Spoken when it moves by more than a tenth, so a chain that starts filling
+                    // says so once rather than every ten seconds.
+                    if announced_window == 0
+                        || window.abs_diff(announced_window) * 10 > announced_window
+                    {
+                        info!(
+                            keep_blocks = window,
+                            budget_mb = budget_bytes / (1024 * 1024),
+                            db_mb = db_bytes / (1024 * 1024),
+                            bytes_per_block = db_bytes / retained.max(1),
+                            "Disk budget: keeping the blocks that fit in it"
+                        );
+                        announced_window = window;
+                    }
+                    window
+                }
+                None => keep_blocks,
+            }
+        } else {
+            keep_blocks
+        };
+
         let Some(horizon) = prune_horizon(tip, keep_blocks) else {
             continue;
         };
@@ -7952,6 +8067,71 @@ mod body_cap_tests {
             None,
             "exactly at the window the horizon would be 0, which is nothing to do"
         );
+    }
+
+    /// The measurement this whole mechanism exists for: a block is not a unit of disk.
+    ///
+    /// Numbers from 2026-09-18, measured on a real node — 4896 B per transaction, 3309 B per
+    /// validator signature in the commit certificate. The same 500 000-block window is 16 GB, 119
+    /// GB or 887 GB depending only on how full the blocks are, and nothing in a block window can
+    /// tell those apart.
+    #[test]
+    fn the_window_shrinks_as_blocks_get_more_expensive() {
+        const BUDGET: u64 = 120 * 1024 * 1024 * 1024;
+        let retained = 500_000u64;
+
+        // Today's near-empty chain: ~34 KB a block.
+        let empty = keep_blocks_for_budget(34_542 * retained, retained, BUDGET).expect("a window");
+        // Full 2 MB blocks: ~1.9 MB a block.
+        let full = keep_blocks_for_budget(1_904_814 * retained, retained, BUDGET).expect("a window");
+
+        assert!(
+            empty > full * 50,
+            "an empty chain must buy far more history than a full one for the same disk: \
+             {empty} against {full}"
+        );
+        assert!(
+            (3_000_000..5_000_000).contains(&empty),
+            "120 GB of 34 KB blocks is about 3.7M blocks, got {empty}"
+        );
+        assert!(
+            (50_000..90_000).contains(&full),
+            "120 GB of 1.9 MB blocks is about 66k blocks, got {full}"
+        );
+    }
+
+    /// The floor outranks the budget. A node squeezed down to a handful of blocks would still
+    /// finalise perfectly well and be useless to every peer trying to catch up — the same reason
+    /// `prune_horizon` clamps a small `HELIX_KEEP_BLOCKS` upward instead of obeying it.
+    #[test]
+    fn a_budget_too_small_to_hold_the_floor_still_keeps_the_floor() {
+        let window = keep_blocks_for_budget(2_000_000 * 1000, 1000, 1024).expect("a window");
+        assert_eq!(window, MIN_KEEP_BLOCKS);
+    }
+
+    /// Nothing to divide by means no opinion — the caller keeps whatever window it had. Returning
+    /// a number here would be a guess wearing a measurement's clothes, and it would arrive exactly
+    /// at startup, before a single block has been written.
+    #[test]
+    fn an_unmeasurable_database_yields_no_window_rather_than_a_guess() {
+        assert_eq!(keep_blocks_for_budget(0, 100, 1 << 30), None, "no bytes yet");
+        assert_eq!(keep_blocks_for_budget(1 << 30, 0, 1 << 30), None, "no blocks yet");
+        assert_eq!(keep_blocks_for_budget(1 << 30, 100, 0), None, "no budget set");
+    }
+
+    #[test]
+    fn a_byte_budget_is_read_with_or_without_a_unit() {
+        assert_eq!(parse_byte_budget("120G"), 120 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_budget("120g"), 120 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_budget("120GB"), 120 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_budget(" 500M "), 500 * 1024 * 1024);
+        assert_eq!(parse_byte_budget("1024K"), 1024 * 1024);
+        assert_eq!(parse_byte_budget("4096"), 4096);
+        // A typo must not switch the limit on *or* off by accident — 0 means "no byte budget",
+        // and the caller then follows HELIX_KEEP_BLOCKS exactly as it did before.
+        assert_eq!(parse_byte_budget("lots"), 0);
+        assert_eq!(parse_byte_budget("12X"), 0);
+        assert_eq!(parse_byte_budget(""), 0);
     }
 
     /// The sync cap is derived from the protocol, never guessed: whatever a batch may legitimately

@@ -1160,3 +1160,314 @@ async fn status_within(rpc_port: u16, timeout: Duration) -> Option<serde_json::V
         .await
         .ok()
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Throughput under a slow link (2026-09-18)
+//
+// Everything above runs three nodes over loopback, where a 2 MB block crosses between processes
+// in about a millisecond. Production does not: every validator reaches every other through one
+// Cloudflare tunnel, measured at ~890 KB/s on 2026-09-18 against 172 MB/s on loopback — a factor
+// of 193. That single number is why `HELIX_MAX_PROPOSAL_BYTES` defaults to 256 KB, and why the
+// question "what is the block time at 367 transactions?" had no measured answer: `load.rs` is a
+// single node, so it exercises the mempool, the packer and the block limits, and never once
+// distributes a block to anyone.
+//
+// This closes that gap. The link is a userspace relay rather than `tc`/`netem` because this
+// machine also runs production: a qdisc on loopback would throttle the production node and the
+// tunnel along with the test. A relay throttles exactly the sockets handed to it and nothing else,
+// needs no privileges, and runs unchanged in CI.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+const TL_A_RPC: u16 = 29_575;
+const TL_A_P2P: u16 = 29_576;
+const TL_A_LINK: u16 = 29_577;
+const TL_B_RPC: u16 = 29_585;
+const TL_B_P2P: u16 = 29_586;
+const TL_B_LINK: u16 = 29_587;
+const TL_C_RPC: u16 = 29_595;
+const TL_C_P2P: u16 = 29_596;
+const TL_C_LINK: u16 = 29_597;
+
+/// The measured production tunnel, in bytes per second (2026-09-18, five runs of 1.76 MB through
+/// `node.silvra.net`: 600–1090 KB/s, median 890).
+const LINK_BYTES_PER_SEC: u64 = 890 * 1024;
+
+/// Forward TCP between two loopback ports at a fixed byte rate, in both directions.
+///
+/// One relay stands for one node's link, so its rate is that node's bandwidth — shared by every
+/// peer talking to it, which is what a single uplink actually is.
+///
+/// The sleep is *after* the write, not before: a relay that pauses first would add its whole
+/// quantum of latency to the very first byte of an idle connection, and consensus is full of
+/// small, urgent messages (a prevote is ~3.3 KB) that must not be charged for bandwidth they do
+/// not use. Charging after the fact bills the bytes that were really sent.
+fn spawn_link(listen: u16, target: u16, bytes_per_sec: u64) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", listen)).await {
+            Ok(l) => l,
+            Err(e) => panic!("throttled link cannot bind {listen}: {e}"),
+        };
+        loop {
+            let Ok((inbound, _)) = listener.accept().await else { continue };
+            tokio::spawn(async move {
+                let Ok(outbound) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await else {
+                    return;
+                };
+                // Nagle off on both halves: the relay already paces by rate, and letting the
+                // kernel additionally hold small writes back would add a second, invisible delay
+                // on top of the one this test is trying to measure.
+                let _ = inbound.set_nodelay(true);
+                let _ = outbound.set_nodelay(true);
+                let (ri, wi) = inbound.into_split();
+                let (ro, wo) = outbound.into_split();
+                tokio::join!(pump(ri, wo, bytes_per_sec), pump(ro, wi, bytes_per_sec));
+            });
+        }
+    })
+}
+
+async fn pump<R, W>(mut r: R, mut w: W, bytes_per_sec: u64)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if w.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs_f64(n as f64 / bytes_per_sec as f64)).await;
+    }
+    let _ = w.shutdown().await;
+}
+
+/// Sign `count` transfers from `kp` at nonces 0.., priced well over the base fee.
+///
+/// Duplicated from `load.rs` rather than shared: the two test binaries cannot see each other's
+/// private helpers without a `tests/common` module, and what is common here is twenty lines of
+/// struct literal — while what differs is everything that carries judgement (the headroom, the
+/// amount, who the sender is).
+fn sign_flood(
+    kp: &KeyPair,
+    to: &Address,
+    count: u64,
+    chain_id: helix_crypto::Hash,
+    base_fee_per_byte: u64,
+) -> Vec<helix_core::Transaction> {
+    use helix_core::{Transaction, TxType};
+    let from = Address::from_public_key(&kp.public);
+    (0..count)
+        .map(|nonce| {
+            let mut tx = Transaction {
+                version: 1,
+                tx_type: TxType::Transfer,
+                from: from.clone(),
+                to: Some(to.clone()),
+                amount: 1_000_000,
+                fee: 0,
+                nonce,
+                data: Vec::new(),
+                crypto_version: kp.scheme,
+                chain_id,
+                signature: helix_crypto::Signature::from_bytes(vec![]),
+                public_key: kp.public.clone(),
+            };
+            tx.signature = kp.sign(tx.signing_hash().as_bytes()).expect("sign at fee 0");
+            // 20× the base fee, for the reason `load.rs` documents: a batch signed up front is
+            // priced before the flood moves the market, and a load test whose transactions get
+            // outbid measures the fee market rather than the chain.
+            tx.fee = (base_fee_per_byte.saturating_mul(tx.size_bytes()) * 20).max(10_000);
+            tx.signature = kp.sign(tx.signing_hash().as_bytes()).expect("sign priced");
+            tx
+        })
+        .collect()
+}
+
+/// **What is the block time when blocks are full and the network is as slow as production?**
+///
+/// Everything that made that question unanswerable is in this test's setup rather than its
+/// assertions: three real validator processes, every one of them reachable only through a relay
+/// pinned to the measured production tunnel rate, announcing that relay as its public address
+/// exactly as the production node announces its tunnel. Then two thousand transactions at once.
+///
+/// Reading block times from header timestamps is legitimate *here* and nowhere else in this
+/// repo: a header carries its proposer's clock, and on 2026-08-28 comparing them across four
+/// machines measured clock skew instead of block time (R2). All three proposers here are
+/// processes on one machine reading one clock, so the skew is zero by construction.
+///
+/// Run it against the protocol ceiling instead of the shipped policy with
+/// `HELIX_MAX_PROPOSAL_BYTES=2097152` — that is the comparison the 256 KB default exists for,
+/// and this test is how it stops being an argument and becomes a number.
+#[tokio::test]
+#[ignore = "three validator processes behind throttled links, two activation epochs, then a 2000-tx flood (~8-12 min) — run with --ignored --nocapture"]
+async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_production() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
+    for (port, label) in [
+        (TL_A_RPC, "A rpc"), (TL_A_P2P, "A p2p"), (TL_A_LINK, "A link"),
+        (TL_B_RPC, "B rpc"), (TL_B_P2P, "B p2p"), (TL_B_LINK, "B link"),
+        (TL_C_RPC, "C rpc"), (TL_C_P2P, "C p2p"), (TL_C_LINK, "C link"),
+    ] {
+        assert_port_free(port, label);
+    }
+
+    // The links come up first: a node that dials a relay which is not listening yet simply fails
+    // that dial and waits for the next redial tick, which costs 30 s of the test's budget for no
+    // reason.
+    let _link_a = spawn_link(TL_A_LINK, TL_A_P2P, LINK_BYTES_PER_SEC);
+    let _link_b = spawn_link(TL_B_LINK, TL_B_P2P, LINK_BYTES_PER_SEC);
+    let _link_c = spawn_link(TL_C_LINK, TL_C_P2P, LINK_BYTES_PER_SEC);
+
+    let kp_a = KeyPair::generate();
+    let kp_b = KeyPair::generate();
+    let kp_c = KeyPair::generate();
+    let addr_b = Address::from_public_key(&kp_b.public);
+    let addr_c = Address::from_public_key(&kp_c.public);
+
+    // Every seed is a *relay* port, and every node announces its own relay as its public address.
+    // Both halves are needed: the seeds route the dials this test sets up, and the announcement
+    // routes everything peer exchange arranges afterwards — without it two nodes that learn about
+    // each other through gossip would connect directly and quietly measure loopback.
+    let ma = |port: u16| format!("/ip4/127.0.0.1/tcp/{port}");
+    let fast = ("HELIX_BLOCK_TIME_MS", JOIN_BLOCK_TIME_MS);
+    let seeds_a = format!("{},{}", ma(TL_B_LINK), ma(TL_C_LINK));
+    let seeds_b = format!("{},{}", ma(TL_A_LINK), ma(TL_C_LINK));
+    let seeds_c = format!("{},{}", ma(TL_A_LINK), ma(TL_B_LINK));
+    let pub_a = ma(TL_A_LINK);
+    let pub_b = ma(TL_B_LINK);
+    let pub_c = ma(TL_C_LINK);
+
+    let _node_a = spawn_node_with(TL_A_RPC, TL_A_P2P, None,
+        &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_a), ("HELIX_P2P_PUBLIC_ADDR", &pub_a),
+          ("HELIX_RPC_RATE_LIMIT", "50000,20000")], Some(&kp_a));
+    wait_until_reachable(TL_A_RPC, Duration::from_secs(15)).await;
+    wait_for_height(TL_A_RPC, 2, Duration::from_secs(30)).await;
+
+    let _node_b = spawn_node_with(TL_B_RPC, TL_B_P2P, Some(TL_A_RPC),
+        &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_b), ("HELIX_P2P_PUBLIC_ADDR", &pub_b)], Some(&kp_b));
+    let _node_c = spawn_node_with(TL_C_RPC, TL_C_P2P, Some(TL_A_RPC),
+        &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_c), ("HELIX_P2P_PUBLIC_ADDR", &pub_c)], Some(&kp_c));
+    wait_until_reachable(TL_B_RPC, Duration::from_secs(15)).await;
+    wait_until_reachable(TL_C_RPC, Duration::from_secs(15)).await;
+
+    let (_kd_a, key_a) = temp_keyfile(&kp_a);
+    let (_kd_b, key_b) = temp_keyfile(&kp_b);
+    let (_kd_c, key_c) = temp_keyfile(&kp_c);
+    fund_and_stake(TL_A_RPC, &key_a, &kp_b, &key_b).await;
+    fund_and_stake(TL_A_RPC, &key_a, &kp_c, &key_c).await;
+    assert!(
+        wait_for_validator_active(TL_A_RPC, &addr_b.to_string(), Duration::from_secs(600)).await,
+        "B staked but never activated — activation stalled"
+    );
+    assert!(
+        wait_for_validator_active(TL_A_RPC, &addr_c.to_string(), Duration::from_secs(600)).await,
+        "C staked but never activated — activation stalled"
+    );
+
+    // Baseline first, on the same three validators and the same links, with nothing in the
+    // mempool. Without it a slow flood cannot be told from a slow test machine — and a debug
+    // build on a loaded host has been measured at 0.91 s per block against a configured 300 ms
+    // (2026-08-26), which is three times the difference this test is looking for.
+    let idle = measure_cadence(TL_A_RPC, 12, Duration::from_secs(180)).await;
+
+    let status = status(TL_A_RPC).await.expect("A status");
+    let base_fee = status["base_fee_per_byte"].as_u64().unwrap_or(1);
+    // The chain id *is* the genesis hash (#174), read from the chain rather than assumed — a
+    // wrong one here would make every signature invalid for a reason that reads like a pool bug.
+    let genesis = block_header(TL_A_RPC, 0).await.expect("genesis header");
+    let chain_id = helix_crypto::Hash::from_hex(genesis["hash"].as_str().expect("genesis hash"))
+        .expect("genesis hash parses");
+
+    let recipient = Address::from_public_key(&KeyPair::generate().public);
+    let txs = sign_flood(&kp_a, &recipient, 2_000, chain_id, base_fee);
+    let client = reqwest::Client::new();
+    let mut accepted = 0u64;
+    for tx in &txs {
+        let ok = client
+            .post(format!("http://127.0.0.1:{TL_A_RPC}/transactions"))
+            .json(tx)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if ok {
+            accepted += 1;
+        }
+    }
+    assert!(accepted > 1_500, "only {accepted}/2000 transactions were accepted — the flood never happened");
+
+    let loaded = measure_cadence(TL_A_RPC, 12, Duration::from_secs(300)).await;
+    eprintln!(
+        "link {} KB/s per node · idle: median {:.2}s p90 {:.2}s · under {accepted} tx: median {:.2}s p90 {:.2}s, fullest block {} tx",
+        LINK_BYTES_PER_SEC / 1024, idle.median, idle.p90, loaded.median, loaded.p90, loaded.fullest
+    );
+
+    // The chain has to still be finalizing — that is the failure this exists to catch, and it is
+    // not hypothetical: a proposal that cannot cross the link inside the round window splits the
+    // prevotes, the round dies, and the backlog that caused it is still there for the next one.
+    assert!(
+        loaded.blocks >= 10,
+        "the chain stopped finalizing under load: only {} blocks in the window",
+        loaded.blocks
+    );
+    // Four times the idle cadence, floored so a fast idle run cannot make this stricter than the
+    // round window it is really testing. Deliberately loose: this is a guard against the
+    // *feedback loop* (#195), where a block too big for the link loses its round, accumulates
+    // more transactions and gets bigger — not a bound on how long a full block may take.
+    let ceiling = (idle.median * 4.0).max(8.0);
+    assert!(
+        loaded.p90 < ceiling,
+        "block time collapsed under load: p90 {:.2}s against an idle median of {:.2}s (ceiling {:.2}s). \
+         Fullest block {} tx. This is the shape of a proposal that cannot cross the link inside the \
+         round window.",
+        loaded.p90, idle.median, ceiling, loaded.fullest
+    );
+}
+
+struct Cadence {
+    median: f64,
+    p90: f64,
+    blocks: usize,
+    fullest: u64,
+}
+
+/// Block-to-block times over the next `want` blocks, from header timestamps.
+async fn measure_cadence(rpc_port: u16, want: u64, timeout: Duration) -> Cadence {
+    let start = status(rpc_port).await.expect("status")["height"].as_u64().unwrap_or(0);
+    wait_for_height(rpc_port, start + want, timeout).await;
+    let mut stamps = Vec::new();
+    let mut fullest = 0u64;
+    for h in start..=(start + want) {
+        if let Some(header) = block_header(rpc_port, h).await {
+            if let Some(ts) = header["timestamp"].as_u64() {
+                stamps.push(ts);
+            }
+        }
+        if let Some(b) = block_body(rpc_port, h).await {
+            let n = b["transactions"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+            fullest = fullest.max(n);
+        }
+    }
+    let mut gaps: Vec<f64> = stamps.windows(2).map(|w| (w[1].saturating_sub(w[0])) as f64 / 1000.0).collect();
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = gaps.len().max(1);
+    Cadence {
+        median: gaps.get(n / 2).copied().unwrap_or(0.0),
+        p90: gaps.get((n * 9) / 10).copied().unwrap_or(0.0),
+        blocks: gaps.len(),
+        fullest,
+    }
+}
+
+async fn block_body(rpc_port: u16, height: u64) -> Option<serde_json::Value> {
+    reqwest::get(format!("http://127.0.0.1:{rpc_port}/blocks/height/{height}"))
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()
+}

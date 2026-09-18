@@ -26,6 +26,21 @@ struct NodeGuard {
     _work_dir: tempdir::TempDir,
 }
 
+impl NodeGuard {
+    /// Size of the chain database on disk, in bytes.
+    ///
+    /// `len()` rather than blocks-on-disk: redb grows the file in chunks and reuses freed pages,
+    /// so the *file* is what an operator's `df` shows and what a 128 GB budget is spent from. The
+    /// difference cost a measurement on 2026-09-09, in the other direction — `metadata().len()`
+    /// read a sparse file as bigger than it was. Here the question is the file, so the file is
+    /// what is asked.
+    fn chain_db_bytes(&self) -> u64 {
+        std::fs::metadata(self._work_dir.path().join("helix-data.redb"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+}
+
 impl Drop for NodeGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -434,4 +449,332 @@ mod tempdir {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+}
+
+/// **What does a block actually cost on disk, and does that cost scale with what is in it?**
+///
+/// The question a disk budget turns on, and it had no answer. `/diagnostics` reports
+/// `chain_db_bytes_per_block` as the database divided by the height — an average over a chain
+/// whose blocks are nearly empty, which says nothing about what a *full* one costs. The pruning
+/// window compounds that: `HELIX_KEEP_BLOCKS` counts blocks, not bytes, so the plateau it promises
+/// is `keep_blocks × whatever a block happens to weigh`. On 2026-09-18 production reported a 15.7
+/// GB plateau at 34 KB per block; the same 500 000-block window over full 2 MB blocks is a
+/// terabyte, on a 367 GB disk.
+///
+/// So this measures the two numbers a budget needs: the fixed cost of an empty block, and the
+/// marginal cost of a transaction. Everything else — window size, block size, how long history
+/// survives — follows from those two and a target.
+///
+/// Reported, not just asserted: the assertion guards against a regression, but the *numbers* are
+/// what the sizing decision is made from, and they belong in the test output where they can be
+/// re-read rather than in a comment that goes stale.
+#[tokio::test]
+#[ignore = "spawns a node and measures disk growth under a flood (~2-3 min) — run with --ignored --nocapture"]
+async fn disk_cost_of_a_block_is_measured_empty_and_full() {
+    const FLOOD: u64 = 1_500;
+    let kp = KeyPair::generate();
+    let sender = Address::from_public_key(&kp.public);
+    let recipient = Address::from_public_key(&KeyPair::generate().public);
+    let node = spawn_loaded_node(&kp, "1000");
+    wait_until_reachable(Duration::from_secs(30)).await;
+
+    // Idle stretch first: the chain produces empty blocks and nothing else, so the growth over
+    // this window is the per-block floor — header, commit certificate, and whatever redb writes
+    // to index them.
+    let h0 = status().await.expect("status")["height"].as_u64().unwrap_or(0);
+    let d0 = node.chain_db_bytes();
+    while status().await.and_then(|s| s["height"].as_u64()).unwrap_or(0) < h0 + 30 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let h1 = status().await.expect("status")["height"].as_u64().unwrap_or(0);
+    let d1 = node.chain_db_bytes();
+    let empty_per_block = (d1.saturating_sub(d0)) as f64 / (h1 - h0).max(1) as f64;
+
+    // Then the same measurement with the blocks full.
+    let chain_id = chain_id().await;
+    let base_fee = status().await.expect("status")["base_fee_per_byte"].as_u64().unwrap_or(1);
+    let txs: Vec<Transaction> = (0..FLOOD)
+        .map(|n| signed_transfer(&kp, &sender, &recipient, 1_000, n, chain_id, base_fee, FEE_HEADROOM_MULTIPLE))
+        .collect();
+    let tx_bytes = txs[0].size_bytes();
+    let client = reqwest::Client::new();
+    let mut accepted = 0u64;
+    for tx in &txs {
+        if submit(&client, tx).await.is_ok() {
+            accepted += 1;
+        }
+    }
+    assert!(accepted > FLOOD / 2, "only {accepted}/{FLOOD} accepted — the flood never happened");
+
+    let h2 = status().await.expect("status")["height"].as_u64().unwrap_or(0);
+    let d2 = node.chain_db_bytes();
+    // Drain: wait until the mempool is empty, so every accepted transaction is on disk.
+    for _ in 0..240 {
+        if status().await.and_then(|s| s["mempool_size"].as_u64()).unwrap_or(1) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // redb defers some of its writing; let it settle so the file reflects the data.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let h3 = status().await.expect("status")["height"].as_u64().unwrap_or(0);
+    let d3 = node.chain_db_bytes();
+
+    let loaded_blocks = (h3 - h2).max(1);
+    let loaded_growth = d3.saturating_sub(d2);
+    let per_tx = loaded_growth.saturating_sub((empty_per_block * loaded_blocks as f64) as u64) as f64
+        / accepted.max(1) as f64;
+
+    println!(
+        "empty block: {empty_per_block:.0} B on disk · {accepted} tx of {tx_bytes} B wire drained over \
+         {loaded_blocks} blocks costing {loaded_growth} B → {per_tx:.0} B/tx on disk ({:.2}x wire)",
+        per_tx / tx_bytes as f64
+    );
+    println!(
+        "  ⇒ a full 2 MB block ({} tx) costs about {:.1} MB on disk",
+        2 * 1024 * 1024 / tx_bytes,
+        (empty_per_block + per_tx * (2.0 * 1024.0 * 1024.0 / tx_bytes as f64)) / 1024.0 / 1024.0
+    );
+
+    // The guard, deliberately loose: what must not happen is a transaction costing several times
+    // its own size on disk, because every disk projection in this repo assumes otherwise.
+    assert!(
+        per_tx < tx_bytes as f64 * 3.0,
+        "a transaction costs {per_tx:.0} B on disk against {tx_bytes} B on the wire — disk \
+         projections based on wire size would be wrong by that factor"
+    );
+}
+
+/// **Does a pruned database actually stop growing, or only grow more slowly?**
+///
+/// A 128 GB budget is a promise about the *file*, and redb never returns space to the filesystem —
+/// pruning frees pages for reuse inside the file, nothing more. So "plateau" is a claim that freed
+/// pages are reused fast enough that the file stops extending, and that claim has never been
+/// tested over more than one prune. The one measurement on record (2026-09-09) saw 46 MB of writes
+/// after a prune cost 11 MB of file growth against 75 MB without — better, but not zero, and a
+/// 24 % residue compounding over a year is not a plateau.
+///
+/// This runs a node with a deliberately tiny window and floods it, so it prunes continuously, then
+/// asks whether the file is still growing once the window is full. Because the file only ever goes
+/// up, a budget has to hold against the *high-water mark* — which is exactly what makes the answer
+/// here load-bearing rather than academic.
+#[tokio::test]
+#[ignore = "runs a node through many prune cycles under load (~3-4 min) — run with --ignored --nocapture"]
+async fn a_pruned_database_stops_extending_its_file() {
+    const WINDOW: u64 = 1_000; // MIN_KEEP_BLOCKS — the smallest window the node accepts
+    let kp = KeyPair::generate();
+    let sender = Address::from_public_key(&kp.public);
+    let recipient = Address::from_public_key(&KeyPair::generate().public);
+
+    let work_dir = tempdir::TempDir::new().expect("temp work dir");
+    KeyFile::from_keypair_plain(&kp)
+        .save(&work_dir.path().join("validator-key.json"))
+        .expect("write validator key");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_helix"));
+    cmd.arg("start")
+        .current_dir(work_dir.path())
+        .env("HELIX_RPC_BIND", format!("127.0.0.1:{RPC_PORT}"))
+        .env("HELIX_P2P_LISTEN", format!("127.0.0.1:{P2P_PORT}"))
+        .env("HELIX_P2P_DISABLE_MDNS", "1")
+        .env("HELIX_NEW_CHAIN", "1")
+        .env("HELIX_BLOCK_TIME_MS", "200")
+        .env("HELIX_KEEP_BLOCKS", WINDOW.to_string())
+        .env("HELIX_RPC_RATE_LIMIT", "50000,20000")
+        .env("HELIX_MAX_PROPOSAL_BYTES", helix_core::fee::MAX_BLOCK_BYTES.to_string())
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let node = NodeGuard { child: cmd.spawn().expect("spawn helix node"), _work_dir: work_dir };
+    wait_until_reachable(Duration::from_secs(30)).await;
+
+    let chain_id = chain_id().await;
+    let base_fee = status().await.expect("status")["base_fee_per_byte"].as_u64().unwrap_or(1);
+    let client = reqwest::Client::new();
+    let mut nonce = 0u64;
+    let mut samples: Vec<(u64, u64)> = Vec::new();
+
+    // The window has to be *full* before any of this measures pruning — the first attempt at this
+    // test floods six times, reached height 179 against a window of 1000, and would have reported
+    // an archive node's growth as a plateau had the precondition below not caught it.
+    for _ in 0..600 {
+        if status().await.and_then(|s| s["height"].as_u64()).unwrap_or(0) > WINDOW + 50 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Eight rounds of "flood, let it drain, measure", all of them past the window, so every block
+    // written is also a block pruned.
+    for round in 0..8u64 {
+        let txs: Vec<Transaction> = (0..400)
+            .map(|i| signed_transfer(&kp, &sender, &recipient, 1_000, nonce + i, chain_id, base_fee, FEE_HEADROOM_MULTIPLE))
+            .collect();
+        nonce += 400;
+        for tx in &txs {
+            let _ = submit(&client, tx).await;
+        }
+        for _ in 0..200 {
+            if status().await.and_then(|s| s["mempool_size"].as_u64()).unwrap_or(1) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let h = status().await.and_then(|s| s["height"].as_u64()).unwrap_or(0);
+        let bytes = node.chain_db_bytes();
+        samples.push((h, bytes));
+        println!("  round {round}: height {h}, file {:.1} MB", bytes as f64 / 1048576.0);
+    }
+
+    let earliest = get_json(&format!("http://127.0.0.1:{RPC_PORT}/diagnostics"))
+        .await
+        .and_then(|d| d["earliest_block"].as_u64());
+    println!("earliest retained block: {earliest:?} (window {WINDOW})");
+    assert!(
+        earliest.is_some_and(|e| e > 0),
+        "the node never pruned anything, so this measured an archive node: earliest={earliest:?}"
+    );
+
+    // **Not** measured as bytes-per-block over a window, which is what the first version of this
+    // test did and why it failed against perfectly healthy behaviour: redb extends the file in
+    // *doubling steps*, measured here as four rounds flat at 32.6 MB, one jump, four flat at 64.8.
+    // Any average across that staircase is an artefact of where the window happens to fall.
+    //
+    // The claim worth testing is the one a disk budget rests on: the file holds a bounded window,
+    // not the whole chain. So it is compared against what the same chain would have cost unpruned.
+    let steps: Vec<String> = samples.iter().map(|(h, b)| format!("{h}:{:.0}MB", *b as f64 / 1048576.0)).collect();
+    println!("file over time: {}", steps.join(" "));
+
+    let (height, file_bytes) = *samples.last().expect("samples");
+    let retained = height - earliest.unwrap_or(0);
+    let unpruned_estimate = file_bytes as f64 * height as f64 / retained.max(1) as f64;
+    println!(
+        "height {height}, retaining {retained} blocks in {:.1} MB — the same chain unpruned would \
+         be about {:.1} MB",
+        file_bytes as f64 / 1048576.0,
+        unpruned_estimate / 1048576.0
+    );
+    assert!(
+        retained < height,
+        "nothing was dropped: retaining {retained} of {height} blocks is an archive node"
+    );
+    // The window is what bounds the file. A node retaining a quarter of the chain whose file is
+    // the size of the whole chain would mean freed pages are never reused — and then no block
+    // window, however small, keeps a promise about disk.
+    assert!(
+        (file_bytes as f64) < unpruned_estimate * 0.9,
+        "the file ({:.1} MB) is as large as the unpruned chain would be ({:.1} MB) — freed pages \
+         are not being reused, so HELIX_KEEP_BLOCKS bounds nothing an operator can see with df",
+        file_bytes as f64 / 1048576.0,
+        unpruned_estimate / 1048576.0
+    );
+}
+
+/// **The byte budget, against a real node rather than against arithmetic.**
+///
+/// `keep_blocks_for_budget` has unit tests, and they would all pass if nothing ever called it —
+/// that is the failure mode this repo has paid for twice (#147's teardown half, #151's tick
+/// counter). So this starts a node with a deliberately small `HELIX_KEEP_BYTES`, floods it well
+/// past that budget, and asks the only question that matters: did the file stop growing.
+///
+/// The budget is a *target*, not a hard ceiling, and the test is written to say so. redb extends
+/// its file in doubling steps — measured 32.6 → 64.8 MB — so a database whose content sits just
+/// under a step lands on the step above it. The assertion therefore allows the overshoot a
+/// doubling can produce and refuses anything beyond, because the failure being guarded against is
+/// unbounded growth, not a few megabytes of allocator granularity.
+#[tokio::test]
+#[ignore = "floods a node past a small disk budget and watches the file (~3-4 min) — run with --ignored --nocapture"]
+async fn a_disk_budget_stops_the_database_from_growing() {
+    // Chosen against `MIN_KEEP_BLOCKS`, not for roundness. The floor outranks the budget, so a
+    // budget below `1000 × bytes-per-block` can never bind and the test would measure the floor
+    // while believing it measured the budget — which is exactly what the first run did: height
+    // 271 against a floor of 1000, nothing pruned, `earliest_block: None`.
+    //
+    // On production the same arithmetic is harmless: 1000 blocks at the 1.9 MB a *full* block
+    // costs is 1.9 GB, well inside a 120 GB budget. It only bites at test scale.
+    const BUDGET_MB: u64 = 80;
+    let kp = KeyPair::generate();
+    let sender = Address::from_public_key(&kp.public);
+    let recipient = Address::from_public_key(&KeyPair::generate().public);
+
+    let work_dir = tempdir::TempDir::new().expect("temp work dir");
+    KeyFile::from_keypair_plain(&kp)
+        .save(&work_dir.path().join("validator-key.json"))
+        .expect("write validator key");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_helix"));
+    cmd.arg("start")
+        .current_dir(work_dir.path())
+        .env("HELIX_RPC_BIND", format!("127.0.0.1:{RPC_PORT}"))
+        .env("HELIX_P2P_LISTEN", format!("127.0.0.1:{P2P_PORT}"))
+        .env("HELIX_P2P_DISABLE_MDNS", "1")
+        .env("HELIX_NEW_CHAIN", "1")
+        .env("HELIX_BLOCK_TIME_MS", "200")
+        .env("HELIX_KEEP_BYTES", format!("{BUDGET_MB}M"))
+        .env("HELIX_RPC_RATE_LIMIT", "50000,20000")
+        .env("HELIX_MAX_PROPOSAL_BYTES", helix_core::fee::MAX_BLOCK_BYTES.to_string())
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let node = NodeGuard { child: cmd.spawn().expect("spawn helix node"), _work_dir: work_dir };
+    wait_until_reachable(Duration::from_secs(30)).await;
+
+    let chain_id = chain_id().await;
+    let base_fee = status().await.expect("status")["base_fee_per_byte"].as_u64().unwrap_or(1);
+    let client = reqwest::Client::new();
+    let mut nonce = 0u64;
+    let mut peak = 0u64;
+
+    // Past the floor before anything is measured, for the reason given on BUDGET_MB.
+    for _ in 0..900 {
+        if status().await.and_then(|s| s["height"].as_u64()).unwrap_or(0) > 1_500 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Ten rounds, each writing a slice of the budget. Without pruning the file would run well past
+    // it; with it, the window has to tighten and the file settle.
+    for round in 0..10u64 {
+        let txs: Vec<Transaction> = (0..500)
+            .map(|i| signed_transfer(&kp, &sender, &recipient, 1_000, nonce + i, chain_id, base_fee, FEE_HEADROOM_MULTIPLE))
+            .collect();
+        nonce += 500;
+        for tx in &txs {
+            let _ = submit(&client, tx).await;
+        }
+        for _ in 0..200 {
+            if status().await.and_then(|s| s["mempool_size"].as_u64()).unwrap_or(1) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let bytes = node.chain_db_bytes();
+        peak = peak.max(bytes);
+        let h = status().await.and_then(|s| s["height"].as_u64()).unwrap_or(0);
+        println!("  round {round}: height {h}, file {:.1} MB (budget {BUDGET_MB} MB)", bytes as f64 / 1048576.0);
+    }
+
+    let diag = get_json(&format!("http://127.0.0.1:{RPC_PORT}/diagnostics")).await;
+    let earliest = diag.as_ref().and_then(|d| d["earliest_block"].as_u64());
+    let height = status().await.and_then(|s| s["height"].as_u64()).unwrap_or(0);
+    println!("peak file {:.1} MB · height {height} · earliest retained {earliest:?}", peak as f64 / 1048576.0);
+
+    assert!(
+        earliest.is_some_and(|e| e > 0),
+        "the budget never pruned anything — it is not wired to the prune loop at all (earliest={earliest:?})"
+    );
+    // Written as tx rather than blocks: 5000 transactions at ~4.9 KB on disk is ~24 MB of payload
+    // alone, so a node that kept everything could not be under the budget by luck.
+    assert!(
+        nonce >= 5_000,
+        "precondition: the flood must exceed the budget several times over, sent {nonce}"
+    );
+    let ceiling = BUDGET_MB * 1024 * 1024 * 2;
+    assert!(
+        peak <= ceiling,
+        "the file reached {:.1} MB against a {BUDGET_MB} MB budget — more than one doubling step \
+         over, so this is unbounded growth rather than allocator granularity",
+        peak as f64 / 1048576.0
+    );
 }
