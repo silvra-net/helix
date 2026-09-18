@@ -23,13 +23,13 @@ use crate::blocksync::{
     BLOCKSYNC_PROTOCOL, MAX_BLOCKSYNC_BATCH,
 };
 use crate::config::P2PConfig;
+use crate::conn_limits::IpConnLimiter;
 use crate::genesis_sync::{GenesisCodec, GenesisProvider, GenesisResponse, GENESIS_PROTOCOL};
+use crate::peer_store;
+use crate::reputation::PeerReputation;
 use crate::roundsync::{
     RoundProvider, RoundSyncCodec, RoundSyncRequest, RoundSyncResponse, ROUNDSYNC_PROTOCOL,
 };
-use crate::conn_limits::IpConnLimiter;
-use crate::peer_store;
-use crate::reputation::PeerReputation;
 use crate::{
     P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_PEER_EXCHANGE,
     TOPIC_TRANSACTIONS, TOPIC_VOTES,
@@ -99,7 +99,10 @@ pub enum P2PCommand {
     /// itself: gossipsub publishes each message once and refuses to re-publish the same bytes for
     /// a minute, so the proposer's per-tick re-offer never reaches a node that was not listening
     /// during the one broadcast that counted. See the `roundsync` module.
-    RequestRoundSync { height: u64, round: u32 },
+    RequestRoundSync {
+        height: u64,
+        round: u32,
+    },
     /// The node could not verify the block-sync batch this peer served (backlog #140). The service
     /// cannot tell that by itself: from here a batch that fails verification and one that applies
     /// cleanly are both just a non-empty response. Without this the peer keeps being picked — it
@@ -317,15 +320,30 @@ impl P2PService {
         let committed_topic = gossipsub::IdentTopic::new(TOPIC_COMMITTED_BLOCKS);
         let peer_exchange_topic = gossipsub::IdentTopic::new(TOPIC_PEER_EXCHANGE);
 
-        swarm.behaviour_mut().gossipsub.subscribe(&block_topic)
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&block_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
-        swarm.behaviour_mut().gossipsub.subscribe(&tx_topic)
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&tx_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
-        swarm.behaviour_mut().gossipsub.subscribe(&vote_topic)
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&vote_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
-        swarm.behaviour_mut().gossipsub.subscribe(&committed_topic)
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&committed_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
-        swarm.behaviour_mut().gossipsub.subscribe(&peer_exchange_topic)
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&peer_exchange_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
 
         let listen_addr: Multiaddr = format!(
@@ -336,7 +354,8 @@ impl P2PService {
         .parse()
         .map_err(|e: libp2p::multiaddr::Error| P2PError::Transport(e.to_string()))?;
 
-        swarm.listen_on(listen_addr)
+        swarm
+            .listen_on(listen_addr)
             .map_err(|e| P2PError::Transport(e.to_string()))?;
 
         // Plaintext `/ws` on purpose: where this is used, TLS is terminated by the proxy in
@@ -347,7 +366,8 @@ impl P2PService {
             let ws_listen: Multiaddr = format!("/ip4/{}/tcp/{}/ws", ws_addr.ip(), ws_addr.port())
                 .parse()
                 .map_err(|e: libp2p::multiaddr::Error| P2PError::Transport(e.to_string()))?;
-            swarm.listen_on(ws_listen)
+            swarm
+                .listen_on(ws_listen)
                 .map_err(|e| P2PError::Transport(e.to_string()))?;
             info!(ws_listen = %ws_addr, "P2P WebSocket listener started");
         }
@@ -1444,7 +1464,13 @@ fn redial_targets(
         targets.extend(rest);
     } else {
         let start = (rotation * MAX_KNOWN_REDIALS_PER_TICK) % rest.len();
-        targets.extend(rest.iter().cycle().skip(start).take(MAX_KNOWN_REDIALS_PER_TICK).cloned());
+        targets.extend(
+            rest.iter()
+                .cycle()
+                .skip(start)
+                .take(MAX_KNOWN_REDIALS_PER_TICK)
+                .cloned(),
+        );
     }
     targets
 }
@@ -1456,7 +1482,11 @@ fn redial_targets(
 ///
 /// It cannot say *which* peer — the gossiped message carries no sender identity — only that
 /// *some* peer on the network runs a different build, which is the fact an operator needs.
-fn foreign_version_warning(their: &str, ours: &str, warned: &mut HashSet<String>) -> Option<String> {
+fn foreign_version_warning(
+    their: &str,
+    ours: &str,
+    warned: &mut HashSet<String>,
+) -> Option<String> {
     if their == ours || !warned.insert(their.to_string()) {
         return None;
     }
@@ -1676,12 +1706,16 @@ fn handle_peer_exchange_message(
 
     // Catch a peer that upgraded (or downgraded) while we keep running — the gap join-time
     // `peer_version_warning` cannot see (#109).
-    if let Some(warning) = foreign_version_warning(&msg.version, OUR_VERSION, &mut warnings.versions) {
+    if let Some(warning) =
+        foreign_version_warning(&msg.version, OUR_VERSION, &mut warnings.versions)
+    {
         warn!("{warning}");
     }
 
     // And catch the peer that is not on this chain at all.
-    if let Some(warning) = foreign_chain_warning(&msg.genesis_hash, our_genesis, &mut warnings.chains) {
+    if let Some(warning) =
+        foreign_chain_warning(&msg.genesis_hash, our_genesis, &mut warnings.chains)
+    {
         warn!("{warning}");
     }
 
@@ -1861,7 +1895,11 @@ struct FlapTracker {
 
 impl FlapTracker {
     fn new(now: std::time::Instant) -> Self {
-        FlapTracker { window_start: now, reconnects: HashMap::new(), warned: HashSet::new() }
+        FlapTracker {
+            window_start: now,
+            reconnects: HashMap::new(),
+            warned: HashSet::new(),
+        }
     }
 
     /// Records a reconnect and reports whether this peer has just crossed the threshold — `true`
@@ -1887,7 +1925,10 @@ impl FlapTracker {
 /// would hold a caught-up node out of block production indefinitely.
 fn publish_highest_peer_tip(slot: &Option<Arc<AtomicU64>>, peer_tips: &HashMap<PeerId, PeerRange>) {
     if let Some(slot) = slot {
-        slot.store(peer_tips.values().map(|r| r.tip).max().unwrap_or(0), Ordering::Relaxed);
+        slot.store(
+            peer_tips.values().map(|r| r.tip).max().unwrap_or(0),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -1991,14 +2032,23 @@ fn record_peer_tip(
     }
     match source {
         TipSource::PeerExchange => {
-            peer_tips.insert(origin, PeerRange { tip: height, earliest });
+            peer_tips.insert(
+                origin,
+                PeerRange {
+                    tip: height,
+                    earliest,
+                },
+            );
         }
         TipSource::GossipedBlock => {
             // A gossiped block says where this peer's chain *ends*, and nothing whatever about
             // where it begins — so the horizon is left at whatever peer exchange last said, and
             // set to 0 ("ask me for anything") only when this is the first we hear of the peer.
             // Letting a block move it would let a proposal quietly widen a pruning node's claim.
-            let entry = peer_tips.entry(origin).or_insert(PeerRange { tip: height, earliest: 0 });
+            let entry = peer_tips.entry(origin).or_insert(PeerRange {
+                tip: height,
+                earliest: 0,
+            });
             if entry.tip < height {
                 entry.tip = height;
             }
@@ -2071,10 +2121,13 @@ fn request_blocks_if_behind(
         peer_tip,
         "Requesting missing blocks from a peer that is ahead"
     );
-    swarm
-        .behaviour_mut()
-        .blocksync
-        .send_request(&peer, BlockSyncRequest { from_height: our_tip + 1, count });
+    swarm.behaviour_mut().blocksync.send_request(
+        &peer,
+        BlockSyncRequest {
+            from_height: our_tip + 1,
+            count,
+        },
+    );
     *in_flight = true;
     true
 }
@@ -2146,11 +2199,17 @@ struct AppMessageOutcome {
 
 impl AppMessageOutcome {
     fn malformed() -> Self {
-        AppMessageOutcome { malformed: true, observed_height: None }
+        AppMessageOutcome {
+            malformed: true,
+            observed_height: None,
+        }
     }
 
     fn clean(observed_height: Option<u64>) -> Self {
-        AppMessageOutcome { malformed: false, observed_height }
+        AppMessageOutcome {
+            malformed: false,
+            observed_height,
+        }
     }
 }
 
@@ -2176,7 +2235,11 @@ async fn handle_app_message(
     if topic == TOPIC_BLOCKS {
         match bincode::deserialize::<Proposal>(data) {
             Ok(proposal) => {
-                debug!(height = proposal.block.height(), round = proposal.round, "Proposal from peer");
+                debug!(
+                    height = proposal.block.height(),
+                    round = proposal.round,
+                    "Proposal from peer"
+                );
                 let proposed = proposal.block.height();
                 let _ = event_tx.send(P2PEvent::NewProposal(proposal)).await;
                 AppMessageOutcome::clean(proposed.checked_sub(1))
@@ -2211,9 +2274,15 @@ async fn handle_app_message(
     } else if topic == TOPIC_COMMITTED_BLOCKS {
         match bincode::deserialize::<(Block, Vec<Vote>)>(data) {
             Ok((block, commit)) => {
-                debug!(height = block.height(), commit_sigs = commit.len(), "Committed block from peer");
+                debug!(
+                    height = block.height(),
+                    commit_sigs = commit.len(),
+                    "Committed block from peer"
+                );
                 let committed = block.height();
-                let _ = event_tx.send(P2PEvent::NewCommittedBlock(block, commit)).await;
+                let _ = event_tx
+                    .send(P2PEvent::NewCommittedBlock(block, commit))
+                    .await;
                 AppMessageOutcome::clean(Some(committed))
             }
             Err(e) => {
@@ -2244,7 +2313,11 @@ mod highest_peer_tip_tests {
 
         publish_highest_peer_tip(&Some(slot.clone()), &tips);
 
-        assert_eq!(slot.load(Ordering::Relaxed), 900, "the maximum, not the last one seen");
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            900,
+            "the maximum, not the last one seen"
+        );
     }
 
     /// The reason this is recomputed on *every* change to `peer_tips` rather than only on insert:
@@ -2264,7 +2337,11 @@ mod highest_peer_tip_tests {
 
         tips.remove(&leaving);
         publish_highest_peer_tip(&Some(slot.clone()), &tips);
-        assert_eq!(slot.load(Ordering::Relaxed), 100, "the claim must leave with the peer");
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            100,
+            "the claim must leave with the peer"
+        );
     }
 
     /// No peers, no claim — and specifically 0, which the node reads as "nothing to compare
@@ -2376,9 +2453,20 @@ mod flap_tracker_tests {
 
         // One reconnect in the next window: counted fresh, and the old bookkeeping is gone.
         let later = t0 + FLAP_WINDOW + Duration::from_secs(1);
-        assert!(!tracker.note_reconnect(peer, later), "a new window starts from zero");
-        assert_eq!(tracker.reconnects.len(), 1, "old counts must not accumulate");
-        assert_eq!(tracker.warned.len(), 0, "and the peer can be reported again if it keeps at it");
+        assert!(
+            !tracker.note_reconnect(peer, later),
+            "a new window starts from zero"
+        );
+        assert_eq!(
+            tracker.reconnects.len(),
+            1,
+            "old counts must not accumulate"
+        );
+        assert_eq!(
+            tracker.warned.len(),
+            0,
+            "and the peer can be reported again if it keeps at it"
+        );
     }
 }
 
@@ -2471,7 +2559,10 @@ mod peer_exchange_tests {
 
         let decoded = decode_peer_exchange(&bytes).expect("the previous shape must stay readable");
         assert_eq!(decoded.tip_height, 166_000);
-        assert_eq!(decoded.genesis_hash, "abc123", "and it must not lose the field it did carry");
+        assert_eq!(
+            decoded.genesis_hash, "abc123",
+            "and it must not lose the field it did carry"
+        );
         assert_eq!(
             decoded.earliest_block, 0,
             "a build that predates pruning keeps everything — that is knowledge, not a guess",
@@ -2497,7 +2588,10 @@ mod peer_exchange_tests {
             "premise: the older struct accepts these bytes, which is why order matters",
         );
         let decoded = decode_peer_exchange(&bytes).expect("must decode");
-        assert_eq!(decoded.earliest_block, 150_000, "the horizon must survive the round trip");
+        assert_eq!(
+            decoded.earliest_block, 150_000,
+            "the horizon must survive the round trip"
+        );
     }
 
     /// The production incident in one assertion (#137): a validator one block behind the rest of
@@ -2564,8 +2658,9 @@ mod peer_exchange_tests {
             None,
             "a quiet stretch shorter than the threshold is a slow batch, not a stall"
         );
-        let stall = super::blocksync_stall_report(100, Some(140), true, super::BLOCKSYNC_STALL_TICKS)
-            .expect("at the threshold it must speak");
+        let stall =
+            super::blocksync_stall_report(100, Some(140), true, super::BLOCKSYNC_STALL_TICKS)
+                .expect("at the threshold it must speak");
         assert_eq!(stall.behind, 40);
         assert_eq!(stall.ticks, super::BLOCKSYNC_STALL_TICKS);
     }
@@ -2576,12 +2671,20 @@ mod peer_exchange_tests {
     /// opposite causes. The report carries that bit through untouched.
     #[test]
     fn the_report_says_whether_this_node_is_asking_at_all() {
-        let asking = super::blocksync_stall_report(100, Some(140), true, super::BLOCKSYNC_STALL_TICKS)
-            .expect("behind and stalled");
-        let silent = super::blocksync_stall_report(100, Some(140), false, super::BLOCKSYNC_STALL_TICKS)
-            .expect("behind and stalled");
-        assert!(asking.requesting, "a request is outstanding — the peers or the link are the suspects");
-        assert!(!silent.requesting, "nobody is being asked — the suspect is this node");
+        let asking =
+            super::blocksync_stall_report(100, Some(140), true, super::BLOCKSYNC_STALL_TICKS)
+                .expect("behind and stalled");
+        let silent =
+            super::blocksync_stall_report(100, Some(140), false, super::BLOCKSYNC_STALL_TICKS)
+                .expect("behind and stalled");
+        assert!(
+            asking.requesting,
+            "a request is outstanding — the peers or the link are the suspects"
+        );
+        assert!(
+            !silent.requesting,
+            "nobody is being asked — the suspect is this node"
+        );
         assert_ne!(
             asking, silent,
             "the two situations must not produce the same line"
@@ -2650,7 +2753,10 @@ mod peer_exchange_tests {
 
     fn peer(n: u8) -> libp2p::PeerId {
         // Deterministic distinct ids; the bytes themselves are irrelevant to the selection logic.
-        libp2p::identity::Keypair::ed25519_from_bytes([n; 32]).unwrap().public().to_peer_id()
+        libp2p::identity::Keypair::ed25519_from_bytes([n; 32])
+            .unwrap()
+            .public()
+            .to_peer_id()
     }
 
     /// No peer is sitting anything out — the default state, and what every test that is not about
@@ -2671,11 +2777,19 @@ mod peer_exchange_tests {
         tips.insert(peer(3), at(90)); // behind us — still must not be picked
 
         let (chosen, _) = super::best_blocksync_peer(&tips, 100, &no_cooldown(), |_| true).unwrap();
-        assert_eq!(chosen, peer(1), "precondition: the highest tip wins when nobody is penalised");
+        assert_eq!(
+            chosen,
+            peer(1),
+            "precondition: the highest tip wins when nobody is penalised"
+        );
 
         let cooling: std::collections::HashMap<_, _> = [(peer(1), 5)].into_iter().collect();
         let (chosen, tip) = super::best_blocksync_peer(&tips, 100, &cooling, |_| true).unwrap();
-        assert_eq!(chosen, peer(2), "the failing peer must not hold up catch-up");
+        assert_eq!(
+            chosen,
+            peer(2),
+            "the failing peer must not hold up catch-up"
+        );
         assert_eq!(tip, 129);
     }
 
@@ -2696,7 +2810,11 @@ mod peer_exchange_tests {
         // One tick later peer(2) has served its penalty — the driver's `retain` drops it at zero.
         let cooling: std::collections::HashMap<_, _> = [(peer(1), 4)].into_iter().collect();
         let (chosen, _) = super::best_blocksync_peer(&tips, 100, &cooling, |_| true).unwrap();
-        assert_eq!(chosen, peer(2), "catch-up has to resume on its own, without a reconnect");
+        assert_eq!(
+            chosen,
+            peer(2),
+            "catch-up has to resume on its own, without a reconnect"
+        );
     }
 
     /// Nobody ahead of us is the healthy steady state, and it must produce no request at all —
@@ -2715,14 +2833,21 @@ mod peer_exchange_tests {
         tips.insert(peer(1), at(105));
         tips.insert(peer(2), at(130));
         tips.insert(peer(3), at(90)); // behind us — must not be picked
-        let (chosen, tip) = super::best_blocksync_peer(&tips, 100, &no_cooldown(), |_| true).unwrap();
+        let (chosen, tip) =
+            super::best_blocksync_peer(&tips, 100, &no_cooldown(), |_| true).unwrap();
         assert_eq!(chosen, peer(2));
         assert_eq!(tip, 130);
     }
 
     #[test]
     fn with_no_known_peers_there_is_nobody_to_ask() {
-        assert!(super::best_blocksync_peer(&std::collections::HashMap::new(), 0, &no_cooldown(), |_| true).is_none());
+        assert!(super::best_blocksync_peer(
+            &std::collections::HashMap::new(),
+            0,
+            &no_cooldown(),
+            |_| true
+        )
+        .is_none());
     }
 
     /// The exact production shape: one block behind, so ask for exactly one block.
@@ -2752,9 +2877,20 @@ mod peer_exchange_tests {
         // Tip mid-epoch: blocks (200, 300] share one signing set, so from 262 we may ask for 300−262+1.
         let our_tip = 2 * epoch + 62; // 262
         let count = super::blocksync_request_count(our_tip, our_tip + 5_000);
-        assert_eq!(u64::from(count), (3 * epoch) - our_tip, "must stop at the boundary at 3·L");
-        assert_eq!(our_tip + u64::from(count), 3 * epoch, "last requested block is the boundary itself");
-        assert!(u64::from(count) < epoch, "and is therefore shorter than a full batch");
+        assert_eq!(
+            u64::from(count),
+            (3 * epoch) - our_tip,
+            "must stop at the boundary at 3·L"
+        );
+        assert_eq!(
+            our_tip + u64::from(count),
+            3 * epoch,
+            "last requested block is the boundary itself"
+        );
+        assert!(
+            u64::from(count) < epoch,
+            "and is therefore shorter than a full batch"
+        );
     }
 
     /// Sitting exactly on a boundary, the next group is a full epoch and may be requested whole —
@@ -2791,7 +2927,9 @@ mod peer_exchange_tests {
     fn a_peer_on_another_chain_is_reported_once() {
         let mut warned = HashSet::new();
         let first = foreign_chain_warning("aaaa", "bbbb", &mut warned);
-        assert!(first.expect("a different genesis must be reported").contains("DIFFERENT CHAIN"));
+        assert!(first
+            .expect("a different genesis must be reported")
+            .contains("DIFFERENT CHAIN"));
         assert!(
             foreign_chain_warning("aaaa", "bbbb", &mut warned).is_none(),
             "the same mismatch arrives every 30 seconds — it must be logged once",
@@ -2833,8 +2971,16 @@ mod peer_exchange_tests {
     fn a_peer_that_did_not_say_which_chain_it_is_on_is_not_treated_as_foreign() {
         assert_eq!(peer_chain("aaaa", "aaaa"), PeerChain::Same);
         assert_eq!(peer_chain("aaaa", "bbbb"), PeerChain::Foreign);
-        assert_eq!(peer_chain("", "bbbb"), PeerChain::Unknown, "did not say ≠ different");
-        assert_eq!(peer_chain("aaaa", ""), PeerChain::Unknown, "we have no genesis yet");
+        assert_eq!(
+            peer_chain("", "bbbb"),
+            PeerChain::Unknown,
+            "did not say ≠ different"
+        );
+        assert_eq!(
+            peer_chain("aaaa", ""),
+            PeerChain::Unknown,
+            "we have no genesis yet"
+        );
     }
 
     /// The behaviour that cost 12 hours of log noise after the 2026-08-07 reset: a node at height 70
@@ -2845,9 +2991,18 @@ mod peer_exchange_tests {
         let ours = "6860abda";
         let foreign = msg_announcing(36378, "ff271e4a");
         let outcome = tip_outcome(&foreign, 70, ours);
-        assert_eq!(outcome.announced_range, None, "a foreign tip must not drive our sync");
-        assert_eq!(outcome.serve_from_tip, None, "nor make us serve blocks it cannot use");
-        assert!(!outcome.malformed, "it is a well-formed message from a peer on another chain");
+        assert_eq!(
+            outcome.announced_range, None,
+            "a foreign tip must not drive our sync"
+        );
+        assert_eq!(
+            outcome.serve_from_tip, None,
+            "nor make us serve blocks it cannot use"
+        );
+        assert!(
+            !outcome.malformed,
+            "it is a well-formed message from a peer on another chain"
+        );
 
         // Positive control: the identical message from a peer on our chain still counts. Without
         // this, the test above would pass just as well if tips had stopped working altogether.
@@ -2872,7 +3027,10 @@ mod peer_exchange_tests {
     fn an_unreadable_peer_exchange_reads_as_an_old_build_before_it_reads_as_abuse() {
         let (message, strike) = unreadable_peer_exchange("12D3KooWpeer", 1);
         let message = message.expect("the first one has to say something");
-        assert!(message.contains("older than 0.9.0"), "must name the likely cause: {message}");
+        assert!(
+            message.contains("older than 0.9.0"),
+            "must name the likely cause: {message}"
+        );
         assert!(message.contains("cannot read"), "{message}");
         assert!(
             !message.contains("Malformed"),
@@ -2918,7 +3076,10 @@ mod peer_exchange_tests {
         assert_eq!(decoded.version, "0.10.0");
         assert_eq!(decoded.tip_height, 4419);
         assert_eq!(decoded.peers, old.peers);
-        assert!(decoded.genesis_hash.is_empty(), "it did not say, and must not appear to have");
+        assert!(
+            decoded.genesis_hash.is_empty(),
+            "it did not say, and must not appear to have"
+        );
     }
 
     #[test]
@@ -2931,7 +3092,10 @@ mod peer_exchange_tests {
             earliest_block: 0,
         };
         let bytes = bincode::serialize(&msg).expect("serializes");
-        assert_eq!(decode_peer_exchange(&bytes).unwrap().genesis_hash, "ff271e4a");
+        assert_eq!(
+            decode_peer_exchange(&bytes).unwrap().genesis_hash,
+            "ff271e4a"
+        );
     }
 
     /// The control that keeps the fallback honest: genuine rubbish must still be malformed, or the
@@ -2953,8 +3117,14 @@ mod peer_exchange_tests {
     fn a_differing_version_warns_once_then_stays_quiet() {
         let mut warned = HashSet::new();
         let first = foreign_version_warning("0.9.0", "0.8.13", &mut warned);
-        assert!(first.is_some(), "the first sight of a foreign version must warn");
-        assert!(first.unwrap().contains("0.9.0"), "the warning names the peer's version");
+        assert!(
+            first.is_some(),
+            "the first sight of a foreign version must warn"
+        );
+        assert!(
+            first.unwrap().contains("0.9.0"),
+            "the warning names the peer's version"
+        );
         // The same mismatch keeps arriving every 30s on the peer-exchange tick — it must not
         // re-warn each time (#109).
         assert!(
@@ -3009,7 +3179,6 @@ mod peer_exchange_tests {
     }
 }
 
-
 /// Build the libp2p swarm every Helix endpoint uses — the long-lived [`P2PService`] and the
 /// one-shot genesis bootstrap in [`crate::genesis_bootstrap`] alike.
 ///
@@ -3034,10 +3203,7 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
         // `/ws` or `/tls/ws` peer must work for every node, including ones that are not
         // themselves reachable that way. A node that only listens on raw TCP still has to
         // be able to reach a tunnelled peer.
-        .with_websocket(
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )
+        .with_websocket(libp2p::noise::Config::new, libp2p::yamux::Config::default)
         .await
         .map_err(|e| P2PError::Transport(e.to_string()))?
         .with_behaviour(|key| {
@@ -3072,11 +3238,8 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
 
             let mdns: Toggle<mdns::tokio::Behaviour> = if config.enable_mdns {
                 Some(
-                    mdns::tokio::Behaviour::new(
-                        mdns::Config::default(),
-                        key.public().to_peer_id(),
-                    )
-                    .expect("mdns behaviour is valid"),
+                    mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())
+                        .expect("mdns behaviour is valid"),
                 )
                 .into()
             } else {
@@ -3098,15 +3261,13 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
             let blocksync = request_response::Behaviour::with_codec(
                 BlockSyncCodec,
                 [(BLOCKSYNC_PROTOCOL, request_response::ProtocolSupport::Full)],
-                request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(30)),
+                request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
             );
 
             let genesis_sync = request_response::Behaviour::with_codec(
                 GenesisCodec,
                 [(GENESIS_PROTOCOL, request_response::ProtocolSupport::Full)],
-                request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(30)),
+                request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
             );
 
             // Short timeout, unlike the two above: this request only has value inside the round
@@ -3116,8 +3277,7 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
             let roundsync = request_response::Behaviour::with_codec(
                 RoundSyncCodec,
                 [(ROUNDSYNC_PROTOCOL, request_response::ProtocolSupport::Full)],
-                request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(5)),
+                request_response::Config::default().with_request_timeout(Duration::from_secs(5)),
             );
 
             HelixBehaviour {
@@ -3335,8 +3495,9 @@ mod observed_height_tests {
     #[tokio::test]
     async fn a_committed_block_claims_its_own_height() {
         let (tx, _rx) = mpsc::channel(4);
-        let data = bincode::serialize(&(block_at(4_200), Vec::<helix_consensus::vote::Vote>::new()))
-            .unwrap();
+        let data =
+            bincode::serialize(&(block_at(4_200), Vec::<helix_consensus::vote::Vote>::new()))
+                .unwrap();
 
         let outcome = handle_app_message(TOPIC_COMMITTED_BLOCKS, &data, &tx).await;
 
@@ -3403,15 +3564,32 @@ mod peer_tip_gate_tests {
         foreign.insert(zombie);
 
         assert!(
-            !super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, 0, TipSource::PeerExchange),
+            !super::record_peer_tip(
+                &mut tips,
+                &foreign,
+                zombie,
+                280_941,
+                0,
+                TipSource::PeerExchange
+            ),
             "peer exchange from a peer on another history must not set a tip",
         );
         assert!(
-            !super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, 0, TipSource::GossipedBlock),
+            !super::record_peer_tip(
+                &mut tips,
+                &foreign,
+                zombie,
+                280_941,
+                0,
+                TipSource::GossipedBlock
+            ),
             "a gossiped block is the same claim through a different door — it must not set a tip \
              either, or the exclusion undoes itself on the peer's next proposal",
         );
-        assert!(tips.is_empty(), "an excluded peer must leave no tip behind at all");
+        assert!(
+            tips.is_empty(),
+            "an excluded peer must leave no tip behind at all"
+        );
     }
 
     /// Live reproduction of the 2026-09-02 loop: exclude, then let the peer gossip. Before the
@@ -3424,18 +3602,42 @@ mod peer_tip_gate_tests {
         let mut foreign: HashSet<PeerId> = HashSet::new();
 
         // Both peers announce; the zombie claims the far higher tip, so it wins on merit.
-        super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, 0, TipSource::PeerExchange);
-        super::record_peer_tip(&mut tips, &foreign, honest, 27_960, 0, TipSource::PeerExchange);
+        super::record_peer_tip(
+            &mut tips,
+            &foreign,
+            zombie,
+            280_941,
+            0,
+            TipSource::PeerExchange,
+        );
+        super::record_peer_tip(
+            &mut tips,
+            &foreign,
+            honest,
+            27_960,
+            0,
+            TipSource::PeerExchange,
+        );
         let (chosen, _) =
             super::best_blocksync_peer(&tips, 27_954, &no_cooldown(), |_| true).unwrap();
-        assert_eq!(chosen, zombie, "positive control: the highest claimed tip wins");
+        assert_eq!(
+            chosen, zombie,
+            "positive control: the highest claimed tip wins"
+        );
 
         // Its batch did not chain. This is what `BlocksyncPeerOnAnotherChain` does.
         foreign.insert(zombie);
         tips.remove(&zombie);
 
         // Now it proposes a block, exactly as the real one did every couple of minutes.
-        super::record_peer_tip(&mut tips, &foreign, zombie, 280_941, 0, TipSource::GossipedBlock);
+        super::record_peer_tip(
+            &mut tips,
+            &foreign,
+            zombie,
+            280_941,
+            0,
+            TipSource::GossipedBlock,
+        );
 
         let (chosen, _) =
             super::best_blocksync_peer(&tips, 27_954, &no_cooldown(), |_| true).unwrap();
@@ -3455,11 +3657,25 @@ mod peer_tip_gate_tests {
         let mut tips: HashMap<PeerId, PeerRange> = HashMap::new();
         let foreign: HashSet<PeerId> = HashSet::new();
 
-        super::record_peer_tip(&mut tips, &foreign, pruner, 166_000, 150_000, TipSource::PeerExchange);
+        super::record_peer_tip(
+            &mut tips,
+            &foreign,
+            pruner,
+            166_000,
+            150_000,
+            TipSource::PeerExchange,
+        );
         assert_eq!(tips.get(&pruner), Some(&holding(150_000, 166_000)));
 
         // Its next proposal arrives. Only the tip may move.
-        super::record_peer_tip(&mut tips, &foreign, pruner, 166_010, 0, TipSource::GossipedBlock);
+        super::record_peer_tip(
+            &mut tips,
+            &foreign,
+            pruner,
+            166_010,
+            0,
+            TipSource::GossipedBlock,
+        );
         assert_eq!(
             tips.get(&pruner),
             Some(&holding(150_000, 166_010)),
@@ -3475,7 +3691,14 @@ mod peer_tip_gate_tests {
         let mut tips: HashMap<PeerId, PeerRange> = HashMap::new();
         let foreign: HashSet<PeerId> = HashSet::new();
 
-        assert!(super::record_peer_tip(&mut tips, &foreign, peer, 100, 0, TipSource::GossipedBlock));
+        assert!(super::record_peer_tip(
+            &mut tips,
+            &foreign,
+            peer,
+            100,
+            0,
+            TipSource::GossipedBlock
+        ));
         assert_eq!(tips.get(&peer), Some(&at(100)));
 
         super::record_peer_tip(&mut tips, &foreign, peer, 90, 0, TipSource::GossipedBlock);
@@ -3522,13 +3745,19 @@ mod redial_target_tests {
     /// learns to skip exactly the lines that matter.
     #[test]
     fn the_redial_line_repeats_at_zero_peers_and_speaks_once_per_change_above_it() {
-        assert!(redial_verdict(0, None).log, "the first line at zero must be spoken");
+        assert!(
+            redial_verdict(0, None).log,
+            "the first line at zero must be spoken"
+        );
         assert!(
             redial_verdict(0, Some(0)).log,
             "at zero it must keep speaking — an operator watching peer_count: 0 needs the cadence",
         );
 
-        assert!(redial_verdict(1, None).log, "the first line at one peer must be spoken");
+        assert!(
+            redial_verdict(1, None).log,
+            "the first line at one peer must be spoken"
+        );
         assert!(
             !redial_verdict(1, Some(1)).log,
             "an unchanged count above zero must stay quiet instead of repeating every 30 s",
@@ -3559,7 +3788,11 @@ mod redial_target_tests {
     #[test]
     fn a_node_without_seeds_still_redials_the_addresses_it_knows() {
         let targets = redial_targets(&[], &known(&[8546, 8547]), &[], 0);
-        assert_eq!(targets.len(), 2, "every known address must be dialed: {targets:?}");
+        assert_eq!(
+            targets.len(),
+            2,
+            "every known address must be dialed: {targets:?}"
+        );
         assert!(targets.contains(&ma(8546)) && targets.contains(&ma(8547)));
     }
 
@@ -3576,7 +3809,11 @@ mod redial_target_tests {
             &[own_configured.as_str(), own_probed.as_str()],
             0,
         );
-        assert_eq!(targets, vec![ma(8546)], "only the foreign address may be dialed");
+        assert_eq!(
+            targets,
+            vec![ma(8546)],
+            "only the foreign address may be dialed"
+        );
     }
 
     /// The seeds keep their precedence and are not dialed twice when they are also remembered —
@@ -3615,6 +3852,10 @@ mod redial_target_tests {
             );
             reached.extend(targets.into_iter().skip(1));
         }
-        assert_eq!(reached.len(), ports.len(), "the rotation must reach every known address");
+        assert_eq!(
+            reached.len(),
+            ports.len(),
+            "the rotation must reach every known address"
+        );
     }
 }

@@ -54,7 +54,8 @@ fn config_announcing(port: u16, seeds: Vec<u16>, store: Option<std::path::PathBu
 }
 
 fn spawn(cfg: P2PConfig) -> tokio::sync::mpsc::Receiver<P2PEvent> {
-    let (service, _cmd, events) = P2PService::new(cfg, Arc::new(AtomicU64::new(0)), Arc::new(NoBlocks));
+    let (service, _cmd, events) =
+        P2PService::new(cfg, Arc::new(AtomicU64::new(0)), Arc::new(NoBlocks));
     tokio::spawn(async move { service.run().await });
     events
 }
@@ -164,7 +165,9 @@ async fn connected_to_a_peer_other_than(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-            Ok(Some(P2PEvent::PeerConnected(peer))) if Some(peer.as_str()) != not => return Some(peer),
+            Ok(Some(P2PEvent::PeerConnected(peer))) if Some(peer.as_str()) != not => {
+                return Some(peer)
+            }
             Ok(Some(_)) => continue,
             Ok(None) => return None,
             Err(_) => continue,
@@ -200,8 +203,12 @@ fn spawn_host(port: u16) -> tokio::task::JoinHandle<()> {
 
 fn spawn_with_handle(
     cfg: P2PConfig,
-) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<P2PEvent>) {
-    let (service, _cmd, events) = P2PService::new(cfg, Arc::new(AtomicU64::new(0)), Arc::new(NoBlocks));
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Receiver<P2PEvent>,
+) {
+    let (service, _cmd, events) =
+        P2PService::new(cfg, Arc::new(AtomicU64::new(0)), Arc::new(NoBlocks));
     let handle = tokio::spawn(async move {
         let _ = service.run().await;
     });
@@ -305,7 +312,8 @@ async fn connected_to_a_new_peer(
 /// zero-peer test, which already passes.
 #[tokio::test]
 async fn a_node_that_still_has_one_peer_redials_the_one_it_lost() {
-    let dir = std::env::temp_dir().join(format!("helix-peer-underconnected-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("helix-peer-underconnected-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let store = dir.join("peers.txt");
     helix_p2p::peer_store::save(

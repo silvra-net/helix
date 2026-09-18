@@ -176,8 +176,16 @@ mod tests {
     /// An unchanged set must produce an unchanged file, or every save looks like news.
     #[test]
     fn the_same_peers_render_the_same_file() {
-        let a = set(&["/ip4/9.9.9.9/tcp/1", "/ip4/1.1.1.1/tcp/2", "/ip4/5.5.5.5/tcp/3"]);
-        let b = set(&["/ip4/5.5.5.5/tcp/3", "/ip4/9.9.9.9/tcp/1", "/ip4/1.1.1.1/tcp/2"]);
+        let a = set(&[
+            "/ip4/9.9.9.9/tcp/1",
+            "/ip4/1.1.1.1/tcp/2",
+            "/ip4/5.5.5.5/tcp/3",
+        ]);
+        let b = set(&[
+            "/ip4/5.5.5.5/tcp/3",
+            "/ip4/9.9.9.9/tcp/1",
+            "/ip4/1.1.1.1/tcp/2",
+        ]);
         assert_eq!(render(&a), render(&b));
     }
 
