@@ -43,7 +43,57 @@ pub const UNBONDING_PERIOD: u64 = 302_400;
 /// there. 1800 blocks is ~30 minutes at the measured cadence and an hour at the nominal one,
 /// which clears a reboot and an unattended upgrade with room to spare. It is still far stricter
 /// than Cosmos SDK's own default, which tolerates 9500 missed blocks in a 10000-block window.
-pub const DOWNTIME_JAIL_THRESHOLD_BLOCKS: u32 = 1_800;
+/// **Doubled from 1800 on 2026-09-18 because the counter below stopped being a streak.** A miss
+/// now adds [`MISS_WEIGHT`] and a signature subtracts [`PARTICIPATION_CREDIT`], so the same 3600
+/// is reached after exactly 1800 consecutively missed blocks — the behaviour this constant had
+/// before, unchanged for the case it was written for.
+pub const DOWNTIME_JAIL_THRESHOLD_BLOCKS: u32 = 3_600;
+
+/// What a missed block adds to a validator's counter, against [`PARTICIPATION_CREDIT`] subtracted
+/// for a signature. The ratio *is* the rule: the counter grows while participation is below
+/// `MISS_WEIGHT / (MISS_WEIGHT + PARTICIPATION_CREDIT)` = **two thirds**, and shrinks
+/// above it.
+///
+/// Two thirds is derived, not chosen. It is what the quorum asks of the set, so it is the least a
+/// member can deliver and still be worth its seat — below it, a validator is consuming quorum
+/// power it does not supply.
+///
+/// **Why this replaced a reset-to-zero, measured on production 2026-09-18.** The counter used to
+/// be cleared outright on any signature, which made it a *streak* of consecutive misses. A
+/// validator that misses 92.5 % of blocks but signs one every thirteenth therefore never
+/// accumulated anything: `hlxnrvu5…` sat at `missed_blocks: 4` against a threshold of 1800 while
+/// proposing **0 of 300** blocks and co-signing 15 of 199. It cost the chain a lost round every
+/// sixth height — measured 4.29 s/block against a 2 s target — and, by occupying a full share of
+/// the quorum denominator, the set's entire fault tolerance: six validators, five signing, five
+/// needed.
+///
+/// That is a perverse incentive and it is the point of this change. A validator that dies
+/// outright crosses the threshold and is jailed, and the chain recovers. One that is merely
+/// unreliable stayed forever — and was the more expensive of the two. Both are now measured the
+/// same way, by what they deliver rather than by whether they ever pause.
+///
+/// It also keeps the property the threshold was raised for on 2026-09-01: a healthy node that
+/// goes away for a reboot, an upgrade or an I/O stall pays the counter down again on its return
+/// (at 90 % participation it drains by 0.7 per block), so routine interruptions still do not jail
+/// the operators who are actually there.
+///
+/// Cosmos SDK reaches the same shape from the other side — 9500 missed blocks in a 10000-block
+/// window — but a sliding window has to store the window. A leaky bucket needs one integer per
+/// validator, which is what the state already carried.
+pub const MISS_WEIGHT: u32 = 2;
+
+/// What a signature subtracts; see [`MISS_WEIGHT`] for the ratio and why it is two thirds.
+pub const PARTICIPATION_CREDIT: u32 = 1;
+
+/// Consecutive absences that jail a validator signing nothing at all — the number
+/// [`DOWNTIME_JAIL_THRESHOLD_BLOCKS`] meant before it became a weighted debt, and the one to
+/// reason in when asking "how long may a node be away?".
+///
+/// Exported because tests that walk a validator to the jail should walk exactly this far. They
+/// used to loop over the threshold itself, which was the same thing while a miss counted one and
+/// is now twice as far as needed — and some of those loops execute real ML-DSA-signed blocks, so
+/// the difference is minutes of suite time for no added coverage.
+pub const BLOCKS_OF_SILENCE_TO_JAIL: u32 = DOWNTIME_JAIL_THRESHOLD_BLOCKS / MISS_WEIGHT;
 
 /// Minimum blocks a downtime-jailed validator must wait before `TxType::Unjail` is accepted —
 /// see its doc comment for why unjailing isn't automatic. 300 blocks ≈ 10 minutes at the 2s
@@ -786,11 +836,27 @@ impl ChainState {
         for addr in current_validators {
             let key = addr.to_string();
             if signers.contains(addr) {
-                self.missed_blocks.remove(&key);
+                // Pay down rather than clear (see `MISS_WEIGHT`). Clearing made this a streak of
+                // consecutive misses, and a validator that signs occasionally never reached any
+                // threshold however little it actually delivered.
+                match self.missed_blocks.get_mut(&key) {
+                    Some(count) => {
+                        *count = count.saturating_sub(PARTICIPATION_CREDIT);
+                        if *count == 0 {
+                            // Dropped at zero so the map stays a record of who currently owes
+                            // something. It is hashed into the state root, so an entry that says
+                            // `0` and an absent entry must not both be reachable for the same
+                            // history — two nodes would agree on the facts and disagree on the
+                            // hash.
+                            self.missed_blocks.remove(&key);
+                        }
+                    }
+                    None => {}
+                }
                 continue;
             }
             let count = self.missed_blocks.entry(key.clone()).or_insert(0);
-            *count += 1;
+            *count = count.saturating_add(MISS_WEIGHT);
             if *count >= DOWNTIME_JAIL_THRESHOLD_BLOCKS && !self.jailed_until.contains_key(&key) {
                 self.jailed_until.insert(key, height + MIN_JAIL_BLOCKS);
                 // Out of the quorum from this block on, not merely at the next rotation — the
@@ -2137,9 +2203,17 @@ mod tests {
         let signers_without_2: std::collections::HashSet<Address> =
             [addr(1), addr(3), addr(4)].into_iter().collect();
 
+        // Collected rather than overwritten each round. It used to keep only the last call's
+        // return, which happened to work while a miss counted 1 and the jail therefore landed on
+        // the final iteration; with `MISS_WEIGHT` the jail lands halfway through and the last
+        // call returns nothing. The test was reading the loop's final step, not its outcome.
         let mut newly_jailed = Vec::new();
-        for height in 0..DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 {
-            newly_jailed = state.record_block_participation(&validators, &signers_without_2, height);
+        for height in 0..BLOCKS_OF_SILENCE_TO_JAIL as u64 {
+            newly_jailed.extend(state.record_block_participation(
+                &validators,
+                &signers_without_2,
+                height,
+            ));
         }
 
         assert_eq!(newly_jailed, vec![addr(2)], "exactly the silent validator must be jailed");
@@ -2172,7 +2246,7 @@ mod tests {
         let half: std::collections::HashSet<Address> = [addr(1), addr(2)].into_iter().collect();
         let empty = std::collections::HashSet::new();
 
-        for height in 0..(DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 * 2) {
+        for height in 0..(BLOCKS_OF_SILENCE_TO_JAIL as u64 * 2) {
             assert!(
                 state.record_block_participation(&validators, &half, height).is_empty(),
                 "an under-quorum certificate must never jail anyone — height {height}"
@@ -2204,7 +2278,7 @@ mod tests {
     /// — and here it matters twice over: with two, `commit_certificate_carries_quorum` would
     /// suppress every conviction, and this test would pass without exercising the reset at all.
     #[test]
-    fn a_signature_partway_through_resets_the_miss_counter() {
+    fn a_signature_partway_through_pays_down_the_miss_counter() {
         let mut state = ChainState::new(0);
         state.governance_params.min_validator_stake = 100;
         for n in 1..=4 {
@@ -2216,26 +2290,139 @@ mod tests {
         let both_sign: std::collections::HashSet<Address> =
             [addr(1), addr(2), addr(3), addr(4)].into_iter().collect();
 
-        for height in 0..DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 - 1 {
+        for height in 0..10 {
             state.record_block_participation(&validators, &silent, height);
         }
-        assert!(!state.jailed_until.contains_key(&addr(2).to_string()), "not jailed yet");
         assert_eq!(
             state.missed_blocks.get(&addr(2).to_string()).copied(),
-            Some(DOWNTIME_JAIL_THRESHOLD_BLOCKS - 1),
-            "the misses must actually have been counted — otherwise the reset below proves nothing"
+            Some(10 * MISS_WEIGHT),
+            "the misses must actually have been counted — otherwise the rest proves nothing"
         );
 
-        // addr(2) signs once — counter must reset to zero, not just decrement.
-        state.record_block_participation(&validators, &both_sign, DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 - 1);
-        assert!(!state.missed_blocks.contains_key(&addr(2).to_string()));
-
-        // One more silent block after the reset must NOT be enough to jail.
-        let newly_jailed = state.record_block_participation(
-            &validators,
-            &silent,
-            DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64,
+        state.record_block_participation(&validators, &both_sign, 10);
+        assert_eq!(
+            state.missed_blocks.get(&addr(2).to_string()).copied(),
+            Some(10 * MISS_WEIGHT - PARTICIPATION_CREDIT),
+            "one signature pays down one credit — it does not wipe the debt"
         );
-        assert!(newly_jailed.is_empty(), "a single miss right after a reset must not jail");
+
+        // And it does reach zero, so an honest validator is not marked forever.
+        for height in 11..100 {
+            state.record_block_participation(&validators, &both_sign, height);
+        }
+        assert!(
+            !state.missed_blocks.contains_key(&addr(2).to_string()),
+            "sustained participation must clear the entry entirely, not leave a zero behind"
+        );
+    }
+
+    /// **The failure this rule was changed for**, in the shape production produced it on
+    /// 2026-09-18: `hlxnrvu5…` signed 7.5 % of blocks and proposed none, and the old
+    /// reset-on-any-signature left it at `missed_blocks: 4` against a threshold of 1800 —
+    /// permanently un-jailable while occupying a full share of the quorum denominator.
+    ///
+    /// One signature in every thirteen blocks is that validator. Under a streak counter it never
+    /// accumulates; under a leaky bucket it crosses.
+    #[test]
+    fn a_validator_that_signs_just_often_enough_to_break_a_streak_is_still_jailed() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        for n in 1..=4 {
+            stake(&mut state, n, 1_000);
+        }
+        let validators = vec![addr(1), addr(2), addr(3), addr(4)];
+        let without_2: std::collections::HashSet<Address> =
+            [addr(1), addr(3), addr(4)].into_iter().collect();
+        let all: std::collections::HashSet<Address> =
+            [addr(1), addr(2), addr(3), addr(4)].into_iter().collect();
+
+        let mut jailed = false;
+        for height in 0..20_000u64 {
+            let signers = if height % 13 == 0 { &all } else { &without_2 };
+            if !state.record_block_participation(&validators, signers, height).is_empty() {
+                jailed = true;
+                break;
+            }
+        }
+        assert!(
+            jailed,
+            "a validator delivering 7.7 % must be jailed — it consumes quorum power it does not supply"
+        );
+        assert!(state.jailed_until.contains_key(&addr(2).to_string()));
+    }
+
+    /// The other side of the same rule, and the one that protects real operators: above two
+    /// thirds the counter drains faster than it fills, so a node with routine interruptions — a
+    /// reboot, an upgrade, an I/O stall — is never jailed however long the chain runs.
+    ///
+    /// Deliberately run far past the threshold. A rule that merely jails *slowly* would pass a
+    /// short test and still evict every honest validator eventually.
+    #[test]
+    fn a_validator_above_two_thirds_participation_is_never_jailed() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        for n in 1..=4 {
+            stake(&mut state, n, 1_000);
+        }
+        let validators = vec![addr(1), addr(2), addr(3), addr(4)];
+        let without_2: std::collections::HashSet<Address> =
+            [addr(1), addr(3), addr(4)].into_iter().collect();
+        let all: std::collections::HashSet<Address> =
+            [addr(1), addr(2), addr(3), addr(4)].into_iter().collect();
+
+        // Misses one block in four: 75 %, comfortably above the two-thirds line.
+        for height in 0..(BLOCKS_OF_SILENCE_TO_JAIL as u64 * 3) {
+            let signers = if height % 4 == 3 { &without_2 } else { &all };
+            assert!(
+                state.record_block_participation(&validators, signers, height).is_empty(),
+                "a validator above two thirds must never be jailed — height {height}"
+            );
+        }
+        assert!(state.jailed_until.is_empty());
+
+        // The assertion that actually carries this test. "Not jailed yet" is satisfied by any rule
+        // that merely convicts *slowly*, and one does: setting `PARTICIPATION_CREDIT` to 0 makes
+        // the counter climb 0.5 per block at this participation, which needs 7200 blocks to reach
+        // the threshold — so the loop above stayed green through that mutation and proved nothing
+        // (lesson 3, caught by the red run, not by reading).
+        //
+        // Above two thirds the debt must *drain*, not merely accumulate below the line. That is
+        // the property, it is what protects an operator whose node reboots, and it is false the
+        // instant the ratio is wrong — at any length of run.
+        assert!(
+            state.missed_blocks.get(&addr(2).to_string()).copied().unwrap_or(0) <= MISS_WEIGHT,
+            "above two thirds the counter must drain to nothing, not creep toward the jail: {:?}",
+            state.missed_blocks.get(&addr(2).to_string())
+        );
+    }
+
+    /// Backwards compatibility, stated as an equation rather than trusted: the threshold was
+    /// doubled alongside `MISS_WEIGHT`, so an outright-silent validator is still jailed after
+    /// exactly the same 1800 blocks it was before 2026-09-18. That was the number chosen on
+    /// 2026-09-01 to clear a reboot and an unattended upgrade, and this change must not quietly
+    /// shorten it.
+    #[test]
+    fn a_fully_silent_validator_is_jailed_after_the_same_1800_blocks_as_before() {
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        for n in 1..=4 {
+            stake(&mut state, n, 1_000);
+        }
+        let validators = vec![addr(1), addr(2), addr(3), addr(4)];
+        let without_2: std::collections::HashSet<Address> =
+            [addr(1), addr(3), addr(4)].into_iter().collect();
+
+        let mut jailed_at = None;
+        for height in 0..5_000u64 {
+            if !state.record_block_participation(&validators, &without_2, height).is_empty() {
+                jailed_at = Some(height);
+                break;
+            }
+        }
+        assert_eq!(
+            jailed_at,
+            Some(1_799),
+            "the 1800th missed block must jail — the height is zero-based, so that is height 1799"
+        );
     }
 }

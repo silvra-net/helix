@@ -4967,7 +4967,7 @@ mod tests {
 
         // Well past the jail threshold, and past a full epoch, with an empty `last_commit`
         // every time — under the old behaviour this jailed it at exactly 150.
-        for height in 1..=(state::DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 + 20) {
+        for height in 1..=(state::BLOCKS_OF_SILENCE_TO_JAIL as u64 + 20) {
             execute_block(&mut state, &empty_block(&proposer, height), None);
         }
 
@@ -5034,7 +5034,7 @@ mod tests {
         state.active_validators.insert(silent.clone());
 
         let signing: Vec<&KeyPair> = witnesses.iter().collect();
-        for height in 1..=state::DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 {
+        for height in 1..=state::BLOCKS_OF_SILENCE_TO_JAIL as u64 {
             execute_block(&mut state, &block_with_commit(&proposer, height, &signing), None);
         }
 
@@ -5076,7 +5076,7 @@ mod tests {
 
         // Twice the threshold, every block proposed by the hostile validator and attesting only
         // itself — precisely the shape the live chain showed.
-        for height in 1..=(state::DOWNTIME_JAIL_THRESHOLD_BLOCKS as u64 * 2) {
+        for height in 1..=(state::BLOCKS_OF_SILENCE_TO_JAIL as u64 * 2) {
             execute_block(
                 &mut state,
                 &block_with_commit(&hostile_addr, height, &[&hostile]),

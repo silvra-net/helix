@@ -239,10 +239,15 @@ pub struct AccountResponse {
     /// downtime-jailed. Presence (not the height itself) is what excludes it from
     /// `stakers()` — see `ChainState::jailed_until`'s doc comment.
     pub jailed_until: Option<u64>,
-    /// Consecutive blocks this address's precommit has been absent from `last_commit`, or
-    /// `null` if it currently has none — resets to `null` the instant it's seen signing
-    /// again. 0 while jailed only if it was jailed and immediately unjailed without ever
-    /// having signed since (rare in practice; `execute_unjail` clears both together).
+    /// How far this address currently is from the downtime jail, or `null` while it owes
+    /// nothing. **Not a count of blocks, and not a streak** (it was both until 2026-09-18): an
+    /// absence from `last_commit` adds `MISS_WEIGHT`, a signature pays back
+    /// `PARTICIPATION_CREDIT`, and `DOWNTIME_JAIL_THRESHOLD_BLOCKS` jails. So it rises while a
+    /// validator delivers less than two thirds of blocks and falls while it delivers more,
+    /// rather than resetting the moment it signs once.
+    ///
+    /// Read it as a debt against the jail, not as "blocks missed": a validator signing one block
+    /// in thirteen used to show `4` here forever while missing 92 % of them.
     pub missed_blocks: Option<u32>,
 }
 
