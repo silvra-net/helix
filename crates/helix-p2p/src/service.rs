@@ -480,6 +480,9 @@ impl P2PService {
         let mut saved_addr_count = 0;
         // Which slice of the known addresses the next redial tick dials (see `redial_targets`).
         let mut redial_rotation: usize = 0;
+        // Peer count the redial line last spoke for, so a node sitting below the target reports
+        // each change instead of repeating itself every 30 s (see `redial_verdict`).
+        let mut redial_logged_for: Option<usize> = None;
 
         // Re-announce periodically, not just on connect — a message published right as a
         // connection is established can be lost before gossipsub's mesh for the topic has
@@ -986,8 +989,10 @@ impl P2PService {
                             .unwrap_or(0),
                     );
 
-                    // Redial while this node has no connection at all — the seeds and, since
+                    // Redial while this node has fewer peers than it wants — the seeds and, since
                     // 2026-09-13, every address it knows (`redial_targets`, backlog #196).
+                    // The threshold was *zero* connections until 2026-09-18, which is the version
+                    // of this that fails in production: see `MIN_HEALTHY_PEERS`.
                     //
                     // Every other way back into the network needs a connection this node no
                     // longer has: peer exchange is gossip (nobody is listening), and mDNS only
@@ -999,10 +1004,13 @@ impl P2PService {
                     // left the second validator disconnected indefinitely, `peer_count: 0`, while
                     // its node reported itself healthy.
                     //
-                    // Only while fully disconnected, so a node with a working mesh never dials on
+                    // Only while under the target, so a node with a working mesh never dials on
                     // a timer; one attempt per seed and at most `MAX_KNOWN_REDIALS_PER_TICK` known
                     // addresses per interval, so an address that stays down costs one connection
-                    // attempt per rotation and nothing else.
+                    // attempt per rotation and nothing else. Addresses of peers already connected
+                    // are dialed too: libp2p refuses the surplus before it is established (measured
+                    // under #147), which is cheaper than keeping a PeerId-to-address map that would
+                    // have to stay correct through every reconnect to avoid a *missed* dial.
                     // `info!`, not `debug!`: an operator staring at `peer_count: 0` needs to see
                     // that the node is trying, and how often — the silent-wait failure mode from
                     // the peer/liveness windows is exactly what made this class of problem so
@@ -1017,7 +1025,12 @@ impl P2PService {
                         }
                     }
 
-                    if swarm.connected_peers().next().is_none() {
+                    let connected = swarm.connected_peers().count();
+                    let verdict = redial_verdict(connected, redial_logged_for);
+                    if !verdict.dial {
+                        redial_logged_for = None;
+                    }
+                    if verdict.dial {
                         // Both of this node's own addresses: the configured one stays in the
                         // remembered file even after a probe replaced it, and dialing either would
                         // only reach this node again (through the proxy, for a tunnel address).
@@ -1030,11 +1043,16 @@ impl P2PService {
                         let targets = redial_targets(&seed_addrs, &known_addrs, &own, redial_rotation);
                         redial_rotation = redial_rotation.wrapping_add(1);
                         if !targets.is_empty() {
-                            info!(
-                                seeds = seed_addrs.len(),
-                                dialing = targets.len(),
-                                "No peers connected — redialing seed peers and known addresses"
-                            );
+                            if verdict.log {
+                                redial_logged_for = Some(connected);
+                                info!(
+                                    peers = connected,
+                                    want = MIN_HEALTHY_PEERS,
+                                    seeds = seed_addrs.len(),
+                                    dialing = targets.len(),
+                                    "Too few peers — redialing seed peers and known addresses"
+                                );
+                            }
                             for addr in targets {
                                 let _ = swarm.dial(addr);
                             }
@@ -1344,6 +1362,43 @@ fn select_new_addrs(
 /// hundred half-open sockets on a node that is offline, exactly while nobody is looking. A bounded
 /// slice that rotates reaches every address within a few minutes, and a node that knows only a
 /// handful (the production node knew seven) still dials all of them on every tick.
+/// How many peers this node wants before it stops looking for more.
+///
+/// The redial below used to ask for *no* connections rather than *too few*, and on
+/// 2026-09-17/18 that cost the chain 8 h 45 min of its 44 h. Both times the shape was the
+/// same: this node's tunnel dropped every peer within 1.5 s of each other, one of them came
+/// back on its own, and from then on the node sat at a single peer — above zero, so nothing
+/// dialed — while the validators it could no longer hear sat behind it. The chain only moved
+/// again when an operator's node dialed *in*, 3 h 21 min and 5 h 22 min later. An address
+/// that would have restored it (`101.33.68.38:8546`, an operator who opened the port) was in
+/// the peer file the whole time.
+///
+/// Three, not more: a node one disconnect away from being alone is the case that hurt, and a
+/// target the network cannot satisfy makes every node dial forever for nothing. Small networks
+/// are the norm here — six validators — so this is deliberately a floor, not a fan-out target.
+const MIN_HEALTHY_PEERS: usize = 3;
+
+/// Whether to dial for more peers this tick, and whether to say so.
+///
+/// Pure so the *when* is testable: a mechanism that fires at the wrong moment is green in any
+/// test that only asks whether it exists (R3).
+fn redial_verdict(connected: usize, last_logged_for: Option<usize>) -> RedialVerdict {
+    let dial = connected < MIN_HEALTHY_PEERS;
+    // At zero the repetition *is* the information — an operator staring at `peer_count: 0`
+    // needs to see that the node is still trying, and how often; that silent-wait failure mode
+    // is what made this class of problem so hard to tell apart from a hung node. Above zero the
+    // node is working and a line every 30 s would only teach that same operator to skip these
+    // lines, so it speaks once per change instead.
+    let log = dial && (connected == 0 || last_logged_for != Some(connected));
+    RedialVerdict { dial, log }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RedialVerdict {
+    dial: bool,
+    log: bool,
+}
+
 const MAX_KNOWN_REDIALS_PER_TICK: usize = 16;
 
 /// Everything to dial on one tick while this node has no connection at all (backlog #196): every
@@ -3441,6 +3496,53 @@ mod peer_tip_gate_tests {
 #[cfg(test)]
 mod redial_target_tests {
     use super::{redial_targets, MAX_KNOWN_REDIALS_PER_TICK};
+
+    use super::{redial_verdict, MIN_HEALTHY_PEERS};
+
+    /// The production failure of 2026-09-17/18 in one assertion: a node holding a single peer is
+    /// one disconnect from being alone, and the old rule (`connected_peers().next().is_none()`)
+    /// left it there. Twice, for 5 h 22 min and 3 h 21 min, while the chain it validates stood.
+    #[test]
+    fn a_node_below_the_target_dials_even_though_it_still_has_a_peer() {
+        assert!(redial_verdict(0, None).dial, "no peers at all must dial");
+        assert!(
+            redial_verdict(1, None).dial,
+            "one peer is the case that cost the chain 8 h 45 min — it must dial",
+        );
+        assert!(redial_verdict(MIN_HEALTHY_PEERS - 1, None).dial);
+        assert!(
+            !redial_verdict(MIN_HEALTHY_PEERS, None).dial,
+            "a node that reached the target must not dial on a timer",
+        );
+        assert!(!redial_verdict(MIN_HEALTHY_PEERS + 5, None).dial);
+    }
+
+    /// Two opposite failure modes, one rule. At zero the repetition is the only sign the node is
+    /// alive and trying; above zero it is a line every 30 s forever, which is how an operator
+    /// learns to skip exactly the lines that matter.
+    #[test]
+    fn the_redial_line_repeats_at_zero_peers_and_speaks_once_per_change_above_it() {
+        assert!(redial_verdict(0, None).log, "the first line at zero must be spoken");
+        assert!(
+            redial_verdict(0, Some(0)).log,
+            "at zero it must keep speaking — an operator watching peer_count: 0 needs the cadence",
+        );
+
+        assert!(redial_verdict(1, None).log, "the first line at one peer must be spoken");
+        assert!(
+            !redial_verdict(1, Some(1)).log,
+            "an unchanged count above zero must stay quiet instead of repeating every 30 s",
+        );
+        assert!(
+            redial_verdict(2, Some(1)).log,
+            "a change must be reported — that is the event an operator can act on",
+        );
+        assert!(
+            !redial_verdict(MIN_HEALTHY_PEERS, Some(1)).log,
+            "a node at the target says nothing at all, because it does not dial",
+        );
+    }
+
     use libp2p::Multiaddr;
     use std::collections::HashSet;
 

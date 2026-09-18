@@ -265,3 +265,111 @@ async fn a_node_without_seeds_redials_the_peer_it_lost_once_that_peer_is_back() 
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Wait for a connection to any peer whose id is not already `known`, or give up.
+///
+/// Same reason as `connected_to_a_peer_other_than`, generalised to two hosts: the surviving peer
+/// keeps producing events throughout, and the redial dials every address it knows on every tick,
+/// so a duplicate `PeerConnected` for a host that never left would otherwise read as the
+/// reconnection the test is waiting for.
+async fn connected_to_a_new_peer(
+    events: &mut tokio::sync::mpsc::Receiver<P2PEvent>,
+    known: &[String],
+    secs: u64,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Some(P2PEvent::PeerConnected(peer))) if !known.contains(&peer) => return Some(peer),
+            Ok(Some(_)) => continue,
+            Ok(None) => return None,
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// The production failure of 2026-09-17 and 2026-09-18, reproduced: a node that loses a peer but
+/// **keeps one** must still go looking for the one it lost.
+///
+/// This is the case the #196 redial does not cover, and it is the one that actually happened. Both
+/// times the production node's tunnel dropped every peer within 1.5 s, exactly one came back on its
+/// own, and from then on the node held a single peer — above zero, so the redial (which asked for
+/// *no* connections) never fired. It sat there for 5 h 22 min and 3 h 21 min while the chain it
+/// validates stood, and only moved again when an operator's node dialed in from outside. An address
+/// that would have restored it was in its peer file the whole time.
+///
+/// The surviving host is what makes this a different test from the one above rather than a slower
+/// copy of it: it holds the node at one connection, which is the precondition the old rule failed
+/// on. That precondition is asserted, not assumed — without it this test would silently become the
+/// zero-peer test, which already passes.
+#[tokio::test]
+async fn a_node_that_still_has_one_peer_redials_the_one_it_lost() {
+    let dir = std::env::temp_dir().join(format!("helix-peer-underconnected-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("peers.txt");
+    helix_p2p::peer_store::save(
+        &store,
+        &[
+            "/ip4/127.0.0.1/tcp/19741".to_string(),
+            "/ip4/127.0.0.1/tcp/19742".to_string(),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let started = tokio::time::Instant::now();
+    let leaving = spawn_host(19_741);
+    let _surviving = spawn_host(19_742);
+    let (_node, mut node_events) = spawn_with_handle(config(19_743, vec![], Some(store.clone())));
+
+    let mut met: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        let peer = connected_to_a_new_peer(&mut node_events, &met, 30)
+            .await
+            .expect("precondition: the node must reach both remembered hosts before one leaves");
+        met.push(peer);
+    }
+
+    // One host goes away entirely; the other stays, holding the node at a single connection.
+    leaving.abort();
+    let mut gone: Option<String> = None;
+    for candidate in &met {
+        if disconnected_within(&mut node_events, candidate, 30).await {
+            gone = Some(candidate.clone());
+            break;
+        }
+    }
+    let gone = gone.expect("precondition: the node must notice the host that left");
+    let survivor: Vec<String> = met.iter().filter(|p| **p != gone).cloned().collect();
+    assert_eq!(
+        survivor.len(),
+        1,
+        "precondition: exactly one peer must remain — with none this is the zero-peer test, \
+         which passed before this fix and would prove nothing about it"
+    );
+
+    // Let the old listener release the port before the host comes back on it, with a new identity.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _back = spawn_host(19_741);
+    let host_back = started.elapsed();
+
+    // The redial tick is 30 s, so one full interval plus slack.
+    let reconnected = connected_to_a_new_peer(&mut node_events, &met, 75).await;
+    // Printed for the same reason as the test above: a reconnection faster than the 30-second tick
+    // allows would mean some other path did it, and this test's conclusion would not follow.
+    eprintln!(
+        "host back after {:.1}s, held {} peer(s) meanwhile, reconnected to the new host: {} after {:.1}s",
+        host_back.as_secs_f64(),
+        survivor.len(),
+        reconnected.is_some(),
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        reconnected.is_some(),
+        "a node holding fewer peers than it wants must keep dialing the addresses it knows — \
+         asking for *zero* connections instead is what left production at one peer for 8 h 45 min"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
