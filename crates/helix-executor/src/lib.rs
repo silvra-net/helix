@@ -5646,7 +5646,7 @@ mod tests {
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
     }
 
-    fn signed_tx(
+    pub(super) fn signed_tx(
         kp: &KeyPair,
         from: &Address,
         tx_type: TxType,
@@ -6630,5 +6630,300 @@ mod tests {
         let stakers = state.stakers();
         assert_eq!(stakers.len(), 1, "effective (self + delegated) stake now clears the minimum");
         assert_eq!(stakers[0].0, target);
+    }
+}
+
+/// Adversarial: transactions chosen to break conservation of money, not to succeed.
+///
+/// Every test above checks one behaviour of one transaction type. This checks the property that
+/// makes all of them worth checking — **the books balance** — and it checks it after each of a
+/// series of attacks rather than at the end, so a failure names the transaction that caused it.
+///
+/// The invariant is deliberately *not* `circulating_supply()`. That is bookkeeping:
+/// `total_issued - total_burned`, two counters the executor maintains. If a bug credits an account
+/// without touching those counters, money appears and `circulating_supply()` reports the old
+/// number, serenely. So the sum that matters is taken from the accounts themselves and compared
+/// against the counters — the two are only equal while nothing has invented money, and the whole
+/// point is to try to make them differ.
+///
+/// The VM did exactly this on 2026-08-05: a contract's `balance -= amount` wrapped, a release
+/// build reported success, and one account ended at 18.4 billion HLX against a 33 million cap.
+/// That was found by reading code. This is the test that would have caught it.
+#[cfg(test)]
+mod money_conservation_attacks {
+    use super::*;
+    // Borrowed from the neighbouring test module rather than copied: a second `signed_tx` that
+    // drifted from the first would quietly stop signing what the executor verifies, and every
+    // test here would pass by not really attacking anything.
+    use super::tests::signed_tx;
+    use helix_crypto::KeyPair;
+
+    /// Every nano-HLX the chain has ever minted, as held by accounts right now.
+    fn money_in_accounts(state: &ChainState) -> u128 {
+        let mut total: u128 = 0;
+        for acc in state.accounts.values() {
+            total += acc.balance as u128;
+            total += acc.staked as u128;
+            total += acc.unbonding_stake as u128;
+        }
+        // Delegated stake lives in the pools, not in the delegators' accounts.
+        for pool in state.validator_pools.values() {
+            total += pool.total_delegated_stake as u128;
+        }
+        total
+    }
+
+    /// `assets == liabilities`. Anything else means money was created or destroyed off-book.
+    fn assert_books_balance(state: &ChainState, after: &str) {
+        let held = money_in_accounts(state);
+        let issued = state.total_issued as u128 - state.total_burned as u128;
+        assert_eq!(
+            held, issued,
+            "the books stopped balancing after {after}: accounts hold {held} nano-HLX, the chain \
+             says it issued {issued} (issued {} burned {})",
+            state.total_issued, state.total_burned
+        );
+    }
+
+    fn funded(state: &mut ChainState, kp: &KeyPair, amount: u64) -> Address {
+        let addr = Address::from_public_key(&kp.public);
+        state.update_account(&addr, |acc| acc.balance = amount);
+        state.total_issued += amount;
+        addr
+    }
+
+    /// Amounts and fees at the edges of `u64`, against a sender that cannot possibly cover them.
+    ///
+    /// `overflow-checks = true` in the release profile turns a wrap into a panic rather than free
+    /// money — which is the right failure, but a panic in `execute_transaction` is a node that
+    /// stops finalising. So neither outcome is acceptable and the test demands the third:
+    /// rejected, books intact, node alive.
+    #[test]
+    fn amounts_and_fees_at_the_edge_of_u64_cannot_mint_or_panic() {
+        let kp = KeyPair::generate();
+        let victim_kp = KeyPair::generate();
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(u64::MAX);
+        let attacker = funded(&mut state, &kp, 1_000_000);
+        let victim = Address::from_public_key(&victim_kp.public);
+        assert_books_balance(&state, "funding");
+
+        let attacks: Vec<(&str, u64, u64)> = vec![
+            ("amount = u64::MAX", u64::MAX, 10_000),
+            ("fee = u64::MAX", 1, u64::MAX),
+            ("both = u64::MAX", u64::MAX, u64::MAX),
+            ("amount just over balance", 1_000_001, 0),
+            ("amount + fee just over balance", 999_999, 10_000),
+            ("amount = 0", 0, 10_000),
+        ];
+        for (n, (label, amount, fee)) in attacks.into_iter().enumerate() {
+            let tx = signed_tx(&kp, &attacker, TxType::Transfer, Some(victim.clone()), amount, vec![], n as u64, fee);
+            let _ = execute_transaction(&mut state, &tx, &validator, 0, 0);
+            assert_books_balance(&state, label);
+        }
+        assert!(
+            state.get(&victim).map_or(0, |a| a.balance) <= 1_000_000,
+            "the victim cannot hold more than the attacker ever had"
+        );
+    }
+
+    /// Paying yourself. The credit and the debit touch the same account, so an implementation that
+    /// reads the balance, writes the debit, then writes the credit from the *stale* read doubles
+    /// the money — a classic, and invisible to any test using two distinct accounts.
+    #[test]
+    fn paying_yourself_does_not_double_the_money() {
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(u64::MAX);
+        let addr = funded(&mut state, &kp, 1_000_000);
+
+        for nonce in 0..3u64 {
+            let tx = signed_tx(&kp, &addr, TxType::Transfer, Some(addr.clone()), 500_000, vec![], nonce, 1_000);
+            let _ = execute_transaction(&mut state, &tx, &validator, 0, 0);
+            assert_books_balance(&state, "a self-transfer");
+        }
+        assert!(
+            state.get(&addr).unwrap().balance <= 1_000_000,
+            "a self-transfer must never increase the balance: {}",
+            state.get(&addr).unwrap().balance
+        );
+    }
+
+    /// Staking, unstaking and delegating amounts nobody has. Money moves between three places
+    /// here (balance, stake, pool) and each move is a chance to credit one without debiting
+    /// another.
+    #[test]
+    fn staking_more_than_you_hold_moves_nothing() {
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(u64::MAX);
+        state.governance_params.min_validator_stake = 100;
+        let addr = funded(&mut state, &kp, 1_000_000);
+
+        let attacks: Vec<(&str, TxType, u64)> = vec![
+            ("stake u64::MAX", TxType::Stake, u64::MAX),
+            ("stake just over balance", TxType::Stake, 1_000_001),
+            ("stake 0", TxType::Stake, 0),
+            ("unstake with nothing staked", TxType::Unstake, 500_000),
+            ("unstake u64::MAX", TxType::Unstake, u64::MAX),
+        ];
+        for (n, (label, tx_type, amount)) in attacks.into_iter().enumerate() {
+            let tx = signed_tx(&kp, &addr, tx_type, None, amount, vec![], n as u64, 1_000);
+            let _ = execute_transaction(&mut state, &tx, &validator, 0, 0);
+            assert_books_balance(&state, label);
+        }
+    }
+
+    /// Signing for somebody else. The signature is over the transaction's own bytes, so an
+    /// attacker can sign a transaction that *claims* to be from a rich account — the binding from
+    /// `from` back to the key is what has to refuse it.
+    #[test]
+    fn a_transaction_signed_by_the_wrong_key_moves_nothing() {
+        let rich_kp = KeyPair::generate();
+        let attacker_kp = KeyPair::generate();
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(u64::MAX);
+        let rich = funded(&mut state, &rich_kp, 5_000_000);
+        let attacker = Address::from_public_key(&attacker_kp.public);
+
+        // Signed by the attacker, but `from` names the rich account. The attacker's own public key
+        // rides along, which is the naive forgery: the signature verifies against it perfectly.
+        let tx = signed_tx(&attacker_kp, &rich, TxType::Transfer, Some(attacker.clone()), 4_000_000, vec![], 0, 1_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+
+        assert!(!receipt.success, "a transaction must not spend an account whose key did not sign it");
+        assert_eq!(
+            state.get(&rich).unwrap().balance,
+            5_000_000,
+            "the victim's balance must be untouched — not even a fee, since it authorised nothing"
+        );
+        assert_eq!(state.get(&attacker).map_or(0, |a| a.balance), 0);
+        assert_books_balance(&state, "a forged sender");
+    }
+
+    /// **The assertion `charge_failed_transaction` rests on, tested instead of trusted.**
+    ///
+    /// That function does `acc.balance -= tx.fee` with no check, on the strength of a comment:
+    /// "`execute_transaction` established `balance >= fee` before dispatching". Under
+    /// `overflow-checks = true` — which the release profile sets — an underflow there is not a
+    /// wrong number, it is a **panic inside block execution**: a validator that stops finalising
+    /// mid-block, and on a chain whose fault tolerance is currently zero, a stopped chain.
+    ///
+    /// Two ways that guarantee could fail, and both are attacked here:
+    ///
+    /// 1. **A second transaction from the same sender in the same block.** The first drains the
+    ///    balance below the second's fee. The guarantee holds only because the check re-reads
+    ///    `get_or_default` from the live state rather than a snapshot taken at block start — which
+    ///    is exactly the kind of detail a refactor changes without noticing.
+    /// 2. **An execution path that writes, then fails.** Every `execute_*` arm can return a
+    ///    failure receipt, and `charge_failed_transaction` runs afterwards. If any arm debits
+    ///    before deciding to fail, the balance it leaves behind may no longer cover the fee.
+    ///
+    /// This test covers case 2 only, and its name says so — case 1 is the test below, and the red
+    /// run is what separated them: with the fee check removed, that one panics and this one stays
+    /// **green**, because a balance of exactly the fee underflows nothing. Named for the underflow
+    /// it does not catch, it would have been a test whose assertions could not fail (lesson 3).
+    ///
+    /// What it does catch is worth having on its own: an `execute_*` arm that debits on the way to
+    /// a failure. The balance here is exactly the fee, so the only two honest outcomes are "failed
+    /// before the fee, balance untouched" and "charged the fee, balance zero". Anything in between
+    /// is a partial write, and a partial write is what would make the guarantee above false.
+    ///
+    /// Run across every transaction type rather than the convenient ones, because the guarantee is
+    /// claimed for the dispatch as a whole and a single arm that breaks it is enough.
+    #[test]
+    fn no_execution_path_debits_before_deciding_to_fail() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let types = [
+            TxType::Transfer, TxType::Stake, TxType::Unstake, TxType::RegisterIdentity,
+            TxType::RegisterName, TxType::RegisterGuardians, TxType::ApproveRecovery,
+            TxType::DeployContract, TxType::CallContract, TxType::CreateProposal,
+            TxType::VoteProposal, TxType::ProvePersonhood, TxType::ClaimUnbonded,
+            TxType::CancelRecoveryRequest, TxType::Delegate, TxType::Undelegate,
+            TxType::Redelegate, TxType::SetCommission, TxType::Unjail,
+        ];
+
+        for tx_type in types {
+            // Balance is *exactly* the fee: any debit at all on the way to a failure takes it
+            // below what `charge_failed_transaction` then subtracts.
+            const FEE: u64 = 10_000;
+            let kp = KeyPair::generate();
+            let mut state = ChainState::new(u64::MAX);
+            state.governance_params.min_validator_stake = 100;
+            let addr = funded(&mut state, &kp, FEE);
+            let target = Address::from_public_key(&KeyPair::generate().public);
+
+            let tx = signed_tx(
+                &kp, &addr, tx_type.clone(), Some(target), FEE * 100, vec![0u8; 32], 0, FEE,
+            );
+            // The panic this guards against happens *inside* this call.
+            let _ = execute_transaction(&mut state, &tx, &validator, 0, 0);
+            assert_books_balance(&state, &format!("{tx_type:?} against a fee-exact balance"));
+
+            let left = state.get(&addr).map_or(0, |a| a.balance);
+            assert!(
+                left == 0 || left == FEE,
+                "{tx_type:?} left {left} of {FEE}: neither untouched nor charged exactly the fee, \
+                 so this path debited something and then failed — which is what would take the \
+                 balance below the fee `charge_failed_transaction` subtracts unchecked"
+            );
+        }
+    }
+
+    /// Case 1 above, as its own test so a failure names it: two transactions from one sender in
+    /// one block, the first taking the balance below the second's fee.
+    #[test]
+    fn a_second_transaction_in_the_same_block_cannot_underflow_the_fee_charge() {
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(u64::MAX);
+        let addr = funded(&mut state, &kp, 100_000);
+        let sink = Address::from_public_key(&KeyPair::generate().public);
+
+        // Takes the balance to 10_000 — below the second transaction's 60_000 fee.
+        let first = signed_tx(&kp, &addr, TxType::Transfer, Some(sink.clone()), 30_000, vec![], 0, 60_000);
+        let r1 = execute_transaction(&mut state, &first, &validator, 0, 0);
+        assert!(r1.success, "precondition: the first transfer must succeed");
+        assert_eq!(state.get(&addr).unwrap().balance, 10_000, "precondition: balance below the next fee");
+
+        // Same sender, same block, a fee the remaining balance cannot cover.
+        let second = signed_tx(&kp, &addr, TxType::Transfer, Some(sink), 1, vec![], 1, 60_000);
+        let r2 = execute_transaction(&mut state, &second, &validator, 0, 0);
+
+        assert!(!r2.success, "a fee the sender cannot cover must fail, not be charged anyway");
+        assert_eq!(
+            state.get(&addr).unwrap().balance,
+            10_000,
+            "an unaffordable fee must take nothing — charging it would underflow"
+        );
+        assert_books_balance(&state, "an unaffordable second transaction");
+    }
+
+    /// The same signed bytes, applied twice. The nonce is what stops it; without that, every
+    /// transaction ever broadcast is a standing order.
+    #[test]
+    fn replaying_the_same_transaction_cannot_pay_twice() {
+        let kp = KeyPair::generate();
+        let victim_kp = KeyPair::generate();
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(u64::MAX);
+        let addr = funded(&mut state, &kp, 1_000_000);
+        let victim = Address::from_public_key(&victim_kp.public);
+
+        let tx = signed_tx(&kp, &addr, TxType::Transfer, Some(victim.clone()), 100_000, vec![], 0, 1_000);
+        let first = execute_transaction(&mut state, &tx, &validator, 0, 0);
+        assert!(first.success, "precondition: the transfer must work once");
+        assert_books_balance(&state, "the first application");
+
+        for _ in 0..5 {
+            let again = execute_transaction(&mut state, &tx, &validator, 0, 0);
+            assert!(!again.success, "the same signed bytes must not apply twice");
+            assert_books_balance(&state, "a replay");
+        }
+        assert_eq!(
+            state.get(&victim).unwrap().balance,
+            100_000,
+            "the recipient must have been paid exactly once"
+        );
     }
 }
