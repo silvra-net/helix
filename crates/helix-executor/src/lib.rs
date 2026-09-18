@@ -2513,7 +2513,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn signed_contract_tx(
+    pub(super) fn signed_contract_tx(
         kp: &KeyPair,
         from: &Address,
         tx_type: TxType,
@@ -6924,6 +6924,215 @@ mod money_conservation_attacks {
             state.get(&victim).unwrap().balance,
             100_000,
             "the recipient must have been paid exactly once"
+        );
+    }
+}
+
+/// Adversarial: contracts written to break the bridge between the VM and the ledger.
+///
+/// The VM itself is careful — floats off by `WasmFeatures`, a memory limiter, per-byte fuel on
+/// storage writes. What went wrong on 2026-08-05 was not in it but *beside* it: the host context
+/// that turns a contract's `transfer` into a balance change. A contract whose caller was itself —
+/// the ordinary case, since a contract's address *is* its deployer's — was measured against a
+/// balance that still contained the fee and the value, `balance -= amount` wrapped, and a release
+/// build reported success while the account held 18.4 billion HLX against a 33 million cap.
+///
+/// Its own doc comment says the VM "has no way to enforce" the invariant the caller must uphold.
+/// These are the tests for the caller upholding it. They are written as contracts an attacker
+/// would deploy, not as unit tests of a function.
+#[cfg(test)]
+mod contract_bridge_attacks {
+    use super::tests::{signed_contract_tx, signed_tx};
+    use super::*;
+    use helix_crypto::KeyPair;
+
+    fn money_in_accounts(state: &ChainState) -> u128 {
+        let mut total: u128 = 0;
+        for acc in state.accounts.values() {
+            total += acc.balance as u128 + acc.staked as u128 + acc.unbonding_stake as u128;
+        }
+        for pool in state.validator_pools.values() {
+            total += pool.total_delegated_stake as u128;
+        }
+        total
+    }
+
+    fn assert_books_balance(state: &ChainState, after: &str) {
+        let held = money_in_accounts(state);
+        let issued = state.total_issued as u128 - state.total_burned as u128;
+        assert_eq!(held, issued, "the books stopped balancing after {after}");
+    }
+
+    /// Transfer in a loop until the fuel runs out, each one for the contract's entire balance.
+    ///
+    /// `iterations` is load-bearing and the positive control found out why: at 100 000 the call
+    /// runs out of fuel and traps, every buffered transfer is discarded atomically — correct
+    /// behaviour — and the test then passes while proving nothing, because nothing was attempted.
+    /// A contract that *completes* is the one that attacks the bridge.
+    ///
+    /// The first succeeds honestly. Every one after it must be refused, because the balance is
+    /// already committed — and "refused" has to mean the ledger never sees it, not merely that a
+    /// later check notices. `pending_debit` is what tracks that within one call, and it is the
+    /// number the 2026-08-05 bug got wrong.
+    fn drain_loop_wasm_n(amount: i64, iterations: u32) -> Vec<u8> {
+        wat::parse_str(&format!(
+            r#"
+            (module
+                (import "env" "transfer" (func $transfer (param i32 i32 i64) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{TARGET}")
+                (func (export "call")
+                    (local $i i32)
+                    (loop $again
+                        (drop (call $transfer (i32.const 0) (i32.const {len}) (i64.const {amount})))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $again (i32.lt_u (local.get $i) (i32.const {iterations})))
+                    )
+                )
+            )
+            "#,
+            TARGET = TARGET_ADDR,
+            len = TARGET_ADDR.len(),
+            iterations = iterations,
+        ))
+        .unwrap()
+    }
+
+    /// A real, parseable address — `Address::from_str` rejects anything else, and a test that
+    /// transferred to an invalid address would prove only that the parser works.
+    const TARGET_ADDR: &str = "hlxVNKfvz35QruD2aws44fseUSaX9uVuU26n";
+
+    /// A contract that hands out its whole balance on every iteration must hand it out **once**.
+    #[test]
+    fn a_contract_transferring_in_a_loop_cannot_spend_its_balance_twice() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let target = Address::from_str(TARGET_ADDR).expect("a valid target address");
+
+        let mut state = ChainState::new(u64::MAX);
+        state.update_account(&deployer, |acc| acc.balance = 1_000_000);
+        state.total_issued += 1_000_000;
+        state.update_account(&caller, |acc| acc.balance = 5_000_000);
+        state.total_issued += 5_000_000;
+        assert_books_balance(&state, "funding");
+
+        let deploy = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, drain_loop_wasm_n(900_000, 10), 0, 10_000);
+        assert!(execute_transaction(&mut state, &deploy, &validator, 0, 0).success, "deploy must succeed");
+        assert_books_balance(&state, "the deploy");
+
+        let call = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, vec![], 0, 100_000);
+        let _ = execute_transaction(&mut state, &call, &validator, 1, 0);
+
+        assert_books_balance(&state, "a looping drain");
+        let received = state.get(&target).map_or(0, |a| a.balance);
+        // Positive control. Without it this passes just as happily on a contract that never
+        // transferred at all — a deploy that failed, a loop that ran out of fuel on its first
+        // iteration — and would prove nothing about the bridge it is named for.
+        assert!(
+            received > 0,
+            "precondition: at least one transfer must have gone through, or this test is vacuous"
+        );
+        assert!(
+            received <= 900_000,
+            "the contract paid out {received} while holding at most 900000 — the loop spent the \
+             same balance more than once"
+        );
+    }
+
+    /// The same loop, but each transfer is for **zero**. Zero passes any balance check, so the
+    /// only thing bounding this is fuel — and every accepted transfer is an entry in a `Vec` the
+    /// node allocates while executing a block.
+    ///
+    /// Not a bug, a bound worth pinning: at `MAX_TX_FUEL` and 300 fuel per transfer that is
+    /// ~333k entries, about 19 MB, paid for by the caller's fee. If the fuel cost of a transfer
+    /// ever drops, this is the test that notices the memory it buys.
+    #[test]
+    fn zero_value_transfers_are_bounded_by_fuel_and_cost_the_ledger_nothing() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(u64::MAX);
+        state.update_account(&deployer, |acc| acc.balance = 1_000_000);
+        state.total_issued += 1_000_000;
+        state.update_account(&caller, |acc| acc.balance = 5_000_000);
+        state.total_issued += 5_000_000;
+
+        let deploy = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, drain_loop_wasm_n(0, 100_000), 0, 10_000);
+        assert!(execute_transaction(&mut state, &deploy, &validator, 0, 0).success);
+
+        let call = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, vec![], 0, 100_000);
+        let receipt = execute_transaction(&mut state, &call, &validator, 1, 0);
+
+        assert_books_balance(&state, "a loop of zero-value transfers");
+        // The loop asks for 100 000 transfers at 300 fuel each — 30 million, which the caller's
+        // fee does not buy. That it comes back at all is the bound working: an unbounded loop
+        // would not return, and this test would hang rather than fail.
+        assert!(
+            !receipt.success,
+            "a 100k-iteration transfer loop must run out of fuel, not complete"
+        );
+        assert!(
+            receipt.error.as_deref().unwrap_or("").to_lowercase().contains("fuel")
+                || receipt.error.is_some(),
+            "it must fail for a stated reason: {:?}",
+            receipt.error
+        );
+    }
+
+    /// A contract paying **itself**. Credit and debit land on one account, which is the shape that
+    /// hid the 2026-08-05 bug: the deployer is the contract, so the naive reading of "balance"
+    /// already included what was about to be spent.
+    #[test]
+    fn a_contract_paying_itself_creates_nothing() {
+        let deployer_kp = KeyPair::generate();
+        let deployer = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(u64::MAX);
+        state.update_account(&deployer, |acc| acc.balance = 1_000_000);
+        state.total_issued += 1_000_000;
+        state.update_account(&caller, |acc| acc.balance = 5_000_000);
+        state.total_issued += 5_000_000;
+
+        // The contract's address is the deployer's, so transferring there is transferring to self.
+        let self_pay = wat::parse_str(&format!(
+            r#"
+            (module
+                (import "env" "get_self_address" (func $self (param i32 i32) (result i32)))
+                (import "env" "transfer" (func $transfer (param i32 i32 i64) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "call")
+                    (local $n i32)
+                    (local.set $n (call $self (i32.const 0) (i32.const 64)))
+                    (drop (call $transfer (i32.const 0) (local.get $n) (i64.const {amount})))
+                    (drop (call $transfer (i32.const 0) (local.get $n) (i64.const {amount})))
+                )
+            )
+            "#,
+            amount = 900_000
+        ))
+        .unwrap();
+
+        let deploy = signed_contract_tx(&deployer_kp, &deployer, TxType::DeployContract, None, 0, self_pay, 0, 10_000);
+        assert!(execute_transaction(&mut state, &deploy, &validator, 0, 0).success);
+        let before = state.get(&deployer).map_or(0, |a| a.balance);
+
+        let call = signed_contract_tx(&caller_kp, &caller, TxType::CallContract, Some(deployer.clone()), 0, vec![], 0, 100_000);
+        let _ = execute_transaction(&mut state, &call, &validator, 1, 0);
+
+        assert_books_balance(&state, "a contract paying itself twice");
+        let after = state.get(&deployer).map_or(0, |a| a.balance);
+        assert!(
+            after <= before,
+            "paying yourself must not increase the balance: {before} -> {after}"
         );
     }
 }
