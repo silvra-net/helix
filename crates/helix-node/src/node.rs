@@ -5640,18 +5640,46 @@ async fn fetch_sync_blocks(
 struct TrustedCheckpoint {
     height: u64,
     block_hash: Hash,
+    /// The state root at `height`, when the operator supplied one.
+    ///
+    /// **This is what makes a snapshot provable, and nothing else can be.** Verifying a state at
+    /// height N means checking it against an authority over that state, and every authority
+    /// inside the data is circular: the block above the anchor carries a `prev_state_root`, but
+    /// that block is pinned by nothing a peer cannot satisfy, and asking for a quorum on it means
+    /// weighing signatures against a validator set read out of the very snapshot under test — an
+    /// attacker writes himself into it and signs. This is weak subjectivity in its plain form:
+    /// the anchor has to come from outside, the way `DEFAULT_GENESIS_HASH` does.
+    ///
+    /// `None` is the two-part form. It still anchors the *blocks*, so the ordinary sync keeps
+    /// working; it just does not license the state shortcut.
+    state_root: Option<Hash>,
 }
 
-/// Parse `HELIX_TRUSTED_CHECKPOINT`, format `<height>:<block hash hex>`.
+/// Parse `HELIX_TRUSTED_CHECKPOINT`, format `<height>:<block hash hex>[:<state root hex>]`.
 ///
 /// Pure, because every rejection here is a node that will *not* take the shortcut — and silently
 /// accepting a malformed anchor is the one outcome that must be impossible. A partially-parsed
 /// checkpoint is worse than none: none falls back to the full sync, which is always correct.
+///
+/// The third part is optional so an operator with an old two-part checkpoint still starts and
+/// still syncs. What they do not get is the snapshot shortcut, and the refusal says how to get
+/// the missing half (`GET /sync/checkpoint`, compared across more than one node — a value from
+/// the single node you are about to sync from is that node vouching for itself, #139).
 fn parse_trusted_checkpoint(raw: &str) -> Option<TrustedCheckpoint> {
-    let (h, hash) = raw.trim().split_once(':')?;
-    let height: u64 = h.trim().parse().ok()?;
-    let block_hash = Hash::from_hex(hash.trim()).ok()?;
-    Some(TrustedCheckpoint { height, block_hash })
+    let mut parts = raw.trim().split(':');
+    let height: u64 = parts.next()?.trim().parse().ok()?;
+    let block_hash = Hash::from_hex(parts.next()?.trim()).ok()?;
+    let state_root = match parts.next() {
+        // A third part that is present but unreadable is a typo, not an omission. Falling back to
+        // `None` there would quietly downgrade the operator to the weaker form they did not ask
+        // for, so the whole checkpoint is refused instead.
+        Some(raw_root) => Some(Hash::from_hex(raw_root.trim()).ok()?),
+        None => None,
+    };
+    if parts.next().is_some() {
+        return None; // more than three parts is not this format
+    }
+    Some(TrustedCheckpoint { height, block_hash, state_root })
 }
 
 /// A state snapshot is the whole account set at once. 256 MB is roughly a million accounts —
@@ -5668,11 +5696,21 @@ const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 ///   2. The block at the checkpoint height hashes to the hash the operator supplied. This is the
 ///      only step whose input does not come from the peer, so it is the only one that makes the
 ///      others mean anything.
-///   3. The next block names that block as its parent, chaining to the anchor.
-///   4. That next block's `prev_state_root` equals the hash of the snapshot we were handed —
-///      which is what binds the state to a block the operator vouched for, rather than to the
-///      server that served it. Nothing here would work before 0.15.0: there was no signed state
-///      commitment to compare against, so a snapshot was only ever the claim of whoever sent it.
+///   3. The snapshot hashes to the state root the operator supplied. This is the other input
+///      that does not come from the peer, and it is the only thing that can prove a *state*.
+///
+/// **Step 3 used to be a different check, and it did not hold.** It compared the snapshot against
+/// `prev_state_root` in the block *above* the anchor — described here as "a block the operator
+/// vouched for", which it was not. The operator vouches for the anchor; the block above it is
+/// pinned only by `prev_hash`, which anyone can satisfy by building on the real anchor. Measured
+/// 2026-09-22: a peer serving the genuine anchor, a block of its own above it, and a ledger
+/// hashing to whatever that block declared, passed every check and had the node adopt a
+/// fabricated account set — including the validator set it would afterwards demand quorums from.
+///
+/// Asking for a quorum on that block instead does not work either: the signatures would be
+/// weighed against a validator set read out of the snapshot being tested, so an attacker writes
+/// himself into it and signs. There is no authority over a state inside the data; it has to come
+/// from outside, which is what the third part of the checkpoint is.
 ///
 /// Returns the height the node now holds. On any failure the caller falls back to the ordinary
 /// sync — a shortcut that cannot be proven is simply not taken, never taken on faith.
@@ -5730,17 +5768,36 @@ async fn snapshot_sync_from_peer(
         expected_chain_id.to_hex()
     );
 
+    // The state root the operator supplied, and the reason the two-part checkpoint cannot take
+    // this path: without it there is nothing to check a state against that the peer does not
+    // also control.
+    let Some(expected_root) = checkpoint.state_root.as_ref() else {
+        anyhow::bail!(
+            "HELIX_TRUSTED_CHECKPOINT names a height and a block hash but no state root, so a \
+             snapshot cannot be proven and this node will replay the chain instead (correct, \
+             only slower). Add the third part: `GET /sync/checkpoint` on a node you trust \
+             reports `<height>:<block hash>:<state root>` — compare it across more than one, \
+             because a value taken from the node you are about to sync from is that node \
+             vouching for itself."
+        );
+    };
+    let snapshot_root = snapshot.state.state_hash();
+    anyhow::ensure!(
+        &snapshot_root == expected_root,
+        "the snapshot hashes to {} but the checkpoint names {} — this is not the state the \
+         operator vouched for",
+        snapshot_root.to_hex(),
+        expected_root.to_hex()
+    );
+
     let mut binary = true;
     let blocks = fetch_sync_blocks(&client, peer_url, checkpoint.height, &mut binary).await?;
     anyhow::ensure!(
-        blocks.len() >= 2,
-        "the peer served {} block(s) from height {}; the checkpoint block and the one above it \
-         are both needed to prove the snapshot",
-        blocks.len(),
+        !blocks.is_empty(),
+        "the peer served no block at height {}, so there is no anchor to store",
         checkpoint.height
     );
     let anchor = &blocks[0];
-    let above = &blocks[1];
 
     anyhow::ensure!(
         anchor.header.height == checkpoint.height && anchor.hash() == checkpoint.block_hash,
@@ -5749,20 +5806,6 @@ async fn snapshot_sync_from_peer(
         checkpoint.height,
         anchor.hash().to_hex(),
         checkpoint.block_hash.to_hex()
-    );
-    anyhow::ensure!(
-        above.header.prev_hash == checkpoint.block_hash,
-        "the block above the checkpoint names parent {}, not the checkpoint block",
-        above.header.prev_hash.to_hex()
-    );
-    let snapshot_root = snapshot.state.state_hash();
-    anyhow::ensure!(
-        above.header.prev_state_root == snapshot_root,
-        "the snapshot hashes to {} but block {} commits to {} as the state above the checkpoint \
-         — this state is not the one the chain agreed on",
-        snapshot_root.to_hex(),
-        above.header.height,
-        above.header.prev_state_root.to_hex()
     );
 
     // Proven. Keep the state and the anchor block; the ordinary sync takes it from there. The
@@ -6455,7 +6498,11 @@ mod sync_blocks_from_peer_tests {
         let mut above = signed_block(kp, height + 1, anchor.hash());
         above.header.prev_state_root = root;
 
-        let cp = TrustedCheckpoint { height, block_hash: anchor.hash() };
+        let cp = TrustedCheckpoint {
+            height,
+            block_hash: anchor.hash(),
+            state_root: Some(root.clone()),
+        };
         (
             helix_executor::state::StateSnapshot { height, state },
             vec![anchor, above],
@@ -6531,8 +6578,8 @@ mod sync_blocks_from_peer_tests {
         assert_eq!(store.read().await.latest_height(), 0, "and nothing is kept");
         let _ = std::fs::remove_file(&path);
 
-        // 2. The state does not hash to what the block above commits to. Note this has to change
-        //    an *account* — `state_hash` covers the accounts and not the height, which is a
+        // 2. The state does not hash to what the checkpoint names. Note this has to change an
+        //    *account* — `state_hash` covers the accounts and not the height, which is a
         //    distinction this test discovered by getting it wrong.
         let (mut snapshot, blocks, cp) = snapshot_fixture(&kp, 10_000, chain_id);
         let intruder = Address::from_public_key(&KeyPair::generate().public);
@@ -6544,8 +6591,8 @@ mod sync_blocks_from_peer_tests {
         let (store, state, path) = fresh_store_and_state().await;
         let err = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state).await.unwrap_err();
         assert!(
-            err.to_string().contains("not the one the chain agreed on"),
-            "a state the chain never committed to must be refused, got: {err}"
+            err.to_string().contains("not the state the operator vouched for"),
+            "a state the operator did not pin must be refused, got: {err}"
         );
         let _ = std::fs::remove_file(&path);
 
@@ -6588,20 +6635,149 @@ mod sync_blocks_from_peer_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **The fifth input, which the refusal test above says there are four of.**
+    ///
+    /// Every check in `snapshot_sync_from_peer` ultimately rests on one field:
+    /// `above.header.prev_state_root`. The checkpoint pins the *anchor* block, so a peer has to
+    /// serve the real one — but the block **above** it is pinned by nothing except
+    /// `prev_hash == anchor.hash()`, which anybody can satisfy by building a block on the real
+    /// anchor. Its signature is never verified, its proposer is never checked against the
+    /// validator set, and no quorum is ever asked for.
+    ///
+    /// So a peer can serve: the genuine anchor, a block it wrote itself above it committing to
+    /// any state root it likes, and a state that hashes to exactly that. All six checks pass and
+    /// the node adopts a fabricated ledger — balances, and with them the validator set the node
+    /// will demand a quorum from afterwards, which is the attacker's own.
+    ///
+    /// This is #139 in a new place: the proof and the thing proven come from the same party.
+    /// `prev_state_root` closes that gap only while the block carrying it is one the chain
+    /// actually produced.
+    #[tokio::test]
+    async fn a_snapshot_proved_by_a_block_the_peer_wrote_itself_is_refused() {
+        let honest = KeyPair::generate();
+        let attacker = KeyPair::generate();
+        let chain_id = Hash::from_bytes([3u8; 32]);
+        let (_, honest_blocks, cp) = snapshot_fixture(&honest, 10_000, chain_id);
+        let real_anchor = honest_blocks[0].clone();
+
+        // A ledger of the attacker's choosing: himself, rich.
+        let mut forged = ChainState::new(1_000_000);
+        forged.chain_id = chain_id;
+        forged.applied_height = 10_000;
+        let beneficiary = Address::from_public_key(&attacker.public);
+        forged.update_account(&beneficiary, |acc| acc.balance = 30_000_000_000_000_000);
+
+        // The genuine anchor — he has to serve that one, the checkpoint names its hash — and on
+        // top of it a block of his own making, committing to the forged state.
+        let mut above = signed_block(&attacker, 10_001, real_anchor.hash());
+        above.header.prev_state_root = forged.state_hash();
+        above.header.signature =
+            attacker.sign(above.header.signing_hash().as_bytes()).unwrap();
+
+        let snapshot = helix_executor::state::StateSnapshot { height: 10_000, state: forged };
+        let peer = serve_snapshot_and_blocks(snapshot, vec![real_anchor, above]).await;
+        let (store, state, path) = fresh_store_and_state().await;
+
+        let result = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state).await;
+
+        assert!(
+            result.is_err(),
+            "a state root is only as good as the block that commits to it — this one was written \
+             by the peer being checked"
+        );
+        assert_eq!(
+            state.read().await.get(&beneficiary).map(|a| a.balance).unwrap_or(0),
+            0,
+            "and nothing of the forged ledger may survive the refusal"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A two-part checkpoint still anchors the blocks, but it licenses no state shortcut — and
+    /// the refusal has to say how to get the missing half, because from the operator's side "it
+    /// replayed the whole chain again" looks like a bug and not a decision.
+    #[tokio::test]
+    async fn a_checkpoint_without_a_state_root_refuses_the_shortcut_and_says_why() {
+        let kp = KeyPair::generate();
+        let chain_id = Hash::from_bytes([3u8; 32]);
+        let (snapshot, blocks, mut cp) = snapshot_fixture(&kp, 10_000, chain_id);
+        cp.state_root = None; // the old two-part form
+        let peer = serve_snapshot_and_blocks(snapshot, blocks).await;
+        let (store, state, path) = fresh_store_and_state().await;
+
+        let err = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state)
+            .await
+            .expect_err("without a pinned state root nothing can prove a snapshot");
+        let text = err.to_string();
+        assert!(
+            text.contains("no state root") && text.contains("/sync/checkpoint"),
+            "the refusal has to name both the cause and the cure, got: {text}"
+        );
+        assert!(
+            text.contains("more than one"),
+            "and it has to say to compare across nodes — a state root from the node you are \
+             about to sync from is that node vouching for itself (#139), got: {text}"
+        );
+        assert_eq!(store.read().await.latest_height(), 0, "and nothing is kept");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A malformed anchor must parse to nothing, never to something partial: the fallback is the
     /// full sync, which is always correct, while a half-read checkpoint would anchor the node to
     /// a height or hash the operator did not write.
+    /// The three-part form, and the two ways the third part can be wrong.
+    ///
+    /// Absent means the operator has an older checkpoint: parse it, anchor the blocks, refuse the
+    /// shortcut. **Present but unreadable is a typo**, and falling back to `None` there would
+    /// silently hand them the weaker form they did not ask for — so the whole checkpoint is
+    /// refused and they get the full sync plus a chance to notice.
+    #[test]
+    fn a_state_root_is_taken_when_readable_and_refused_when_it_is_a_typo() {
+        let block = Hash::from_bytes([1u8; 32]);
+        let root = Hash::from_bytes([2u8; 32]);
+
+        let full = format!("175000:{}:{}", block.to_hex(), root.to_hex());
+        assert_eq!(
+            parse_trusted_checkpoint(&full),
+            Some(TrustedCheckpoint {
+                height: 175_000,
+                block_hash: block.clone(),
+                state_root: Some(root.clone())
+            })
+        );
+
+        assert_eq!(
+            parse_trusted_checkpoint(&format!("175000:{}:", block.to_hex())),
+            None,
+            "an empty third part is a truncated paste, not an omission"
+        );
+        assert_eq!(
+            parse_trusted_checkpoint(&format!("175000:{}:nothex", block.to_hex())),
+            None,
+            "and an unreadable one must not quietly downgrade to the two-part form"
+        );
+        assert_eq!(
+            parse_trusted_checkpoint(&format!("175000:{}:{}:extra", block.to_hex(), root.to_hex())),
+            None,
+            "nor may a fourth part be ignored — this is not that format"
+        );
+    }
+
     #[test]
     fn a_checkpoint_parses_only_when_both_halves_are_whole() {
         let hash = Hash::from_bytes([1u8; 32]);
         let good = format!("175000:{}", hash.to_hex());
         assert_eq!(
             parse_trusted_checkpoint(&good),
-            Some(TrustedCheckpoint { height: 175_000, block_hash: hash.clone() })
+            Some(TrustedCheckpoint {
+                height: 175_000,
+                block_hash: hash.clone(),
+                state_root: None
+            })
         );
         assert_eq!(
             parse_trusted_checkpoint(&format!("  175000 : {}  ", hash.to_hex())),
-            Some(TrustedCheckpoint { height: 175_000, block_hash: hash }),
+            Some(TrustedCheckpoint { height: 175_000, block_hash: hash, state_root: None }),
             "whitespace around either half is the operator's copy-paste, not a different value"
         );
 

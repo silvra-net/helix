@@ -716,35 +716,47 @@ async fn get_sync_blocks(
 /// all of them.
 ///
 /// Reports the newest height where a joiner would actually succeed, which is narrower than "the
-/// newest snapshot": it needs the stored snapshot, the block at that height, *and* the block above
-/// it, because the proof runs snapshot -> prev_state_root of the block above -> the anchor hash.
-/// Naming a height where any of those is missing would hand out a checkpoint that fails on use.
+/// newest snapshot": it needs the stored snapshot *and* the block at that height, because a
+/// joiner stores that block as its anchor.
+///
+/// **The `state_root` is the part that does the work.** A joiner cannot prove a state from
+/// anything the serving peer also controls — the block above the anchor carries a
+/// `prev_state_root`, but nothing pins that block, and weighing a quorum on it means using a
+/// validator set read out of the snapshot under test. So the state root has to arrive the way the
+/// genesis hash does: from outside, through the operator. This endpoint is how an operator
+/// collects it — from several nodes, and only when they agree.
 async fn get_sync_checkpoint(State(state): State<AppState>) -> impl IntoResponse {
     let store = state.store.read().await;
     let tip = store.latest_height();
     let heights = store.state_snapshot_heights().unwrap_or_default();
 
     for height in heights.into_iter().rev() {
-        // Both blocks have to be here: the anchor, and the one above whose `prev_state_root`
-        // proves the snapshot. Asking the store is the whole test — an earlier version also
-        // compared against the tip, and a red run showed that check could never fail on its own,
-        // because a block that exists is a block at or below the tip. Two conditions for one
-        // question is one too many, and the redundant one is the one that quietly stops meaning
-        // anything.
+        // The anchor block has to be here — a joiner stores it. Asking the store is the whole
+        // test; an earlier version also compared against the tip, and a red run showed that check
+        // could never fail on its own, because a block that exists is a block at or below the
+        // tip. Two conditions for one question is one too many, and the redundant one is the one
+        // that quietly stops meaning anything.
+        //
+        // It used to require the block *above* as well, because the proof ran through that
+        // block's `prev_state_root`. It no longer does: that block proved nothing a peer could
+        // not forge, so the state root is named here and pinned by the operator instead.
         let Ok(block) = store.get_block_by_height(height) else { continue };
-        if store.get_block_by_height(height + 1).is_err() {
+        let Ok(Some((_, snapshot_state))) = store.state_snapshot_at_or_before(height) else {
             continue;
-        }
+        };
         let hash = block.hash().to_hex();
+        let root = snapshot_state.state_hash().to_hex();
         return (
             StatusCode::OK,
             Json(json!({
                 "height": height,
                 "block_hash": hash,
-                "checkpoint": format!("{height}:{hash}"),
+                "state_root": root,
+                "checkpoint": format!("{height}:{hash}:{root}"),
                 "advice": "Compare this against the same endpoint on other nodes before trusting \
                            it. A checkpoint from the node you are about to sync from proves \
-                           nothing on its own.",
+                           nothing on its own — and the state_root is the half that decides \
+                           whether a snapshot can be believed at all.",
             })),
         );
     }
@@ -2793,10 +2805,13 @@ mod tests {
         );
     }
 
-    /// A checkpoint must name a height where a joiner would actually get through — which needs
-    /// three things present at once, not just a stored snapshot. Handing out a height whose block
-    /// above is missing produces a checkpoint that fails on use, and the operator who copied it
-    /// has no way to tell that from a hostile peer.
+    /// A checkpoint must name a height where a joiner would actually get through, and carry the
+    /// state root that lets them prove the snapshot at all.
+    ///
+    /// **The tip is now nameable, and that is the change.** This used to skip the newest snapshot
+    /// whenever the block *above* it was missing, because the old proof ran through that block's
+    /// `prev_state_root`. That proof did not hold (a peer can write that block itself), so it is
+    /// gone — and with it the reason to hold the checkpoint one snapshot interval behind.
     #[tokio::test]
     async fn a_checkpoint_names_only_a_height_a_joiner_could_actually_use() {
         let state = fresh_test_state();
@@ -2820,8 +2835,7 @@ mod tests {
             for h in 0..=3u64 {
                 db.put_block(mk(h)).unwrap();
             }
-            // Snapshots at 2 and 3. Only 2 is usable: height 3 is the tip, so there is no block
-            // above it to prove it with.
+            // Snapshots at 2 and 3. Both are usable now; 3 wins for being the newest.
             for h in [2u64, 3] {
                 cs.applied_height = h;
                 db.put_state_snapshot(h, &cs).unwrap();
@@ -2834,16 +2848,23 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(
-            v["height"], 2,
-            "3 is a stored snapshot but sits at the tip — nothing above it to prove it with: {v}"
+            v["height"], 3,
+            "the newest stored snapshot, tip or not — a joiner only needs the anchor block: {v}"
         );
-        let expected = {
+        let (expected_hash, expected_root) = {
             let db = state.store.read().await;
-            db.get_block_by_height(2).unwrap().hash().to_hex()
+            let hash = db.get_block_by_height(3).unwrap().hash().to_hex();
+            let (_, cs) = db.state_snapshot_at_or_before(3).unwrap().unwrap();
+            (hash, cs.state_hash().to_hex())
         };
-        assert_eq!(v["block_hash"], expected, "and the hash is this node's own block 2");
+        assert_eq!(v["block_hash"], expected_hash, "and the hash is this node's own block 3");
         assert_eq!(
-            v["checkpoint"], format!("2:{expected}"),
+            v["state_root"], expected_root,
+            "the state root is the half that decides whether a snapshot can be believed — a \
+             checkpoint without it licenses nothing"
+        );
+        assert_eq!(
+            v["checkpoint"], format!("3:{expected_hash}:{expected_root}"),
             "handed over in the exact shape HELIX_TRUSTED_CHECKPOINT takes, so nobody has to \
              assemble it by hand"
         );

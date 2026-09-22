@@ -867,7 +867,8 @@
         $("checkpoint").textContent = cp.checkpoint;
         $("cp-note").textContent =
           "HELIX_TRUSTED_CHECKPOINT — lets a new node start here instead of replaying the chain. " +
-          "Check it against another node before you trust it.";
+          "The third part is the state root, and it is what makes a snapshot provable at all. " +
+          "Check the whole line against another node before you trust it.";
       }
       height = status.height;
 
