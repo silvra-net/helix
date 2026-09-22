@@ -39,9 +39,23 @@ pub fn precommit_signing_bytes(
 /// This is the data downtime-jailing counts from: `helix-executor::ChainState` walks a new
 /// block's `last_commit`, and any current validator whose address is absent gets a miss
 /// recorded against it. A proposer can only ever hurt an honest validator's count by omitting
-/// a real signature it holds — it can't fabricate one, `verify()` below is the reason why —
-/// and round-robin proposer rotation means that omission can't persist past the next honest
-/// proposer's turn, which will include the real signature and reset the count.
+/// a real signature it holds — it can't fabricate one, `verify()` below is the reason why.
+///
+/// **How much that omission costs changed on 2026-09-18 (#198), and this comment said otherwise
+/// until 2026-09-22.** It used to read "that omission can't persist past the next honest
+/// proposer's turn, which will include the real signature and reset the count" — true while the
+/// counter was a streak cleared by any signature, and false since it became a leaky bucket that
+/// is only *paid down*. The property is no longer free; it is an arithmetic one:
+///
+/// misses charge `MISS_WEIGHT`, signatures refund `PARTICIPATION_CREDIT`, so a validator omitted
+/// in a fraction `p` of blocks drifts upward exactly when `p > 1/3`. **Jailing an honest
+/// validator therefore costs more than a third of the proposer slots — more than a third of the
+/// set, which `3f+1` already does not tolerate.** So the rate rule spends no margin that was not
+/// already spent, and that is the reason it is acceptable rather than merely useful.
+///
+/// Pinned by `jailing_an_honest_validator_costs_more_than_a_third_of_the_proposers`
+/// (helix-executor), both sides of the boundary, because a claim of this shape in a comment is
+/// what the four attacks of 2026-09-22 were each made of.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitSig {
     pub validator: Address,

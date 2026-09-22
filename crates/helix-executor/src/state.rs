@@ -2396,6 +2396,84 @@ mod tests {
         );
     }
 
+    /// **What a hostile proposer can do to an honest validator, now that the counter is a rate.**
+    ///
+    /// A proposer chooses who appears in the `last_commit` it writes. It cannot forge a signature
+    /// (`CommitSig::verify`), so its only move is to omit a real one — and omission charges the
+    /// victim a miss. Before 2026-09-18 that was harmless by construction: any signature cleared
+    /// the counter outright, so a miss could not survive the next honest proposer's turn. **#198
+    /// removed that property along with the streak**, and the doc comment on `CommitSig` went on
+    /// claiming it ("will include the real signature and reset the count") until this test was
+    /// written.
+    ///
+    /// What replaces it is an equation, and it is worth stating because it is not obvious:
+    /// omitted blocks charge `MISS_WEIGHT`, included ones refund `PARTICIPATION_CREDIT`, so a
+    /// victim omitted in a fraction `p` of blocks drifts by `MISS_WEIGHT·p − CREDIT·(1−p)` per
+    /// block. That is positive exactly when `p > 1/3`.
+    ///
+    /// **So a colluding group must hold more than a third of the proposer slots to jail anyone —
+    /// which is more than a third of the validator set, the share BFT already does not tolerate.**
+    /// The rate rule therefore costs no safety margin that `3f+1` had not already spent. That is
+    /// the argument for keeping it, and it is checked here rather than asserted in a comment,
+    /// because this is exactly the kind of claim the four attacks of 2026-09-22 were all made of.
+    #[test]
+    fn jailing_an_honest_validator_costs_more_than_a_third_of_the_proposers() {
+        // Three of nine slots is exactly one third — the boundary, and the side that must hold.
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        for n in 1..=4 {
+            stake(&mut state, n, 1_000);
+        }
+        let validators = vec![addr(1), addr(2), addr(3), addr(4)];
+        let without_2: std::collections::HashSet<Address> =
+            [addr(1), addr(3), addr(4)].into_iter().collect();
+        let all: std::collections::HashSet<Address> =
+            [addr(1), addr(2), addr(3), addr(4)].into_iter().collect();
+
+        for height in 0..(BLOCKS_OF_SILENCE_TO_JAIL as u64 * 4) {
+            let hostile_turn = height % 3 == 0; // one proposer in three omits the victim
+            let signers = if hostile_turn { &without_2 } else { &all };
+            assert!(
+                state.record_block_participation(&validators, signers, height).is_empty(),
+                "a third of the proposers is not enough to jail an honest validator — height \
+                 {height}. If this fails, the rate rule punishes honest nodes inside the fault \
+                 budget, which is worse than the problem it was built for."
+            );
+        }
+        assert!(
+            state.missed_blocks.get(&addr(2).to_string()).copied().unwrap_or(0) <= MISS_WEIGHT,
+            "and at exactly one third the debt must not accumulate at all: {:?}",
+            state.missed_blocks.get(&addr(2).to_string())
+        );
+
+        // Past the third — the positive control. Without it the loop above would be satisfied by
+        // a rule that never jails anybody, which is the other way to get this wrong.
+        let mut state = ChainState::new(0);
+        state.governance_params.min_validator_stake = 100;
+        for n in 1..=4 {
+            stake(&mut state, n, 1_000);
+        }
+        let mut jailed_at = None;
+        for height in 0..100_000u64 {
+            let hostile_turn = height % 5 < 2; // two slots in five = 40 %, past the third
+            let signers = if hostile_turn { &without_2 } else { &all };
+            if !state.record_block_participation(&validators, signers, height).is_empty() {
+                jailed_at = Some(height);
+                break;
+            }
+        }
+        let at = jailed_at.expect(
+            "past a third of the proposers the victim must eventually be jailed — otherwise the \
+             boundary above is not a boundary and the rule does not measure a rate at all",
+        );
+        // 2·0.4 − 1·0.6 = 0.2 per block against a threshold of 3600.
+        assert!(
+            (17_000..=19_000).contains(&at),
+            "the drift is an equation, not a vibe: at 40 % omission the jail lands near height \
+             18000, got {at}"
+        );
+    }
+
     /// Backwards compatibility, stated as an equation rather than trusted: the threshold was
     /// doubled alongside `MISS_WEIGHT`, so an outright-silent validator is still jailed after
     /// exactly the same 1800 blocks it was before 2026-09-18. That was the number chosen on

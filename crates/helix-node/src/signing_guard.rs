@@ -89,13 +89,6 @@ pub enum Decision {
     RefuseRegression,
 }
 
-impl Decision {
-    /// Whether this decision withholds the vote.
-    pub fn is_refusal(&self) -> bool {
-        !matches!(self, Decision::Allow)
-    }
-}
-
 pub struct SigningGuard {
     /// `None` disables the guard entirely (permit everything, persist nothing). Only for tests
     /// and non-signing nodes — a real validator always loads a `Some` path via [`load`].

@@ -2589,7 +2589,7 @@ mod multiaddr_ip_tests {
 #[cfg(test)]
 mod peer_exchange_tests {
     use super::{
-        at, decode_peer_exchange, foreign_chain_warning, foreign_version_warning, holding,
+        at, decode_peer_exchange, foreign_chain_warning, foreign_version_warning,
         peer_chain, select_new_addrs, should_serve_catchup, tip_outcome, unreadable_peer_exchange,
         PeerChain, PeerExchangeMsg, PeerExchangeMsgV1, PeerExchangeMsgV2, MAX_CATCHUP_SERVE_BLOCKS,
         MAX_KNOWN_PEER_ADDRS, OUR_VERSION, UNREADABLE_PEER_EXCHANGE_TOLERANCE,

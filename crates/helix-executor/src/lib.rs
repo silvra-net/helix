@@ -7031,7 +7031,7 @@ mod money_conservation_attacks {
 /// would deploy, not as unit tests of a function.
 #[cfg(test)]
 mod contract_bridge_attacks {
-    use super::tests::{signed_contract_tx, signed_tx};
+    use super::tests::signed_contract_tx;
     use super::*;
     use helix_crypto::KeyPair;
 
