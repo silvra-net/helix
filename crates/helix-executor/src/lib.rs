@@ -1153,15 +1153,6 @@ fn execute_register_guardians(
     tx_hash: Hash,
     base_fee_amount: u64,
 ) -> Receipt {
-    if state.recovery_request(&tx.from).is_some() {
-        return Receipt::failure(
-            tx_hash,
-            "cannot change guardians while a recovery request is pending",
-            0,
-            0,
-        );
-    }
-
     let raw = match std::str::from_utf8(&tx.data) {
         Ok(s) => s,
         Err(_) => return Receipt::failure(tx_hash, "guardian payload is not valid UTF-8", 0, 0),
@@ -1181,6 +1172,26 @@ fn execute_register_guardians(
         Err(e) => return Receipt::failure(tx_hash, &e.to_string(), 0, 0),
     };
     state.set_guardians(&tx.from, set);
+
+    // Any vote in progress dies with the set it was cast under.
+    //
+    // This used to *refuse* while a request was pending, and that handed one guardian a veto
+    // over the whole mechanism: the owner needs two transactions (cancel, then register) with
+    // nothing in between, the guardian needs one approval, and it is the proposer who orders a
+    // block. Re-approving after every cancel is not a race the owner can win — so a guardian
+    // that turned hostile could never be removed, and the owner stayed exposed to that set's
+    // threshold with a known adversary inside it, permanently.
+    //
+    // **An owner who can still sign outranks one guardian's sub-threshold vote**, and that is not
+    // a trade-off: recovery exists for a key that is *lost*, and a signature from that key is
+    // proof it is not. An attacker holding a stolen key has no reason to sabotage a recovery —
+    // they can empty the account directly.
+    //
+    // Clearing rather than keeping is the only safe half: approvals were counted against the old
+    // set's membership and the old threshold, so carrying them into a new set would let
+    // guardians who are no longer guardians vote in it. `CancelRecoveryRequest` stays, for an
+    // owner who wants to clear a request without replacing anybody.
+    state.clear_recovery_request(&tx.from);
 
     state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
@@ -2450,10 +2461,20 @@ mod tests {
         tx
     }
 
+    /// An owner can clear a stuck sub-threshold request with their own key, without replacing
+    /// anybody.
+    ///
+    /// **Renamed 2026-09-22 (was `cancel_recovery_request_unblocks_guardian_changes`), because
+    /// what it asserted is the hole.** It required `RegisterGuardians` to be *refused* while a
+    /// request was pending, and called cancelling the way out — which works exactly once. A
+    /// guardian watching the chain re-approves before the owner's second transaction lands, and
+    /// the owner needs two transactions against the guardian's one. See
+    /// `a_guardian_re_approving_cannot_keep_the_owner_from_replacing_it`.
+    ///
+    /// What is left here is the part that was always true and is still worth pinning: cancelling
+    /// works, and it is the right tool when the owner wants the request gone and the set kept.
     #[test]
-    fn cancel_recovery_request_unblocks_guardian_changes() {
-        // A single guardian's sub-threshold approval must not be able to permanently
-        // lock the owner out of ever changing their guardian set again.
+    fn an_owner_can_cancel_a_stuck_recovery_request_with_their_own_key() {
         let validator = Address::from_public_key(&KeyPair::generate().public);
         let owner_kp = KeyPair::generate();
         let owner = Address::from_public_key(&owner_kp.public);
@@ -2487,24 +2508,171 @@ mod tests {
         assert!(execute_transaction(&mut state, &approve_tx, &validator, 1, 0).success);
         assert!(state.recovery_request(&owner).is_some());
 
-        // Owner is now locked out of changing guardians... The attempt is rejected but still
-        // pays and consumes nonce 1, like any payable transaction that took a block slot and
-        // failed — hence nonce 2 for the next one.
-        let blocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 1, 10_000);
-        let receipt = execute_transaction(&mut state, &blocked_tx, &validator, 2, 0);
-        assert!(!receipt.success, "guardian changes should be blocked while a request is pending");
-
-        // ...until they cancel the stuck request themselves, still with their original key
-        // (recovery never finalized, so no override key was ever set).
-        let cancel_tx = signed_cancel_recovery_request_tx(&owner_kp, &owner, 2, 10_000);
+        // The owner clears it with their original key — recovery never finalized, so no override
+        // key was ever set.
+        let cancel_tx = signed_cancel_recovery_request_tx(&owner_kp, &owner, 1, 10_000);
         let receipt = execute_transaction(&mut state, &cancel_tx, &validator, 2, 0);
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert!(state.recovery_request(&owner).is_none());
 
-        // Guardian changes work again.
-        let unblocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 3, 10_000);
+        // And the set is untouched by the cancellation — that is the difference between this and
+        // replacing the guardians.
+        assert!(state.guardians(&owner).unwrap().contains(&guardian_addrs[0]));
+        let unblocked_tx = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 2, 10_000);
         let receipt = execute_transaction(&mut state, &unblocked_tx, &validator, 3, 0);
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+    }
+
+    /// **Cancelling is not enough: the owner needs two transactions, a hostile guardian needs
+    /// one.**
+    ///
+    /// `cancel_recovery_request_unblocks_guardian_changes` proves the owner can get through
+    /// *once*, and its comment claims a single guardian cannot "permanently" lock them out. It
+    /// shows one round of a race that the guardian can re-enter at every block: cancel, approve,
+    /// cancel, approve. The owner has to land `CancelRecoveryRequest` *and* `RegisterGuardians`
+    /// with nothing in between; the guardian only has to land one `ApproveRecovery`, and it is
+    /// the proposer who decides the order inside a block.
+    ///
+    /// What that costs is not griefing. It means **a guardian who turns hostile can never be
+    /// removed**, so the owner stays exposed to that set's threshold — with a known adversary
+    /// inside it — for as long as the account exists.
+    ///
+    /// The fix is to let `RegisterGuardians` through: an owner who can still sign outranks one
+    /// guardian's sub-threshold vote. Recovery exists for a key that is *lost*, and a signature
+    /// from that key is proof it is not. (An attacker who has stolen the key does not need to
+    /// sabotage a recovery — they can empty the account outright.)
+    #[test]
+    fn a_guardian_re_approving_cannot_keep_the_owner_from_replacing_it() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let owner_kp = KeyPair::generate();
+        let owner = Address::from_public_key(&owner_kp.public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&owner, |acc| acc.balance = 1_000_000);
+
+        let guardian_kps: Vec<KeyPair> = (0..5).map(|_| KeyPair::generate()).collect();
+        let guardian_addrs: Vec<Address> =
+            guardian_kps.iter().map(|kp| Address::from_public_key(&kp.public)).collect();
+        for addr in &guardian_addrs {
+            state.update_account(addr, |acc| acc.balance = 1_000_000);
+        }
+        let reg = signed_register_guardians_tx(&owner_kp, &owner, &guardian_addrs, 0, 10_000);
+        assert!(execute_transaction(&mut state, &reg, &validator, 0, 0).success);
+
+        let bogus = KeyPair::generate();
+        let mut guardian_nonce = 0u64;
+        let mut approve = |state: &mut ChainState, n: &mut u64| {
+            let tx = signed_approve_recovery_tx(
+                &guardian_kps[0],
+                &guardian_addrs[0],
+                &owner,
+                &bogus.public,
+                *n,
+                10_000,
+            );
+            *n += 1;
+            assert!(execute_transaction(state, &tx, &validator, 1, 0).success);
+        };
+
+        // Round one: the guardian opens a request, the owner clears it.
+        approve(&mut state, &mut guardian_nonce);
+        let cancel = signed_cancel_recovery_request_tx(&owner_kp, &owner, 1, 10_000);
+        assert!(execute_transaction(&mut state, &cancel, &validator, 2, 0).success);
+
+        // The guardian is watching the chain and re-opens it before the owner's second
+        // transaction lands. Nothing here needs luck — it needs one transaction against two.
+        approve(&mut state, &mut guardian_nonce);
+        assert!(state.recovery_request(&owner).is_some(), "premise: the request is back");
+
+        // The owner, still holding their own key, replaces the guardian set.
+        let replacement: Vec<Address> = (0..5)
+            .map(|_| Address::from_public_key(&KeyPair::generate().public))
+            .collect();
+        let register = signed_register_guardians_tx(&owner_kp, &owner, &replacement, 2, 10_000);
+        let receipt = execute_transaction(&mut state, &register, &validator, 3, 0);
+
+        assert!(
+            receipt.success,
+            "an owner who can sign must be able to remove a guardian that has turned on them, \
+             whatever that guardian keeps re-opening: {:?}",
+            receipt.error
+        );
+        assert!(
+            !state.guardians(&owner).unwrap().contains(&guardian_addrs[0]),
+            "and the hostile guardian must actually be gone from the set"
+        );
+        assert!(
+            state.recovery_request(&owner).is_none(),
+            "the request it opened dies with the set it was voted under — keeping it would let \
+             approvals from the old guardians count toward the new threshold"
+        );
+    }
+
+    /// **Why replacing the set has to destroy the vote, and not merely unblock it.**
+    ///
+    /// Approvals are counted as a bare list against the *current* set's threshold — `approve`
+    /// checks only that the same guardian has not voted twice, and finalisation is
+    /// `approvals.len() >= threshold`. Neither is re-checked against membership later.
+    ///
+    /// So a request carried across a guardian change is a vote counted under one electorate and
+    /// settled under another. Five old guardians (threshold 3) leave two approvals standing;
+    /// shrink to three new guardians (threshold 2) and the request is already over the line — one
+    /// approval from a single new guardian finalises a key that nobody in the new set chose, and
+    /// two of the votes behind it come from people who are no longer guardians at all.
+    ///
+    /// That is the reason `RegisterGuardians` clears it, rather than just no longer refusing.
+    #[test]
+    fn approvals_from_a_replaced_guardian_set_cannot_finalise_under_the_new_one() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let owner_kp = KeyPair::generate();
+        let owner = Address::from_public_key(&owner_kp.public);
+        let mut state = ChainState::new(0);
+        state.update_account(&owner, |acc| acc.balance = 1_000_000);
+
+        let old_kps: Vec<KeyPair> = (0..5).map(|_| KeyPair::generate()).collect();
+        let old_addrs: Vec<Address> =
+            old_kps.iter().map(|kp| Address::from_public_key(&kp.public)).collect();
+        let new_kps: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+        let new_addrs: Vec<Address> =
+            new_kps.iter().map(|kp| Address::from_public_key(&kp.public)).collect();
+        for a in old_addrs.iter().chain(new_addrs.iter()) {
+            state.update_account(a, |acc| acc.balance = 1_000_000);
+        }
+
+        let reg = signed_register_guardians_tx(&owner_kp, &owner, &old_addrs, 0, 10_000);
+        assert!(execute_transaction(&mut state, &reg, &validator, 0, 0).success);
+
+        // Two of the five old guardians approve an attacker's key: 2 of 3 needed, not enough.
+        let attacker = KeyPair::generate();
+        for i in 0..2 {
+            let tx = signed_approve_recovery_tx(
+                &old_kps[i], &old_addrs[i], &owner, &attacker.public, 0, 10_000,
+            );
+            assert!(execute_transaction(&mut state, &tx, &validator, 1, 0).success);
+        }
+        assert!(state.recovery_request(&owner).is_some(), "premise: two votes are standing");
+
+        // The owner replaces the set with three fresh guardians — threshold 2.
+        let replace = signed_register_guardians_tx(&owner_kp, &owner, &new_addrs, 1, 10_000);
+        assert!(execute_transaction(&mut state, &replace, &validator, 2, 0).success);
+
+        // One new guardian approves the same key. If the old votes had survived, this would be
+        // the third approval against a threshold of two and control would change hands here.
+        let tx = signed_approve_recovery_tx(
+            &new_kps[0], &new_addrs[0], &owner, &attacker.public, 0, 10_000,
+        );
+        assert!(execute_transaction(&mut state, &tx, &validator, 3, 0).success);
+
+        assert!(
+            state.recovery_key(&owner).is_none(),
+            "one vote from the new set must not carry a request two former guardians left \
+             behind — the electorate that finishes a vote has to be the one that started it"
+        );
+        assert_eq!(
+            state.recovery_request(&owner).map(|r| r.approvals.len()),
+            Some(1),
+            "the new request starts from this guardian alone"
+        );
     }
 
     #[test]
