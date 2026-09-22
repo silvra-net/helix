@@ -224,6 +224,10 @@ struct Sim {
     /// time, and recovering from it is the property that keeps failing.
     swallow_proposals: Vec<(usize, usize)>,
     roundsync: bool,
+    /// Validators that sign two conflicting votes for every one they cast (see `equivocate`).
+    byzantine: HashSet<usize>,
+    /// Byzantine nodes tell the lower and upper halves of the network different values.
+    split_brain: bool,
 }
 
 impl Sim {
@@ -256,6 +260,8 @@ impl Sim {
             partition: None,
             swallow_proposals: Vec::new(),
             roundsync: false,
+            byzantine: HashSet::new(),
+            split_brain: false,
         }
     }
 
@@ -286,6 +292,16 @@ impl Sim {
 
     fn swallow_proposals(mut self, i: usize, count: usize) -> Self {
         self.swallow_proposals.push((i, count));
+        self
+    }
+
+    fn byzantine(mut self, i: usize) -> Self {
+        self.byzantine.insert(i);
+        self
+    }
+
+    fn split_brain(mut self) -> Self {
+        self.split_brain = true;
         self
     }
 
@@ -340,6 +356,23 @@ impl Sim {
             return;
         }
         let t = self.t;
+        // A byzantine node's votes go out *twice*, the second for a different value and correctly
+        // signed by the same key — real equivocation, not a forgery. The distinction is the whole
+        // point: a forged signature is refused at the boundary and proves nothing about consensus,
+        // while a validator signing two conflicting things is a live validator doing exactly what
+        // the protocol is built to survive. Splitting it here rather than inside the node keeps
+        // the production path free of any "be evil" switch.
+        // Split-brain equivocation is *targeted*: half the network is told one value and half the
+        // other, which is the only version of this attack that could actually fork a chain. The
+        // undirected kind — both votes to everyone — is measurably harmless, and this harness said
+        // so before the distinction existed: two undirected equivocators of five committed 83
+        // blocks against an honest baseline of 66, because the honest half of each pair of votes
+        // still counted and the other half was simply discarded.
+        if self.split_brain && self.byzantine.contains(&from) {
+            self.broadcast_split(from, msgs);
+            return;
+        }
+        let msgs = self.equivocate(from, msgs);
         for m in msgs {
             for to in 0..self.nodes.len() {
                 if to == from || !self.reachable(from, to, t) {
@@ -349,6 +382,74 @@ impl Sim {
                 self.wire.push((at, to, m.clone(), Transport::Gossip));
             }
         }
+    }
+
+    /// Tell the lower half of the network one value and the upper half another, both signed.
+    ///
+    /// Each honest node receives exactly **one** vote per (height, round) from this validator, so
+    /// none of them sees a conflict locally — the equivocation is invisible to every individual
+    /// participant and exists only in the difference between them. That is what makes it the
+    /// dangerous shape: there is no single node that could refuse it.
+    fn broadcast_split(&mut self, from: usize, msgs: Vec<Msg>) {
+        let t = self.t;
+        let half = self.nodes.len() / 2;
+        // Signed up front, while only a shared borrow of the node is needed: `KeyPair` is not
+        // `Clone` (deliberately — a signing key that copies itself around is a key that ends up
+        // somewhere unintended), so the twins cannot be built inside the send loop below.
+        let pairs: Vec<(Msg, Option<Msg>)> = {
+            let kp = &self.nodes[from].kp;
+            msgs.into_iter()
+                .map(|m| {
+                    let twin = match &m {
+                        Msg::Vote(v) => {
+                            let mut tw = (**v).clone();
+                            tw.block_hash = Hash::digest(b"the other branch");
+                            tw.signature =
+                                kp.sign(&tw.signing_bytes()).expect("sign the twin vote");
+                            Some(Msg::Vote(Box::new(tw)))
+                        }
+                        _ => None,
+                    };
+                    (m, twin)
+                })
+                .collect()
+        };
+        for (m, twin) in pairs {
+            for to in 0..self.nodes.len() {
+                if to == from || !self.reachable(from, to, t) {
+                    continue;
+                }
+                let at = t + self.latency + self.extra_latency(to);
+                let msg = match (&twin, to >= half) {
+                    (Some(tw), true) => tw.clone(),
+                    _ => m.clone(),
+                };
+                self.wire.push((at, to, msg, Transport::Gossip));
+            }
+        }
+    }
+
+    /// Duplicate a byzantine node's votes with a conflicting block hash, signed by its own key.
+    fn equivocate(&self, from: usize, msgs: Vec<Msg>) -> Vec<Msg> {
+        if !self.byzantine.contains(&from) {
+            return msgs;
+        }
+        let kp = &self.nodes[from].kp;
+        let mut out = Vec::with_capacity(msgs.len() * 2);
+        for m in msgs {
+            if let Msg::Vote(v) = &m {
+                let mut twin = (**v).clone();
+                // A different value for the same (height, round, type) — which is precisely what
+                // `VoteSet::add` is meant to catch and turn into double-sign evidence.
+                twin.block_hash = Hash::digest(b"the other branch");
+                twin.signature = kp.sign(&twin.signing_bytes()).expect("sign the twin vote");
+                out.push(m);
+                out.push(Msg::Vote(Box::new(twin)));
+                continue;
+            }
+            out.push(m);
+        }
+        out
     }
 
     /// The pull, modelled as what it is: a question and an answer, not a rebroadcast. It is the one
@@ -470,6 +571,12 @@ impl Sim {
     /// Compares committed chains rather than tips, because a fork below the tip is still a fork —
     /// and comparing only tips would call two nodes on different heights "not forked" for the
     /// uninteresting reason that there is nothing to compare.
+    /// Double-sign evidence every node has accumulated. Drains it, which is what the node layer
+    /// does too — nothing here reads it twice.
+    fn evidence_collected(&mut self) -> usize {
+        self.nodes.iter_mut().map(|n| n.engine.take_evidence().len()).sum()
+    }
+
     fn assert_no_fork(&self, ctx: &str) {
         for (i, a) in self.nodes.iter().enumerate() {
             for (j, b) in self.nodes.iter().enumerate().skip(i + 1) {
@@ -796,4 +903,216 @@ fn a_proposal_that_arrives_too_late_splits_the_prevotes_and_kills_a_full_round()
          regression test"
     );
     split.assert_no_fork("split prevotes");
+}
+
+/// **A validator that signs two conflicting votes for everything it casts.**
+///
+/// The fault class every other test here leaves out. Silence, lag, partition and dropped messages
+/// are all things that happen *to* a node; this is a node doing something no correct one ever
+/// does, with a valid key and a valid signature — which is why it cannot be refused at the
+/// boundary the way a forgery can. It is the case BFT exists for, and the one the five production
+/// outages of the last month were never this: every one of them was a node that went quiet.
+///
+/// Five validators, one byzantine, so `3f+1` holds with f=1 and the protocol is owed both
+/// guarantees. They are asserted in the order they matter:
+///
+/// 1. **Safety.** No two nodes commit different blocks at the same height. This is the one that
+///    must never bend — a halt costs hours, a fork costs the chain.
+/// 2. **Liveness.** The honest four keep finalising. A protocol that survives byzantium by
+///    stopping has not survived it.
+/// 3. **Evidence.** Equivocation is detectable, because slashing is what makes it expensive
+///    rather than free.
+#[test]
+fn a_validator_signing_two_conflicting_votes_forks_nothing_and_stops_nothing() {
+    let mut honest = Sim::new(5, 1);
+    honest.run(200);
+    let baseline = honest.heights().iter().copied().max().unwrap_or(0);
+
+    let mut sim = Sim::new(5, 1).byzantine(4);
+    sim.run(200);
+    let heights = sim.heights();
+    let evidence = sim.evidence_collected();
+    println!(
+        "one equivocator of five: heights={heights:?} (honest baseline {baseline}), \
+         double-sign evidence observed {evidence}x"
+    );
+
+    // 1 — the guarantee that must not bend.
+    sim.assert_no_fork("one validator equivocating on every vote");
+
+    // 2 — and it must not have cost the chain its liveness either. Compared against the honest
+    // run rather than against zero: a threshold picked out of the air would pass a chain that
+    // crawled, and crawling under one byzantine node out of five is itself a failure.
+    let best = heights.iter().copied().max().unwrap_or(0);
+    assert!(
+        best * 2 >= baseline,
+        "one equivocator of five took the chain from {baseline} to {best} — the honest four hold \
+         a quorum without it and must keep finalising"
+    );
+
+    // 3 — detectable. Without this the attack is free, and a free attack is one that gets run.
+    assert!(
+        evidence > 0,
+        "nobody noticed a validator signing two different values for the same height and round; \
+         double-sign evidence is what makes equivocation cost its stake"
+    );
+}
+
+/// The same attack, but the equivocator is also the *proposer* it takes turns being — and the
+/// honest nodes are slowed enough that its two conflicting votes land in different orders at
+/// different peers.
+///
+/// Order is the interesting variable: a node that saw the good vote first and a node that saw the
+/// twin first hold different first impressions of the same validator. If anything downstream
+/// treats "the first vote I saw" as the truth, this is where the two halves of the network stop
+/// agreeing — and it would show up as a fork rather than as a rejected vote.
+#[test]
+fn conflicting_votes_arriving_in_different_orders_still_agree_on_one_chain() {
+    let mut sim = Sim::new(5, 2).byzantine(2).slow(3, 3).slow(4, 1);
+    sim.run(250);
+    println!(
+        "equivocator with reordered delivery: heights={:?}, evidence={}",
+        sim.heights(),
+        sim.evidence_collected()
+    );
+    sim.assert_no_fork("conflicting votes delivered in different orders");
+}
+
+/// **Do five honest validators accuse each other of double-signing?**
+///
+/// Found while red-running the byzantine test above: with the attack switched off, the run still
+/// reported 264 pieces of double-sign evidence. Either the harness manufactures it, or honest
+/// nodes really do produce conflicting votes — and the second would mean a validator can be
+/// slashed 5 % of its stake for doing nothing wrong, which is worse than any attack tested here.
+///
+/// No faults at all: no silence, no latency beyond one tick, no byzantine node. Anything this
+/// finds, an honest network finds.
+#[test]
+fn honest_validators_never_accuse_each_other_of_double_signing() {
+    let mut sim = Sim::new(5, 1);
+    sim.run(200);
+    // Inspect before asserting: "there is evidence" is a symptom, and the shape of the conflict
+    // is what says whether this is the harness or the engine.
+    let mut detail: Vec<String> = Vec::new();
+    let mut evidence = 0usize;
+    for (i, n) in sim.nodes.iter_mut().enumerate() {
+        let all = n.engine.take_evidence();
+        // Counted in full, shown in part: the assertion is about *whether* honest nodes accuse
+        // each other, and a count that silently reported only the first few per node would
+        // understate a regression by whatever factor the sample happened to be.
+        evidence += all.len();
+        for e in all.into_iter().take(3) {
+            detail.push(format!(
+                "node{i} saw {} at h{} r{} type {:?}: {} vs {}",
+                &e.validator.to_string()[..10],
+                e.height,
+                e.round,
+                e.vote_a.vote_type,
+                &e.vote_a.block_hash.to_hex()[..8],
+                &e.vote_b.block_hash.to_hex()[..8],
+            ));
+        }
+    }
+    println!("five honest validators, 200 ticks: heights={:?}, evidence={evidence}", sim.heights());
+    for d in detail.iter().take(10) {
+        println!("  {d}");
+    }
+    assert_eq!(
+        evidence, 0,
+        "honest validators produced {evidence} pieces of double-sign evidence against each other. \
+         Evidence is what slashing runs on, so this is a validator losing stake for behaving \
+         correctly — or, if the evidence is never acted on, a detector that cries wolf so often \
+         that a real equivocation is indistinguishable from the noise"
+    );
+}
+
+/// **Two equivocators of five — one more than the protocol is owed.**
+///
+/// `3f+1` with five validators buys f=1. At two, every guarantee about *progress* is void and the
+/// chain is allowed to do nothing at all. Exactly one thing is still owed, and it is the one that
+/// matters: **it must not fork.** A halt costs hours and is recoverable by people; two nodes
+/// finalising different blocks at the same height is not recoverable by anyone.
+///
+/// This is the boundary the whole design is built on, and it had no test. The five production
+/// outages of the last month were all halts — which is the *correct* failure, and this is what
+/// says so on purpose rather than by luck.
+#[test]
+fn two_equivocators_of_five_may_halt_the_chain_but_must_never_fork_it() {
+    let mut sim = Sim::new(5, 1).byzantine(3).byzantine(4);
+    sim.run(250);
+    let heights = sim.heights();
+    let evidence = sim.evidence_collected();
+    println!("two equivocators of five: heights={heights:?}, evidence={evidence}");
+
+    // The guarantee. Nothing else here is asserted as a requirement, because nothing else is owed.
+    sim.assert_no_fork("two of five equivocating, past the fault budget");
+
+    // Stated rather than asserted: whether it also kept moving is worth knowing and is not a
+    // promise. A run that halts here is correct; one that forks is not.
+    assert!(
+        evidence > 0,
+        "two validators equivocating must still be detectable — undetected equivocation past the \
+         fault budget is an attack with no cost at all"
+    );
+}
+
+/// A byzantine validator that equivocates **and** is slow, so its two conflicting votes reach the
+/// honest nodes at different times as well as in different orders.
+///
+/// Timing is the variable a same-tick delivery hides: if anything treats "the vote I already had"
+/// as settled and refuses the second rather than recording the conflict, evidence disappears while
+/// the equivocation still happened — the attack becomes free.
+#[test]
+fn an_equivocator_whose_votes_arrive_apart_is_still_caught() {
+    let mut sim = Sim::new(5, 1).byzantine(1).slow(1, 4);
+    sim.run(250);
+    let evidence = sim.evidence_collected();
+    println!("slow equivocator: heights={:?}, evidence={evidence}", sim.heights());
+    sim.assert_no_fork("an equivocator whose votes arrive apart");
+    assert!(
+        evidence > 0,
+        "an equivocation spread over four ticks must still be recorded — catching it only when \
+         both votes land together would make the attack free by simply waiting"
+    );
+}
+
+/// **The dangerous shape: a validator that tells half the network one value and half another.**
+///
+/// The undirected equivocation above is measurably harmless — both votes reach everyone, the
+/// honest one still counts, and the chain does not even slow down. This is the version that could
+/// actually fork a chain: each honest node receives exactly one vote per round from the attacker,
+/// so **no individual node ever sees a conflict**. There is nothing for any single participant to
+/// refuse. The disagreement exists only in the difference between them, which is precisely the
+/// situation quorum arithmetic is supposed to survive.
+///
+/// With five validators and one attacker, neither half can reach the 4-of-5 quorum on its own
+/// value — that is the claim, and this is the test of it rather than a re-derivation of it.
+#[test]
+fn a_validator_telling_each_half_of_the_network_a_different_value_forks_nothing() {
+    let mut sim = Sim::new(5, 1).byzantine(2).split_brain();
+    sim.run(250);
+    println!(
+        "split-brain equivocator: heights={:?}, evidence={}",
+        sim.heights(),
+        sim.evidence_collected()
+    );
+    sim.assert_no_fork("one validator feeding each half a different value");
+}
+
+/// The same split-brain attack from **two** validators — past the fault budget, where progress is
+/// no longer owed and only safety is.
+///
+/// This is the worst case the design admits: two of five lying in a coordinated, targeted way,
+/// with no honest node able to detect either of them locally. If a fork is reachable at all, it is
+/// reachable here.
+#[test]
+fn two_split_brain_validators_past_the_fault_budget_still_cannot_fork_the_chain() {
+    let mut sim = Sim::new(5, 1).byzantine(3).byzantine(4).split_brain();
+    sim.run(300);
+    println!(
+        "two split-brain equivocators: heights={:?}, evidence={}",
+        sim.heights(),
+        sim.evidence_collected()
+    );
+    sim.assert_no_fork("two validators feeding each half a different value");
 }

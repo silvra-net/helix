@@ -108,6 +108,10 @@ impl Node {
 struct Outcome {
     a_commits: usize,
     b_commits: usize,
+    /// What each node actually finalized, so agreement can be checked on the blocks rather than
+    /// inferred from how many there were.
+    a_chain: Vec<(u64, Hash)>,
+    b_chain: Vec<(u64, Hash)>,
     a_round: u32,
     b_round: u32,
 }
@@ -163,6 +167,8 @@ fn run(latency: usize, skew: usize, ticks: usize) -> Outcome {
     Outcome {
         a_commits: a.committed.len(),
         b_commits: b.committed.len(),
+        a_chain: a.committed.clone(),
+        b_chain: b.committed.clone(),
         a_round: a.engine.pending_round(),
         b_round: b.engine.pending_round(),
     }
@@ -211,10 +217,44 @@ fn two_validators_keep_committing_however_their_clocks_are_offset() {
             out.a_round,
             out.b_round
         );
-        assert_eq!(
-            out.a_commits, out.b_commits,
-            "latency={latency} skew={skew}: both nodes must finalize the same blocks — one \
-             counting more than the other means a commit that the other never saw"
+        // Agreement on the *blocks*, not on how many there were.
+        //
+        // This used to compare the two counts, and that is a stricter statement than consensus
+        // makes: a run ends on a fixed tick budget, so one node being a block ahead when the
+        // music stops is ordinary. It only held while throughput was low enough that the two
+        // rarely straddled a commit — at latency=3/skew=2 the figures were 12 and 12, and the
+        // moment a fix raised them to 20 and 21 the test failed on healthy behaviour.
+        //
+        // What must never happen is the two finalizing *different* blocks at the same height,
+        // and that is checked here instead. It is the property the old assertion was reaching
+        // for ("a commit that the other never saw") and it is strictly stronger: equal counts
+        // would not have caught a genuine fork, and this does.
+        let b_at: std::collections::HashMap<u64, &Hash> =
+            out.b_chain.iter().map(|(h, hash)| (*h, hash)).collect();
+        let mut shared = 0;
+        for (height, hash) in &out.a_chain {
+            if let Some(theirs) = b_at.get(height) {
+                shared += 1;
+                assert_eq!(
+                    hash, *theirs,
+                    "latency={latency} skew={skew}: both nodes committed height {height} but not \
+                     the same block — that is a fork"
+                );
+            }
+        }
+        assert!(
+            shared > 0,
+            "latency={latency} skew={skew}: the two nodes share no committed height at all \
+             (a={}, b={}), so there is nothing to agree on and this case proves nothing",
+            out.a_commits,
+            out.b_commits
+        );
+        assert!(
+            out.a_commits.abs_diff(out.b_commits) <= 1,
+            "latency={latency} skew={skew}: a={} b={} — more than one block apart is a node that \
+             stopped following, not a run that ended mid-commit",
+            out.a_commits,
+            out.b_commits
         );
     }
 }

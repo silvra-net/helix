@@ -921,6 +921,35 @@ impl BftEngine {
         if prev_height + 1 != height {
             return Err(ConsensusError::ProposerBehind { height, tip: prev_height });
         }
+
+        // Proposing twice into the same round is equivocation by this node, against itself.
+        //
+        // Everything below builds a fresh `RoundState` and casts a prevote for a **new** block —
+        // new because the header carries a timestamp, so the second one hashes differently. The
+        // round it replaces already holds this node's prevote for the first. Two prevotes, same
+        // height, same round, different values: exactly what `VoteSet::add` turns into
+        // double-sign evidence, and exactly what costs a validator 5 % of its stake.
+        //
+        // Nothing in production does this — `block_production_loop` checks `has_active_round()`
+        // first, and its comment says why ("don't clobber it with a brand-new proposal (different
+        // timestamp/hash) for the same height"). The guarantee lived entirely in that one caller,
+        // which is the shape that has gone wrong here before: the VM's own doc comment said the
+        // same thing about a rule its caller had to uphold, and on 2026-08-05 the caller did not.
+        //
+        // Measured 2026-09-18: all three consensus harnesses call this every tick without that
+        // check, so every "honest" run was measuring a network where each proposer equivocated on
+        // its own proposal — 264 pieces of double-sign evidence in a five-node, fault-free,
+        // 200-tick run. The numbers those harnesses produced were baselines taken against a
+        // network that does not exist.
+        //
+        // `AwaitingVotes` rather than a new error: it is what the caller already handles for "the
+        // round is running, wait", and that is the truth here.
+        if let Some(active) = &self.round {
+            if active.height == height && active.round == round_num {
+                return Err(ConsensusError::AwaitingVotes { height, round: round_num });
+            }
+        }
+
         self.round_ticks = 0;
         self.pending_round = round_num;
 
