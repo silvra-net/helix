@@ -255,9 +255,14 @@ async fn params(node: &str) -> Result<()> {
 /// much more yes-stake it needs, and whether voting is still open.
 ///
 /// Neither used to be. "Yes votes: 1 (12000 HLX)" is a number with nothing to compare it to, and
-/// the quorum denominator cannot be worked out client-side — it is frozen at proposal creation
-/// precisely so a voter cannot unstake afterwards and shrink the bar behind them, so the chain's
-/// *current* total stake gives a different, wrong, entirely plausible-looking answer. Same for the
+/// the quorum denominator cannot be worked out client-side — it is the largest total stake the
+/// proposal has ever seen, which is neither the total at creation nor the total right now, so the
+/// chain's *current* total stake gives a different, wrong, entirely plausible-looking answer.
+/// (It said "frozen at proposal creation" until #208 made the denominator rise with stake that
+/// arrives mid-vote; freezing guarded only against a voter unstaking afterwards, and left the
+/// mirror image — stake created after the proposal counted in the numerator and in no
+/// denominator — wide open. **The bar can therefore move upward while a proposal is open**, which
+/// is the reason this is re-read with the proposal rather than cached beside it.) Same for the
 /// deadline: `VOTING_PERIOD_BLOCKS` is a protocol constant no client knows, so an expired proposal
 /// printed exactly like a live one. Both now come from the node (`quorum_stake_hlx`,
 /// `expires_at_height`); `chain_height`, when known, turns the second into a plain verdict.

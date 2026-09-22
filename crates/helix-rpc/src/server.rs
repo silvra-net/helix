@@ -765,7 +765,7 @@ async fn get_sync_checkpoint(State(state): State<AppState>) -> impl IntoResponse
         StatusCode::NOT_FOUND,
         Json(json!({
             "error": "this node has no usable checkpoint yet — it needs a stored state snapshot \
-                      with the block above it still on disk",
+                      with the block at that height still on disk",
             "tip": tip,
         })),
     )

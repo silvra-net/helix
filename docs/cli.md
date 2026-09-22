@@ -201,11 +201,20 @@ helix recovery approve hlx... <new_pubkey_hex> --key guardian2.json
 #    way, any number of times.
 ```
 
-A single stuck guardian request that never reaches quorum can be cleared at the protocol
-level (`CancelRecoveryRequest`, signed by the account owner with their still-valid original
-key) so a malicious or unresponsive guardian can't lock you out of ever changing your
-guardian set — but there is no `helix recovery` CLI subcommand for it yet; it currently
-requires constructing that transaction directly against the REST API.
+**Replacing your guardians works even with a recovery vote in progress**, and doing so
+cancels that vote. An owner who can still sign outranks a guardian's part-way approval —
+recovery exists for a key that is *lost*, and signing proves yours is not. So a guardian who
+turns hostile or unresponsive can simply be replaced; you do not have to clear anything first.
+
+A stuck sub-threshold request can also be cleared on its own, without touching the guardian
+set, at the protocol level (`CancelRecoveryRequest`, signed by the account owner). There is no
+`helix recovery` CLI subcommand for either yet; both currently require constructing the
+transaction directly against the REST API.
+
+(Until 2026-09-22 registering guardians was *refused* while any request was pending, and
+cancelling was the documented way out. It did not work: the owner needs two transactions
+landing with nothing in between, a guardian needs one approval to re-open the request, and the
+proposer decides the order inside a block — so a hostile guardian could never be removed.)
 
 ### Governance
 

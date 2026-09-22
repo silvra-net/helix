@@ -95,12 +95,27 @@ That setup has its own high-water mark that knows nothing of the first, so the t
 conflicting blocks and slash you. There is no remote-signer coordination yet; "one node per key"
 is a discipline you keep, not something the software can currently enforce across machines.
 
-**Downtime risk (no slash, but real friction):** a validator whose precommit is missing from
-`last_commit` for ~1800 consecutive blocks (~30-60 minutes) is downtime-jailed — excluded from
-`stakers()`, earning nothing, until it explicitly rejoins:
+**Downtime risk (no slash, but real friction):** a validator that misses too many of the
+`last_commit`s it should appear in is downtime-jailed — excluded from `stakers()`, earning
+nothing, until it explicitly rejoins:
 ```bash
 helix tx unjail --key validator-key.json   # only once your node is actually back and connected
 ```
+**"Too many" is a rate, not a streak, and that changed on 2026-09-18.** A missed block adds 2, a
+signed one subtracts 1, so the count grows while you are below **two thirds** participation and
+shrinks above it. Two consequences worth knowing before you run a node:
+
+* Go fully dark and you are jailed after **1800 blocks** (~30–60 minutes) — the same figure as
+  before, deliberately unchanged.
+* Deliver, say, half the blocks indefinitely and you are *also* jailed eventually, where the old
+  rule never would have touched you: any signature at all reset it, so a validator that delivered
+  7.5 % looked perfectly healthy to every counter. One did, on this chain, and it cost the network
+  a sixth of its rounds.
+
+Two thirds is not a tuning choice — it is what the quorum needs from the set, so a validator below
+it is consuming quorum power it does not supply. Routine interruptions (a reboot, an upgrade, an
+I/O stall) stay far above the line and are never jailed however long the chain runs.
+
 Requires the minimum jail window (~300 blocks, ~10 minutes) to have passed and your stake to
 still meet the minimum. Unlike double-sign slashing this costs no HLX — going offline isn't
 proof of malice, only sustained silence is treated as a liveness problem — but it isn't
@@ -150,8 +165,14 @@ The stake earns at the old validator up to this transaction and at the new one i
 after. What it does *not* do is shed the old validator's slashing risk: the moved stake stays
 slashable for the validator you left for a full 7 days, so redelegating away from one that has
 already double-signed does not dodge the hit — the loss comes out of your shares at the new
-validator, leaving that validator's other delegators untouched. Redelegating stake that is
-itself still inside such a window is rejected; wait it out before moving again.
+validator, leaving that validator's other delegators untouched.
+
+**While that window is open the stake cannot leave the new validator either** — neither by
+redelegating on (A→B→C) nor by undelegating out of B. Both are refused until the 7 days are up.
+That is not an extra restriction so much as the one that makes the sentence above true: the old
+validator's claim is anchored in the shares you now hold at the new one, so a withdrawal before
+the window closes would erase it. Until 2026-09-22 undelegating was allowed there, and doing it
+dropped the old validator's slashing risk entirely — two transactions, no wait, no loss.
 
 A few things worth knowing about delegation generally:
 

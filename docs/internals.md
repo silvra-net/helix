@@ -158,13 +158,18 @@ advances, since real compute was spent either way.
 
 - **Hard cap:** 33,000,000 HLX — never more, forever. This is an *honest* ceiling: it sits
   just above what the emission schedule actually pays out (the 1 HLX halving subsidy converges
-  to ~31.5M emitted, plus the 200k genesis allocation ≈ 31.7M real max supply), not an
+  to ~31.5M emitted, plus the 510k genesis allocation ≈ 32.0M real max supply), not an
   aspirational round number the chain could never reach. The same asymptotic shape as Bitcoin's
   21M cap — approached over time, not handed out at genesis.
-- **Genesis allocation:** 200,000 HLX — the bootstrap validator's 100k stake (exactly the
-  minimum the rules demand of any validator) plus a 100k liquid reserve, so a slash that drops
-  it below that minimum is recoverable. That is ~0.6% of the supply the chain eventually
-  reaches; everything else is earned block by block. There is no founder pre-mine beyond this.
+- **Genesis allocation:** 510,000 HLX — the bootstrap validator's 10k stake (exactly the
+  minimum the rules demand of any validator, `MIN_VALIDATOR_STAKE`) plus a 500k liquid reserve.
+  The reserve does two jobs: a slash that drops the stake below the minimum is recoverable, and
+  every operator this network has onboarded was funded out of it. At 15k apiece that is around
+  thirty validators' worth of seed capital, which is the one thing the chain has never had enough
+  of. That is ~1.6% of the supply the chain eventually reaches; everything else is earned block by
+  block. There is no founder pre-mine beyond this.
+  (Read "200,000 — 100k stake plus 100k liquid" until 2026-09-22: the minimum dropped from 100k to
+  10k on 2026-08-26 and the reserve was raised to 500k, and this paragraph followed neither.)
 - **Denomination:** 1 HLX = 1,000,000,000 nano-HLX
 - **Fee split:** the base fee (`base_fee_per_byte × transaction size`) is burned in full; the
   rest of what the sender paid is the validator's tip. Not a fixed ratio — a sender who pays

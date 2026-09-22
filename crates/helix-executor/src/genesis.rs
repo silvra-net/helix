@@ -41,8 +41,13 @@ pub const MIN_VALIDATOR_STAKE: u64 = 10_000 * NANO_PER_HLX;
 
 /// Default validator pre-stake at genesis, for a chain being launched fresh. The validator
 /// needs this staked from block 0 so it survives the first epoch rotation (which filters by
-/// MIN_VALIDATOR_STAKE). This is the ONLY genesis allocation — see `GENESIS_PREFUND`'s doc
-/// comment for why there is deliberately no liquid pre-mine on top of it.
+/// MIN_VALIDATOR_STAKE).
+///
+/// **Not the only genesis allocation**, though it said so until 2026-09-22: the bootstrap
+/// validator also gets `VALIDATOR_GENESIS_LIQUID_HLX` liquid on top, and that is the larger of
+/// the two by fifty times. The sentence was confusing this with `GENESIS_PREFUND` — the list of
+/// *arbitrary* extra prefunds, which really is empty and has been for a long time. Two different
+/// things, and the one that is empty is not this one.
 ///
 /// Only a *default*: the value a chain actually launched with is recorded in
 /// `ChainState::genesis_validator_stake` and handed to joining nodes via `GET /genesis`, so
