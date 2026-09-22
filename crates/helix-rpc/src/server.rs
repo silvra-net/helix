@@ -3576,7 +3576,7 @@ mod tests {
             created_at_height: 0,
             voters: Default::default(),
             yes_stake: 0,
-            total_staked_at_creation: 0,
+            quorum_denominator: 0,
             executed: false,
         }
     }

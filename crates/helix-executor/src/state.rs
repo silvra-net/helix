@@ -1359,7 +1359,7 @@ impl ChainState {
             created_at_height: u64,
             voters: Vec<&'a str>,
             yes_stake: u64,
-            total_staked_at_creation: u64,
+            quorum_denominator: u64,
             executed: bool,
         }
 
@@ -1433,7 +1433,7 @@ impl ChainState {
                             created_at_height: p.created_at_height,
                             voters,
                             yes_stake: p.yes_stake,
-                            total_staked_at_creation: p.total_staked_at_creation,
+                            quorum_denominator: p.quorum_denominator,
                             executed: p.executed,
                         },
                     )
@@ -1768,7 +1768,7 @@ mod tests {
             created_at_height: 10,
             voters: voters_a,
             yes_stake: 400,
-            total_staked_at_creation: 1000,
+            quorum_denominator: 1000,
             executed: false,
         };
 

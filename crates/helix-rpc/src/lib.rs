@@ -296,14 +296,18 @@ pub struct GovernanceProposalResponse {
     pub yes_stake_hlx: f64,
     pub yes_votes: usize,
     pub executed: bool,
-    /// Yes-stake this proposal needs to pass — `2/3 + 1` of the total staked **at creation**.
+    /// Yes-stake this proposal needs to pass — `2/3 + 1` of this proposal's own denominator.
     ///
     /// Reported rather than left to the caller, because the caller cannot compute it. The
-    /// denominator is frozen when the proposal is made (see `total_staked_at_creation`) precisely
-    /// so a voter cannot unstake afterwards and shrink the bar behind them; deriving it from the
-    /// chain's *current* total stake would therefore be a different, wrong number — and one that
-    /// looks entirely plausible. Without this, a wallet can show "12,000 HLX yes" and nothing to
-    /// measure it against.
+    /// denominator is the **largest** total stake this proposal has ever seen (see
+    /// `quorum_denominator`): it does not shrink when a voter unstakes after voting, and it does
+    /// not stay behind when stake arrives mid-vote. Deriving the bar from the chain's current
+    /// total would be a different number in both cases — and one that looks entirely plausible.
+    /// Without this, a wallet can show "12,000 HLX yes" and nothing to measure it against.
+    ///
+    /// **It can move while a proposal is open**, upward only. A client that caches it will show
+    /// a bar that is too low, which is the direction that misleads — so re-read it with the
+    /// proposal rather than storing it alongside.
     pub quorum_stake_hlx: f64,
     /// Last height at which a vote on this proposal is still accepted.
     ///
@@ -325,7 +329,7 @@ impl From<&helix_executor::GovernanceProposal> for GovernanceProposalResponse {
             yes_votes: p.voters.len(),
             executed: p.executed,
             quorum_stake_hlx: helix_executor::governance::quorum_threshold(
-                p.total_staked_at_creation,
+                p.quorum_denominator,
             ) as f64
                 / 1_000_000_000.0,
             expires_at_height: p.created_at_height

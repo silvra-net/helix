@@ -153,13 +153,27 @@ pub struct GovernanceProposal {
     pub voters: HashSet<String>,
     /// Cumulative staked HLX (recorded at time of vote) of everyone who voted yes.
     pub yes_stake: u64,
-    /// Total staked HLX network-wide at proposal creation — the fixed quorum
-    /// denominator for this proposal's entire voting period. Frozen here instead of
-    /// recomputed live at each vote: `yes_stake` only ever grows (a voter's stake
-    /// contribution is never revisited), so if the denominator could shrink — e.g.
-    /// a voter immediately unstaking after voting yes — a proposal could cross
-    /// quorum against a total that no longer includes the stake that got it there.
-    pub total_staked_at_creation: u64,
+    /// The quorum denominator: **the largest network-wide staked total this proposal has ever
+    /// seen**, starting at creation and raised — never lowered — at every vote.
+    ///
+    /// Both halves matter, and until 2026-09-22 only one was here.
+    ///
+    /// *It must not shrink*, because `yes_stake` only ever grows: a voter's contribution is
+    /// counted once and never revisited, so a denominator that fell with a post-vote unstake
+    /// would let a proposal cross quorum against a total that no longer contains the stake which
+    /// got it there. That was the original argument and it is correct.
+    ///
+    /// *It must not stay behind either.* `yes_stake` adds the voter's stake **as of the vote**,
+    /// so stake created after the proposal existed counted in the numerator while never
+    /// appearing in a denominator frozen before it. Measured: an attacker holding nothing at
+    /// creation stakes two thirds of the honest total, votes alone, and carries it — while
+    /// holding **40 %** of all stake in existence, under a rule the chain calls a two-thirds
+    /// supermajority.
+    ///
+    /// Taking the maximum closes both without storing anything per voter. Honest stake arriving
+    /// mid-vote raises the bar too, which is right: the threshold is a share of the stakers, and
+    /// they are who it must be a share of.
+    pub quorum_denominator: u64,
     pub executed: bool,
 }
 
@@ -222,7 +236,7 @@ mod tests {
             created_at_height: 10,
             voters: Default::default(),
             yes_stake: 0,
-            total_staked_at_creation: 0,
+            quorum_denominator: 0,
             executed: false,
         };
         assert!(!proposal.is_expired(10 + VOTING_PERIOD_BLOCKS));

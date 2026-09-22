@@ -1826,9 +1826,9 @@ fn execute_create_proposal(
         created_at_height: height,
         voters: Default::default(),
         yes_stake: 0,
-        // Frozen quorum denominator for this proposal's lifetime — see the field's
-        // doc comment on why this must not be recomputed live at vote time.
-        total_staked_at_creation: state.total_staked(),
+        // The starting denominator. It is raised at every vote and never lowered — see the
+        // field's doc comment for why it needs both directions.
+        quorum_denominator: state.total_staked(),
         executed: false,
     });
 
@@ -1878,12 +1878,19 @@ fn execute_vote_proposal(
     }
     proposal.yes_stake = proposal.yes_stake.saturating_add(sender.staked);
 
-    // Quorum is checked against the total stake frozen at proposal creation, not a
-    // live recomputation — otherwise a voter could vote yes then immediately
-    // unstake, shrinking the denominator while their already-counted yes_stake
-    // stays put, letting a trivial follow-up vote cross a quorum that no longer
-    // reflects real backing.
-    if proposal.yes_stake >= governance::quorum_threshold(proposal.total_staked_at_creation) {
+    // The denominator rises to meet the stake being counted, and never falls.
+    //
+    // Falling is the attack the freeze was built against: vote yes, unstake, and a `yes_stake`
+    // already counted crosses a total that no longer contains it. Staying behind is the mirror
+    // image and was open until 2026-09-22 — `yes_stake` takes the voter's stake *as of the vote*,
+    // so stake created after the proposal counted in the numerator and appeared in no
+    // denominator. Measured: a voter holding 7 of 16 units carried a two-thirds supermajority.
+    //
+    // `max` is the whole fix, and it needs nothing per voter: whatever the network has ever held
+    // while this proposal was open is what two thirds is two thirds *of*.
+    proposal.quorum_denominator = proposal.quorum_denominator.max(state.total_staked());
+
+    if proposal.yes_stake >= governance::quorum_threshold(proposal.quorum_denominator) {
         match proposal.param {
             GovernanceParam::MinValidatorStake => {
                 // The same ceiling `execute_create_proposal` applies, **re-checked here**, because
@@ -3616,6 +3623,86 @@ mod tests {
         assert!(state.proposal(0).is_none(), "nothing may be recorded for it");
     }
 
+    /// **The frozen denominator is guarded in one direction only.**
+    ///
+    /// `quorum_denominator` is frozen so a voter cannot vote yes and then unstake,
+    /// shrinking the denominator under a `yes_stake` that has already been counted. Its doc
+    /// comment makes exactly that argument, and it is right.
+    ///
+    /// The other direction is open. `yes_stake` adds the voter's stake **as of the vote**, so
+    /// stake created *after* the proposal exists counts in the numerator while never appearing in
+    /// the denominator. An attacker stakes nothing beforehand, waits for any proposal, stakes two
+    /// thirds of the pre-existing total, and votes.
+    ///
+    /// What "two thirds" then means in real terms: with `H` honest stake he needs `2H/3`, and
+    /// afterwards holds `(2H/3) / (H + 2H/3)` — **40 % of all stake in existence, carrying a vote
+    /// the chain describes as a two-thirds supermajority.**
+    #[test]
+    fn stake_created_after_a_proposal_cannot_carry_it_to_quorum_alone() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let unit = crate::genesis::MIN_VALIDATOR_STAKE;
+
+        // Three honest stakers, 3 units each: 9 units of honest stake.
+        let kps: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+        let addrs: Vec<Address> =
+            kps.iter().map(|kp| Address::from_public_key(&kp.public)).collect();
+        let mut state = ChainState::new(0);
+        for a in &addrs {
+            state.update_account(a, |acc| {
+                acc.balance = 1_000_000_000;
+                acc.staked = 3 * unit;
+            });
+        }
+
+        // An honest proposal. The denominator freezes at 9 units, so quorum is 7.
+        let data = governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 7);
+        let create =
+            signed_governance_tx(&kps[0], &addrs[0], TxType::CreateProposal, data, 0, 10_000);
+        assert!(execute_transaction(&mut state, &create, &validator, 0, 0).success);
+        assert_eq!(
+            state.proposal(0).unwrap().quorum_denominator,
+            9 * unit,
+            "premise: the denominator is the honest stake and nothing else"
+        );
+
+        // Now the attacker appears. He held nothing when the proposal was made, and stakes the
+        // quorum figure afterwards — 7 units against a denominator of 9.
+        let attacker_kp = KeyPair::generate();
+        let attacker = Address::from_public_key(&attacker_kp.public);
+        state.update_account(&attacker, |acc| {
+            acc.balance = 1_000_000_000;
+            acc.staked = 7 * unit;
+        });
+        assert_eq!(
+            state.total_staked(),
+            16 * unit,
+            "premise: he holds 7 of 16 units — under half, nowhere near two thirds"
+        );
+
+        let vote = signed_governance_tx(
+            &attacker_kp,
+            &attacker,
+            TxType::VoteProposal,
+            governance::encode_vote(0),
+            0,
+            10_000,
+        );
+        let receipt = execute_transaction(&mut state, &vote, &validator, 1, 0);
+        assert!(receipt.success, "the vote itself is legitimate and must be recorded");
+
+        assert!(
+            !state.proposal(0).unwrap().executed,
+            "a single voter holding 7 of 16 units — 44 % — must not carry a proposal the chain \
+             calls a two-thirds supermajority. The denominator has to see the stake the \
+             numerator is counting."
+        );
+        assert_eq!(
+            state.governance_params.fuel_per_fee_unit,
+            governance::DEFAULT_FUEL_PER_FEE_UNIT,
+            "and the parameter must be untouched"
+        );
+    }
+
     /// **The creation-time ceiling is not enough on its own, and the gap is a fork.**
     ///
     /// Creation and execution are up to `VOTING_PERIOD_BLOCKS` apart, and stakes move in that
@@ -3681,10 +3768,10 @@ mod tests {
         assert!(receipt.success, "the vote itself is valid and must be recorded: {:?}", receipt.error);
         let proposal = state.proposal(0).expect("the proposal still exists");
         assert!(
-            proposal.yes_stake >= governance::quorum_threshold(proposal.total_staked_at_creation),
+            proposal.yes_stake >= governance::quorum_threshold(proposal.quorum_denominator),
             "premise: this vote does cross the supermajority ({} of {})",
             proposal.yes_stake,
-            governance::quorum_threshold(proposal.total_staked_at_creation),
+            governance::quorum_threshold(proposal.quorum_denominator),
         );
         assert!(
             !proposal.executed,
@@ -3886,7 +3973,7 @@ mod tests {
             signed_governance_tx(&attacker_kp, &attacker, TxType::CreateProposal, data, 0, 1);
         assert!(execute_transaction(&mut state, &create_tx, &validator, 0, 0).success);
         // Frozen denominator: 200 (attacker) + 150 (honest) = 350 -> quorum 234.
-        assert_eq!(state.proposal(0).unwrap().total_staked_at_creation, 350);
+        assert_eq!(state.proposal(0).unwrap().quorum_denominator, 350);
         assert_eq!(governance::quorum_threshold(350), 234);
 
         let attacker_vote = signed_governance_tx(
