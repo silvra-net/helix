@@ -1323,7 +1323,13 @@ fn execute_submit_double_sign_evidence(
 
     // A validator can only meaningfully double-sign once per (height, round) — reject a
     // resubmission of an incident already slashed, whether by this reporter or another.
-    let incident_key = format!("{}:{}:{}", evidence.validator, evidence.height, evidence.round);
+    //
+    // **From the votes, not from the envelope.** This read `evidence.height`/`evidence.round`,
+    // which nothing checked against the votes they describe, so the same two genuine votes
+    // relabelled with a different height formed a different key and slashed again — 5 % per
+    // submission, repeatable to zero, against a validator who equivocated exactly once. The
+    // comment above was already the right rule; it was reading the wrong height.
+    let incident_key = evidence.incident_key();
     if !state.slashed_double_sign_incidents.insert(incident_key) {
         return Receipt::failure(tx_hash, "this double-sign incident was already slashed", 0, 0);
     }
@@ -4676,6 +4682,89 @@ mod tests {
         let expected_slash = 1_000_000 * helix_consensus::SLASH_FRACTION_BPS / 10_000;
         assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000 - expected_slash);
         assert_eq!(state.total_burned, expected_slash);
+    }
+
+    /// **One incident, slashed as often as the reporter likes.**
+    ///
+    /// The replay guard keys incidents on `(evidence.validator, evidence.height, evidence.round)`,
+    /// and `DoubleSignEvidence::is_valid` never checks that `height`/`round` are the ones the
+    /// votes actually carry. It checks the two votes against *each other* and the validator
+    /// against `vote_a` — but its own height and round are free text.
+    ///
+    /// So the same pair of genuine, correctly signed votes can be resubmitted with the declared
+    /// height bumped, and it lands as a fresh incident every time: 5 % of stake per submission,
+    /// until the validator is at zero and out of the set. The evidence never has to be forged —
+    /// one real equivocation, ever, is enough to destroy that validator entirely.
+    ///
+    /// The doc comment on the guard states the rule it was meant to enforce: "a validator can only
+    /// meaningfully double-sign once per (height, round)". True of the votes, and the guard was
+    /// reading a different height than the votes had.
+    #[test]
+    fn one_double_sign_incident_cannot_be_slashed_twice_by_relabelling_it() {
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        let reporter_kp = KeyPair::generate();
+        let reporter = Address::from_public_key(&reporter_kp.public);
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&validator_addr, |acc| acc.staked = 1_000_000);
+        state.update_account(&reporter, |acc| acc.balance = 1_000_000);
+
+        // One real incident: two genuine precommits at height 10, round 0.
+        let vote_a = signed_vote(
+            &validator_kp,
+            &validator_addr,
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-a"),
+        );
+        let vote_b = signed_vote(
+            &validator_kp,
+            &validator_addr,
+            helix_consensus::VoteType::Precommit,
+            10,
+            0,
+            Hash::digest(b"block-b"),
+        );
+
+        let submit = |state: &mut ChainState, nonce: u64, height: u64, round: u32| {
+            let evidence = DoubleSignEvidence {
+                validator: validator_addr.clone(),
+                height,
+                round,
+                vote_a: vote_a.clone(),
+                vote_b: vote_b.clone(),
+            };
+            let tx = signed_evidence_tx(&reporter_kp, &reporter, &evidence, nonce);
+            execute_transaction(state, &tx, &block_validator, 0, 0)
+        };
+
+        let first = submit(&mut state, 0, 10, 0);
+        assert!(first.success, "the honest report must land: {:?}", first.error);
+        let after_one = state.get(&validator_addr).unwrap().staked;
+        assert!(after_one < 1_000_000, "positive control: the first report really slashed");
+
+        // The same two votes, relabelled. Nothing about the incident changed — only the two
+        // numbers the evidence declares about itself, neither of which is checked against it.
+        let second = submit(&mut state, 1, 11, 0);
+        assert!(
+            !second.success,
+            "the same votes must not slash twice because the envelope says a different height"
+        );
+        let third = submit(&mut state, 2, 10, 7);
+        assert!(
+            !third.success,
+            "nor because it says a different round — the round is not the votes' round either"
+        );
+
+        assert_eq!(
+            state.get(&validator_addr).unwrap().staked,
+            after_one,
+            "one incident, one slash: a validator that equivocated once must not be reducible \
+             to nothing by a reporter with a loop"
+        );
     }
 
     /// A slashed double-signer leaves the active set immediately, exactly like a downtime jail

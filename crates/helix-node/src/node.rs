@@ -3446,7 +3446,12 @@ async fn apply_finalized_block(
             let Ok(evidence) = bincode::deserialize::<DoubleSignEvidence>(&tx.data) else {
                 continue;
             };
-            let incident_key = format!("{}:{}:{}", evidence.validator, evidence.height, evidence.round);
+            // Built by `DoubleSignEvidence`, not here. This was the second place that spelled
+            // out the same key, and a key with two authors is how the two come to disagree
+            // (#184, the same shape in `peer_tips`). Since 2026-09-22 the executor derives it
+            // from the signed votes; a copy that kept reading the envelope would look up an
+            // incident under a name nothing stores it by, and quietly never jail anyone.
+            let incident_key = evidence.incident_key();
             if state.slashed_double_sign_incidents.contains(&incident_key)
                 && engine.write().await.validator_set.remove(&evidence.validator)
             {
