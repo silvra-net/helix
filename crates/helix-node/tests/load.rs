@@ -755,14 +755,36 @@ async fn a_disk_budget_stops_the_database_from_growing() {
         println!("  round {round}: height {h}, file {:.1} MB (budget {BUDGET_MB} MB)", bytes as f64 / 1048576.0);
     }
 
-    let diag = get_json(&format!("http://127.0.0.1:{RPC_PORT}/diagnostics")).await;
-    let earliest = diag.as_ref().and_then(|d| d["earliest_block"].as_u64());
+    // **Wait for the sweep, do not assume it already ran.** The budget cannot tighten the window
+    // until the file has actually grown — it derives bytes-per-block from the file on disk — so
+    // the first prune necessarily happens *after* a doubling step, and the prune loop runs on its
+    // own timer rather than with the last transaction of the last round.
+    //
+    // Under load that ordering became a coin flip. Measured in `build-all.sh` on 2026-09-22: the
+    // chain crawled from 1529 to 1774 across the ten rounds instead of racing ahead, so the window
+    // only fell below the height at the very last one — and this assertion fired a moment before
+    // the sweep it was asking about. Run alone it passes; run beside twelve other crates it does
+    // not, which makes it a load artefact of the kind R7 lists, not a regression.
+    //
+    // Polling instead keeps the property the test is named for (the budget *does* prune) and drops
+    // the one it never meant to assert (it prunes within three seconds of the last round).
+    let mut earliest = None;
+    for _ in 0..40 {
+        let diag = get_json(&format!("http://127.0.0.1:{RPC_PORT}/diagnostics")).await;
+        earliest = diag.as_ref().and_then(|d| d["earliest_block"].as_u64());
+        peak = peak.max(node.chain_db_bytes());
+        if earliest.is_some_and(|e| e > 0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
     let height = status().await.and_then(|s| s["height"].as_u64()).unwrap_or(0);
     println!("peak file {:.1} MB · height {height} · earliest retained {earliest:?}", peak as f64 / 1048576.0);
 
     assert!(
         earliest.is_some_and(|e| e > 0),
-        "the budget never pruned anything — it is not wired to the prune loop at all (earliest={earliest:?})"
+        "the budget never pruned anything after two minutes of waiting — it is not wired to the \
+         prune loop at all (earliest={earliest:?}, height={height})"
     );
     // Written as tx rather than blocks: 5000 transactions at ~4.9 KB on disk is ~24 MB of payload
     // alone, so a node that kept everything could not be under the budget by luck.
