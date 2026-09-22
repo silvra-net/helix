@@ -296,7 +296,7 @@ pub fn execute_transaction_metered(
         }
         TxType::CreateProposal => execute_create_proposal(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::VoteProposal => execute_vote_proposal(state, tx, validator, tx_hash, height, base_fee_amount),
-        TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash, base_fee_amount),
+        TxType::ProvePersonhood => execute_prove_personhood(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::ClaimUnbonded => execute_claim_unbonded(state, tx, validator, tx_hash, height, base_fee_amount),
         TxType::CancelRecoveryRequest => execute_cancel_recovery_request(state, tx, validator, tx_hash, base_fee_amount),
         TxType::SubmitDoubleSignEvidence => execute_submit_double_sign_evidence(state, tx, validator, tx_hash, base_fee_amount),
@@ -1146,8 +1146,10 @@ fn execute_register_name(
 /// ZK proof in `execute_prove_personhood` (backlog points 27/28) — but was left live and
 /// completely undermined that fix: an attacker only needs 3 freely-generated addresses (cost:
 /// three tx fees) to attest a target and reach `Verified`, with no ZK proof and no authority
-/// signature at all, bypassing Sybil resistance entirely and unlocking the 1% (instead of
-/// 0.5%) validator voting-power cap for a fully self-issued identity. Disabled outright,
+/// signature at all, bypassing Sybil resistance entirely and doubling the stake a fully
+/// self-issued identity brings to the quorum (`stake` rather than `stake / 2` — **not** a
+/// higher cap; the `total_stake / 100` ceiling is the same for everyone, see
+/// `personhood_doubles_the_stake_entering_the_cap_not_the_cap_itself`). Disabled outright,
 /// failing closed like the no-authority-configured branch of `execute_prove_personhood` — the
 /// only sanctioned path to `Verified` is now the authority-gated ZK proof.
 fn execute_register_identity(_state: &mut ChainState, _tx: &Transaction, tx_hash: Hash, _base_fee_amount: u64) -> Receipt {
@@ -1161,8 +1163,15 @@ fn execute_register_identity(_state: &mut ChainState, _tx: &Transaction, tx_hash
 }
 
 /// Owner registers (or replaces) their social-recovery guardian set. `tx.data` is a
-/// newline-separated list of guardian address strings. Blocked while a recovery vote is
-/// in progress, so guardians can't be swapped out mid-recovery to sabotage a quorum.
+/// newline-separated list of guardian address strings.
+///
+/// **Allowed while a recovery vote is in progress, and that vote is destroyed by it** (#210).
+/// This used to be blocked, on the reasoning that guardians must not be swapped out mid-recovery
+/// to sabotage a quorum — which handed one guardian a veto: the owner needed two transactions
+/// (cancel, then register) landing with nothing in between, the guardian needed one approval, and
+/// a guardian that turned hostile could therefore never be removed. An owner who can still sign
+/// outranks one guardian's sub-threshold vote, because recovery is for a key that is *lost* and a
+/// signature from it proves otherwise.
 fn execute_register_guardians(
     state: &mut ChainState,
     tx: &Transaction,
@@ -1964,6 +1973,7 @@ fn execute_prove_personhood(
     tx: &Transaction,
     validator: &Address,
     tx_hash: Hash,
+    height: u64,
     base_fee_amount: u64,
 ) -> Receipt {
 
@@ -2015,10 +2025,18 @@ fn execute_prove_personhood(
         return Receipt::failure(tx_hash, "personhood commitment already claimed", 0, 0);
     }
 
-    // Mark account as ZK-STARK personhood-verified in chain state
+    // Mark account as ZK-STARK personhood-verified in chain state.
+    //
+    // The height is the block this landed in, not `0`. It was hardcoded to zero because this
+    // function had no `height` to hand — a missing parameter turned into a stated fact, and the
+    // fact went into the state hash: every verified account claimed it had been verified at
+    // genesis. Nothing reads the field today, which is exactly why it could be wrong for as long
+    // as it liked; the next reader would have believed it. Same reasoning as clearing
+    // `unbonding_source` on claim — a field that says something false is worse than one that says
+    // nothing.
     state.set_personhood_status(
         &tx.from,
-        PersonhoodStatus::Verified { verified_at_height: 0 },
+        PersonhoodStatus::Verified { verified_at_height: height },
     );
     state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
@@ -4724,6 +4742,38 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert!(state.has_personhood(&addr));
+    }
+
+    /// The status records the height it was granted at, not zero.
+    ///
+    /// `verified_at_height` was hardcoded `0` because `execute_prove_personhood` had no `height`
+    /// parameter — a missing argument that turned into a stated fact, and the fact went into the
+    /// state hash: every verified account claimed genesis. **Nothing reads the field**, which is
+    /// precisely why it could stay wrong indefinitely; the first reader to trust it would have
+    /// been the one to pay. The same reasoning that clears `unbonding_source` when an unbonding
+    /// is claimed — a field that says something false is worse than one that says nothing.
+    #[test]
+    fn personhood_records_the_height_it_was_granted_at() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let authority_kp = KeyPair::generate();
+
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+        state.personhood_authorities.push(authority_kp.public.clone());
+
+        let (proof, commitment) = helix_zkp::prove_personhood([7u8; 16]);
+        let payload = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr);
+        let tx = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
+
+        let receipt = execute_transaction(&mut state, &tx, &validator, 174_371, 0);
+        assert!(receipt.success, "expected success, got: {:?}", receipt.error);
+        assert_eq!(
+            state.personhood_status(&addr),
+            PersonhoodStatus::Verified { verified_at_height: 174_371 },
+            "the height the proof landed at, not genesis"
+        );
     }
 
     #[test]

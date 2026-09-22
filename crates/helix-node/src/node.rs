@@ -3000,8 +3000,8 @@ async fn publish_fee_exempt_probationers(
 /// Build the live BFT validator inputs from chain state — the set every node must run to agree
 /// on the round-robin proposer schedule and the quorum denominator. Reads `engine_validator_set()`
 /// (the post-rotation `active_validators`, or `stakers()` during the genesis window before the
-/// first rotation) and pairs each address with its current personhood so the 1% / 0.5%
-/// voting-power cap is applied. Shared by the startup engine build and both catch-up paths, so a
+/// first rotation) and pairs each address with its current personhood so the stake-halving that
+/// personhood lifts is applied (one `total_stake / 100` cap for everyone, not two). Shared by the startup engine build and both catch-up paths, so a
 /// synced validator can never construct a different set from the same state than a live one does.
 fn validators_from_state(state: &ChainState) -> Vec<Validator> {
     // Delegates to `ChainState::consensus_validator_set` so this and the `/validators` RPC route

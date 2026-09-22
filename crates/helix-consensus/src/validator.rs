@@ -25,9 +25,15 @@ pub struct Validator {
     /// Staked HLX in nano-HLX
     pub stake: u64,
     /// Whether this validator has a verified Proof of Personhood identity.
-    /// Validators without personhood are capped at 0.5% voting power.
+    ///
+    /// Halves the stake that enters the cap when absent (`stake / 2` rather than `stake`). It is
+    /// **not** a second, lower ceiling: the ceiling is `total_stake / 100` for everyone, so above
+    /// it personhood changes nothing at all. Said "capped at 0.5% voting power" until 2026-09-22,
+    /// which reads as two ceilings and is wrong in the regime this chain actually runs in — every
+    /// validator pinned at the cap. See
+    /// `personhood_doubles_the_stake_entering_the_cap_not_the_cap_itself`.
     pub has_personhood: bool,
-    /// Effective voting power after personhood cap is applied
+    /// Effective voting power: the stake personhood admits, clamped to the one cap
     pub voting_power: u64,
     /// A newly-activated validator serving its one-epoch **probation** (see backlog #132): it is
     /// in the set so it syncs and participates, but it carries **zero voting power** and is
@@ -438,6 +444,98 @@ mod tests {
             full_only.get(&a).unwrap().voting_power,
             "the full member's capped power must not change when a probationer joins the set",
         );
+    }
+
+    /// **What personhood actually buys, measured — because the comments describe it wrongly.**
+    ///
+    /// `execute_register_identity` calls it "the 1% (instead of 0.5%) validator voting-power
+    /// cap", which reads as two different ceilings. There is one ceiling, `total_stake / 100`,
+    /// and every validator gets it. What personhood changes is the number *entering* the cap:
+    /// `stake` rather than `stake / 2`.
+    ///
+    /// The difference matters in the direction nobody wrote down: **above the cap, personhood
+    /// buys nothing at all**, because both halves clamp to the same ceiling. That is the regime
+    /// this chain has actually run in — five validators all pinned at `total/100` — so the
+    /// mechanism the decentralisation guarantee rests on has been inert here, and no test said
+    /// so either way. This one does.
+    #[test]
+    fn personhood_doubles_the_stake_entering_the_cap_not_the_cap_itself() {
+        let unverified = rand_address();
+        let verified = rand_address();
+        let whale = rand_address();
+
+        // Below the cap: the ceiling is 10_000_000/100 = 100_000, and both stakes stay under it,
+        // so the halving is the only thing acting.
+        let below = ValidatorSet::new(
+            vec![
+                Validator::new(unverified.clone(), 50_000, false),
+                Validator::new(verified.clone(), 50_000, true),
+                Validator::new(whale.clone(), 9_900_000, true),
+            ],
+            0,
+        );
+        assert_eq!(below.get(&unverified).unwrap().voting_power, 25_000, "stake / 2");
+        assert_eq!(below.get(&verified).unwrap().voting_power, 50_000, "stake");
+
+        // Above the cap: same two stakes, but now large enough that *both* clamp. The verified
+        // one has no advantage left — this is the half the "0.5% cap" wording gets wrong.
+        let above = ValidatorSet::new(
+            vec![
+                Validator::new(unverified.clone(), 400_000, false),
+                Validator::new(verified.clone(), 400_000, true),
+                Validator::new(whale.clone(), 9_200_000, true),
+            ],
+            0,
+        );
+        let ceiling = 10_000_000u64 / 100;
+        assert_eq!(above.get(&unverified).unwrap().voting_power, ceiling);
+        assert_eq!(
+            above.get(&verified).unwrap().voting_power,
+            ceiling,
+            "both clamp to the one ceiling: personhood is not a second, higher cap"
+        );
+    }
+
+    /// The ceiling is integer division, so a small enough total collapses it to zero — and a set
+    /// with zero total voting power is the bootstrap condition every ingest path treats as "no
+    /// validators exist", which is a fork rather than a stall.
+    ///
+    /// It is unreachable in practice, and that is the point of pinning *why*: the reachable floor
+    /// is governance's `min_validator_stake`, itself floored at `MIN_VALIDATOR_STAKE / 100`
+    /// (1e11 nano), and a single validator at that floor already puts the ceiling at 1e9. The
+    /// arithmetic has no other guard, so the guard is that floor, and this records the link
+    /// between two numbers that live in different crates.
+    #[test]
+    fn a_total_stake_under_a_hundred_leaves_every_validator_powerless() {
+        let a = rand_address();
+        let b = rand_address();
+        let tiny = ValidatorSet::new(
+            vec![Validator::new(a.clone(), 40, true), Validator::new(b.clone(), 50, true)],
+            0,
+        );
+        assert_eq!(tiny.total_voting_power(), 0, "90 / 100 = 0: nobody has any power");
+        assert!(
+            !tiny.precommits_reach_quorum(&[], 1, &Hash::ZERO),
+            "and such a set must never certify anything — it is indistinguishable from an \
+             empty one, which is what every bootstrap path keys on"
+        );
+
+        // The reachable floor, one crate over: a lone validator at governance's minimum keeps the
+        // ceiling far away from zero.
+        let floor = helix_executor_min_validator_stake_floor();
+        let real = ValidatorSet::new(vec![Validator::new(a, floor, true)], 0);
+        assert!(
+            real.total_voting_power() > 0,
+            "a validator at the governance floor must carry power, or the chain cannot start"
+        );
+    }
+
+    /// `MIN_VALIDATOR_STAKE / 100`, the lowest value governance can set the minimum stake to.
+    /// Spelled out here rather than imported: helix-consensus does not depend on helix-executor,
+    /// and the point of the test above is the *relationship* between the two numbers, which a
+    /// dependency would not make any truer.
+    fn helix_executor_min_validator_stake_floor() -> u64 {
+        10_000 * 1_000_000_000 / 100
     }
 
     /// A probationer never takes a proposer turn, at any height or round.

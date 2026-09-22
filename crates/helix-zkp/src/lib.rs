@@ -9,7 +9,8 @@
 //!
 //! and registers the `commitment` on-chain via `TxType::RegisterPersonhood`.
 //!
-//! To claim full personhood voting weight (1% cap instead of 0.5%), the
+//! To claim full personhood voting weight (the full stake entering the one
+//! `total_stake / 100` cap, rather than half of it — not a higher cap), the
 //! validator submits `TxType::ProvePersonhood` with a STARK proof that they
 //! know a `secret` such that `secret^(2^63) = commitment` — without ever
 //! revealing `secret`.
