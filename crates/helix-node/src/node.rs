@@ -1998,11 +1998,17 @@ async fn handle_p2p_event(
                         let eng = engine.read().await;
                         let set = eng.validator_set();
                         // Bootstrap window: before the network's first `Stake` tx there is no staked
-                        // power to form a quorum from — the only producer is the genesis/self-fallback
-                        // validator, and the `is_known_validator` check above is the only gate that
-                        // can apply. Once real stake exists this reduces to the strict quorum check.
-                        // Same window `sync_blocks_from_peer` handles via `stakers().is_empty()`.
-                        set.total_voting_power() == 0
+                        // power to form a quorum from, so the quorum check cannot be the gate.
+                        //
+                        // This comment used to say "the only producer is the genesis/self-fallback
+                        // validator" and nothing checked it — so the waiver was open to any key at
+                        // all. `bootstrap_verdict` makes the sentence true: the window admits the
+                        // genesis validator and nobody else. Once real stake exists this reduces to
+                        // the strict quorum check, exactly as before.
+                        let gv = genesis_validator_of(&*store.read().await);
+                        let cs = chain_state.read().await;
+                        bootstrap_verdict(&cs, gv.as_ref(), &block.header.validator)
+                            == Bootstrap::AnchoredHere
                             || set.precommits_reach_quorum(&commit_certificate, block_height, &block.hash())
                     };
                     if !has_quorum {
@@ -2149,6 +2155,7 @@ async fn apply_synced_batch(
 
     // How much of this batch its own proof covers. A prefix rather than the whole batch is normal,
     // not a warning sign — see `verify_block_batch`. The rest arrives certified in the next batch.
+    let genesis_validator = genesis_validator_of(&*store.read().await);
     let proven = {
         let cs = chain_state.read().await;
         match verify_block_batch(
@@ -2158,6 +2165,7 @@ async fn apply_synced_batch(
             base_hash,
             &cs,
             &validator_set,
+            genesis_validator.as_ref(),
         ) {
             Ok(proven) => proven,
             Err(e) => {
@@ -2308,6 +2316,67 @@ async fn serve_catchup_blocks(
     }
 }
 
+/// What the pre-stake bootstrap window says about one block's proposer.
+///
+/// Every ingest path in this node has a bootstrap exemption, and all three stated the same
+/// justification: before the network's first `Stake` there is no staked power, so no certificate
+/// can reach a quorum, and without the exemption no node could ever sync past block 1. That part
+/// is true and the exemption has to exist.
+///
+/// **What none of them checked is who gets to use it.** The comment on the gossip path said "the
+/// only producer is the genesis/self-fallback validator" — an assumption written as a fact.
+/// Measured 2026-09-22: a `KeyPair::generate()` the chain had never seen produced five blocks that
+/// `verify_block_batch` accepted whole, certified by nobody. From there it is not five blocks: a
+/// block credits its scheduled reward to `header.validator` with no membership check, so an
+/// attacker's self-made history pays him 1 HLX a block, and after `MIN_VALIDATOR_STAKE` worth of
+/// them he stakes himself inside his own chain and every block after that carries a certificate
+/// that is genuinely, arithmetically valid. That is a complete substitute history, offered to any
+/// node joining from scratch, at the cost of signing blocks.
+///
+/// The window can be closed without giving up the exemption, because the chain already names the
+/// one address entitled to it: **the validator that signed the genesis block.** That block is the
+/// node's existing trust anchor — its hash is compiled into the binary (`DEFAULT_GENESIS_HASH`)
+/// and checked on join — so reading a proposer out of it adds no trust that was not already
+/// assumed. On a real chain the first proposer *is* that validator, so nothing honest changes.
+///
+/// `genesis_validator` is `None` when this node cannot name one (no genesis block stored yet).
+/// That reads as **closed**, never as open: a node that cannot say who its anchor is has no
+/// business waiving quorum for anybody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bootstrap {
+    /// Stake exists. The window is shut and the ordinary quorum rules decide.
+    Closed,
+    /// No stake yet, and this proposer is the genesis validator: the one producer the window
+    /// was ever meant to admit.
+    AnchoredHere,
+    /// No stake yet, and this proposer is not the anchor (or this node cannot name one).
+    /// Nothing vouches for this block — not a quorum, and not the chain's own origin.
+    Unanchored,
+}
+
+fn bootstrap_verdict(
+    chain_state: &ChainState,
+    genesis_validator: Option<&Address>,
+    proposer: &Address,
+) -> Bootstrap {
+    if !chain_state.stakers().is_empty() {
+        return Bootstrap::Closed;
+    }
+    match genesis_validator {
+        Some(anchor) if anchor == proposer => Bootstrap::AnchoredHere,
+        _ => Bootstrap::Unanchored,
+    }
+}
+
+/// The genesis block's proposer, or `None` if this node holds no genesis block.
+///
+/// Read from the store rather than passed down from configuration on purpose: the stored genesis
+/// is the one whose hash `DEFAULT_GENESIS_HASH` was checked against, so it is the anchor this node
+/// actually joined on, not the one it was told about.
+fn genesis_validator_of(store: &HelixDb) -> Option<Address> {
+    store.get_block_by_height(0).ok().map(|b| b.header.validator)
+}
+
 /// Verify a batch of blocks offered by a peer *before* a single one of them is written (#138).
 ///
 /// The whole batch rests on one proof: a BFT quorum certificate for its **last** block. Given an
@@ -2332,6 +2401,7 @@ fn verify_block_batch(
     expected_prev_hash: Hash,
     chain_state: &ChainState,
     validator_set: &ValidatorSet,
+    genesis_validator: Option<&Address>,
 ) -> std::result::Result<usize, String> {
     // Structure first, cryptography second: a peer must not be able to make us verify signatures
     // over a batch that is already provably not ours.
@@ -2425,7 +2495,17 @@ fn verify_block_batch(
     // the live chain on 2026-08-27: the second of two validators wiped its data, could get past
     // neither this path nor the RPC one, and a 2-of-2 quorum has no way to continue without it.
     let tip = blocks.last().expect("non-empty, checked above");
-    let bootstrapping = validator_set.total_voting_power() == 0;
+    // The bootstrap exemption, and who is allowed to use it. `total_voting_power() == 0` alone
+    // waived the quorum requirement for *any* proposer, which is the hole `bootstrap_verdict`
+    // exists to close: the waiver now needs every block in the batch to come from the genesis
+    // validator. One unanchored block anywhere and the batch has to prove itself the ordinary
+    // way, which without stake it cannot — so it is refused, which is the correct answer to a
+    // history nothing vouches for.
+    let bootstrapping = validator_set.total_voting_power() == 0
+        && blocks.iter().all(|b| {
+            bootstrap_verdict(chain_state, genesis_validator, &b.header.validator)
+                == Bootstrap::AnchoredHere
+        });
     let proven = if bootstrapping
         || validator_set.precommits_reach_quorum(tip_certificate, tip.height(), &tip.hash())
     {
@@ -2463,8 +2543,13 @@ fn verify_block_batch(
         }
         // Same bootstrap fallback as `sync_blocks_from_peer`: before the network's first `Stake`
         // tx, every node's own genesis fallback validator is absent from `stakers()`, so without
-        // this no node could sync past block 1.
-        let is_known_validator = chain_state.stakers().is_empty()
+        // this no node could sync past block 1 — but only that validator, not whoever asks
+        // (`bootstrap_verdict`).
+        let is_known_validator = bootstrap_verdict(
+            chain_state,
+            genesis_validator,
+            &block.header.validator,
+        ) == Bootstrap::AnchoredHere
             || chain_state
                 .stakers()
                 .iter()
@@ -5705,6 +5790,11 @@ async fn sync_blocks_from_peer(
 ) -> Result<u64> {
     let client = peer_http_client(Duration::from_secs(30))?;
 
+    // Read once: genesis does not change, and this is the anchor every bootstrap-window decision
+    // below is measured against. `None` (no genesis stored yet) closes the window rather than
+    // opening it — see `bootstrap_verdict`.
+    let genesis_validator = genesis_validator_of(&*store.read().await);
+
     let mut from = local_tip + 1;
     // Incremented per block, not per batch (backlog #160). The abort messages below quote this
     // number, and quoting a per-batch counter meant an abort five blocks into a 200-block batch
@@ -5804,7 +5894,14 @@ async fn sync_blocks_from_peer(
             // its own solo genesis fallback instead, forking itself off the real chain
             // block by block. Once real stake exists, this reduces to the strict
             // membership check exactly as before.
-            let is_known_validator = chain_state.stakers().is_empty()
+            //
+            // **Only the genesis validator may use that fallback** (`bootstrap_verdict`). Before
+            // that, any key at all could serve a joining node a history it wrote itself.
+            let is_known_validator = bootstrap_verdict(
+                chain_state,
+                genesis_validator.as_ref(),
+                &block.header.validator,
+            ) == Bootstrap::AnchoredHere
                 || chain_state
                     .stakers()
                     .iter()
@@ -5877,7 +5974,11 @@ async fn sync_blocks_from_peer(
             // Unproven blocks are **held back, not applied optimistically**: `proven_through_idx`
             // is the last index the batch vouches for, and the loop stops there. The next request
             // starts with the first unproven block, and by then its certifier exists.
-            let proven = chain_state.stakers().is_empty()
+            let proven = bootstrap_verdict(
+                chain_state,
+                genesis_validator.as_ref(),
+                &block.header.validator,
+            ) == Bootstrap::AnchoredHere
                 || matches!(proven_through_idx, Some(p) if idx <= p);
             if !proven {
                 if idx + 1 == blocks.len() && !peer_has_more {
@@ -6133,6 +6234,25 @@ mod sync_blocks_from_peer_tests {
         let sig = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
         block.header.signature = sig;
         block
+    }
+
+    /// A store holding a genesis block signed by `kp` — which is what every real node has, and
+    /// what the bootstrap window measures its anchor against (`bootstrap_verdict`).
+    ///
+    /// `fresh_store()` holds *nothing*, including no block 0. That is a state no running node is
+    /// ever in: the startup path either writes a genesis or fetches one (#139) before any sync
+    /// begins. Tests that skipped it were not testing a lighter node, they were testing a node
+    /// with no trust anchor at all — and before 2026-09-22 that difference did not show, because
+    /// the anchor was never consulted.
+    fn store_with_genesis_by(kp: &KeyPair) -> (HelixDb, Hash) {
+        let mut store = fresh_store();
+        let genesis = signed_block(kp, 0, Hash::ZERO);
+        let hash = genesis.hash();
+        store.put_block(genesis).expect("store a genesis block");
+        // The hash comes back because block 1 has to chain from it. A fixture that hands out a
+        // store with a genesis in it and lets the caller keep building from `Hash::ZERO` is a
+        // fixture that fails for a reason no test in it is about.
+        (store, hash)
     }
 
     /// A precommit by `kp` for `(height, block_hash)`, in the form a block header carries it.
@@ -7283,7 +7403,7 @@ mod sync_blocks_from_peer_tests {
         let blocks =
             chained_blocks_on_state(&a, &[&a, &b], &[1, 2, 3, 4, 5], chain_state.state_hash());
 
-        let proven = verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set)
+        let proven = verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set, None)
             .expect("a batch that certifies four of its own blocks is not a refusal");
         assert_eq!(
             proven, 4,
@@ -7299,7 +7419,7 @@ mod sync_blocks_from_peer_tests {
             &key_from_state(&chain_state),
         );
         assert_eq!(
-            verify_block_batch(&blocks, &tip_certificate, 1, Hash::ZERO, &chain_state, &set),
+            verify_block_batch(&blocks, &tip_certificate, 1, Hash::ZERO, &chain_state, &set, None),
             Ok(5)
         );
     }
@@ -7324,7 +7444,7 @@ mod sync_blocks_from_peer_tests {
         // Positive control: the same blocks on the right state are accepted. Without it, the
         // refusal below could just as well mean the batch was malformed some other way.
         let good = chained_blocks_on_state(&a, &[&a, &b], &[1, 2, 3], chain_state.state_hash());
-        verify_block_batch(&good, &[], 1, Hash::ZERO, &chain_state, &set)
+        verify_block_batch(&good, &[], 1, Hash::ZERO, &chain_state, &set, None)
             .expect("a batch built on our state must be accepted");
 
         let wrong = chained_blocks_on_state(
@@ -7333,7 +7453,7 @@ mod sync_blocks_from_peer_tests {
             &[1, 2, 3],
             Hash::digest(b"a state this node never computed"),
         );
-        let err = verify_block_batch(&wrong, &[], 1, Hash::ZERO, &chain_state, &set)
+        let err = verify_block_batch(&wrong, &[], 1, Hash::ZERO, &chain_state, &set, None)
             .expect_err("a batch built on another state must not be applied");
         assert!(
             err.contains("built on state") && err.contains("this node computed"),
@@ -7366,7 +7486,7 @@ mod sync_blocks_from_peer_tests {
             &[1, 2, 3],
             Hash::digest(b"whatever the state was back then"),
         );
-        verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set)
+        verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set, None)
             .expect("a state root for a height this node cannot recompute is not a reason to refuse");
     }
 
@@ -7388,7 +7508,7 @@ mod sync_blocks_from_peer_tests {
             chain_state.state_hash(),
         );
 
-        let err = verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set)
+        let err = verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set, None)
             .expect_err("one validator's own signature is not a quorum, anywhere in the batch");
         assert!(err.contains("reaches a BFT quorum"), "{err}");
     }
@@ -7526,25 +7646,58 @@ mod sync_blocks_from_peer_tests {
     }
 
     #[tokio::test]
-    async fn accepts_unstaked_validator_for_the_very_first_block_when_no_stakers_exist_yet() {
+    async fn accepts_the_genesis_validator_for_the_very_first_block_when_no_stakers_exist_yet() {
         // A block signed by a not-yet-staked address, synced against a chain_state with
-        // literally no stakers registered, is indistinguishable from every real node's own
-        // legitimate bootstrap block — every node's BFT engine falls back to "no qualifying
-        // stakers yet, accept self as sole validator" before anyone has ever submitted a
-        // real on-chain Stake tx (see `HelixNode::run`), and that fallback validator is never
-        // reflected in `chain_state.stakers()` since it was never established via a Stake tx.
-        // Before this fix, sync could never get past this very first block for any node —
-        // found by wiping a node's data and watching it fail to resync from a live peer.
+        // literally no stakers registered, is every real node's legitimate bootstrap block —
+        // every node's BFT engine falls back to "no qualifying stakers yet, accept self as sole
+        // validator" before anyone has ever submitted a real on-chain Stake tx (see
+        // `HelixNode::run`), and that fallback validator is never reflected in
+        // `chain_state.stakers()` since it was never established via a Stake tx. Without this,
+        // sync could never get past this very first block for any node — found by wiping a
+        // node's data and watching it fail to resync from a live peer.
+        //
+        // **Renamed 2026-09-22, and the rename is the point.** It used to say "unstaked
+        // validator" and meant it literally: *any* key was admitted here, which is the whole
+        // attack (`a_batch_from_a_stranger_is_refused…`). The block is accepted because its
+        // proposer signed this node's genesis block, not because nobody has staked.
         let kp = KeyPair::generate();
-        let blocks = vec![signed_block(&kp, 1, Hash::ZERO)];
+        let (db, genesis_hash) = store_with_genesis_by(&kp);
+        let blocks = vec![signed_block(&kp, 1, genesis_hash)];
         let peer_url = serve_blocks(blocks).await;
 
-        let store = Arc::new(RwLock::new(fresh_store()));
+        let store = Arc::new(RwLock::new(db));
         let chain_state = Arc::new(RwLock::new(ChainState::new(0))); // no stakers registered
         let result = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await;
 
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(store.read().await.latest_height(), 1);
+    }
+
+    /// The same first block, from anybody else. This is the half the test above was missing for
+    /// as long as it existed: it proved the window lets the anchor through and never that it
+    /// stops anyone.
+    #[tokio::test]
+    async fn refuses_the_very_first_block_when_a_stranger_proposed_it() {
+        let anchor = KeyPair::generate();
+        let stranger = KeyPair::generate();
+        let (db, genesis_hash) = store_with_genesis_by(&anchor);
+        let blocks = vec![signed_block(&stranger, 1, genesis_hash)];
+        let peer_url = serve_blocks(blocks).await;
+
+        let store = Arc::new(RwLock::new(db));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        let result = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await;
+
+        assert!(
+            result.is_err(),
+            "a block from a key the chain has never seen must not be applied just because \
+             nobody has staked yet — that window is what a joining node has instead of a quorum"
+        );
+        assert_eq!(
+            store.read().await.latest_height(),
+            0,
+            "and nothing of it may be persisted"
+        );
     }
 
     #[tokio::test]
@@ -7600,6 +7753,137 @@ mod sync_blocks_from_peer_tests {
         // Block 1 stays applied, block 2 (the non-chaining one) is never persisted.
         assert_eq!(store.read().await.latest_height(), 1);
         assert!(store.read().await.get_block_by_height(2).is_err());
+    }
+
+    /// **The bootstrap hole this closes: what proved the chain to a node that held nothing yet?**
+    ///
+    /// Nothing did. `verify_block_batch` waived the quorum requirement whenever
+    /// `validator_set.total_voting_power() == 0`, and the per-block proposer check waived itself
+    /// whenever `chain_state.stakers()` was empty. Both waivers were needed — this chain's genesis
+    /// carries no transactions, so nobody holds stake at height 0 and without them no node could
+    /// sync past block 1 — and neither asked *who* was using them.
+    ///
+    /// Measured 2026-09-22, before the fix: a `KeyPair::generate()` the chain had never seen
+    /// produced five blocks certified by nobody, and this call returned `Ok(5)`. It does not stop
+    /// at five: `execute_block` credits the scheduled reward to `header.validator` with no
+    /// membership check, so the attacker's own history pays him 1 HLX per block, and after
+    /// `MIN_VALIDATOR_STAKE` of them he stakes himself inside it — from there every certificate he
+    /// writes is arithmetically genuine, because he is the whole validator set of the chain he
+    /// invented. A complete substitute history for any node joining from scratch.
+    ///
+    /// The window stays open; it just admits one address now — the validator that signed the
+    /// genesis block this node joined on, whose hash is already compiled in.
+    #[test]
+    fn a_batch_from_a_stranger_is_refused_while_no_one_has_staked_yet() {
+        let stranger = KeyPair::generate();
+        let anchor = Address::from_public_key(&KeyPair::generate().public);
+        // A node at genesis: no accounts, no stakes, nothing. Not a contrived fixture — it is
+        // exactly `ChainState::new(0)`, what every joining node starts from.
+        let chain_state = ChainState::new(0);
+        assert!(
+            chain_state.stakers().is_empty(),
+            "precondition: a genesis state has no stakers, which is what opens the window"
+        );
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        assert_eq!(
+            set.total_voting_power(),
+            0,
+            "precondition: with no stakers there is no voting power to form a quorum from"
+        );
+
+        // Signed by a key the chain has never seen, certified by nobody at all.
+        let blocks =
+            chained_blocks_on_state(&stranger, &[], &[1, 2, 3, 4, 5], chain_state.state_hash());
+
+        let err = verify_block_batch(
+            &blocks,
+            &[],
+            1,
+            Hash::ZERO,
+            &chain_state,
+            &set,
+            Some(&anchor),
+        )
+        .expect_err("a history from a stranger must not be adopted for want of anything better");
+        assert!(
+            err.contains("BFT quorum"),
+            "the refusal has to be the quorum one: with the window shut to him there is nothing \
+             else left to vouch for these blocks, got: {err}"
+        );
+    }
+
+    /// The same batch from the anchor itself — the case the window exists for, and the positive
+    /// control without which the refusal above could just mean the fixture was malformed.
+    #[test]
+    fn the_genesis_validators_own_batch_is_still_adoptable_before_anyone_stakes() {
+        let anchor_kp = KeyPair::generate();
+        let anchor = Address::from_public_key(&anchor_kp.public);
+        let chain_state = ChainState::new(0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+
+        let blocks =
+            chained_blocks_on_state(&anchor_kp, &[], &[1, 2, 3, 4, 5], chain_state.state_hash());
+
+        let proven = verify_block_batch(
+            &blocks,
+            &[],
+            1,
+            Hash::ZERO,
+            &chain_state,
+            &set,
+            Some(&anchor),
+        )
+        .expect("the genesis validator's own first blocks are what the window is for");
+        assert_eq!(proven, 5, "and the whole batch, as before — nothing honest got slower");
+    }
+
+    /// A node that cannot name its anchor waives nothing. `None` is "I do not know who signed my
+    /// genesis", and the safe reading of that is **closed**, not open — otherwise the fix could be
+    /// undone by serving blocks to a node before it has a genesis, which is a state an attacker
+    /// controlling the peer has some say over.
+    #[test]
+    fn a_node_that_cannot_name_its_genesis_validator_waives_nothing() {
+        let anyone = KeyPair::generate();
+        let chain_state = ChainState::new(0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        let blocks =
+            chained_blocks_on_state(&anyone, &[], &[1, 2, 3], chain_state.state_hash());
+
+        assert!(
+            verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set, None).is_err(),
+            "without an anchor there is nobody the window may admit, so it admits nobody"
+        );
+    }
+
+    /// The other half, and the one that says how long the window stays open: **one** staker is
+    /// enough to close it. The moment anybody has stake, the waiver is gone and the same stranger
+    /// proves nothing.
+    ///
+    /// This is the positive control for the test above. Without it, "accepted" could mean the
+    /// fixture was simply too weak to be refused by anything.
+    #[test]
+    fn the_same_batch_from_the_same_stranger_proves_nothing_once_one_validator_exists() {
+        let stranger = KeyPair::generate();
+        let honest = KeyPair::generate();
+        let mut chain_state = ChainState::new(0);
+        stake_validator(&mut chain_state, &honest);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        assert!(set.total_voting_power() > 0, "precondition: the window is closed");
+
+        let blocks = chained_blocks_on_state(
+            &stranger,
+            &[],
+            &[1, 2, 3, 4, 5],
+            chain_state.state_hash(),
+        );
+
+        let err = verify_block_batch(&blocks, &[], 1, Hash::ZERO, &chain_state, &set, None)
+            .expect_err("with a real validator set, an uncertified batch proves nothing");
+        assert!(
+            err.contains("BFT quorum"),
+            "the refusal has to be the quorum one — any other reason would mean this test \
+             measures something other than the waiver it is named after, got: {err}"
+        );
     }
 }
 
@@ -8241,6 +8525,20 @@ mod handle_p2p_event_tests {
         store.read().await.latest_hash()
     }
     use super::*;
+
+    /// A store holding a genesis block signed by `kp` — this node's bootstrap anchor
+    /// (`bootstrap_verdict`). See the twin of this helper in `sync_blocks_from_peer_tests` for
+    /// why an empty store is not a lighter node but a node with no anchor at all.
+    fn store_with_genesis_by(kp: &KeyPair) -> (HelixDb, Hash) {
+        let mut store = fresh_store();
+        let genesis = signed_block(kp, 0, Hash::ZERO);
+        let hash = genesis.hash();
+        store.put_block(genesis).expect("store a genesis block");
+        // The hash comes back because block 1 has to chain from it. A fixture that hands out a
+        // store with a genesis in it and lets the caller keep building from `Hash::ZERO` is a
+        // fixture that fails for a reason no test in it is about.
+        (store, hash)
+    }
     use helix_core::genesis_block;
     use helix_crypto::{Hash, KeyPair, Signature as Sig};
     use std::sync::atomic::AtomicUsize;
@@ -8665,6 +8963,21 @@ mod handle_p2p_event_tests {
             .collect()
     }
 
+    /// Re-chain a run of blocks onto `prev_hash` and re-sign them.
+    ///
+    /// The fixtures above build from `Hash::ZERO`, which is what an empty store's tip hash is. A
+    /// store that holds a genesis block has a real one, and a batch that ignores it is refused for
+    /// not chaining — correctly, and for a reason that has nothing to do with what such a test is
+    /// trying to measure.
+    fn rechain_onto(blocks: &mut [Block], prev_hash: Hash, kp: &KeyPair) {
+        let mut prev = prev_hash;
+        for block in blocks.iter_mut() {
+            block.header.prev_hash = prev;
+            block.header.signature = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
+            prev = block.hash();
+        }
+    }
+
     /// Puts `blocks` into a fresh store and returns it alongside a tip-certificate cell holding a
     /// quorum certificate for the last one — the state a node is in after committing them.
     async fn store_with_chain(
@@ -8861,8 +9174,13 @@ mod handle_p2p_event_tests {
         chain_state.accounts.insert(addr.to_string(), acc);
     }
 
-    /// A store at genesis, chain state with `kp` staked, and an engine — the state of a node about
+    /// An empty store, chain state with `kp` staked, and an engine — the state of a node about
     /// to receive its first block-sync batch.
+    ///
+    /// The store holds no genesis block, and for these tests that is right: `kp` is staked, so
+    /// the bootstrap window is shut and the anchor is never consulted. The one test that needs an
+    /// anchor builds its own store (`the_bootstrap_window_…`). Said "at genesis" until
+    /// 2026-09-22, when it started to matter what that meant.
     async fn blocksync_fixture(
         kp: &KeyPair,
     ) -> (
@@ -9177,7 +9495,11 @@ mod handle_p2p_event_tests {
     #[tokio::test]
     async fn the_bootstrap_window_syncs_without_a_quorum_certificate() {
         let kp = KeyPair::generate();
-        let store = Arc::new(RwLock::new(fresh_store()));
+        // The anchor: this node's genesis was signed by `kp`, so `kp` is the one producer the
+        // window admits. Before 2026-09-22 it admitted anybody, which is what made a joining
+        // node adoptable by a stranger's invented history.
+        let (db, _genesis_hash) = store_with_genesis_by(&kp);
+        let store = Arc::new(RwLock::new(db));
         // No stakers at all — `validators_from_state` yields an empty set.
         let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
         let addr = Address::from_public_key(&kp.public);
@@ -9190,7 +9512,10 @@ mod handle_p2p_event_tests {
         // Built on the state this node holds (#194) — the bootstrap window relaxes the *quorum*
         // requirement, not the requirement that a block describe a chain this node is on.
         let root = chain_state.read().await.state_hash();
-        let blocks = chained_blocks_on_state(&kp, &[1, 2], root);
+        // Chained onto the genesis block this store holds, which is what a real batch does — an
+        // empty store made `latest_hash()` zero and let the fixture skip that.
+        let mut blocks = chained_blocks_on_state(&kp, &[1, 2], root);
+        rechain_onto(&mut blocks, tip_of(&store).await, &kp);
 
         deliver_batch(
             BlockSyncResponse { blocks, tip_certificate: vec![] },
@@ -9763,7 +10088,11 @@ mod handle_p2p_event_tests {
         use std::collections::HashMap;
 
         let kp = KeyPair::generate();
-        let mut prev_hash = Hash::ZERO;
+        // This node's own genesis, signed by `kp` — the bootstrap anchor. Nobody has staked in
+        // this fixture, so the anchor is the only thing that can admit these blocks
+        // (`bootstrap_verdict`), which is what a real node in this situation also has.
+        let (db, genesis_hash) = store_with_genesis_by(&kp);
+        let mut prev_hash = genesis_hash;
         let chained: Vec<Block> = (1u64..=3)
             .map(|h| {
                 let b = signed_block(&kp, h, prev_hash);
@@ -9792,10 +10121,10 @@ mod handle_p2p_event_tests {
 
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let peer_count = Arc::new(AtomicUsize::new(0));
-        let store = Arc::new(RwLock::new(fresh_store()));
+        let store = Arc::new(RwLock::new(db));
         let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
-        // Empty validator set — mirrors the same bootstrap fallback `sync_blocks_from_peer`
-        // already relies on (`chain_state.stakers().is_empty()`), same as its own test suite.
+        // Empty validator set — mirrors the same bootstrap window `sync_blocks_from_peer` relies
+        // on, which since 2026-09-22 admits the genesis validator rather than anyone at all.
         let validator_set = ValidatorSet::new(vec![], 0);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, Address::from_public_key(&kp.public), 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
@@ -9803,7 +10132,7 @@ mod handle_p2p_event_tests {
 
         // A gossiped block far ahead of our tip — triggers the gap-fill branch. Its own
         // content is irrelevant; it's never applied directly, only used to detect the gap.
-        let far_ahead = signed_block(&kp, 5, Hash::ZERO);
+        let far_ahead = signed_block(&kp, 5, prev_hash);
         handle_p2p_event(
             P2PEvent::NewCommittedBlock(far_ahead, vec![]),
             &mempool,
