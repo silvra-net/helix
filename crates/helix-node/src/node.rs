@@ -2779,10 +2779,33 @@ async fn report_double_sign_evidence(
     p2p_tx: &mpsc::Sender<P2PCommand>,
 ) {
     let self_address = Address::from_public_key(&keypair.public);
-    let (nonce, chain_id) = {
+    let (nonce, chain_id, balance) = {
         let state = chain_state.read().await;
-        (state.get(&self_address).map(|acc| acc.nonce).unwrap_or(0), state.chain_id)
+        let acc = state.get(&self_address);
+        (
+            acc.map(|a| a.nonce).unwrap_or(0),
+            state.chain_id,
+            acc.map(|a| a.balance).unwrap_or(0),
+        )
     };
+    // Pay what this reporter has, up to the usual fee — never more.
+    //
+    // Peers gate an incoming transaction on `can_pay_fee` (`handle_p2p_event`), so a fee the
+    // reporter cannot cover means every peer drops the evidence and the slash never reaches a
+    // block. The reporter's own pool takes it regardless, so from its side nothing looks wrong:
+    // evidence detected, logged, queued, and silently going nowhere. That is the same failure
+    // `DOUBLE_SIGN_EVIDENCE_FEE_NANO` was raised from zero to avoid, reached from the other side.
+    //
+    // A validator staked at exactly `MIN_VALIDATOR_STAKE` has nothing liquid — the configuration
+    // this chain's own V1 runs, and the one the `ProbationHeartbeat` exemption exists for. It
+    // must not be the configuration that cannot report a double-sign.
+    //
+    // Zero is a legitimate fee for this transaction type and always was: the pool exempts it from
+    // both fee gates (`Mempool::is_fee_exempt`) and the executor charges it no base fee. The
+    // fixed figure survived from before that exemption existed, where it bought admission; now it
+    // only buys priority, which is worth having when affordable and worth nothing when it stops
+    // the report altogether.
+    let fee = DOUBLE_SIGN_EVIDENCE_FEE_NANO.min(balance);
 
     let data = match bincode::serialize(&evidence) {
         Ok(d) => d,
@@ -2798,7 +2821,7 @@ async fn report_double_sign_evidence(
         from: self_address,
         to: None,
         amount: 0,
-        fee: DOUBLE_SIGN_EVIDENCE_FEE_NANO,
+        fee,
         nonce,
         data,
         crypto_version: keypair.scheme,
@@ -9930,6 +9953,111 @@ mod handle_p2p_event_tests {
             mempool.read().await.len(),
             1,
             "the evidence tx must actually clear the mempool's fee floor, not just get logged"
+        );
+    }
+
+    /// **The fourth door, checked at the door a peer actually opens.**
+    ///
+    /// The test above proves the reporter's *own* pool takes the evidence. That is the sender's
+    /// view, and it is not the question: the slash happens in a block, so what decides is whether
+    /// the *peers* accept it. Their gate is `handle_p2p_event`'s `can_pay_fee`, which the
+    /// reporter's local `add` never runs — so a reporter can watch its evidence sit happily in
+    /// its own mempool while every other node drops it.
+    ///
+    /// `DOUBLE_SIGN_EVIDENCE_FEE_NANO` is 10_000 nano, picked so the tx would clear the pool's
+    /// `min_fee` floor back when there was no exemption for it. There is one now
+    /// (`Mempool::is_fee_exempt`), so the figure buys nothing at that gate any more — and at the
+    /// new one it costs: a validator staked at exactly `MIN_VALIDATOR_STAKE`, with nothing
+    /// liquid, cannot report a double-sign at all. That operator is not hypothetical; it is the
+    /// configuration this chain's own V1 runs, and the exact case the `ProbationHeartbeat`
+    /// exemption was written for.
+    ///
+    /// This is the fourth door of the project's rituals — the one that has been nearly closed
+    /// four times (#47, #80, #88, #92), each time by a fee change that looked unrelated.
+    #[tokio::test]
+    async fn a_reporter_with_nothing_liquid_can_still_have_its_evidence_accepted_by_peers() {
+        let bad_kp = KeyPair::generate();
+        let bad_addr = Address::from_public_key(&bad_kp.public);
+        let vote_a = signed_vote(&bad_kp, &bad_addr, helix_consensus::VoteType::Prevote, 5, 0, Hash::digest(b"a"));
+        let vote_b = signed_vote(&bad_kp, &bad_addr, helix_consensus::VoteType::Prevote, 5, 0, Hash::digest(b"b"));
+        let evidence = DoubleSignEvidence { validator: bad_addr, height: 5, round: 0, vote_a, vote_b };
+
+        // A validator with everything staked and nothing liquid — `MIN_VALIDATOR_STAKE` locked,
+        // balance zero. Reporting is the one thing it still has to be able to do.
+        let reporter_kp = KeyPair::generate();
+        let reporter = Address::from_public_key(&reporter_kp.public);
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        chain_state.write().await.update_account(&reporter, |acc| {
+            acc.staked = helix_executor::genesis::MIN_VALIDATOR_STAKE;
+            acc.balance = 0;
+        });
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
+        report_double_sign_evidence(evidence, &reporter_kp, &chain_state, &mempool, &p2p_tx).await;
+
+        // What actually goes on the wire, rather than what the reporter kept for itself.
+        let broadcast = p2p_rx.try_recv().expect("the evidence has to be broadcast at all");
+        let P2PCommand::BroadcastTransaction(tx) = broadcast else {
+            panic!("expected the evidence transaction to be broadcast");
+        };
+
+        // The peer's gate, exactly as `handle_p2p_event` applies it.
+        let chain = chain_state.read().await;
+        assert!(
+            helix_executor::can_pay_fee(&chain, &tx),
+            "a peer drops this before it ever reaches a block: the reporter is staked to the \
+             minimum and holds nothing liquid, so a fixed reporter fee prices it out of \
+             reporting. Evidence that no peer accepts is slashing switched off, which is the \
+             failure this fee was raised from zero to avoid — now reached from the other side."
+        );
+
+        // And it must still execute, not merely be accepted: a fee the reporter can pay is worth
+        // nothing if the executor then refuses it.
+        let mut state = chain.clone();
+        drop(chain);
+        let receipt = helix_executor::execute_transaction(
+            &mut state,
+            &tx,
+            &Address::from_public_key(&KeyPair::generate().public),
+            1,
+            0,
+        );
+        assert!(
+            receipt.success,
+            "and the slash has to land once it is in a block: {:?}",
+            receipt.error
+        );
+    }
+
+    /// The counterweight: paying what you have must not become paying nothing.
+    ///
+    /// The fee still buys priority in a contended pool — `tip` ranks by it, and evidence losing
+    /// an eviction race is the same silent failure as evidence no peer accepts. A reporter that
+    /// can afford the full figure pays the full figure.
+    #[tokio::test]
+    async fn a_reporter_that_can_afford_the_fee_still_pays_it_in_full() {
+        let bad_kp = KeyPair::generate();
+        let bad_addr = Address::from_public_key(&bad_kp.public);
+        let vote_a = signed_vote(&bad_kp, &bad_addr, helix_consensus::VoteType::Prevote, 5, 0, Hash::digest(b"a"));
+        let vote_b = signed_vote(&bad_kp, &bad_addr, helix_consensus::VoteType::Prevote, 5, 0, Hash::digest(b"b"));
+        let evidence = DoubleSignEvidence { validator: bad_addr, height: 5, round: 0, vote_a, vote_b };
+
+        let reporter_kp = KeyPair::generate();
+        let reporter = Address::from_public_key(&reporter_kp.public);
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        chain_state.write().await.update_account(&reporter, |acc| acc.balance = 1_000_000);
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
+        report_double_sign_evidence(evidence, &reporter_kp, &chain_state, &mempool, &p2p_tx).await;
+
+        let P2PCommand::BroadcastTransaction(tx) = p2p_rx.try_recv().expect("broadcast") else {
+            panic!("expected the evidence transaction to be broadcast");
+        };
+        assert_eq!(
+            tx.fee, DOUBLE_SIGN_EVIDENCE_FEE_NANO,
+            "a funded reporter must not quietly drop to a fee that ranks last in a full pool"
         );
     }
 
