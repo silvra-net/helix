@@ -1043,6 +1043,53 @@ fn a_third_of_all_messages_lost_for_four_hundred_ticks_never_forks_and_always_re
     }
 }
 
+/// **Safety over fifty different networks, because three is an anecdote.**
+///
+/// The one property that must never fail is that two nodes never commit different blocks at the
+/// same height. Everything else this chain has suffered — stalls, strandings, lost rounds — costs
+/// time. A fork costs the ledger.
+///
+/// Three seeds prove that nothing obvious is wrong. Fifty, each a different pattern of loss across
+/// 400 ticks, is the difference between "we did not see one" and "we looked". Liveness is
+/// deliberately not asserted here: under a third of messages lost it is genuinely allowed to be
+/// gone (see the test above for what that costs), and mixing the two would mean weakening the
+/// safety check to whatever liveness happens to permit.
+///
+/// `#[ignore]` because fifty runs is minutes, not seconds — and wired into `scripts/build-all.sh`,
+/// because skipped is not passed (lesson 4).
+#[test]
+#[ignore = "50 chaos networks × 600 ticks of real ML-DSA — run with --release --ignored, or via scripts/build-all.sh"]
+fn no_seed_in_fifty_can_make_two_nodes_disagree_on_a_height() {
+    let mut dead = 0usize;
+    let mut stranded_total = 0usize;
+    for seed in 0..50u64 {
+        let mut sim = Sim::new(5, 1).chaos(seed, 0, 400).with_roundsync();
+        // Checked in slices rather than once at the end: a fork that is later overwritten by a
+        // longer branch would be invisible to a single look afterwards, and that is exactly the
+        // shape a real one takes.
+        for _ in 0..40 {
+            sim.run(10);
+            sim.assert_no_fork(&format!("seed {seed}"));
+        }
+        sim.run(200);
+        sim.assert_no_fork(&format!("seed {seed}, after the network calmed"));
+
+        let after = sim.heights();
+        let top = *after.iter().max().unwrap();
+        let on_tip = after.iter().filter(|h| **h == top).count();
+        if on_tip * 3 <= after.len() * 2 {
+            dead += 1;
+        }
+        stranded_total += after.len() - on_tip;
+    }
+    // Not an assertion — a measurement, printed so the cost of a lossy network is a number
+    // somebody can look at rather than a feeling. The assertion is the absence of forks above.
+    println!(
+        "50 chaos networks: {dead} ended without a quorum on one height, {stranded_total} \
+         node-stragglers in total — every one of them block-sync's job (#188)"
+    );
+}
+
 /// The number the test above produces, stated as its own claim because it is an operational fact
 /// and not a detail: **under a third of messages lost, five validators do not all come back.**
 ///
