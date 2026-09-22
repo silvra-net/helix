@@ -442,6 +442,46 @@ fn keep_blocks_for_budget(db_bytes: u64, retained_blocks: u64, budget_bytes: u64
 /// Unparseable is also 0 rather than some default, for the reason `HELIX_DB_CACHE_MB` does the
 /// same — a typo must not silently switch on a limit the operator did not choose, nor switch off
 /// one they did.
+/// Parse a comma-separated list of personhood authority public keys, keeping only the ones that
+/// really are keys.
+///
+/// **`PublicKey::from_hex` decodes hex and stops there** — it does not check that the bytes form
+/// a key under any scheme. Well-formed hex of the wrong length therefore used to pass straight
+/// through into the genesis state, where it is **permanent for the life of the chain**: every
+/// later `ProvePersonhood` failed with "personhood authority signature verification failed",
+/// which reads as a problem with the proof rather than with a typo made once at launch, by
+/// someone who is no longer looking.
+///
+/// A rejected entry is dropped with a warning rather than failing the start: one bad key among
+/// several should not stop a node, and zero authorities is already a defined state (personhood
+/// disabled, failing closed).
+///
+/// Pulled out of `HelixNode::new` so it can be tested at all — the same reason `redial_verdict`,
+/// `liveness_verdict` and `bootstrap_verdict` are their own functions. A rule that only exists
+/// inside a constructor is a rule nobody checks.
+fn parse_personhood_authorities(raw: &str) -> Vec<helix_crypto::PublicKey> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|hex| match helix_crypto::PublicKey::from_hex(hex) {
+            Ok(pk) if pk.is_valid() => Some(pk),
+            Ok(pk) => {
+                warn!(
+                    key = hex,
+                    bytes = pk.as_bytes().len(),
+                    "HELIX_PERSONHOOD_AUTHORITIES / helix.toml contains well-formed hex that is \
+                     not a valid public key — skipping it"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(err = %e, key = hex, "HELIX_PERSONHOOD_AUTHORITIES / helix.toml contains an invalid public key — skipping it");
+                None
+            }
+        })
+        .collect()
+}
+
 fn configured_keep_bytes() -> u64 {
     let Ok(raw) = std::env::var("HELIX_KEEP_BYTES") else {
         return 0;
@@ -671,19 +711,7 @@ impl HelixNode {
         // existing chain's authorities (if any) were already persisted at its own genesis.
         let personhood_authorities: Vec<helix_crypto::PublicKey> =
             config::resolve("HELIX_PERSONHOOD_AUTHORITIES", &cfg.personhood_authorities)
-                .map(|raw| {
-                    raw.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .filter_map(|hex| match helix_crypto::PublicKey::from_hex(hex) {
-                            Ok(pk) => Some(pk),
-                            Err(e) => {
-                                warn!(err = %e, key = hex, "HELIX_PERSONHOOD_AUTHORITIES / helix.toml contains an invalid public key — skipping it");
-                                None
-                            }
-                        })
-                        .collect()
-                })
+                .map(|raw| parse_personhood_authorities(&raw))
                 .unwrap_or_default();
         if personhood_authorities.is_empty() {
             info!("No personhood authorities configured — ProvePersonhood transactions will be rejected");
@@ -8088,6 +8116,50 @@ mod sync_blocks_from_peer_tests {
             "the refusal has to be the quorum one — any other reason would mean this test \
              measures something other than the waiver it is named after, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod personhood_authority_tests {
+    use super::*;
+
+    /// The good case, and the control for the two below.
+    #[test]
+    fn real_keys_are_kept_and_whitespace_does_not_matter() {
+        let a = KeyPair::generate().public;
+        let b = KeyPair::generate().public;
+        let raw = format!(" {} , {} ", a.to_hex(), b.to_hex());
+        let parsed = parse_personhood_authorities(&raw);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|k| k.is_valid()));
+    }
+
+    /// **Well-formed hex that is not a key.** This is the one that used to get through, and the
+    /// cost is out of all proportion to the typo: the value goes into the genesis state, which is
+    /// permanent for the life of the chain, and the only symptom is that every `ProvePersonhood`
+    /// fails with a message pointing at the proof.
+    #[test]
+    fn hex_that_is_not_a_key_is_dropped() {
+        let real = KeyPair::generate().public;
+        // Valid hex, wrong length — exactly what a truncated paste produces.
+        let raw = format!("{},deadbeef", real.to_hex());
+        let parsed = parse_personhood_authorities(&raw);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "the short one must be dropped, not carried into genesis as an authority that can \
+             never verify anything"
+        );
+        assert_eq!(parsed[0].as_bytes(), real.as_bytes(), "and the real one must survive");
+    }
+
+    /// One bad entry must not take the good ones with it, and an all-bad list must end at zero
+    /// rather than anywhere else — zero authorities is a defined state (personhood disabled,
+    /// failing closed), which is why dropping is safe here and failing the start would be worse.
+    #[test]
+    fn a_list_of_nothing_usable_ends_at_zero_authorities() {
+        assert!(parse_personhood_authorities("zz,deadbeef, ,").is_empty());
+        assert!(parse_personhood_authorities("").is_empty());
     }
 }
 

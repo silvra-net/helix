@@ -181,6 +181,24 @@ pub const DEFAULT_COMMISSION_BPS: u16 = 1_000;
 /// earn.
 pub const MAX_COMMISSION_BPS: u16 = 5_000;
 
+/// A commission above 100 % would make `credit_validator_reward` panic on **every block**.
+///
+/// It computes `commission = delegated_share · commission_bps / 10_000` and then
+/// `pool_gain = delegated_share - commission`, with `overflow-checks = true` in the release
+/// profile (#161) — so a rate over 10_000 bps underflows that subtraction, and the panic lands
+/// in the reward path every node runs for every block. Not a stalled chain: a dead one, on all
+/// nodes at once, from a single accepted transaction.
+///
+/// Nothing reaches that today — `execute_set_commission` refuses anything above
+/// `MAX_COMMISSION_BPS` — but the guard and the subtraction live in different functions and
+/// neither names the other. Raising this constant past 10_000 is a one-character change that
+/// compiles, passes every test that does not happen to have a delegation pool, and takes the
+/// network down on the next block. So it does not compile.
+const _: () = assert!(
+    MAX_COMMISSION_BPS <= 10_000,
+    "a commission over 100 % underflows pool_gain in credit_validator_reward"
+);
+
 /// Minimum fraction of a validator's effective stake (self + delegated, see
 /// `ChainState::effective_stake`) that must be backed by the validator's own capital, in basis
 /// points. Below this ratio a validator collects the full block-production/voting-power benefit
