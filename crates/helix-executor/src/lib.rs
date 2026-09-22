@@ -822,12 +822,7 @@ fn execute_redelegate(
 
     // No A->B->C hopping while the earlier hop's window is still open — see `TxType::Redelegate`.
     let sender_key = tx.from.to_string();
-    let already_redelegating = state
-        .redelegations
-        .values()
-        .flatten()
-        .any(|r| r.delegator == sender_key && r.dst == src_key);
-    if already_redelegating {
+    if state.is_inside_redelegation_window(&sender_key, &src_key) {
         return Receipt::failure(
             tx_hash,
             "this delegation is itself still inside a redelegation window; wait for it to end \
@@ -987,6 +982,28 @@ fn execute_undelegate(
     }
 
     let target_key = target.to_string();
+    // Capital that redelegated *into* this pool is still on the hook for the validator it left,
+    // and the only place that hook is anchored is the shares it holds here
+    // (`slash_redelegations_away_from` burns them, and gives up if they are gone). Withdrawing
+    // before the window closes therefore erased the source's claim entirely: redelegate, then
+    // undelegate, and the source's slash finds no shares in the destination while the unbonding
+    // slot names the destination rather than the source. Two transactions, no waiting, nothing
+    // taken — the whole deterrent for delegated capital.
+    //
+    // Refused rather than made to follow the money: the unbonding slot holds a single
+    // `unbonding_source`, and this capital would need two (the destination it is leaving and the
+    // source that can still slash it). Waiting out a window the delegator chose to open is the
+    // cheaper honest answer, and it is the same rule `execute_redelegate` already applies to a
+    // second hop.
+    if state.is_inside_redelegation_window(&tx.from.to_string(), &target_key) {
+        return Receipt::failure(
+            tx_hash,
+            "this stake is still inside a redelegation window and can still be slashed for the \
+             validator it left; wait for that window to close before undelegating",
+            0,
+            0,
+        );
+    }
     let Some(pool) = state.validator_pools.get(&target_key) else {
         return Receipt::failure(tx_hash, "no delegation pool for this validator", 0, 0);
     };
@@ -2561,7 +2578,7 @@ mod tests {
 
         let bogus = KeyPair::generate();
         let mut guardian_nonce = 0u64;
-        let mut approve = |state: &mut ChainState, n: &mut u64| {
+        let approve = |state: &mut ChainState, n: &mut u64| {
             let tx = signed_approve_recovery_tx(
                 &guardian_kps[0],
                 &guardian_addrs[0],
@@ -6313,6 +6330,150 @@ mod tests {
             state.get(&addr).unwrap().balance,
             1_000_000 - 10_000,
             "the fee is still charged: the transaction was payable and took a block slot"
+        );
+    }
+
+    /// **Redelegate, then undelegate: the slashing window is washed off in two transactions.**
+    ///
+    /// `Redelegate` moves stake between pools with no unbonding wait, and keeps the source's
+    /// claim alive in `redelegations` so the source's slash can still reach it. That claim is
+    /// enforced by `slash_redelegations_away_from`, which finds the redelegator's shares **in the
+    /// destination pool** and burns them.
+    ///
+    /// It gives up when they are not there:
+    ///
+    /// ```ignore
+    /// let Some(held) = self.delegator_shares.get_mut(&entry.dst)
+    ///     .and_then(|m| m.get_mut(&entry.delegator)) else { continue };
+    /// ```
+    ///
+    /// So the capital only has to leave the destination. `execute_undelegate` never looks at
+    /// `redelegations` — it burns the shares, moves the value into the unbonding queue, and
+    /// stamps `unbonding_source` with the *destination*. When the source is finally slashed,
+    /// the redelegation entry finds no shares, the unbonding slot names a different validator,
+    /// and nothing is taken.
+    ///
+    /// Two transactions, no waiting, and the delegator keeps everything. That is the whole
+    /// deterrent for delegated capital.
+    #[test]
+    fn stake_redelegated_away_cannot_escape_the_slash_by_leaving_the_destination() {
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let src = Address::from_public_key(&KeyPair::generate().public);
+        let dst = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 10_000_000_000);
+        // Both validators self-staked well above what the self-bond ratio needs.
+        state.update_account(&src, |acc| acc.staked = 1_000_000_000);
+        state.update_account(&dst, |acc| acc.staked = 1_000_000_000);
+
+        // Delegate to the source, then move it all to the destination.
+        let delegate = signed_tx(&delegator_kp, &delegator, TxType::Delegate,
+            Some(src.clone()), 1_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate, &block_validator, 1, 0).success);
+
+        let redelegate = signed_tx(&delegator_kp, &delegator, TxType::Redelegate,
+            Some(dst.clone()), 1_000_000, src.to_string().into_bytes(), 1, 10_000);
+        let receipt = execute_transaction(&mut state, &redelegate, &block_validator, 2, 0);
+        assert!(receipt.success, "premise: the redelegation goes through: {:?}", receipt.error);
+        assert!(
+            state.redelegations.get(&src.to_string()).is_some_and(|v| !v.is_empty()),
+            "premise: the source's claim on this capital is recorded"
+        );
+
+        // Straight back out of the destination, still inside the source's window.
+        let undelegate = signed_tx(&delegator_kp, &delegator, TxType::Undelegate,
+            Some(dst.clone()), 1_000_000, vec![], 2, 10_000);
+        let receipt = execute_transaction(&mut state, &undelegate, &block_validator, 3, 0);
+
+        // Whatever the mechanism, the outcome has to be that the source's slash still bites.
+        let before = state.get(&delegator).map(|a| a.unbonding_stake).unwrap_or(0);
+        state.slash(&src, helix_consensus::SLASH_FRACTION_BPS);
+        let after = state.get(&delegator).map(|a| a.unbonding_stake).unwrap_or(0);
+
+        if receipt.success {
+            assert!(
+                after < before,
+                "the capital left the destination while the source's window was open, so the \
+                 source's slash has to reach it in the unbonding queue — it took {before} to \
+                 {after}, i.e. nothing"
+            );
+        } else {
+            // Refusing the exit while the window is open is the other correct answer, and the
+            // one that keeps the accounting to a single slashable location.
+            assert!(
+                state
+                    .delegator_shares
+                    .get(&dst.to_string())
+                    .and_then(|m| m.get(&delegator.to_string()))
+                    .is_some_and(|s| *s > 0),
+                "if the undelegation is refused, the stake must still be in the destination \
+                 pool where the redelegation slash can find it"
+            );
+        }
+    }
+
+    /// The counterweight, and the failure mode a lock like this creates if nobody checks it:
+    /// **the window has to close.**
+    ///
+    /// A refusal that never lifts is not a safety property, it is stake seized by accident —
+    /// the same shape as the guardian lock in #210, where an owner could be held out of their
+    /// own account indefinitely because one party could keep re-opening a state.
+    ///
+    /// Here the window is bounded by `UNBONDING_PERIOD` and swept once per block by
+    /// `prune_expired_redelegations`, so this test drives that sweep rather than asserting the
+    /// constant: once it has run past the unlock height, the delegator walks out.
+    #[test]
+    fn a_redelegation_window_closes_and_the_stake_can_then_leave() {
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        let src = Address::from_public_key(&KeyPair::generate().public);
+        let dst = Address::from_public_key(&KeyPair::generate().public);
+
+        let mut state = ChainState::new(0);
+        state.update_account(&delegator, |acc| acc.balance = 10_000_000_000);
+        state.update_account(&src, |acc| acc.staked = 1_000_000_000);
+        state.update_account(&dst, |acc| acc.staked = 1_000_000_000);
+
+        let delegate = signed_tx(&delegator_kp, &delegator, TxType::Delegate,
+            Some(src.clone()), 1_000_000, vec![], 0, 10_000);
+        assert!(execute_transaction(&mut state, &delegate, &block_validator, 1, 0).success);
+        let redelegate = signed_tx(&delegator_kp, &delegator, TxType::Redelegate,
+            Some(dst.clone()), 1_000_000, src.to_string().into_bytes(), 1, 10_000);
+        assert!(execute_transaction(&mut state, &redelegate, &block_validator, 2, 0).success);
+
+        // Positive control: while the window is open, it is shut.
+        let early = signed_tx(&delegator_kp, &delegator, TxType::Undelegate,
+            Some(dst.clone()), 1_000_000, vec![], 2, 10_000);
+        assert!(
+            !execute_transaction(&mut state, &early, &block_validator, 3, 0).success,
+            "premise: the window is open and the exit is refused"
+        );
+
+        // The chain moves past the unlock height and the per-block sweep runs.
+        state.prune_expired_redelegations(2 + state::UNBONDING_PERIOD);
+        assert!(
+            !state.is_inside_redelegation_window(&delegator.to_string(), &dst.to_string()),
+            "the sweep has to actually drop it — otherwise the refusal above is permanent"
+        );
+
+        let late = signed_tx(&delegator_kp, &delegator, TxType::Undelegate,
+            Some(dst.clone()), 1_000_000, vec![], 3, 10_000);
+        let receipt =
+            execute_transaction(&mut state, &late, &block_validator, 3 + state::UNBONDING_PERIOD, 0);
+        assert!(
+            receipt.success,
+            "once the source can no longer slash it, the stake is the delegator's to withdraw: \
+             {:?}",
+            receipt.error
+        );
+        assert_eq!(
+            state.get(&delegator).unwrap().unbonding_stake,
+            1_000_000,
+            "and it lands in the ordinary unbonding queue"
         );
     }
 

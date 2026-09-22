@@ -927,6 +927,30 @@ impl ChainState {
         signed_power >= set.quorum_threshold()
     }
 
+    /// Is `delegator`'s stake in `pool` still inside a redelegation window that some *other*
+    /// validator's slash can reach?
+    ///
+    /// `Redelegate` moves stake between pools immediately and keeps the source's claim alive in
+    /// `redelegations`. That claim is collected by `slash_redelegations_away_from`, which burns
+    /// the redelegator's shares **in the destination pool** — so it only works while the shares
+    /// are still there. Anything that lets that capital leave the destination before the window
+    /// closes erases the claim.
+    ///
+    /// One question, one answer, because there are two callers and they were about to disagree:
+    /// `execute_redelegate` asks it to refuse a second hop (A→B→C), and `execute_undelegate` asks
+    /// it to refuse the same escape by a different door — withdrawing from B outright, which is
+    /// the cheaper version of the same move and was allowed until 2026-09-22.
+    ///
+    /// Expiry is not checked here: `prune_expired_redelegations` runs once per block
+    /// (`execute_block`), so a closed window is already gone from this map by the time any
+    /// transaction in the next block is executed.
+    pub fn is_inside_redelegation_window(&self, delegator: &str, pool: &str) -> bool {
+        self.redelegations
+            .values()
+            .flatten()
+            .any(|r| r.delegator == delegator && r.dst == pool)
+    }
+
     /// Drop redelegation entries whose source-slashing window has closed. Called once per block
     /// (see `execute_block`) — without it every redelegation ever made would stay in consensus
     /// state forever, and each source validator's slash would walk a list that only grows.
