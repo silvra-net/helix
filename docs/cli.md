@@ -22,7 +22,7 @@ The client itself holds no state beyond whatever wallet file you point it at.
 
 ```bash
 helix wallet new -o alice.json                       # generate a new ML-DSA keypair
-helix wallet new -o alice.json --passphrase "..."     # ...encrypted at rest (AES-256-GCM + Argon2id)
+helix wallet new -o alice.json --passphrase          # ...encrypted at rest — asks twice, no echo
 helix wallet new -o alice.json --scheme sphincs-plus  # ...using SPHINCS+ instead of ML-DSA
 
 helix wallet restore                                  # rebuild a wallet from its 24 words
@@ -31,8 +31,8 @@ helix wallet restore --mnemonic "trim thought ..."    # ...non-interactively (la
 helix wallet info --key alice.json                    # address, public key, algorithm
 helix wallet address --key alice.json                 # just the address (for scripting)
 helix wallet address --key alice.json --verify        # ...unlocked and derived from the key itself
-helix wallet encrypt "newpass" --key alice.json        # add/change passphrase on an existing wallet
-helix wallet encrypt "" --key alice.json               # remove passphrase encryption
+helix wallet encrypt --key alice.json                 # add/change its passphrase (asks, no echo)
+helix wallet encrypt --key alice.json --remove        # remove the passphrase
 
 ```
 
@@ -43,6 +43,24 @@ per-use conversion step.
 
 A wallet file is portable — it's just JSON. Anyone with the file (and its passphrase, if
 encrypted) can sign as that address, so treat it like a private key, because it is one.
+
+**A passphrase is never typed on the command line.** Anything there is saved in your shell
+history — next to the wallet it protects — and readable by every user on the machine in the
+process list while the command runs. So `--passphrase` takes no value: it asks, twice, without
+echo, and refuses an empty answer. `--passphrase <value>` is refused with an explanation, and
+the value is **not** used — treat it as exposed and choose another. Scripts read the passphrase
+from a file instead:
+
+```bash
+helix wallet new -o bot.json --passphrase-file /run/secrets/helix-bot   # a mounted secret
+helix wallet new -o bot.json --passphrase-file <(pass show helix/bot)   # never touches a disk
+```
+
+The file is used exactly as it is, minus one trailing newline (so `echo secret > file` works) —
+spaces belong to the passphrase. An empty file is refused rather than giving you a wallet
+without one, and a file other users can read gets a warning. The same two options work on
+`wallet restore`, `wallet import-node-key` and (as `--passphrase-file`) `wallet encrypt`.
+Unlocking — every `tx` command — still asks on the terminal; there is no file option for it yet.
 
 **What the CLI does to protect that file:**
 - `wallet new`, `wallet restore` and `wallet import-node-key` **never overwrite** an existing

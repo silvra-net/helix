@@ -8,6 +8,141 @@ use helix_crypto::{Address, CryptoScheme, KeyPair};
 use crate::commands::tx::rpassword_read;
 use crate::keyfile::KeyFile;
 
+/// Where a new wallet's passphrase comes from — never from the command line itself.
+///
+/// It used to be `--passphrase <value>`: typed into the shell, which saves it in the history file
+/// next to the very wallet it protects, and shows it for as long as the command runs in the
+/// process list every local user can read (`/proc/<pid>/cmdline`). Now `--passphrase` is a switch
+/// that asks for it twice without echo, and scripts read it from a file.
+///
+/// **A file, not an environment variable,** for the scriptable path: only the path appears in the
+/// command line and the history; a file is what Docker and Kubernetes secrets and systemd's
+/// `LoadCredential=` already hand a process; and `--passphrase-file <(pass show helix)` works
+/// without the secret ever touching a disk. A variable is inherited by every child process, sits
+/// in `/proc/<pid>/environ`, and `VAR=secret helix …` puts it straight back into the history.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct NewPassphrase {
+    /// Encrypt the key (AES-256-GCM + Argon2id) with a passphrase you are asked for twice,
+    /// without echo. Takes no value — a passphrase typed here would be saved in your shell history
+    #[arg(long, num_args = 0..=1, value_name = "NO VALUE")]
+    passphrase: Option<Option<String>>,
+    /// Read the passphrase from this file instead of asking — for scripts. One trailing newline
+    /// is dropped, nothing else. Works with `<(pass show …)` and mounted secrets
+    #[arg(long, value_name = "PATH", conflicts_with = "passphrase")]
+    passphrase_file: Option<PathBuf>,
+}
+
+/// What refusing `--passphrase <value>` says. The passphrase has already been typed by the time
+/// this runs, so the message is about that, not about syntax.
+const PASSPHRASE_ON_COMMAND_LINE: &str = "A passphrase given on the command line is not used: it \
+     is now in your shell history, and was visible in the process list while this ran. Nothing was \
+     written. Treat that passphrase as exposed and choose a different one — use `--passphrase` \
+     on its own to be asked for it, or `--passphrase-file <path>` in scripts. (In bash, \
+     `history -d <number>` removes the line.)";
+
+/// The new passphrase `source` asks for, or `None` for a plaintext wallet (neither option given).
+/// `ask` shows a prompt and reads an answer without echo; a parameter so tests need no terminal.
+fn resolve_new_passphrase(
+    source: &NewPassphrase,
+    ask: &mut dyn FnMut(&str) -> Result<String>,
+) -> Result<Option<String>> {
+    match (&source.passphrase, &source.passphrase_file) {
+        (Some(Some(_)), _) => bail!(PASSPHRASE_ON_COMMAND_LINE),
+        (Some(None), _) => Ok(Some(ask_new_passphrase_twice(ask)?)),
+        (None, Some(path)) => Ok(Some(read_passphrase_file(path)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Ask twice and require both to match. A typo in a passphrase typed without echo is otherwise
+/// found the first time the wallet is opened — and a wallet nobody can open is lost unless its 24
+/// words were written down (a SPHINCS+ wallet has none). An empty answer is refused rather than
+/// read as "no passphrase": whoever asked for encryption and pressed Enter mistyped.
+fn ask_new_passphrase_twice(ask: &mut dyn FnMut(&str) -> Result<String>) -> Result<String> {
+    let first = ask("New passphrase: ")?;
+    if first.is_empty() {
+        bail!(
+            "An empty passphrase protects nothing, so none was set and nothing was written. For a \
+             wallet without a passphrase, leave out --passphrase."
+        );
+    }
+    let second = ask("Repeat the passphrase: ")?;
+    if first != second {
+        bail!("The two passphrases differ, so nothing was written. Run the command again.");
+    }
+    Ok(first)
+}
+
+/// A passphrase from a file: exactly its contents, minus one trailing line ending — which
+/// `echo secret > file` adds and nobody means — and nothing else (#223: spaces are the
+/// passphrase's own). An empty file is refused: a secret that failed to mount must not quietly
+/// produce an unencrypted wallet.
+fn read_passphrase_file(path: &std::path::Path) -> Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read the passphrase file {}", path.display()))?;
+    let passphrase = raw
+        .strip_suffix("\r\n")
+        .or_else(|| raw.strip_suffix('\n'))
+        .unwrap_or(&raw)
+        .to_string();
+    if passphrase.is_empty() {
+        bail!(
+            "The passphrase file {} is empty, so no passphrase was set and nothing was written.",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.is_file() && meta.permissions().mode() & 0o077 != 0 {
+                eprintln!(
+                    "  ⚠  {} can be read by other users on this machine — `chmod 600` it.",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(passphrase)
+}
+
+/// `wallet encrypt` used to take the new passphrase as its argument. Refuse it, and say why —
+/// or, for the old empty argument, what replaced it.
+fn refuse_encrypt_argument(passphrase_on_command_line: Option<&str>) -> Result<()> {
+    match passphrase_on_command_line {
+        Some("") => bail!("To remove the passphrase, use `helix wallet encrypt --remove`."),
+        Some(_) => bail!(PASSPHRASE_ON_COMMAND_LINE),
+        None => Ok(()),
+    }
+}
+
+/// Ask for a new passphrase on the terminal. Without one — a script, a pipe, `< /dev/null` —
+/// rpassword cannot open `/dev/tty` and says only "No such device or address (os error 6)"; for a
+/// new passphrase there is a way round that, so the error names it.
+fn ask_on_terminal(prompt: &str) -> Result<String> {
+    rpassword_read(prompt).map_err(|e| {
+        anyhow::anyhow!(
+            "Could not ask for a passphrase: there is no terminal to type it into ({e}). In a \
+             script, use --passphrase-file <path>."
+        )
+    })
+}
+
+/// What `wallet encrypt` should do: `Some(passphrase)` to encrypt, `None` to remove encryption.
+fn resolve_encrypt_target(
+    passphrase_file: Option<&std::path::Path>,
+    remove: bool,
+    ask: &mut dyn FnMut(&str) -> Result<String>,
+) -> Result<Option<String>> {
+    if remove {
+        return Ok(None);
+    }
+    match passphrase_file {
+        Some(path) => Ok(Some(read_passphrase_file(path)?)),
+        None => Ok(Some(ask_new_passphrase_twice(ask)?)),
+    }
+}
+
 /// Write `kp` encrypted under `passphrase`, or in plaintext when there is none — and an empty
 /// passphrase is none. Encrypting under "" gave a file that reports `aes256gcm-argon2id` and
 /// opens for anyone who presses Enter, while `wallet encrypt`'s own help promised that empty
@@ -81,9 +216,8 @@ pub enum WalletCmd {
     New {
         #[arg(short, long, default_value = "wallet.json")]
         output: PathBuf,
-        /// Protect the key with a passphrase (AES-256-GCM + Argon2id)
-        #[arg(long)]
-        passphrase: Option<String>,
+        #[command(flatten)]
+        passphrase: NewPassphrase,
         /// Signature scheme: "ml-dsa" (default) or "sphincs-plus" — pick the
         /// latter to migrate a wallet to the hash-based PQC scheme
         #[arg(long, default_value = "ml-dsa")]
@@ -98,9 +232,8 @@ pub enum WalletCmd {
         mnemonic: Option<String>,
         #[arg(short, long, default_value = "wallet.json")]
         output: PathBuf,
-        /// Protect the restored key with a passphrase (AES-256-GCM + Argon2id)
-        #[arg(long)]
-        passphrase: Option<String>,
+        #[command(flatten)]
+        passphrase: NewPassphrase,
     },
     /// Show address and public key for a wallet file
     Info {
@@ -118,12 +251,21 @@ pub enum WalletCmd {
         #[arg(long)]
         verify: bool,
     },
-    /// Change or add passphrase encryption on an existing wallet
+    /// Add or change a wallet's passphrase — asked for twice, without echo — or remove it
     Encrypt {
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
-        /// New passphrase (leave empty to remove encryption)
-        passphrase: String,
+        /// Read the new passphrase from this file instead of asking (for scripts; see
+        /// `wallet new --help`)
+        #[arg(long, value_name = "PATH", conflicts_with = "remove")]
+        passphrase_file: Option<PathBuf>,
+        /// Remove the passphrase: store the key in plaintext
+        #[arg(long)]
+        remove: bool,
+        /// Refused. This used to be the new passphrase, typed on the command line, which puts it
+        /// in your shell history. Kept only to say so instead of a bare parse error.
+        #[arg(hide = true)]
+        passphrase_on_command_line: Option<String>,
     },
     /// Import a node's raw validator key file (e.g. validator-key.bin) into a
     /// normal CLI wallet file, so `wallet info`/`tx send`/etc. can use it directly.
@@ -137,9 +279,8 @@ pub enum WalletCmd {
         /// Output wallet file
         #[arg(short, long, default_value = "wallet.json")]
         output: PathBuf,
-        /// Protect the imported key with a passphrase (AES-256-GCM + Argon2id)
-        #[arg(long)]
-        passphrase: Option<String>,
+        #[command(flatten)]
+        passphrase: NewPassphrase,
     },
 }
 
@@ -151,6 +292,8 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
                 "sphincs-plus" => CryptoScheme::SphincsPlus,
                 other => bail!("Unknown scheme '{}' — expected 'ml-dsa' or 'sphincs-plus'", other),
             };
+            // Asked before the key exists, so a mismatch or a refusal leaves nothing behind.
+            let passphrase = resolve_new_passphrase(&passphrase, &mut |p| ask_on_terminal(p))?;
             println!("Generating {:?} keypair...", scheme);
             // ML-DSA keys are generated from a seed we draw ourselves rather than by
             // `generate_for`, which keeps its randomness internal. The seed is the whole key
@@ -193,6 +336,9 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
         }
 
         WalletCmd::Restore { mnemonic, output, passphrase } => {
+            // Before the 24 words: a refused `--passphrase <value>` should not cost anyone a
+            // second round of typing them.
+            let passphrase = resolve_new_passphrase(&passphrase, &mut |p| ask_on_terminal(p))?;
             let phrase = match mnemonic {
                 Some(words) => words,
                 None => prompt_recovery_phrase()?,
@@ -242,6 +388,7 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
         }
 
         WalletCmd::ImportNodeKey { from, output, passphrase } => {
+            let passphrase = resolve_new_passphrase(&passphrase, &mut |p| ask_on_terminal(p))?;
             let data = std::fs::read(&from)
                 .map_err(|e| anyhow::anyhow!("Could not read {}: {}", from.display(), e))?;
 
@@ -284,20 +431,33 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
             println!("  Use it like any other wallet, e.g.: hlx tx send <to> <amount> --key {}", output.display());
         }
 
-        WalletCmd::Encrypt { key, passphrase } => {
+        WalletCmd::Encrypt {
+            key,
+            passphrase_file,
+            remove,
+            passphrase_on_command_line,
+        } => {
+            // A refused command line fails before anything is asked.
+            refuse_encrypt_argument(passphrase_on_command_line.as_deref())?;
             let kf = KeyFile::load(&key)?;
+            // The current passphrase first, so a wrong one fails before a new one is typed twice.
             let pass = if kf.is_encrypted() {
                 Some(rpassword_read("Current passphrase: ")?)
             } else {
                 None
             };
             let kp = kf.to_keypair(pass.as_deref())?;
-            let new_kf = encode(&kp, Some(&passphrase))?;
+            let new_passphrase =
+                resolve_encrypt_target(passphrase_file.as_deref(), remove, &mut |p| {
+                    ask_on_terminal(p)
+                })?;
+            let new_kf = encode(&kp, new_passphrase.as_deref())?;
             // `replace`, not `save`: this is the one command that means to overwrite a key
             // file, and it rewrites the only copy — so in one step, never truncate-then-write.
             new_kf.replace(&key)?;
             if new_kf.is_encrypted() {
-                println!("✓ Wallet re-encrypted at {}", key.display());
+                let verb = if kf.is_encrypted() { "re-encrypted" } else { "encrypted" };
+                println!("✓ Wallet {verb} at {}", key.display());
             } else {
                 println!(
                     "✓ Encryption removed — {} now holds the key in plaintext",
@@ -405,5 +565,196 @@ mod tests {
         assert!(!encode(&kp, Some("")).unwrap().is_encrypted());
         assert!(!encode(&kp, None).unwrap().is_encrypted());
         assert!(encode(&kp, Some("x")).unwrap().is_encrypted());
+    }
+
+    mod passphrase_arguments {
+        use super::super::*;
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            wallet: WalletCmd,
+        }
+
+        fn parse(args: &[&str]) -> std::result::Result<WalletCmd, clap::Error> {
+            Cli::try_parse_from(std::iter::once("wallet").chain(args.iter().copied()))
+                .map(|c| c.wallet)
+        }
+
+        fn new_passphrase(args: &[&str]) -> NewPassphrase {
+            match parse(args).expect("parses") {
+                WalletCmd::New { passphrase, .. }
+                | WalletCmd::Restore { passphrase, .. }
+                | WalletCmd::ImportNodeKey { passphrase, .. } => passphrase,
+                _ => panic!("not a command that sets a new passphrase"),
+            }
+        }
+
+        /// Answers prompts in order, and counts how many it was shown.
+        struct Keyboard {
+            answers: Vec<&'static str>,
+            asked: usize,
+        }
+
+        impl Keyboard {
+            fn typing(answers: &[&'static str]) -> Self {
+                Keyboard {
+                    answers: answers.to_vec(),
+                    asked: 0,
+                }
+            }
+            fn ask(&mut self, _prompt: &str) -> Result<String> {
+                let answer = self.answers.get(self.asked).map(|a| a.to_string());
+                self.asked += 1;
+                answer.ok_or_else(|| anyhow::anyhow!("asked more often than the test expected"))
+            }
+        }
+
+        fn temp_file(contents: &str) -> std::path::PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("helix-passphrase-{}-{nanos}", std::process::id()));
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+
+        /// The point of the change. By the time this runs the passphrase is in the history file,
+        /// so it must not be *used* — a wallet encrypted under an exposed passphrase is worse
+        /// than one the person knows to be unprotected — and the refusal says so.
+        #[test]
+        fn a_passphrase_typed_on_the_command_line_is_refused_not_used() {
+            let mut keys = Keyboard::typing(&[]);
+            let source = new_passphrase(&["new", "--passphrase", "hunter2"]);
+            let err = resolve_new_passphrase(&source, &mut |p| keys.ask(p)).unwrap_err();
+            assert!(err.to_string().contains("shell history"), "{err}");
+            assert_eq!(keys.asked, 0, "refused before anything was asked");
+        }
+
+        #[test]
+        fn the_switch_alone_asks_twice_and_the_answer_never_touches_the_command_line() {
+            let mut keys = Keyboard::typing(&["correct horse", "correct horse"]);
+            let source = new_passphrase(&["new", "--passphrase"]);
+            let got = resolve_new_passphrase(&source, &mut |p| keys.ask(p)).unwrap();
+            assert_eq!(got.as_deref(), Some("correct horse"));
+            assert_eq!(keys.asked, 2);
+        }
+
+        /// Typed without echo, a typo is otherwise found the first time the wallet is opened.
+        #[test]
+        fn two_different_answers_set_nothing() {
+            let mut keys = Keyboard::typing(&["correct horse", "correct hrose"]);
+            let source = new_passphrase(&["new", "--passphrase"]);
+            let err = resolve_new_passphrase(&source, &mut |p| keys.ask(p)).unwrap_err();
+            assert!(err.to_string().contains("differ"), "{err}");
+        }
+
+        /// Whoever asked for encryption and pressed Enter mistyped; that is not "no passphrase".
+        #[test]
+        fn an_empty_answer_is_refused_not_read_as_no_passphrase() {
+            let mut keys = Keyboard::typing(&[""]);
+            let source = new_passphrase(&["new", "--passphrase"]);
+            assert!(resolve_new_passphrase(&source, &mut |p| keys.ask(p)).is_err());
+            assert_eq!(keys.asked, 1, "no point asking to repeat nothing");
+        }
+
+        /// Scripts that create a plaintext wallet keep working, and never meet a prompt.
+        #[test]
+        fn no_option_means_no_passphrase_and_no_question() {
+            let mut keys = Keyboard::typing(&[]);
+            let source = new_passphrase(&["new"]);
+            assert_eq!(
+                resolve_new_passphrase(&source, &mut |p| keys.ask(p)).unwrap(),
+                None
+            );
+            assert_eq!(keys.asked, 0);
+        }
+
+        /// Exactly the file, minus the one line ending `echo secret > file` adds — spaces are
+        /// the passphrase's own (#223), and an empty file is a secret that failed to arrive.
+        #[test]
+        fn a_passphrase_file_is_read_exactly_minus_one_line_ending() {
+            for (contents, expected) in [
+                ("pw\n", Some("pw")),
+                ("pw\r\n", Some("pw")),
+                ("pw", Some("pw")),
+                (" pw \n", Some(" pw ")),
+                ("pw\n\n", Some("pw\n")),
+                ("", None),
+                ("\n", None),
+            ] {
+                let path = temp_file(contents);
+                let got = read_passphrase_file(&path).ok();
+                std::fs::remove_file(&path).ok();
+                assert_eq!(got.as_deref(), expected, "file contents {contents:?}");
+            }
+        }
+
+        #[test]
+        fn a_file_and_the_switch_together_do_not_parse() {
+            assert!(parse(&["new", "--passphrase", "--passphrase-file", "secret"]).is_err());
+        }
+
+        /// The same options on every command that sets a new passphrase.
+        #[test]
+        fn restore_and_import_take_the_same_options() {
+            let mut keys = Keyboard::typing(&[]);
+            let refused = new_passphrase(&["restore", "--passphrase", "hunter2"]);
+            assert!(resolve_new_passphrase(&refused, &mut |p| keys.ask(p)).is_err());
+            let path = temp_file("from a file\n");
+            let source = new_passphrase(&[
+                "import-node-key",
+                "--from",
+                "validator-key.bin",
+                "--passphrase-file",
+                path.to_str().unwrap(),
+            ]);
+            let got = resolve_new_passphrase(&source, &mut |p| keys.ask(p)).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(got.as_deref(), Some("from a file"));
+        }
+
+        fn encrypt_parts(args: &[&str]) -> (Option<String>, Option<std::path::PathBuf>, bool) {
+            match parse(args).expect("parses") {
+                WalletCmd::Encrypt {
+                    passphrase_on_command_line,
+                    passphrase_file,
+                    remove,
+                    ..
+                } => (passphrase_on_command_line, passphrase_file, remove),
+                _ => panic!("not encrypt"),
+            }
+        }
+
+        #[test]
+        fn encrypt_refuses_its_old_argument_and_names_the_new_way_to_remove() {
+            let (given, _, _) = encrypt_parts(&["encrypt", "hunter2"]);
+            let err = refuse_encrypt_argument(given.as_deref()).unwrap_err();
+            assert!(err.to_string().contains("shell history"), "{err}");
+
+            let (given, _, _) = encrypt_parts(&["encrypt", ""]);
+            let err = refuse_encrypt_argument(given.as_deref()).unwrap_err();
+            assert!(err.to_string().contains("--remove"), "{err}");
+        }
+
+        #[test]
+        fn encrypt_asks_twice_or_removes_on_request() {
+            let (given, file, remove) = encrypt_parts(&["encrypt"]);
+            assert!(refuse_encrypt_argument(given.as_deref()).is_ok());
+            let mut keys = Keyboard::typing(&["new one", "new one"]);
+            let got = resolve_encrypt_target(file.as_deref(), remove, &mut |p| keys.ask(p));
+            assert_eq!(got.unwrap().as_deref(), Some("new one"));
+
+            let (_, file, remove) = encrypt_parts(&["encrypt", "--remove"]);
+            let mut keys = Keyboard::typing(&[]);
+            let got = resolve_encrypt_target(file.as_deref(), remove, &mut |p| keys.ask(p));
+            assert_eq!(got.unwrap(), None);
+            assert_eq!(keys.asked, 0);
+
+            assert!(parse(&["encrypt", "--remove", "--passphrase-file", "secret"]).is_err());
+        }
     }
 }
