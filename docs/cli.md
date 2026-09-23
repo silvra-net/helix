@@ -113,6 +113,15 @@ clears if the base fee climbs while the transaction waits. Pin `--fee` only when
 overpay for priority — or underpay and find out. A transaction paying less than its size costs is
 rejected on submission, with the shortfall spelled out.
 
+**A fee the CLI works out for itself never exceeds 1 HLX.** The base fee comes from the node you
+talk to, and nothing in the protocol caps it — so a node that lies (a stranger's public endpoint,
+or a compromised one) could otherwise have your wallet sign a transfer with millions of HLX in
+fees. At the floor a transfer costs about 0.00001 HLX; the ceiling is ~92,000 times that. Above
+it the CLI stops with "Not sent", the reported base fee and the fee in HLX. If the network really
+is that busy, check the base fee against another node or the explorer and pass `--fee`
+explicitly — an explicit fee is never second-guessed. The desktop wallet applies the same ceiling
+and, having no fee field, asks you to wait or use the CLI.
+
 Two rules follow from the fee being real money rather than a number you write down:
 
 - **You must be able to afford the fee you declare.** Submission checks it against your balance

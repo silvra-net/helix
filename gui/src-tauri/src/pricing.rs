@@ -3,7 +3,8 @@
 //! This mirrors `helix-cli`'s `fee.rs` deliberately — the GUI must produce a transaction the
 //! node accepts on the same terms the CLI does. It is re-implemented here (rather than depending
 //! on `helix-cli`, which pulls clap/rpassword) to keep the backend's dependency graph small, and
-//! kept short enough to eyeball against the original.
+//! kept short enough to eyeball against the original. The pricing rule itself is not mirrored
+//! any more: both call `helix_core::fee::wallet_auto_fee`, headroom and ceiling included.
 
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Hash, KeyPair, Signature};
@@ -13,11 +14,6 @@ pub const NANO_PER_HLX: u64 = 1_000_000_000;
 /// The honest supply cap (mirrors `helix_executor::genesis::TOTAL_SUPPLY_HLX`). Used only to
 /// reject an amount that cannot exist; not consensus, so a local copy is fine.
 const TOTAL_SUPPLY_HLX: u64 = 33_000_000;
-
-/// Headroom over the bare base fee (percent), same rationale as the CLI: the base fee can climb
-/// up to 12.5%/block and a tx is charged the fee of the block that includes it. Only
-/// `base_fee × size` is burned; the rest tips the validator, so this is not wasted.
-const FEE_HEADROOM_PERCENT: u64 = 100;
 
 /// Convert a user-typed HLX amount to nano-HLX, rejecting what cannot be an amount — the exact
 /// checks from `helix-cli::fee::hlx_to_nano`. `f64 as u64` is a saturating cast that answers for
@@ -81,9 +77,15 @@ pub fn finalize_and_sign(tx: &mut Transaction, explicit_fee: Option<u64>, base_f
 
     tx.fee = 0;
     tx.signature = kp.sign(tx.signing_hash().as_bytes()).map_err(|e| e.to_string())?;
-    let size = tx.size_bytes();
-    let required = base_fee_per_byte.saturating_mul(size);
-    tx.fee = required.saturating_add(required.saturating_mul(FEE_HEADROOM_PERCENT) / 100);
+    // The one wallet pricing rule, shared with the CLI — and its 1-HLX ceiling: the base fee
+    // came from the node, and this wallet has no fee field, so a node reporting an absurd one
+    // would otherwise be the one deciding what the user pays.
+    tx.fee = helix_core::fee::wallet_auto_fee(base_fee_per_byte, tx.size_bytes()).map_err(|e| {
+        format!(
+            "Not sent: {e}. If the network really is that busy, wait for it to calm down, or \
+             send from the command line with an explicit --fee."
+        )
+    })?;
     tx.signature = kp.sign(tx.signing_hash().as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -111,5 +113,37 @@ mod tests {
         finalize_and_sign(&mut tx, None, 1, &kp).unwrap();
         assert!(tx.fee > 0, "an unpinned fee must be priced above zero");
         assert!(tx.verify_signature().is_ok(), "the node would reject this signature");
+    }
+
+    #[test]
+    fn a_node_reporting_an_absurd_base_fee_does_not_get_the_wallet_to_sign_it() {
+        let kp = KeyPair::generate();
+        let from = Address::from_public_key(&kp.public);
+        let to = Address::from_public_key(&KeyPair::generate().public);
+        let mut tx = build_tx(
+            TxType::Transfer,
+            from.clone(),
+            Some(to.clone()),
+            1,
+            0,
+            vec![],
+            helix_core::default_chain_id(),
+            &kp,
+        );
+        let err = finalize_and_sign(&mut tx, None, 1_000_000_000_000, &kp).unwrap_err();
+        assert!(err.contains("Not sent"), "{err}");
+        // Positive control: the same transaction at the floor is priced and signed.
+        let mut tx = build_tx(
+            TxType::Transfer,
+            from,
+            Some(to),
+            1,
+            0,
+            vec![],
+            helix_core::default_chain_id(),
+            &kp,
+        );
+        finalize_and_sign(&mut tx, None, 1, &kp).unwrap();
+        assert_eq!(tx.fee, 2 * tx.size_bytes());
     }
 }

@@ -86,16 +86,6 @@ pub async fn fetch_base_fee_per_byte(node: &str) -> Result<u64> {
         )
 }
 
-/// Headroom over the bare base fee, as a percentage, when the fee is computed rather than given.
-///
-/// The base fee moves at most ±12.5% per block, and a transaction is charged the fee of the
-/// block that *includes* it, not the one current when it was signed — so pricing at exactly
-/// today's rate means anything that waits a few busy blocks gets rejected on arrival. 100% of
-/// headroom covers roughly six consecutive rises (1.125⁶ ≈ 2.03). It is not wasted: only
-/// `base_fee × size` is burned, the remainder tips the validator and buys priority. At the
-/// floor this turns a ~5.4 KB transfer's ~5410 nano into ~10820 — about 0.00001 HLX.
-const FEE_HEADROOM_PERCENT: u64 = 100;
-
 /// Sign `tx`, pricing it for the chain unless the caller pinned a fee with `--fee`.
 ///
 /// The fee depends on the transaction's serialized size, and the size depends on the signature —
@@ -118,9 +108,19 @@ pub async fn price_and_sign(
     }
 
     let base_fee_per_byte = fetch_base_fee_per_byte(node).await?;
-    let size = tx.size_bytes();
-    let required = base_fee_per_byte.saturating_mul(size);
-    tx.fee = required.saturating_add(required.saturating_mul(FEE_HEADROOM_PERCENT) / 100);
+    sign_at_base_fee(tx, base_fee_per_byte, kp)
+}
+
+/// The second pass of [`price_and_sign`], apart from the network so it can be tested: price the
+/// already-signed `tx` with the one wallet rule (`helix_core::fee::wallet_auto_fee`, headroom
+/// and a 1-HLX ceiling) and sign it again. Above the ceiling nothing is signed at that fee — the
+/// base fee came from a node, and a node is not someone whose word should spend your money.
+fn sign_at_base_fee(tx: &mut Transaction, base_fee_per_byte: u64, kp: &KeyPair) -> Result<()> {
+    tx.fee = helix_core::fee::wallet_auto_fee(base_fee_per_byte, tx.size_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "Not sent: {e}. If the fee is real, pass it explicitly with --fee <nano-HLX>."
+        )
+    })?;
     tx.signature = kp.sign(tx.signing_hash().as_bytes())?;
     Ok(())
 }
@@ -159,5 +159,77 @@ mod tests {
         assert_eq!(hlx_to_nano(1.5).unwrap(), 1_500_000_000);
         assert_eq!(hlx_to_nano(0.000_000_001).unwrap(), 1, "one nano, the smallest unit");
         assert_eq!(hlx_to_nano(100_000.0).unwrap(), 100_000 * 1_000_000_000);
+    }
+
+    fn unsigned_transfer(kp: &KeyPair) -> Transaction {
+        Transaction {
+            version: 1,
+            tx_type: helix_core::TxType::Transfer,
+            from: helix_crypto::Address::from_public_key(&kp.public),
+            to: Some(helix_crypto::Address::from_public_key(
+                &KeyPair::generate().public,
+            )),
+            amount: 1,
+            fee: 0,
+            nonce: 0,
+            data: vec![],
+            crypto_version: kp.scheme,
+            chain_id: helix_core::default_chain_id(),
+            signature: helix_crypto::Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        }
+    }
+
+    #[test]
+    fn a_node_cannot_make_the_cli_sign_away_the_wallet_in_fees() {
+        let kp = KeyPair::generate();
+        let mut tx = unsigned_transfer(&kp);
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        let err = sign_at_base_fee(&mut tx, 1_000_000_000_000, &kp)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--fee"), "{err}");
+        // The refused fee never reaches the transaction, so no signature over it ever exists.
+        assert_eq!(tx.fee, 0);
+
+        // Positive control: the floor price is signed, and the signature covers that fee.
+        let mut tx = unsigned_transfer(&kp);
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        sign_at_base_fee(&mut tx, 1, &kp).unwrap();
+        assert_eq!(tx.fee, 2 * tx.size_bytes());
+        assert!(
+            helix_crypto::verify(&tx.public_key, tx.signing_hash().as_bytes(), &tx.signature)
+                .is_ok()
+        );
+    }
+
+    /// The same, through a real socket: the path `price_and_sign` takes in production, so the
+    /// test covers the wiring and not only the pure function behind it.
+    #[tokio::test]
+    async fn price_and_sign_refuses_what_a_lying_node_asks_for() {
+        use axum::{routing::get, Router};
+        let app = Router::new().route(
+            "/status",
+            get(|| async {
+                axum::Json(serde_json::json!({ "base_fee_per_byte": 1_000_000_000_000u64 }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let kp = KeyPair::generate();
+        let mut tx = unsigned_transfer(&kp);
+        let err = price_and_sign(&mut tx, None, &kp, &node)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Not sent"), "{err}");
+
+        // An explicit fee is the person's own decision and is not second-guessed.
+        price_and_sign(&mut tx, Some(5_000_000_000), &kp, &node)
+            .await
+            .unwrap();
+        assert_eq!(tx.fee, 5_000_000_000);
     }
 }
