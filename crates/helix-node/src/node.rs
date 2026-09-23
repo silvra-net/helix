@@ -1522,8 +1522,22 @@ impl HelixNode {
         let signing_guard_for_p2p = signing_guard.clone();
         let tip_certificate_for_p2p = tip_certificate.clone();
         let mut p2p_event_rx = self.p2p_event_rx;
+        // Peer transactions are admitted on their own task, never in line with consensus
+        // messages — see `route_peer_transaction`.
+        let (peer_tx_queue, mut peer_tx_rx) = mpsc::channel::<Transaction>(PEER_TX_QUEUE);
+        let mempool_for_admission = self.mempool.clone();
+        let chain_state_for_admission = self.chain_state.clone();
+        tokio::spawn(async move {
+            while let Some(tx) = peer_tx_rx.recv().await {
+                admit_peer_transaction(tx, &mempool_for_admission, &chain_state_for_admission)
+                    .await;
+            }
+        });
         tokio::spawn(async move {
             while let Some(event) = p2p_event_rx.recv().await {
+                let Some(event) = route_peer_transaction(event, &peer_tx_queue) else {
+                    continue;
+                };
                 handle_p2p_event(
                     event,
                     &mempool_for_p2p,
@@ -1826,6 +1840,82 @@ async fn apply_peer_vote(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// How many peer transactions may wait for their signature check before more are dropped.
+/// ~2048 × 5.4 KB ≈ 11 MB at most. Room enough to ride out a burst; a flood beyond it is dropped
+/// rather than queued, because every transaction waiting here is one that a vote would otherwise
+/// have had to wait behind (see `route_peer_transaction`).
+const PEER_TX_QUEUE: usize = 2048;
+
+/// Transactions from peers go to their own worker; everything else stays in the event loop.
+///
+/// Admitting a transaction means an ML-DSA signature check under the mempool lock. The P2P
+/// events used to be handled one after another in a single loop, so a vote that arrived behind
+/// a burst of transactions waited for every one of those checks — and when that loop fell behind,
+/// the channel from the swarm filled and the swarm itself stopped (#224). On 2026-09-23 a flood
+/// of 2000 transactions held three test validators at `heard=none` for 2.5 minutes. Votes,
+/// proposals, round-sync answers and blocks now never wait for a transaction; a transaction that
+/// finds the worker's queue full is dropped, the same trade the swarm makes one step earlier.
+fn route_peer_transaction(event: P2PEvent, queue: &mpsc::Sender<Transaction>) -> Option<P2PEvent> {
+    match event {
+        P2PEvent::NewTransaction(tx) => {
+            if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send(tx) {
+                note_dropped_queued_transaction();
+            }
+            None
+        }
+        other => Some(other),
+    }
+}
+
+/// Transactions dropped because the admission worker's queue was full.
+static DROPPED_QUEUED_TRANSACTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn note_dropped_queued_transaction() {
+    let dropped =
+        DROPPED_QUEUED_TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if dropped == 1 || dropped % 1000 == 0 {
+        warn!(
+            dropped_total = dropped,
+            "Peer transactions are arriving faster than this node can check their signatures — \
+             dropping the excess so that votes are never held up behind them"
+        );
+    }
+}
+
+/// Check a transaction a peer gossiped and, if it passes, put it in the pool. Runs on the
+/// admission worker in production (`route_peer_transaction`), and from `handle_p2p_event` for
+/// anything that calls it directly.
+async fn admit_peer_transaction(
+    tx: Transaction,
+    mempool: &Arc<RwLock<Mempool>>,
+    chain_state: &Arc<RwLock<ChainState>>,
+) {
+    let (recovery_key, can_pay, chain_id, account_nonce) = {
+        let chain = chain_state.read().await;
+        (
+            chain.recovery_key(&tx.from).cloned(),
+            helix_executor::can_pay_fee(&chain, &tx),
+            chain.chain_id,
+            // Same gate as the RPC submit path, and for the same reason it exists there:
+            // a spent nonce is refused at the pool rather than inside a block.
+            chain.accounts.get(tx.from.as_str()).map_or(0, |a| a.nonce),
+        )
+    };
+    // The same gate the RPC submit path applies. Without it here, the RPC's rate limiter
+    // would be the only thing between an unfunded fee claim and the pool — and a peer
+    // reaches this path without ever touching the RPC. See `helix_executor::can_pay_fee`.
+    if !can_pay {
+        warn!(from = %tx.from, fee = tx.fee, "Rejected peer tx: sender cannot pay the declared fee");
+        return;
+    }
+    let mut pool = mempool.write().await;
+    match pool.add_with_recovery_key(tx, recovery_key.as_ref(), chain_id, Some(account_nonce)) {
+        Ok(()) => {}
+        Err(e) => warn!("Rejected peer tx: {}", e),
+    }
+}
+
 async fn handle_p2p_event(
     event: P2PEvent,
     mempool: &Arc<RwLock<Mempool>>,
@@ -1841,31 +1931,7 @@ async fn handle_p2p_event(
     tip_certificate: &Arc<RwLock<TipCertificate>>,
 ) {
     match event {
-        P2PEvent::NewTransaction(tx) => {
-            let (recovery_key, can_pay, chain_id, account_nonce) = {
-                let chain = chain_state.read().await;
-                (
-                    chain.recovery_key(&tx.from).cloned(),
-                    helix_executor::can_pay_fee(&chain, &tx),
-                    chain.chain_id,
-                    // Same gate as the RPC submit path, and for the same reason it exists there:
-                    // a spent nonce is refused at the pool rather than inside a block.
-                    chain.accounts.get(tx.from.as_str()).map_or(0, |a| a.nonce),
-                )
-            };
-            // The same gate the RPC submit path applies. Without it here, the RPC's rate limiter
-            // would be the only thing between an unfunded fee claim and the pool — and a peer
-            // reaches this path without ever touching the RPC. See `helix_executor::can_pay_fee`.
-            if !can_pay {
-                warn!(from = %tx.from, fee = tx.fee, "Rejected peer tx: sender cannot pay the declared fee");
-                return;
-            }
-            let mut pool = mempool.write().await;
-            match pool.add_with_recovery_key(tx, recovery_key.as_ref(), chain_id, Some(account_nonce)) {
-                Ok(()) => {}
-                Err(e) => warn!("Rejected peer tx: {}", e),
-            }
-        }
+        P2PEvent::NewTransaction(tx) => admit_peer_transaction(tx, mempool, chain_state).await,
         P2PEvent::NewProposal(proposal) => {
             apply_peer_proposal(proposal, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
         }
@@ -11842,5 +11908,54 @@ mod self_address_discovery_tests {
             let candidate = candidate_self_multiaddr(&body, 8546).expect("should build");
             candidate.parse::<libp2p::Multiaddr>().unwrap_or_else(|e| panic!("{candidate}: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod peer_transaction_routing_tests {
+    use super::*;
+
+    fn a_transaction(nonce: u64) -> Transaction {
+        Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: Address::from_public_key(&PublicKey::from_bytes(vec![1; 32])),
+            to: None,
+            amount: 1,
+            fee: 1,
+            nonce,
+            data: vec![],
+            crypto_version: CryptoScheme::MlDsa,
+            chain_id: Hash::digest(b"chain"),
+            signature: Signature::from_bytes(vec![]),
+            public_key: PublicKey::from_bytes(vec![1; 32]),
+        }
+    }
+
+    #[test]
+    fn everything_but_a_transaction_stays_in_the_event_loop() {
+        let (queue, mut worker) = mpsc::channel(1);
+        let routed = route_peer_transaction(P2PEvent::PeerConnected("peer".into()), &queue);
+        assert!(matches!(routed, Some(P2PEvent::PeerConnected(_))));
+        assert!(
+            worker.try_recv().is_err(),
+            "nothing but transactions goes to the worker"
+        );
+    }
+
+    #[test]
+    fn transactions_go_to_the_worker_and_a_full_worker_drops_them_without_waiting() {
+        let (queue, mut worker) = mpsc::channel(1);
+        for nonce in 0..3 {
+            assert!(
+                route_peer_transaction(P2PEvent::NewTransaction(a_transaction(nonce)), &queue)
+                    .is_none(),
+                "a transaction never reaches the consensus event loop"
+            );
+        }
+        // Capacity one: the first was queued, the other two dropped — and routing returned for
+        // all three, which is the property that matters: it never waited for room.
+        assert_eq!(worker.try_recv().unwrap().nonce, 0);
+        assert!(worker.try_recv().is_err());
     }
 }

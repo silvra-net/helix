@@ -1422,8 +1422,11 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
     assert!(
         loaded.p90 < ceiling,
         "block time collapsed under load: p90 {:.2}s against an idle median of {:.2}s (ceiling {:.2}s). \
-         Fullest block {} tx. This is the shape of a proposal that cannot cross the link inside the \
-         round window.",
+         Fullest block {} tx. Two causes look exactly like this, and a message naming one of them \
+         sent the first diagnosis the wrong way (#224): a proposal that cannot cross the link inside \
+         the round window, or nodes that are not processing consensus messages at all. Re-run with \
+         `HELIX_TEST_LOG_DIR` set — `heard=none` on every node is the second — and with the link \
+         unthrottled: if it still fails, bandwidth is not the cause.",
         loaded.p90, idle.median, ceiling, loaded.fullest
     );
 }

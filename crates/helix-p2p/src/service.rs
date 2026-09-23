@@ -2269,6 +2269,23 @@ impl AppMessageOutcome {
     }
 }
 
+/// Gossiped transactions dropped because the node was not taking them in fast enough.
+static DROPPED_PEER_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Count a dropped transaction, and say so on the first and then every thousandth — a flood
+/// should be visible to an operator without its log becoming the flood.
+fn note_dropped_peer_transaction() {
+    let dropped = DROPPED_PEER_TRANSACTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped == 1 || dropped % 1000 == 0 {
+        warn!(
+            dropped_total = dropped,
+            "Gossiped transactions are arriving faster than this node takes them in — dropping the \
+             excess instead of stalling the network loop. Votes, proposals and blocks are never \
+             dropped; a transaction dropped here is still held by the peers that sent it."
+        );
+    }
+}
+
 /// Decode one gossiped message, hand it to the node, and report what it implies about the
 /// sender's height.
 ///
@@ -2308,7 +2325,19 @@ async fn handle_app_message(
     } else if topic == TOPIC_TRANSACTIONS {
         match bincode::deserialize::<Transaction>(data) {
             Ok(tx) => {
-                let _ = event_tx.send(P2PEvent::NewTransaction(tx)).await;
+                // Never `send().await` a transaction. This runs inside the swarm loop — the loop
+                // that also reads every socket and sends every vote this node casts — and a
+                // blocking send on a full channel stops all of it. On 2026-09-23 a flood of 2000
+                // transactions did exactly that to three test validators: for 2.5 minutes every
+                // node heard nobody, while the node at the other end of the channel was still
+                // checking signatures. A transaction dropped here is still in every mempool the
+                // gossip reached and in its sender's node; a vote held up here costs the round.
+                // So transactions are best-effort, and proposals, votes and blocks are not.
+                if let Err(mpsc::error::TrySendError::Full(_)) =
+                    event_tx.try_send(P2PEvent::NewTransaction(tx))
+                {
+                    note_dropped_peer_transaction();
+                }
                 AppMessageOutcome::clean(None)
             }
             Err(e) => {
@@ -3556,7 +3585,10 @@ mod blocksync_selection_tests {
 
 #[cfg(test)]
 mod observed_height_tests {
-    use super::{handle_app_message, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_VOTES};
+    use super::{
+        handle_app_message, P2PEvent, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_TRANSACTIONS,
+        TOPIC_VOTES,
+    };
     use helix_consensus::proposal::Proposal;
     use helix_core::block::{genesis_block, Block};
     use helix_crypto::{Address, PublicKey, Signature};
@@ -3611,6 +3643,50 @@ mod observed_height_tests {
         let outcome = handle_app_message(TOPIC_BLOCKS, &data, &tx).await;
 
         assert_eq!(outcome.observed_height, None);
+    }
+
+    /// The flood of 2026-09-23. The node could not keep up, the channel to it was full — and
+    /// this function runs inside the swarm loop, the loop that also reads every socket and sends
+    /// every vote this node casts. A `send().await` here stopped all of it: three validators
+    /// heard nobody for 2.5 minutes while their nodes were still checking signatures. A
+    /// transaction must be dropped when there is no room, never waited on.
+    #[tokio::test]
+    async fn a_transaction_never_holds_up_the_swarm_on_a_full_channel() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(P2PEvent::PeerConnected("already queued".into()))
+            .unwrap();
+        let transaction = helix_core::Transaction {
+            version: 1,
+            tx_type: helix_core::TxType::Transfer,
+            from: Address::from_public_key(&PublicKey::from_bytes(vec![1; 32])),
+            to: None,
+            amount: 1,
+            fee: 1,
+            nonce: 0,
+            data: vec![],
+            crypto_version: helix_crypto::CryptoScheme::MlDsa,
+            chain_id: helix_crypto::Hash::digest(b"chain"),
+            signature: Signature::from_bytes(vec![]),
+            public_key: PublicKey::from_bytes(vec![1; 32]),
+        };
+        let data = bincode::serialize(&transaction).unwrap();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_app_message(TOPIC_TRANSACTIONS, &data, &tx),
+        )
+        .await
+        .expect("handing on a transaction must not wait for room in the channel");
+
+        assert!(
+            !outcome.malformed,
+            "a well-formed transaction is not a strike"
+        );
+        assert!(matches!(rx.try_recv(), Ok(P2PEvent::PeerConnected(_))));
+        assert!(
+            rx.try_recv().is_err(),
+            "the transaction was dropped, not queued"
+        );
     }
 
     /// A vote carries a height, but it is a claim about the round being decided, not about what
