@@ -290,6 +290,16 @@ impl Transaction {
     /// `verify_tx_signature` check is unreachable: every such tx would already have been
     /// rejected before it ever reached the executor.
     pub fn verify_signature_with_recovery_key(&self, recovery_key: Option<&PublicKey>) -> CryptoResult<()> {
+        self.verify_sender_key(recovery_key)?;
+        self.verify_own_signature()
+    }
+
+    /// The first half of [`Self::verify_signature_with_recovery_key`]: is the attached key
+    /// entitled to sign for `from`? Cheap — no cryptography — and **dependent on chain state**:
+    /// a recovery key is set and replaced by transactions, so a node one block behind can see an
+    /// honest transaction from a just-recovered account fail here. A failure says the transaction
+    /// is not admissible *here, now*; it does not say its author lied.
+    pub fn verify_sender_key(&self, recovery_key: Option<&PublicKey>) -> CryptoResult<()> {
         match recovery_key {
             Some(active_key) => {
                 if self.public_key.as_bytes() != active_key.as_bytes() {
@@ -309,6 +319,15 @@ impl Transaction {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The second half: does the signature verify against the key **this transaction carries**?
+    /// A function of the transaction's own bytes and nothing else — no chain state, no
+    /// configuration — so a failure is something no honest node can have produced. It is also
+    /// the expensive half (a full ML-DSA or SLH-DSA verification), which is why a peer that sends
+    /// such transactions is worth holding to it (the node charges the author, #225).
+    pub fn verify_own_signature(&self) -> CryptoResult<()> {
         let hash = self.signing_hash();
         helix_crypto::verify_with_scheme(
             self.crypto_version,
@@ -427,5 +446,31 @@ mod tests {
         let victim_address = Address::from_public_key(&victim.public);
         let tx = build_tx(victim_address, &attacker);
         assert!(tx.verify_signature().is_err());
+    }
+
+    /// #225 splits the check so a caller can tell *which* half failed — a spoofed `from` is
+    /// the state-dependent half, a signature that fails under the transaction's own key is the
+    /// state-independent one. Both halves must still add up to the whole.
+    #[test]
+    fn a_spoofed_from_fails_the_key_half_and_passes_the_signature_half() {
+        let attacker = KeyPair::generate();
+        let victim = Address::from_public_key(&KeyPair::generate().public);
+        let tx = build_tx(victim, &attacker);
+        assert!(tx.verify_sender_key(None).is_err());
+        assert!(
+            tx.verify_own_signature().is_ok(),
+            "the attacker's signature is genuinely theirs"
+        );
+        assert!(tx.verify_signature_with_recovery_key(None).is_err());
+    }
+
+    #[test]
+    fn a_forged_signature_passes_the_key_half_and_fails_the_signature_half() {
+        let keypair = KeyPair::generate();
+        let mut tx = build_tx(Address::from_public_key(&keypair.public), &keypair);
+        tx.signature = keypair.sign(b"some other message").unwrap();
+        assert!(tx.verify_sender_key(None).is_ok());
+        assert!(tx.verify_own_signature().is_err());
+        assert!(tx.verify_signature_with_recovery_key(None).is_err());
     }
 }
