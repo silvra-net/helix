@@ -484,9 +484,23 @@ async fn submit_tx(tx: &Transaction, node: &str) -> Result<()> {
 /// commands went on echoing the passphrase — and, because the ignored `_prompt` was never
 /// printed, gave no sign they were waiting for one. Found on 2026-07-22 while walking the
 /// governance path end to end. Hence `pub(crate)` and this note: a private duplicate cannot be
-/// fixed once and stay fixed.
+/// fixed once and stay fixed. (It did not stay fixed: `wallet encrypt` carried a sixth copy under
+/// another name, `rpassword_prompt`, until 2026-09-23 — a grep for this name could not find it.)
 pub(crate) fn rpassword_read(prompt: &str) -> Result<String> {
-    Ok(rpassword::prompt_password(prompt)?.trim().to_string())
+    Ok(as_typed(rpassword::prompt_password(prompt)?))
+}
+
+/// The passphrase exactly as typed, minus only a line ending.
+///
+/// This used to `trim()`, which also stripped spaces at either end — spaces the person typed on
+/// purpose. Nothing else trims: `wallet new --passphrase`, the desktop wallet and the node's
+/// `HELIX_VALIDATOR_KEY_PASSPHRASE` all take it byte for byte. So a passphrase with a space at
+/// its edge — one pasted from a password manager is enough — opened in the desktop wallet and
+/// never here, with "wrong passphrase?" as the only explanation. rpassword stops reading at the
+/// Enter key and does not return it; the line ending is stripped anyway, in case a future
+/// version or another input path does.
+fn as_typed(line: String) -> String {
+    line.trim_end_matches(['\r', '\n']).to_string()
 }
 
 /// The one command that talks to a node without going through `super::get_optional`, on purpose:
@@ -633,5 +647,18 @@ mod tx_status_tests {
         let err = tx_status("cd".repeat(32), &node).await.unwrap_err().to_string();
 
         assert!(err.starts_with("Not found:"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod passphrase_tests {
+    use super::*;
+
+    #[test]
+    fn a_passphrase_keeps_the_spaces_that_were_typed() {
+        assert_eq!(as_typed("correct horse ".into()), "correct horse ");
+        assert_eq!(as_typed(" leading".into()), " leading");
+        assert_eq!(as_typed("pw\r\n".into()), "pw");
+        assert_eq!(as_typed("pw\n".into()), "pw");
     }
 }
