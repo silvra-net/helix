@@ -189,6 +189,11 @@ either the GUI or the [CLI](docs/cli.md#using-the-cli-helix); neither is missing
   `KeyFile` format the CLI uses, and never leaves the app — the wallet signs transactions itself
   and only talks to a node over its public REST API. The 24-word recovery phrase is shown once
   and also works in the Spark mobile app.
+- **It locks itself after 10 minutes without use.** The key is cleared from memory, not just
+  hidden behind a screen, and a laptop closed with the wallet open wakes up locked. A send that
+  is under way always shows you its result first. The lock protects a wallet that has a
+  passphrase — without one, unlocking is a single click. Choose one when you create or restore
+  the wallet; to add one to an existing wallet file, use `helix wallet encrypt` from the CLI.
 - **It uses your own node if you have one.** The wallet checks whether a node is running on this
   machine — whether it started it or you did, from a terminal, systemd or pm2 — and reads balances
   from that instead of a public server, switching back on its own if that node goes away. It also

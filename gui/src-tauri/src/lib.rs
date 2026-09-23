@@ -39,6 +39,24 @@ pub fn run() {
         )
         .manage(WalletState::default())
         .manage(NodeProcessState::default())
+        .setup(|app| {
+            // The idle lock is enforced here, not in the webview — see `WalletState`. A plain
+            // thread rather than a task on the async runtime: it must keep sweeping however busy
+            // that runtime is, and it needs nothing from it.
+            let handle = app.handle().clone();
+            std::thread::Builder::new()
+                .name("wallet-idle-lock".into())
+                .spawn(move || loop {
+                    std::thread::sleep(state::IDLE_SWEEP_EVERY);
+                    use tauri::{Emitter, Manager};
+                    if handle.state::<WalletState>().lock_if_idle() {
+                        let minutes = state::IDLE_LOCK_AFTER.as_secs() / 60;
+                        log::info!("wallet locked itself after {minutes} minutes without use");
+                        let _ = handle.emit(state::WALLET_LOCKED_EVENT, minutes);
+                    }
+                })?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             node_process::node_start,
             node_process::node_stop,
@@ -49,6 +67,7 @@ pub fn run() {
             commands::restore_wallet,
             commands::unlock_wallet,
             commands::lock_wallet,
+            commands::touch_wallet,
             commands::get_network,
             commands::get_overview,
             commands::get_history,

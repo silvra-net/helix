@@ -1,7 +1,16 @@
 import { useState } from "react";
 import { api } from "../api";
 
-export default function Unlock({ encrypted, onUnlocked }: { encrypted: boolean; onUnlocked: () => void }) {
+export default function Unlock({
+  encrypted,
+  notice,
+  onUnlocked,
+}: {
+  encrypted: boolean;
+  /** Why the wallet is locked, when it locked itself after going unused. */
+  notice?: string | null;
+  onUnlocked: () => void;
+}) {
   const [passphrase, setPassphrase] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -26,6 +35,12 @@ export default function Unlock({ encrypted, onUnlocked }: { encrypted: boolean; 
           <span className="brand-mark big" aria-hidden>⛓</span>
           <h1>Unlock your wallet</h1>
         </div>
+
+        {notice && (
+          <p className="muted" role="status">
+            {notice}
+          </p>
+        )}
 
         {encrypted ? (
           <label className="field">

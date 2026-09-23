@@ -37,6 +37,13 @@ export const api = {
 
   lockWallet: () => invoke<void>("lock_wallet"),
 
+  // Somebody is using the wallet — restarts the backend's idle lock. See `idle.ts`.
+  touchWallet: () => invoke<void>("touch_wallet"),
+
+  // The backend locked the wallet by itself after its idle limit. Payload: that limit in minutes.
+  onWalletLocked: (handler: (minutes: number) => void) =>
+    listen<number>("wallet-locked", (e) => handler(e.payload)),
+
   getNetwork: (node: string) => invoke<NetworkStatus>("get_network", { node }),
 
   getOverview: (node: string) => invoke<Overview>("get_overview", { node }),

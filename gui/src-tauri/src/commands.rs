@@ -82,7 +82,7 @@ pub fn create_wallet(app: AppHandle, state: State<'_, WalletState>, passphrase: 
     let address = created.address.clone();
     let mnemonic = created.mnemonic.clone();
     log::info!("wallet created: {address}");
-    *state.inner.lock().unwrap() = Some(UnlockedWallet { keypair: created.keypair, address: address.clone() });
+    *state.inner.lock().unwrap() = Some(UnlockedWallet::new(created.keypair, address.clone()));
     Ok(NewWallet { address, mnemonic })
 }
 
@@ -93,7 +93,7 @@ pub fn restore_wallet(app: AppHandle, state: State<'_, WalletState>, mnemonic: S
         log::error!("wallet restore failed: {e}");
     })?;
     log::info!("wallet restored: {address}");
-    *state.inner.lock().unwrap() = Some(UnlockedWallet { keypair, address: address.clone() });
+    *state.inner.lock().unwrap() = Some(UnlockedWallet::new(keypair, address.clone()));
     Ok(address)
 }
 
@@ -107,13 +107,21 @@ pub fn unlock_wallet(app: AppHandle, state: State<'_, WalletState>, passphrase: 
         log::error!("wallet unlock failed: {e}");
     })?;
     log::info!("wallet unlocked: {address}");
-    *state.inner.lock().unwrap() = Some(UnlockedWallet { keypair, address: address.clone() });
+    *state.inner.lock().unwrap() = Some(UnlockedWallet::new(keypair, address.clone()));
     Ok(address)
 }
 
 #[tauri::command]
 pub fn lock_wallet(state: State<'_, WalletState>) {
     *state.inner.lock().unwrap() = None;
+}
+
+/// The person is using the wallet — restart the idle lock's count (`state::IDLE_LOCK_AFTER`).
+/// The frontend calls this on input, at most every half minute. It cannot keep a locked wallet
+/// open or reopen one: on a locked wallet it does nothing.
+#[tauri::command]
+pub fn touch_wallet(state: State<'_, WalletState>) {
+    state.touch();
 }
 
 /// Where `tauri-plugin-log` is writing the app's log file — shown (with a copy button) in
@@ -165,6 +173,10 @@ async fn build_sign_submit(
     data: Vec<u8>,
     fee: Option<u64>,
 ) -> Result<rpc::SubmitResult, String> {
+    // First, before anything goes over the network: refuses if the wallet sat idle past the
+    // limit, and otherwise keeps the start and the end of this send counting as activity, so no
+    // idle lock can land between signing and showing the person the result.
+    let _signing = state.begin_signing()?;
     let from_str = state.address().ok_or("wallet is locked")?;
     let from = Address::from_str(&from_str).map_err(|e| e.to_string())?;
 

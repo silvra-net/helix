@@ -5,6 +5,7 @@ import { nodeOfferAnswered, shouldOfferOwnNode } from "./nodePrompt";
 import OwnNodeOffer from "./components/OwnNodeOffer";
 import type { NetworkStatus, WalletMeta } from "./types";
 import { shortAddr } from "./format";
+import { ACTIVITY_EVENTS, createActivityReporter, inactivityNotice } from "./idle";
 import Setup from "./views/Setup";
 import Unlock from "./views/Unlock";
 import Overview from "./views/Overview";
@@ -32,6 +33,9 @@ export default function App() {
   // Read once at mount: localStorage is not reactive, and re-reading it every render would
   // make the card flicker back after a click until the next re-render settled.
   const [nodeOfferOpen, setNodeOfferOpen] = useState(!nodeOfferAnswered());
+  // Why the wallet is locked, when it locked itself — shown on the unlock screen so a person
+  // coming back does not wonder whether something went wrong. `null` after a lock they chose.
+  const [lockNotice, setLockNotice] = useState<string | null>(null);
 
   const refreshMeta = useCallback(async () => {
     try {
@@ -43,6 +47,32 @@ export default function App() {
 
   useEffect(() => {
     refreshMeta();
+  }, [refreshMeta]);
+
+  // The idle lock: the backend enforces it; all this does is report input while the wallet is
+  // open (throttled — see `idle.ts`) and follow the backend when it locks by itself.
+  useEffect(() => {
+    if (!meta?.unlocked) return;
+    const onActivity = createActivityReporter(() => {
+      // Nothing to do on failure: at worst the backend locks a little early, which is the safe
+      // direction.
+      api.touchWallet().catch(() => {});
+    });
+    for (const ev of ACTIVITY_EVENTS) window.addEventListener(ev, onActivity, { passive: true });
+    return () => {
+      for (const ev of ACTIVITY_EVENTS) window.removeEventListener(ev, onActivity);
+    };
+  }, [meta?.unlocked]);
+
+  useEffect(() => {
+    const unlisten = api.onWalletLocked((minutes) => {
+      setLockNotice(inactivityNotice(minutes));
+      setNet(null);
+      refreshMeta();
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
   }, [refreshMeta]);
 
   // Use a node already running on this machine, unless the user has chosen one themselves.
@@ -151,6 +181,7 @@ export default function App() {
 
   const lock = async () => {
     await api.lockWallet();
+    setLockNotice(null);
     setNet(null);
     refreshMeta();
   };
@@ -179,7 +210,16 @@ export default function App() {
   }
 
   if (!meta.unlocked) {
-    return <Unlock encrypted={meta.encrypted} onUnlocked={refreshMeta} />;
+    return (
+      <Unlock
+        encrypted={meta.encrypted}
+        notice={lockNotice}
+        onUnlocked={() => {
+          setLockNotice(null);
+          refreshMeta();
+        }}
+      />
+    );
   }
 
   return (
