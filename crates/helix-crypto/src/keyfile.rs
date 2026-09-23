@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 use argon2::{password_hash::SaltString, Algorithm, Argon2, Params, PasswordHasher, Version};
 use serde::{Deserialize, Serialize};
 
-use crate::{Address, CryptoScheme, KeyPair};
+use crate::{Address, CryptoScheme, KeyPair, PublicKey};
 
 /// Human-readable algo strings stored in `KeyFile::algo` — the on-disk name for
 /// each `CryptoScheme`, so a wallet file records which scheme to reconstruct on load.
@@ -74,8 +74,15 @@ fn scheme_from_algo(algo: &str) -> Result<CryptoScheme> {
 /// fallback (pre-2026-07-05 key files) was removed on 2026-07-13 once no known key
 /// file still used it — `hlx wallet import-node-key` (`WalletCmd::ImportNodeKey` in
 /// helix-cli) still knows how to convert an old file to this format if one turns up.
+///
+/// **Every way of reading one checks it** (`#[serde(try_from)]`, not a check in `load`): a
+/// file whose `address` is not the address of its `public_key` does not become a `KeyFile` at
+/// all — see `check_plaintext_fields` for why that field is the one worth attacking.
 #[derive(Serialize, Deserialize)]
+#[serde(try_from = "KeyFileOnDisk")]
 pub struct KeyFile {
+    /// A cache of `Address::from_public_key(public_key)`, stored in plaintext so a wallet can
+    /// show it without being unlocked. Checked on every read, never trusted on its own.
     pub address: String,
     pub public_key: String,
     pub algo: String,
@@ -95,7 +102,76 @@ pub struct KeyFile {
     pub kdf_params: Option<KdfParams>,
 }
 
+/// A key file as it stands on disk, before anything has checked it. Deserialization lands
+/// here first and becomes a `KeyFile` only through `TryFrom` — the field list is repeated on
+/// purpose, and a field added to one without the other fails to compile rather than slip past.
+#[derive(Deserialize)]
+struct KeyFileOnDisk {
+    address: String,
+    public_key: String,
+    algo: String,
+    encryption: String,
+    secret_key: String,
+    kdf_salt: Option<String>,
+    nonce: Option<String>,
+    kdf_params: Option<KdfParams>,
+}
+
+impl TryFrom<KeyFileOnDisk> for KeyFile {
+    type Error = anyhow::Error;
+
+    fn try_from(f: KeyFileOnDisk) -> Result<Self> {
+        let kf = KeyFile {
+            address: f.address,
+            public_key: f.public_key,
+            algo: f.algo,
+            encryption: f.encryption,
+            secret_key: f.secret_key,
+            kdf_salt: f.kdf_salt,
+            nonce: f.nonce,
+            kdf_params: f.kdf_params,
+        };
+        kf.check_plaintext_fields()?;
+        Ok(kf)
+    }
+}
+
 impl KeyFile {
+    /// The checks that need no passphrase: the scheme is one this build knows, the public key
+    /// is a well-formed key of that scheme, and the address is the one that key hashes to.
+    ///
+    /// **Why the address.** It sits in plaintext beside the encrypted secret, and `hlx wallet
+    /// address`, `hlx wallet info` and the desktop wallet all showed it straight from the file.
+    /// Nothing compared it with the key, so anyone able to write the file — passphrase or not —
+    /// could put their own address there, and from then on every payment the owner asked for
+    /// went to them. Checked here on every read, and again in `to_keypair`.
+    ///
+    /// **The limit, stated because it is real:** a *matching* forged pair of `public_key` and
+    /// `address` passes this — anything checkable without the secret is forgeable without it.
+    /// That pair is caught when the wallet is unlocked, where `KeyPair::from_raw` requires the
+    /// public key to be the one the secret derives. An address shown *without* unlocking is only
+    /// as trustworthy as the file it was read from.
+    fn check_plaintext_fields(&self) -> Result<CryptoScheme> {
+        let scheme = scheme_from_algo(&self.algo)?;
+        let public = PublicKey::from_hex(&self.public_key)
+            .map_err(|e| anyhow::anyhow!("Wallet file's public key is not valid hex: {}", e))?;
+        if !public.is_valid_for(scheme) {
+            bail!("Wallet file's public key is not a valid {} key", self.algo);
+        }
+        // Deliberately not naming the address the key hashes to: if `public_key` was the field
+        // that got rewritten, that address is the attacker's, and this message would hand it out.
+        match Address::from_str(&self.address) {
+            Ok(stated) if stated == Address::from_public_key(&public) => Ok(scheme),
+            _ => bail!(
+                "The address in this wallet file ({}) does not belong to the key stored in it — \
+                 the file has been altered or damaged. Do not use that address or give it to \
+                 anyone. Restore the wallet from its recovery phrase (`hlx wallet restore`) or \
+                 from a backup.",
+                self.address
+            ),
+        }
+    }
+
     /// Create an unencrypted key file (devnet)
     pub fn from_keypair_plain(kp: &KeyPair) -> Self {
         let address = Address::from_public_key(&kp.public);
@@ -160,17 +236,27 @@ impl KeyFile {
         if !path.exists() {
             bail!("Key file not found: {}", path.display());
         }
-        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+        Self::from_json_str(&std::fs::read_to_string(path)?)
     }
 
-    /// Parse from an already-read string (node loader reads the file itself to also
-    /// support the legacy raw-bytes fallback — see `helix-node::load_or_create_keypair`).
+    /// Parse from an already-read string (the node reads its key file itself, so its errors
+    /// can name the path — see `helix-node::load_or_create_keypair_with`).
+    ///
+    /// Parsed and checked as two steps, so a refusal reads as its reason rather than as a JSON
+    /// syntax error "at line 1 column 4127". It is the same `TryFrom` serde runs.
     pub fn from_json_str(s: &str) -> Result<Self> {
-        Ok(serde_json::from_str(s)?)
+        let raw: KeyFileOnDisk = serde_json::from_str(s)?;
+        KeyFile::try_from(raw)
     }
 
     /// Recover the KeyPair, decrypting if needed
+    ///
+    /// The address this file shows is checked against the key before anything is decrypted,
+    /// and the key against the decrypted secret by `KeyPair::from_raw` — so a `KeyPair` handed
+    /// out here is always the one the address belongs to. Checked here and not only on read:
+    /// the fields are public, and this is the step that hands out a signing key.
     pub fn to_keypair(&self, passphrase: Option<&str>) -> Result<KeyPair> {
+        let scheme = self.check_plaintext_fields()?;
         let sk_bytes = match self.encryption.as_str() {
             "plaintext" => hex::decode(&self.secret_key)?,
 
@@ -215,7 +301,6 @@ impl KeyFile {
         };
 
         let pk_bytes = hex::decode(&self.public_key)?;
-        let scheme = scheme_from_algo(&self.algo)?;
         Ok(KeyPair::from_raw(scheme, sk_bytes, pk_bytes)?)
     }
 
@@ -275,5 +360,112 @@ mod tests {
 
         let restored = file.to_keypair(Some("pw")).unwrap();
         assert_eq!(restored.secret.as_bytes(), kp.secret.as_bytes());
+    }
+
+    /// Rewrite one or more plaintext fields the way someone with write access to the file —
+    /// but not its passphrase — would: edit the JSON on disk and leave everything else alone.
+    fn tampered(file: &KeyFile, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut v = serde_json::to_value(file).unwrap();
+        edit(&mut v);
+        v.to_string()
+    }
+
+    #[test]
+    fn a_rewritten_address_is_refused_before_anyone_can_read_it() {
+        // The attack: `address` sits in plaintext beside the encrypted key, and `hlx wallet
+        // address` / the desktop wallet showed it without ever touching the key. Swapping it
+        // for the attacker's address needs no passphrase, and every payment the owner asks for
+        // from then on goes to the attacker.
+        let owner = KeyPair::generate();
+        let attacker = Address::from_public_key(&KeyPair::generate().public);
+        let file = KeyFile::from_keypair_encrypted(&owner, "pw").unwrap();
+        let json = tampered(&file, |v| v["address"] = attacker.to_string().into());
+
+        // Every way into a `KeyFile` refuses it — including plain serde, so a future caller
+        // that deserializes directly cannot step around the check (#203's shape: a guarantee
+        // that lives in one caller is a guarantee until the second caller).
+        assert!(KeyFile::from_json_str(&json).is_err());
+        assert!(serde_json::from_str::<KeyFile>(&json).is_err());
+        let path = std::env::temp_dir().join(format!(
+            "helix-keyfile-tamper-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, &json).unwrap();
+        let loaded = KeyFile::load(&path);
+        std::fs::remove_file(&path).ok();
+        let err = loaded
+            .err()
+            .expect("a file whose address is not its key's must not load");
+        assert!(err.to_string().contains("does not belong to"), "{err}");
+
+        // Positive control: the untouched file loads, so the refusal above is about the edit.
+        assert!(KeyFile::from_json_str(&serde_json::to_string(&file).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn an_address_changed_in_memory_does_not_survive_unlocking() {
+        // `to_keypair` checks on its own rather than trusting that its `KeyFile` came through
+        // deserialization — the fields are public, and this is the step that hands out a key.
+        let owner = KeyPair::generate();
+        let mut file = KeyFile::from_keypair_plain(&owner);
+        file.address = Address::from_public_key(&KeyPair::generate().public).to_string();
+        assert!(file.to_keypair(None).is_err());
+    }
+
+    #[test]
+    fn rewriting_address_and_public_key_together_is_caught_when_the_wallet_is_unlocked() {
+        // The stronger edit: replace the public key *and* the address with a matching pair, so
+        // the plaintext fields agree with each other. Without the passphrase nothing can tell —
+        // anything checkable without the secret is forgeable without it (that limit is real and
+        // stays documented). With it, the decrypted secret disagrees, and the wallet must refuse
+        // to open rather than open on the attacker's address.
+        for scheme in [CryptoScheme::MlDsa, CryptoScheme::SphincsPlus] {
+            let owner = KeyPair::generate_for(scheme);
+            let attacker = KeyPair::generate_for(scheme);
+            let file = KeyFile::from_keypair_encrypted(&owner, "pw").unwrap();
+            let json = tampered(&file, |v| {
+                v["public_key"] = attacker.public.to_hex().into();
+                v["address"] = Address::from_public_key(&attacker.public)
+                    .to_string()
+                    .into();
+            });
+            let loaded = KeyFile::from_json_str(&json)
+                .expect("self-consistent plaintext fields cannot be told apart without the secret");
+            assert!(
+                loaded.to_keypair(Some("pw")).is_err(),
+                "{scheme:?}: the owner's passphrase opened a wallet that shows the attacker's address"
+            );
+            // Positive control: the same passphrase opens the untouched file.
+            assert!(file.to_keypair(Some("pw")).is_ok(), "{scheme:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_for_an_unknown_scheme_or_a_malformed_key_does_not_load() {
+        let kp = KeyPair::generate();
+        let file = KeyFile::from_keypair_plain(&kp);
+        for (what, json) in [
+            (
+                "unknown algo",
+                tampered(&file, |v| v["algo"] = "ML-DSA-Dilithium3".into()),
+            ),
+            (
+                "truncated key",
+                tampered(&file, |v| {
+                    let pk = v["public_key"].as_str().unwrap().to_string();
+                    v["public_key"] = pk[..pk.len() - 2].to_string().into();
+                }),
+            ),
+            (
+                "address not an address",
+                tampered(&file, |v| v["address"] = "hlx".into()),
+            ),
+        ] {
+            assert!(KeyFile::from_json_str(&json).is_err(), "{what} loaded");
+        }
     }
 }

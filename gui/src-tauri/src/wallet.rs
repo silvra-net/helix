@@ -131,6 +131,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_wallet_file_whose_address_was_swapped_does_not_open() {
+        // The attack, on the surface people use: someone with write access to the wallet file
+        // but not its passphrase replaces the plaintext `address` with their own. `load_at`
+        // returned that field as the wallet's address — after a successful unlock with the right
+        // passphrase — so the receive screen showed the attacker's address as the owner's.
+        let dir = std::env::temp_dir().join(format!("helix-gui-tamper-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.json");
+        let created = create_at(&path, Some("hunter2")).unwrap();
+
+        let attacker = Address::from_public_key(&KeyPair::generate().public).to_string();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["address"] = attacker.clone().into();
+        std::fs::write(&path, v.to_string()).unwrap();
+
+        let err = load_at(&path, Some("hunter2"))
+            .err()
+            .expect("a swapped address must not open");
+        // The refusal names the address the file claimed, never the one its key hashes to —
+        // had the public key been the rewritten field, that one would be the attacker's.
+        assert!(!err.contains(&created.address), "{err}");
+        assert!(err.contains("does not belong to"), "{err}");
+        // Not even "is this encrypted?" answers for such a file — nothing reads it as a wallet.
+        assert!(is_encrypted_at(&path).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The phrase must reproduce the exact wallet, and it must match the *other* implementation:
     /// Spark's `@scure/bip39` + `@noble/post-quantum` over the same seed. Pinned so the desktop
     /// wallet and the mobile app never derive different addresses from the same 24 words.

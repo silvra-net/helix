@@ -270,10 +270,38 @@ impl KeyPair {
                 }
             }
             CryptoScheme::SphincsPlus => {
-                SlhSigningKey::<Sha2_192s>::try_from(secret_bytes.as_slice())
+                // The same guarantee, which SLH-DSA does not give for free. Its secret carries
+                // its own copy of the public key (FIPS 205: SK.seed ‖ SK.prf ‖ PK.seed ‖ PK.root)
+                // and parsing takes that copy on trust: nothing recomputes PK.root from SK.seed,
+                // and nothing compares the copy with the public key stored beside it. Both gaps
+                // mattered — a's secret beside b's public key opened a wallet on b's address,
+                // and a secret whose seed no longer matches its root shows an address nobody can
+                // ever spend from (no recovery phrase exists for this scheme).
+                let parsed = SlhSigningKey::<Sha2_192s>::try_from(secret_bytes.as_slice())
                     .map_err(|e| CryptoError::InvalidSecretKey(e.to_string()))?;
-                SlhVerifyingKey::<Sha2_192s>::try_from(public_bytes.as_slice())
+                let stored = SlhVerifyingKey::<Sha2_192s>::try_from(public_bytes.as_slice())
                     .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
+                // Recompute the key from its seeds — FIPS 205 `slh_keygen_internal`, the only
+                // way the crate exposes (doc-hidden, "for KAT validation": this is validation).
+                // Measured 0.12 s in release, a tenth of the signature that follows any load.
+                // `try_from` above fixed the length at four seeds of n bytes each.
+                let n = secret_bytes.len() / 4;
+                let rebuilt = SlhSigningKey::<Sha2_192s>::slh_keygen_internal(
+                    &secret_bytes[..n],
+                    &secret_bytes[n..2 * n],
+                    &secret_bytes[2 * n..3 * n],
+                );
+                if rebuilt != parsed {
+                    return Err(CryptoError::InvalidSecretKey(
+                        "SPHINCS+ secret key is damaged: its public root does not match its seed"
+                            .into(),
+                    ));
+                }
+                if AsRef::<SlhVerifyingKey<Sha2_192s>>::as_ref(&parsed) != &stored {
+                    return Err(CryptoError::InvalidPublicKey(
+                        "SPHINCS+ public key does not match the secret key".into(),
+                    ));
+                }
             }
         }
         Ok(KeyPair {
@@ -460,6 +488,57 @@ mod tests {
             CryptoScheme::MlDsa,
             a.secret.as_bytes().to_vec(),
             b.public.as_bytes().to_vec(),
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn sphincs_from_raw_rejects_mismatched_public() {
+        // The same check the ML-DSA arm has always made. Without it `from_raw` accepted a's
+        // secret beside b's public key, and a wallet file edited that way opened on b's address.
+        let a = KeyPair::generate_for(CryptoScheme::SphincsPlus);
+        let b = KeyPair::generate_for(CryptoScheme::SphincsPlus);
+        let res = KeyPair::from_raw(
+            CryptoScheme::SphincsPlus,
+            a.secret.as_bytes().to_vec(),
+            b.public.as_bytes().to_vec(),
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn sphincs_from_raw_rejects_a_secret_whose_embedded_public_key_is_not_its_own() {
+        // An SLH-DSA secret carries its own copy of the public key (FIPS 205:
+        // SK.seed ‖ SK.prf ‖ PK.seed ‖ PK.root), and parsing takes that copy on trust. Put b's
+        // public key inside a's secret *and* beside it: the two copies now agree, so comparing
+        // them proves nothing — only recomputing PK.root from SK.seed does. The key this builds
+        // signs nothing that verifies, and the address it shows belongs to b.
+        let a = KeyPair::generate_for(CryptoScheme::SphincsPlus);
+        let b = KeyPair::generate_for(CryptoScheme::SphincsPlus);
+        let half = a.secret.as_bytes().len() / 2;
+        let mut secret = a.secret.as_bytes()[..half].to_vec();
+        secret.extend_from_slice(b.public.as_bytes());
+        let res = KeyPair::from_raw(
+            CryptoScheme::SphincsPlus,
+            secret,
+            b.public.as_bytes().to_vec(),
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn sphincs_from_raw_rejects_a_corrupted_seed() {
+        // One flipped bit in SK.seed: address and public key are still the right ones, so the
+        // wallet shows an address people can pay — and no signature it makes will ever verify.
+        // For SPHINCS+ there is no recovery phrase, so anything sent there is gone. Refuse on
+        // load, before the address is handed to anyone.
+        let a = KeyPair::generate_for(CryptoScheme::SphincsPlus);
+        let mut secret = a.secret.as_bytes().to_vec();
+        secret[0] ^= 1;
+        let res = KeyPair::from_raw(
+            CryptoScheme::SphincsPlus,
+            secret,
+            a.public.as_bytes().to_vec(),
         );
         assert!(res.is_err());
     }
