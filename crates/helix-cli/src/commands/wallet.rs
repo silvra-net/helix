@@ -3,9 +3,25 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use bip39::Mnemonic;
 use clap::Subcommand;
-use helix_crypto::{CryptoScheme, KeyPair};
+use helix_crypto::{Address, CryptoScheme, KeyPair};
 
+use crate::commands::tx::rpassword_read;
 use crate::keyfile::KeyFile;
+
+/// Write `kp` encrypted under `passphrase`, or in plaintext when there is none — and an empty
+/// passphrase is none. Encrypting under "" gave a file that reports `aes256gcm-argon2id` and
+/// opens for anyone who presses Enter, while `wallet encrypt`'s own help promised that empty
+/// removes encryption. The desktop wallet has always read empty as plaintext (its `encode`);
+/// the four commands here used to decide separately, and now decide the same way.
+fn encode(kp: &KeyPair, passphrase: Option<&str>) -> Result<KeyFile> {
+    match passphrase {
+        Some(pass) if !pass.is_empty() => {
+            println!("Encrypting with AES-256-GCM + Argon2id...");
+            KeyFile::from_keypair_encrypted(kp, pass)
+        }
+        _ => Ok(KeyFile::from_keypair_plain(kp)),
+    }
+}
 
 /// A fresh 32-byte ML-DSA seed (FIPS 204's ξ) from the OS CSPRNG. Its own function so the one
 /// place the entropy behind a wallet comes from is obvious and auditable.
@@ -95,6 +111,12 @@ pub enum WalletCmd {
     Address {
         #[arg(short, long, default_value = "wallet.json")]
         key: PathBuf,
+        /// Unlock the key and print the address it derives, instead of the one stored beside
+        /// it. Without this the address comes from the file's plaintext fields — checked
+        /// against each other, but a forger who replaces both together is only caught on
+        /// unlock. Use it before handing an address out for a large payment.
+        #[arg(long)]
+        verify: bool,
     },
     /// Change or add passphrase encryption on an existing wallet
     Encrypt {
@@ -145,13 +167,7 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
                 CryptoScheme::SphincsPlus => (KeyPair::generate_for(scheme), None),
             };
 
-            let kf = match passphrase {
-                Some(ref pass) => {
-                    println!("Encrypting with AES-256-GCM + Argon2id...");
-                    KeyFile::from_keypair_encrypted(&kp, pass)?
-                }
-                None => KeyFile::from_keypair_plain(&kp),
-            };
+            let kf = encode(&kp, passphrase.as_deref())?;
 
             kf.save(&output)?;
             println!();
@@ -161,7 +177,7 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
             println!("  Encryption : {}", kf.encryption);
             println!("  Saved to   : {}", output.display());
             println!();
-            if passphrase.is_none() {
+            if !kf.is_encrypted() {
                 println!("  ⚠  No passphrase — key stored in plaintext. Use --passphrase for security.");
             } else {
                 println!("  ✓  Key encrypted. Don't forget your passphrase — it cannot be recovered.");
@@ -190,10 +206,7 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
             let seed = mnemonic.to_entropy();
             let kp = KeyPair::from_mldsa_seed(&seed)?;
 
-            let kf = match passphrase {
-                Some(ref pass) => KeyFile::from_keypair_encrypted(&kp, pass)?,
-                None => KeyFile::from_keypair_plain(&kp),
-            };
+            let kf = encode(&kp, passphrase.as_deref())?;
             kf.save(&output)?;
 
             println!("Wallet restored from its recovery phrase.");
@@ -213,9 +226,19 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
             println!("  Public key : {}...", &kf.public_key[..32]);
         }
 
-        WalletCmd::Address { key } => {
+        WalletCmd::Address { key, verify } => {
             let kf = KeyFile::load(&key)?;
-            println!("{}", kf.address);
+            if verify {
+                let pass = if kf.is_encrypted() {
+                    Some(rpassword_read("Wallet passphrase: ")?)
+                } else {
+                    None
+                };
+                let kp = kf.to_keypair(pass.as_deref())?;
+                println!("{}", Address::from_public_key(&kp.public));
+            } else {
+                println!("{}", kf.address);
+            }
         }
 
         WalletCmd::ImportNodeKey { from, output, passphrase } => {
@@ -248,13 +271,7 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
             let kp = KeyPair::from_raw(scheme, sk_bytes, pk_bytes)
                 .map_err(|e| anyhow::anyhow!("Invalid key in {}: {}", from.display(), e))?;
 
-            let kf = match passphrase {
-                Some(ref pass) => {
-                    println!("Encrypting with AES-256-GCM + Argon2id...");
-                    KeyFile::from_keypair_encrypted(&kp, pass)?
-                }
-                None => KeyFile::from_keypair_plain(&kp),
-            };
+            let kf = encode(&kp, passphrase.as_deref())?;
 
             kf.save(&output)?;
             println!();
@@ -270,25 +287,26 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
         WalletCmd::Encrypt { key, passphrase } => {
             let kf = KeyFile::load(&key)?;
             let pass = if kf.is_encrypted() {
-                print!("Current passphrase: ");
-                Some(rpassword_prompt("Current passphrase: "))
+                Some(rpassword_read("Current passphrase: ")?)
             } else {
                 None
             };
             let kp = kf.to_keypair(pass.as_deref())?;
-            let new_kf = KeyFile::from_keypair_encrypted(&kp, &passphrase)?;
-            new_kf.save(&key)?;
-            println!("✓ Wallet re-encrypted at {}", key.display());
+            let new_kf = encode(&kp, Some(&passphrase))?;
+            // `replace`, not `save`: this is the one command that means to overwrite a key
+            // file, and it rewrites the only copy — so in one step, never truncate-then-write.
+            new_kf.replace(&key)?;
+            if new_kf.is_encrypted() {
+                println!("✓ Wallet re-encrypted at {}", key.display());
+            } else {
+                println!(
+                    "✓ Encryption removed — {} now holds the key in plaintext",
+                    key.display()
+                );
+            }
         }
     }
     Ok(())
-}
-
-fn rpassword_prompt(_prompt: &str) -> String {
-    // For now, read from stdin (in production: use rpassword crate for hidden input)
-    let mut s = String::new();
-    std::io::stdin().read_line(&mut s).unwrap();
-    s.trim().to_string()
 }
 
 #[cfg(test)]
@@ -380,5 +398,12 @@ mod tests {
         words[0] = "helix".to_string(); // not a BIP39 word
         assert!(Mnemonic::parse_normalized(&words.join(" ")).is_err());
     }
-}
 
+    #[test]
+    fn an_empty_passphrase_means_plaintext_not_a_lock_that_opens_on_enter() {
+        let kp = KeyPair::generate();
+        assert!(!encode(&kp, Some("")).unwrap().is_encrypted());
+        assert!(!encode(&kp, None).unwrap().is_encrypted());
+        assert!(encode(&kp, Some("x")).unwrap().is_encrypted());
+    }
+}

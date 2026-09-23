@@ -30,6 +30,7 @@ helix wallet restore --mnemonic "trim thought ..."    # ...non-interactively (la
 
 helix wallet info --key alice.json                    # address, public key, algorithm
 helix wallet address --key alice.json                 # just the address (for scripting)
+helix wallet address --key alice.json --verify        # ...unlocked and derived from the key itself
 helix wallet encrypt "newpass" --key alice.json        # add/change passphrase on an existing wallet
 helix wallet encrypt "" --key alice.json               # remove passphrase encryption
 
@@ -42,6 +43,26 @@ per-use conversion step.
 
 A wallet file is portable — it's just JSON. Anyone with the file (and its passphrase, if
 encrypted) can sign as that address, so treat it like a private key, because it is one.
+
+**What the CLI does to protect that file:**
+- `wallet new`, `wallet restore` and `wallet import-node-key` **never overwrite** an existing
+  file. Running `helix wallet new` twice in one directory used to replace the first
+  `wallet.json` with a new wallet; now the second run stops with "already exists". Pick another
+  `-o`, or move the old file away first.
+- Key files are written **readable by their owner only** (mode `0600`), whatever the umask.
+  Files written by older versions keep their mode until `wallet encrypt` rewrites them; to fix
+  one by hand: `chmod 600 alice.json`.
+- `wallet encrypt` replaces the file **in one step** (written beside it, then renamed), so a
+  crash or a full disk cannot leave you with an empty wallet file.
+- **A file whose address does not belong to its key is refused.** The address is stored in
+  plaintext next to the (possibly encrypted) key, so someone who can write the file but does
+  not know the passphrase could otherwise swap in their own address and have `wallet address`
+  hand it out as yours. If you ever see "does not belong to the key stored in it", do not use
+  the address that file shows — restore from your 24 words. One limit remains: `wallet
+  address` and `wallet info` do not unlock the key, so a file forged consistently (address
+  *and* public key replaced together) is only caught when the wallet is next unlocked — by any
+  `tx` command, by `wallet address --verify`, or by the desktop wallet, which always unlocks.
+  Before handing out an address for a large payment, get it with `--verify`.
 
 #### The recovery phrase
 

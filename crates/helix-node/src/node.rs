@@ -272,6 +272,7 @@ mod keypair_file_tests {
     #[test]
     fn loads_passphrase_encrypted_keyfile_when_passphrase_given() {
         let path = std::env::temp_dir().join(format!("helix-test-encrypted-key-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
         let kp = KeyPair::generate();
         let kf = KeyFile::from_keypair_encrypted(&kp, "correct horse battery staple").unwrap();
         kf.save(&path).unwrap();
