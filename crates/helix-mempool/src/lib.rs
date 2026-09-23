@@ -26,6 +26,16 @@ pub enum MempoolError {
     },
     #[error("Invalid transaction: {0}")]
     Invalid(String),
+    /// The signature does not verify against the public key the transaction itself carries.
+    ///
+    /// Split from `Invalid` because it is the one rejection that says something about whoever
+    /// wrote the transaction: it depends on nothing but the transaction's own bytes, so no honest
+    /// node can have produced it — and checking it cost a full signature verification. `Invalid`
+    /// also covers a key that does not match `from`, which depends on chain state (recovery keys
+    /// change by transaction) and can be an honest peer one block ahead. Displays exactly like
+    /// `Invalid`, so nothing a wallet shows changes.
+    #[error("Invalid transaction: {0}")]
+    ForgedSignature(String),
     #[error("Signed for a different chain: transaction {theirs}, this chain {ours}")]
     ForeignChain { theirs: String, ours: String },
     #[error(
@@ -416,8 +426,15 @@ impl Mempool {
         // an inflated fee to have `evict_lowest_fee()` discard a legitimate tx, then
         // have their own (never-admitted) tx rejected here — a free way to grind
         // down other users' pending transactions.
-        tx.verify_signature_with_recovery_key(recovery_key)
+        //
+        // In two halves, so the rejection says which: a key not entitled to `from` is state-
+        // dependent and cheap, a signature that fails under the transaction's own key is neither
+        // (see `MempoolError::ForgedSignature`). Same checks, same order as
+        // `verify_signature_with_recovery_key`.
+        tx.verify_sender_key(recovery_key)
             .map_err(|e| MempoolError::Invalid(e.to_string()))?;
+        tx.verify_own_signature()
+            .map_err(|e| MempoolError::ForgedSignature(e.to_string()))?;
 
         // Another chain's transaction cannot execute here, so holding it wastes a pool slot and,
         // once a proposer packs it, block space — for free, since a transaction that fails this
@@ -636,6 +653,40 @@ mod tests {
     /// actually be spent.
     fn make_tx(keypair: &KeyPair, fee: Amount, nonce: u64) -> Transaction {
         make_tx_with_data(keypair, fee, nonce, 0)
+    }
+
+    /// #225. A signature that fails under the transaction's own key is the one rejection that
+    /// says something about whoever wrote the transaction, so it is its own variant — and it must
+    /// read exactly like every other invalid transaction, because wallets show this text.
+    #[test]
+    fn a_signature_that_fails_under_its_own_key_is_a_forgery_not_just_invalid() {
+        let kp = KeyPair::generate();
+        let mut tx = make_tx(&kp, 10_000, 0);
+        tx.signature = kp.sign(b"a different message").unwrap();
+
+        let err = Mempool::new().add(tx, Hash::ZERO, Some(0)).unwrap_err();
+
+        assert!(matches!(err, MempoolError::ForgedSignature(_)), "{err:?}");
+        assert!(
+            err.to_string().starts_with("Invalid transaction: "),
+            "{err}"
+        );
+    }
+
+    /// The other half, and the reason for the split: a key that is not entitled to `from` depends
+    /// on chain state — an account recovered in a block this node has not applied yet looks
+    /// exactly like this — so it is merely invalid here, and says nothing about its author.
+    #[test]
+    fn a_key_not_entitled_to_from_is_invalid_but_not_a_forgery() {
+        let owner = KeyPair::generate();
+        let stranger = KeyPair::generate();
+        let mut tx = make_tx(&owner, 10_000, 0);
+        tx.public_key = stranger.public.clone();
+        tx.signature = stranger.sign(tx.signing_hash().as_bytes()).unwrap();
+
+        let err = Mempool::new().add(tx, Hash::ZERO, Some(0)).unwrap_err();
+
+        assert!(matches!(err, MempoolError::Invalid(_)), "{err:?}");
     }
 
     /// #185. The admission check (`a_transaction_whose_nonce_is_already_spent_is_refused`) fires
@@ -1341,10 +1392,14 @@ mod tests {
         assert_eq!(pool.len(), 2);
 
         // Would outbid the cheapest tx (5_000) on fee alone, but the signature is
-        // garbage — must be rejected as Invalid without evicting anything.
+        // garbage — must be rejected as a forgery (#225: its own variant, since it fails under
+        // the transaction's own key) without evicting anything.
         let mut forged = make_tx(&attacker_kp, 100_000, 0);
         forged.signature = Signature::from_bytes(vec![0u8; 32]);
-        assert!(matches!(pool.add(forged, Hash::ZERO, None), Err(MempoolError::Invalid(_))));
+        assert!(matches!(
+            pool.add(forged, Hash::ZERO, None),
+            Err(MempoolError::ForgedSignature(_))
+        ));
 
         assert_eq!(pool.len(), 2);
         assert!(pool.contains(&cheap_hash), "cheapest tx must survive a forged eviction attempt");

@@ -15,7 +15,7 @@ use helix_executor::{
     state::ChainState,
     GovernanceParams,
 };
-use helix_mempool::Mempool;
+use helix_mempool::{Mempool, MempoolError};
 use helix_p2p::{
     blocksync::BlockSyncResponse,
     config::P2PConfig,
@@ -1524,13 +1524,21 @@ impl HelixNode {
         let mut p2p_event_rx = self.p2p_event_rx;
         // Peer transactions are admitted on their own task, never in line with consensus
         // messages — see `route_peer_transaction`.
-        let (peer_tx_queue, mut peer_tx_rx) = mpsc::channel::<Transaction>(PEER_TX_QUEUE);
+        let (peer_tx_queue, mut peer_tx_rx) =
+            mpsc::channel::<(Transaction, Option<String>)>(PEER_TX_QUEUE);
         let mempool_for_admission = self.mempool.clone();
         let chain_state_for_admission = self.chain_state.clone();
+        let p2p_tx_for_admission = self.p2p_command_tx.clone();
         tokio::spawn(async move {
-            while let Some(tx) = peer_tx_rx.recv().await {
-                admit_peer_transaction(tx, &mempool_for_admission, &chain_state_for_admission)
-                    .await;
+            while let Some((tx, author)) = peer_tx_rx.recv().await {
+                admit_peer_transaction(
+                    tx,
+                    author,
+                    &mempool_for_admission,
+                    &chain_state_for_admission,
+                    &p2p_tx_for_admission,
+                )
+                .await;
             }
         });
         tokio::spawn(async move {
@@ -1855,10 +1863,13 @@ const PEER_TX_QUEUE: usize = 2048;
 /// of 2000 transactions held three test validators at `heard=none` for 2.5 minutes. Votes,
 /// proposals, round-sync answers and blocks now never wait for a transaction; a transaction that
 /// finds the worker's queue full is dropped, the same trade the swarm makes one step earlier.
-fn route_peer_transaction(event: P2PEvent, queue: &mpsc::Sender<Transaction>) -> Option<P2PEvent> {
+fn route_peer_transaction(
+    event: P2PEvent,
+    queue: &mpsc::Sender<(Transaction, Option<String>)>,
+) -> Option<P2PEvent> {
     match event {
-        P2PEvent::NewTransaction(tx) => {
-            if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send(tx) {
+        P2PEvent::NewTransaction(tx, author) => {
+            if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send((tx, author)) {
                 note_dropped_queued_transaction();
             }
             None
@@ -1886,10 +1897,19 @@ fn note_dropped_queued_transaction() {
 /// Check a transaction a peer gossiped and, if it passes, put it in the pool. Runs on the
 /// admission worker in production (`route_peer_transaction`), and from `handle_p2p_event` for
 /// anything that calls it directly.
+///
+/// `author` is the peer that *wrote* the transaction (gossipsub's signed `message.source`). If
+/// its signature fails under its own key — the one rejection that no honest node can cause —
+/// that author is reported to the P2P service to be charged a strike (#225). Every other
+/// rejection is left alone: a spent nonce, a pool that is full, a fee under today's base fee,
+/// a key that does not match `from` — each can be an honest peer on a slightly different chain
+/// state, and charging them would get honest peers banned for being a block ahead or behind.
 async fn admit_peer_transaction(
     tx: Transaction,
+    author: Option<String>,
     mempool: &Arc<RwLock<Mempool>>,
     chain_state: &Arc<RwLock<ChainState>>,
+    p2p_tx: &mpsc::Sender<P2PCommand>,
 ) {
     let (recovery_key, can_pay, chain_id, account_nonce) = {
         let chain = chain_state.read().await;
@@ -1909,10 +1929,19 @@ async fn admit_peer_transaction(
         warn!(from = %tx.from, fee = tx.fee, "Rejected peer tx: sender cannot pay the declared fee");
         return;
     }
-    let mut pool = mempool.write().await;
-    match pool.add_with_recovery_key(tx, recovery_key.as_ref(), chain_id, Some(account_nonce)) {
-        Ok(()) => {}
-        Err(e) => warn!("Rejected peer tx: {}", e),
+    let admitted = mempool.write().await.add_with_recovery_key(
+        tx,
+        recovery_key.as_ref(),
+        chain_id,
+        Some(account_nonce),
+    );
+    if let Err(e) = admitted {
+        if let (MempoolError::ForgedSignature(_), Some(author)) = (&e, author) {
+            // `try_send`: the admission worker must never wait on the swarm (the lesson of
+            // #224). A report dropped here is one strike not charged, nothing worse.
+            let _ = p2p_tx.try_send(P2PCommand::ForgedTransactionFrom(author));
+        }
+        warn!("Rejected peer tx: {}", e);
     }
 }
 
@@ -1931,7 +1960,9 @@ async fn handle_p2p_event(
     tip_certificate: &Arc<RwLock<TipCertificate>>,
 ) {
     match event {
-        P2PEvent::NewTransaction(tx) => admit_peer_transaction(tx, mempool, chain_state).await,
+        P2PEvent::NewTransaction(tx, author) => {
+            admit_peer_transaction(tx, author, mempool, chain_state, p2p_tx).await
+        }
         P2PEvent::NewProposal(proposal) => {
             apply_peer_proposal(proposal, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
         }
@@ -11948,14 +11979,205 @@ mod peer_transaction_routing_tests {
         let (queue, mut worker) = mpsc::channel(1);
         for nonce in 0..3 {
             assert!(
-                route_peer_transaction(P2PEvent::NewTransaction(a_transaction(nonce)), &queue)
-                    .is_none(),
+                route_peer_transaction(
+                    P2PEvent::NewTransaction(a_transaction(nonce), None),
+                    &queue
+                )
+                .is_none(),
                 "a transaction never reaches the consensus event loop"
             );
         }
         // Capacity one: the first was queued, the other two dropped — and routing returned for
         // all three, which is the property that matters: it never waited for room.
-        assert_eq!(worker.try_recv().unwrap().nonce, 0);
+        assert_eq!(worker.try_recv().unwrap().0.nonce, 0);
         assert!(worker.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod forged_transaction_tests {
+    use super::*;
+
+    const AUTHOR: &str = "12D3KooWAuthorOfTheTransaction";
+
+    struct Fixture {
+        mempool: Arc<RwLock<Mempool>>,
+        chain_state: Arc<RwLock<ChainState>>,
+        commands_tx: mpsc::Sender<P2PCommand>,
+        commands: mpsc::Receiver<P2PCommand>,
+        kp: KeyPair,
+        chain_id: Hash,
+    }
+
+    /// One funded account and an empty pool.
+    fn fixture(mempool: Mempool) -> Fixture {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let mut state = ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX);
+        let mut account = helix_executor::AccountState::new(&addr);
+        account.balance = 1_000 * NANO_PER_HLX;
+        state.accounts.insert(addr.to_string(), account);
+        let chain_id = state.chain_id;
+        let (commands_tx, commands) = mpsc::channel(8);
+        Fixture {
+            mempool: Arc::new(RwLock::new(mempool)),
+            chain_state: Arc::new(RwLock::new(state)),
+            commands_tx,
+            commands,
+            kp,
+            chain_id,
+        }
+    }
+
+    /// A transfer honestly signed by `kp`.
+    fn signed(kp: &KeyPair, nonce: u64, fee: u64, chain_id: Hash) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: Address::from_public_key(&kp.public),
+            to: Some(Address::from_public_key(&KeyPair::generate().public)),
+            amount: 1,
+            fee,
+            nonce,
+            data: vec![],
+            crypto_version: kp.scheme,
+            chain_id,
+            signature: Signature::from_bytes(vec![]),
+            public_key: kp.public.clone(),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    async fn admit(f: &Fixture, tx: Transaction, author: Option<&str>) {
+        admit_peer_transaction(
+            tx,
+            author.map(str::to_string),
+            &f.mempool,
+            &f.chain_state,
+            &f.commands_tx,
+        )
+        .await;
+    }
+
+    /// The attack from the task: a funded account's real `from` and real public key, and a
+    /// signature that is right in length and wrong in content. It passes every cheap check —
+    /// the fee is payable, the key derives `from` — and costs a full ML-DSA verification.
+    #[tokio::test]
+    async fn a_forged_signature_is_reported_against_the_peer_that_wrote_it() {
+        let mut f = fixture(Mempool::new());
+        let mut tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
+        tx.signature = f.kp.sign(b"some other message entirely").unwrap();
+
+        admit(&f, tx, Some(AUTHOR)).await;
+
+        match f.commands.try_recv() {
+            Ok(P2PCommand::ForgedTransactionFrom(author)) => assert_eq!(author, AUTHOR),
+            other => panic!("expected the author to be reported, got {other:?}"),
+        }
+        assert_eq!(
+            f.mempool.read().await.len(),
+            0,
+            "and the transaction is not admitted"
+        );
+    }
+
+    /// Nothing to report when gossipsub could not say who wrote it.
+    #[tokio::test]
+    async fn a_forged_signature_with_no_known_author_reports_nobody() {
+        let mut f = fixture(Mempool::new());
+        let mut tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
+        tx.signature = f.kp.sign(b"some other message entirely").unwrap();
+
+        admit(&f, tx, None).await;
+
+        assert!(f.commands.try_recv().is_err());
+    }
+
+    /// Every rejection below is one an honest peer can cause — by being a block ahead or behind,
+    /// by pricing against a different base fee, by reaching a full pool. Each must cost that peer
+    /// nothing: charging any of them gets honest peers banned for disagreeing about state. One
+    /// test per case, so a red run names the case.
+    async fn assert_rejected_and_nobody_reported(mut f: Fixture, tx: Transaction, case: &str) {
+        let before = f.mempool.read().await.len();
+        admit(&f, tx, Some(AUTHOR)).await;
+        assert_eq!(
+            f.mempool.read().await.len(),
+            before,
+            "{case}: must have been rejected"
+        );
+        assert!(
+            f.commands.try_recv().is_err(),
+            "{case}: an honest rejection reported its author"
+        );
+    }
+
+    /// What an honest transaction from an account recovered in a block this node has not applied
+    /// yet looks like: signed correctly, by a key this node does not (yet) accept for `from`.
+    #[tokio::test]
+    async fn a_key_not_entitled_to_from_is_not_held_against_the_author() {
+        let f = fixture(Mempool::new());
+        let mut tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
+        let stranger = KeyPair::generate();
+        tx.public_key = stranger.public.clone();
+        tx.signature = stranger.sign(tx.signing_hash().as_bytes()).unwrap();
+        assert_rejected_and_nobody_reported(f, tx, "key not entitled to `from`").await;
+    }
+
+    #[tokio::test]
+    async fn a_spent_nonce_is_not_held_against_the_author() {
+        let f = fixture(Mempool::new());
+        let addr = Address::from_public_key(&f.kp.public).to_string();
+        f.chain_state
+            .write()
+            .await
+            .accounts
+            .get_mut(&addr)
+            .unwrap()
+            .nonce = 5;
+        let tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
+        assert_rejected_and_nobody_reported(f, tx, "spent nonce").await;
+    }
+
+    #[tokio::test]
+    async fn an_unpayable_fee_is_not_held_against_the_author() {
+        let f = fixture(Mempool::new());
+        let tx = signed(&f.kp, 0, 10_000 * NANO_PER_HLX, f.chain_id);
+        assert_rejected_and_nobody_reported(f, tx, "fee not payable").await;
+    }
+
+    #[tokio::test]
+    async fn a_fee_below_this_nodes_base_fee_is_not_held_against_the_author() {
+        let mut pool = Mempool::new();
+        pool.set_base_fee_per_byte(1_000_000);
+        let f = fixture(pool);
+        let tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
+        assert_rejected_and_nobody_reported(f, tx, "below the base fee").await;
+    }
+
+    #[tokio::test]
+    async fn another_chains_transaction_is_not_held_against_the_author() {
+        let f = fixture(Mempool::new());
+        let tx = signed(&f.kp, 0, 1_000_000, Hash::digest(b"another chain"));
+        assert_rejected_and_nobody_reported(f, tx, "foreign chain").await;
+    }
+
+    #[tokio::test]
+    async fn a_full_pool_is_not_held_against_the_author() {
+        let f = fixture(Mempool::with_limits(1, 0));
+        admit(&f, signed(&f.kp, 0, 1_000_000, f.chain_id), None).await;
+        assert_eq!(f.mempool.read().await.len(), 1, "sanity: the pool is full");
+        let tx = signed(&f.kp, 1, 1_000_000, f.chain_id);
+        assert_rejected_and_nobody_reported(f, tx, "mempool full").await;
+    }
+
+    /// Positive control for all of the above: an honest transaction goes in and nobody is
+    /// reported — so "nobody reported" above is not merely "nothing happened".
+    #[tokio::test]
+    async fn an_honest_transaction_is_admitted_and_reports_nobody() {
+        let mut f = fixture(Mempool::new());
+        admit(&f, signed(&f.kp, 0, 1_000_000, f.chain_id), Some(AUTHOR)).await;
+        assert_eq!(f.mempool.read().await.len(), 1);
+        assert!(f.commands.try_recv().is_err());
     }
 }

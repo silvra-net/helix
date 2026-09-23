@@ -39,7 +39,10 @@ use crate::{
 #[derive(Debug)]
 pub enum P2PEvent {
     NewProposal(Proposal),
-    NewTransaction(Transaction),
+    /// A gossiped transaction, with the peer that **wrote** it — gossipsub's signature-checked
+    /// `message.source`, not the peer that happened to hand it over. The node needs it to say
+    /// whose transaction was forged, if it turns out to be (`P2PCommand::ForgedTransactionFrom`).
+    NewTransaction(Transaction, Option<String>),
     NewVote(Vote),
     /// A peer broadcast a committed block (already past BFT quorum), together with the commit
     /// certificate — the precommit votes that finalized it. The receiving node applies the block
@@ -123,6 +126,11 @@ pub enum P2PCommand {
     /// so it won every `best_blocksync_peer` choice, which is precisely the wrong peer to prefer
     /// when a real validator needs to catch up.
     BlocksyncPeerOnAnotherChain(String),
+    /// The node checked a transaction this peer **wrote** and its signature does not verify
+    /// against the key it carries — provably forged, whatever the chain state (see
+    /// `MempoolError::ForgedSignature`). Charged as a misbehavior strike to that author, and only
+    /// if it is connected here; see `accountable_author` for why never the relay.
+    ForgedTransactionFrom(String),
     /// A synced batch is on disk and `tip_height` has moved — ask for the next one now instead of
     /// waiting out the rest of `blocksync_interval`.
     ///
@@ -585,23 +593,42 @@ impl P2PService {
                                 // An unreadable peer-exchange message is an old build far more often
                                 // than it is an attack (#166), so it is counted per peer rather
                                 // than charged on sight — see `unreadable_peer_exchange`.
+                                //
+                                // Counted per *author*, like every strike (see
+                                // `accountable_author`): an honest relay forwarding an old
+                                // node's announcements is not the old node. And only for a
+                                // connected author — this map is never cleaned up.
                                 if outcome.malformed {
-                                    let seen = unreadable_peer_exchange_counts
-                                        .entry(propagation_source)
-                                        .and_modify(|n| *n += 1)
-                                        .or_insert(1);
-                                    let (message, strike) =
-                                        unreadable_peer_exchange(&peer_str, *seen);
-                                    if let Some(message) = message {
-                                        warn!("{message}");
+                                    match accountable_author(message.source, |peer| {
+                                        swarm.is_connected(peer)
+                                    }) {
+                                        Some(author) => {
+                                            let seen = unreadable_peer_exchange_counts
+                                                .entry(author)
+                                                .and_modify(|n| *n += 1)
+                                                .or_insert(1);
+                                            let (text, strike) = unreadable_peer_exchange(
+                                                &author.to_string(),
+                                                *seen,
+                                            );
+                                            if let Some(text) = text {
+                                                warn!("{text}");
+                                            }
+                                            strike
+                                        }
+                                        None => false,
                                     }
-                                    strike
                                 } else {
                                     false
                                 }
                             } else {
-                                let outcome =
-                                    handle_app_message(topic, &message.data, &event_tx).await;
+                                let outcome = handle_app_message(
+                                    topic,
+                                    &message.data,
+                                    message.source,
+                                    &event_tx,
+                                )
+                                .await;
                                 // A gossiped block is a live statement about its sender's height,
                                 // and it arrives with every block rather than once per
                                 // `peer_exchange_interval`. Without it `peer_tips` has exactly one
@@ -639,9 +666,13 @@ impl P2PService {
                                 outcome.malformed
                             };
 
-                            if malformed && reputation.record_infraction(&peer_str) {
-                                warn!(peer = %peer_str, "peer exceeded misbehavior threshold — disconnecting");
-                                let _ = swarm.disconnect_peer_id(propagation_source);
+                            if malformed {
+                                charge_author(
+                                    &mut swarm,
+                                    &mut reputation,
+                                    message.source,
+                                    "unreadable gossip payload",
+                                );
                             }
                         }
 
@@ -1249,6 +1280,15 @@ impl P2PService {
                                 Err(_) => warn!(peer = %peer, "Unparseable peer id in block-sync report"),
                             }
                         }
+                        P2PCommand::ForgedTransactionFrom(author) => match author.parse::<PeerId>() {
+                            Ok(author) => charge_author(
+                                &mut swarm,
+                                &mut reputation,
+                                Some(author),
+                                "transaction with a forged signature",
+                            ),
+                            Err(_) => warn!(peer = %author, "Unparseable peer id in forged-transaction report"),
+                        },
                         P2PCommand::BlocksyncBatchRejected(peer) => {
                             // The node verified the batch and threw it away. From the service's own
                             // view that is indistinguishable from success — it only ever sees a
@@ -1713,6 +1753,65 @@ fn decode_peer_exchange(data: &[u8]) -> Option<PeerExchangeMsg> {
 /// without ever earning a strike would have a free channel. Repetition is what separates the two,
 /// so repetition is what is counted.
 const UNREADABLE_PEER_EXCHANGE_TOLERANCE: u32 = 3;
+
+/// Who answers for a message that turned out to be bad: its **author**, and only if the author
+/// is connected to this node. Never the peer that relayed it.
+///
+/// gossipsub here forwards every message whose envelope signature checks out *before* this node
+/// has read the payload (no application-level validation — `libp2p-gossipsub` 0.47,
+/// `handle_received_message`). So the peer that hands us a bad message is, more often than not,
+/// an honest node that relayed it one step earlier. Charging that peer was the rule until #225,
+/// and it was an attack: an outsider with no stake published ten garbage messages to one honest
+/// node, and the node's neighbour — which had never spoken to the outsider — banned the honest
+/// node (`tests/hostile_gossip.rs`, red before the fix). On a chain whose operators all reach
+/// each other through one hub (#177), that is every validator banning the hub: a partition from
+/// a handful of messages.
+///
+/// The author is safe to charge because it is authenticated: the service runs gossipsub with
+/// `MessageAuthenticity::Signed` and `ValidationMode::Strict`, so `message.source` is the key
+/// that signed exactly these bytes. **Only a connected author** is charged, for two reasons: there
+/// is nothing to disconnect otherwise, and a strike recorded for an identity that never connects
+/// is never cleaned up (`PeerReputation::on_disconnect` does that), so an author minting a fresh
+/// identity per message would grow the table without bound.
+///
+/// **The limit, stated because it is real:** that same attacker — one fresh author key per
+/// message — is never charged at all. What it can still do is what #224 already bounded: every
+/// bad message costs a decode or one signature check, inside a queue that drops when full. What it
+/// can no longer do is get an honest node disconnected. Stopping such messages from being relayed
+/// in the first place needs validation *before* forwarding (gossipsub's `validate_messages`),
+/// which is a larger change and not this one.
+fn accountable_author(
+    author: Option<PeerId>,
+    is_connected: impl Fn(&PeerId) -> bool,
+) -> Option<PeerId> {
+    author.filter(|a| is_connected(a))
+}
+
+/// Charge one misbehavior strike to the author of a bad message — see [`accountable_author`] —
+/// and disconnect it once it crosses the ban threshold. The one place that decides whom to
+/// charge, for garbage payloads and forged transactions alike (Lehre 12).
+fn charge_author(
+    swarm: &mut libp2p::Swarm<HelixBehaviour>,
+    reputation: &mut PeerReputation,
+    author: Option<PeerId>,
+    what: &str,
+) {
+    match accountable_author(author, |peer| swarm.is_connected(peer)) {
+        Some(author) => {
+            let peer = author.to_string();
+            if reputation.record_infraction(&peer) {
+                warn!(peer = %peer, offence = what, "peer exceeded misbehavior threshold — disconnecting");
+                let _ = swarm.disconnect_peer_id(author);
+            }
+        }
+        None => debug!(
+            author = ?author,
+            offence = what,
+            "Bad message written by a peer not connected here — not charged: the peer that relayed \
+             it is not its author, and a strike for an absent identity would never be cleared"
+        ),
+    }
+}
 
 /// What to do about a peer whose peer-exchange message this build cannot read.
 ///
@@ -2303,6 +2402,7 @@ fn note_dropped_peer_transaction() {
 async fn handle_app_message(
     topic: &str,
     data: &[u8],
+    author: Option<PeerId>,
     event_tx: &mpsc::Sender<P2PEvent>,
 ) -> AppMessageOutcome {
     if topic == TOPIC_BLOCKS {
@@ -2333,8 +2433,9 @@ async fn handle_app_message(
                 // checking signatures. A transaction dropped here is still in every mempool the
                 // gossip reached and in its sender's node; a vote held up here costs the round.
                 // So transactions are best-effort, and proposals, votes and blocks are not.
+                // So transactions are best-effort, and proposals, votes and blocks are not.
                 if let Err(mpsc::error::TrySendError::Full(_)) =
-                    event_tx.try_send(P2PEvent::NewTransaction(tx))
+                    event_tx.try_send(P2PEvent::NewTransaction(tx, author.map(|a| a.to_string())))
                 {
                     note_dropped_peer_transaction();
                 }
@@ -3614,7 +3715,7 @@ mod observed_height_tests {
             bincode::serialize(&(block_at(4_200), Vec::<helix_consensus::vote::Vote>::new()))
                 .unwrap();
 
-        let outcome = handle_app_message(TOPIC_COMMITTED_BLOCKS, &data, &tx).await;
+        let outcome = handle_app_message(TOPIC_COMMITTED_BLOCKS, &data, None, &tx).await;
 
         assert!(!outcome.malformed);
         assert_eq!(outcome.observed_height, Some(4_200));
@@ -3628,7 +3729,7 @@ mod observed_height_tests {
         let (tx, _rx) = mpsc::channel(4);
         let data = bincode::serialize(&Proposal::fresh(0, block_at(4_200))).unwrap();
 
-        let outcome = handle_app_message(TOPIC_BLOCKS, &data, &tx).await;
+        let outcome = handle_app_message(TOPIC_BLOCKS, &data, None, &tx).await;
 
         assert!(!outcome.malformed);
         assert_eq!(outcome.observed_height, Some(4_199));
@@ -3640,7 +3741,7 @@ mod observed_height_tests {
         let (tx, _rx) = mpsc::channel(4);
         let data = bincode::serialize(&Proposal::fresh(0, block_at(0))).unwrap();
 
-        let outcome = handle_app_message(TOPIC_BLOCKS, &data, &tx).await;
+        let outcome = handle_app_message(TOPIC_BLOCKS, &data, None, &tx).await;
 
         assert_eq!(outcome.observed_height, None);
     }
@@ -3673,7 +3774,7 @@ mod observed_height_tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            handle_app_message(TOPIC_TRANSACTIONS, &data, &tx),
+            handle_app_message(TOPIC_TRANSACTIONS, &data, None, &tx),
         )
         .await
         .expect("handing on a transaction must not wait for room in the channel");
@@ -3695,7 +3796,7 @@ mod observed_height_tests {
     async fn a_malformed_vote_is_a_strike_and_still_claims_no_height() {
         let (tx, _rx) = mpsc::channel(4);
 
-        let outcome = handle_app_message(TOPIC_VOTES, b"not a vote", &tx).await;
+        let outcome = handle_app_message(TOPIC_VOTES, b"not a vote", None, &tx).await;
 
         assert!(outcome.malformed);
         assert_eq!(outcome.observed_height, None);
@@ -4044,5 +4145,37 @@ mod proposal_reoffer_tests {
         assert!(!proposal_reached_the_network(&Err(PublishError::TransformFailed(
             std::io::Error::other("transform"),
         ))));
+    }
+}
+
+#[cfg(test)]
+mod accountability_tests {
+    use super::accountable_author;
+    use libp2p::PeerId;
+
+    #[test]
+    fn a_connected_author_answers_for_its_message() {
+        let author = PeerId::random();
+        assert_eq!(
+            accountable_author(Some(author), |p| *p == author),
+            Some(author)
+        );
+    }
+
+    /// Nothing to disconnect, and a strike recorded for it would never be cleared — an author
+    /// minting a fresh identity per message would grow the reputation table without bound.
+    #[test]
+    fn an_author_that_is_not_connected_here_answers_to_no_one_here() {
+        let author = PeerId::random();
+        let someone_else = PeerId::random();
+        assert_eq!(
+            accountable_author(Some(author), |p| *p == someone_else),
+            None
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_known_author_is_charged_to_no_one() {
+        assert_eq!(accountable_author(None, |_| true), None);
     }
 }
