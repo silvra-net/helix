@@ -21,7 +21,10 @@ pub use reputation::PeerReputation;
 pub use roundsync::{
     RoundProvider, RoundSyncRequest, RoundSyncResponse, MAX_ROUNDSYNC_VOTES, ROUNDSYNC_PROTOCOL,
 };
-pub use service::{P2PCommand, P2PEvent, P2PService, MAX_CATCHUP_SERVE_BLOCKS, MIN_HEALTHY_PEERS};
+pub use service::{
+    GossipTicket, P2PCommand, P2PEvent, P2PService, TicketProbe, TransactionVerdict,
+    MAX_CATCHUP_SERVE_BLOCKS, MIN_HEALTHY_PEERS,
+};
 
 use thiserror::Error;
 

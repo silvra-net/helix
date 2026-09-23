@@ -39,10 +39,10 @@ use crate::{
 #[derive(Debug)]
 pub enum P2PEvent {
     NewProposal(Proposal),
-    /// A gossiped transaction, with the peer that **wrote** it — gossipsub's signature-checked
-    /// `message.source`, not the peer that happened to hand it over. The node needs it to say
-    /// whose transaction was forged, if it turns out to be (`P2PCommand::ForgedTransactionFrom`).
-    NewTransaction(Transaction, Option<String>),
+    /// A gossiped transaction, and — when it came through gossip — the ticket the node answers
+    /// with its verdict (`GossipTicket::answer`): the transaction is not forwarded to anyone until
+    /// then (#228). `None` for a transaction that reached the node another way.
+    NewTransaction(Transaction, Option<GossipTicket>),
     NewVote(Vote),
     /// A peer broadcast a committed block (already past BFT quorum), together with the commit
     /// certificate — the precommit votes that finalized it. The receiving node applies the block
@@ -83,6 +83,108 @@ pub enum P2PEvent {
     /// its pending proposal and the votes it has seen. Entirely untrusted — the node feeds both
     /// through `receive_proposal`/`add_vote`, the same paths a gossiped message takes.
     RoundSynced(RoundSyncResponse, String),
+}
+
+/// A gossiped transaction the swarm is holding back until the node has checked it (#228).
+///
+/// The node answers it with [`GossipTicket::answer`], and that decides whether gossipsub forwards
+/// the transaction. **A ticket answers exactly once, and a dropped one answers for itself**
+/// (`Unjudged`): any path that loses a transaction — a full queue, a worker that stopped, a
+/// rejection nobody thought to report — still tells the swarm, and nothing can answer twice.
+///
+/// The answer goes straight back to the swarm loop on a channel of its own, never on the command
+/// channel: that one carries this node's votes by `try_send`, and a flood of verdicts there would
+/// displace them.
+#[derive(Debug)]
+pub struct GossipTicket {
+    message_id: gossipsub::MessageId,
+    propagation_source: PeerId,
+    author: Option<PeerId>,
+    /// `None` once answered.
+    answer_to: Option<mpsc::Sender<CheckedTransaction>>,
+}
+
+/// A ticket's answer, on its way back to the swarm loop.
+#[derive(Debug)]
+struct CheckedTransaction {
+    message_id: gossipsub::MessageId,
+    propagation_source: PeerId,
+    author: Option<PeerId>,
+    verdict: TransactionVerdict,
+}
+
+/// How many answered tickets may wait for the swarm loop. Far more than can be outstanding at once
+/// (the event channel plus the node's admission queue); an answer that finds it full is dropped,
+/// and the transaction is then simply not forwarded.
+const TRANSACTION_VERDICT_QUEUE: usize = 4096;
+
+impl GossipTicket {
+    /// The peer that wrote the transaction (gossipsub's signed `message.source`).
+    pub fn author(&self) -> Option<String> {
+        self.author.map(|a| a.to_string())
+    }
+
+    /// The node's verdict. Never waits: the admission worker must not wait on the swarm (#224). An
+    /// answer the swarm cannot take in is dropped, and the transaction is not forwarded — it ages
+    /// out of gossipsub's cache within seconds.
+    pub fn answer(mut self, verdict: TransactionVerdict) {
+        self.send(verdict);
+    }
+
+    fn send(&mut self, verdict: TransactionVerdict) {
+        if let Some(answer_to) = self.answer_to.take() {
+            let _ = answer_to.try_send(CheckedTransaction {
+                message_id: self.message_id.clone(),
+                propagation_source: self.propagation_source,
+                author: self.author,
+                verdict,
+            });
+        }
+    }
+
+    /// A ticket for no real message, and the verdicts it gives — for tests of code that answers
+    /// tickets.
+    #[doc(hidden)]
+    pub fn for_test() -> (Self, TicketProbe) {
+        let (answer_to, answers) = mpsc::channel(4);
+        let ticket = GossipTicket {
+            message_id: gossipsub::MessageId::from("for-test"),
+            propagation_source: PeerId::random(),
+            author: Some(PeerId::random()),
+            answer_to: Some(answer_to),
+        };
+        (ticket, TicketProbe(answers))
+    }
+}
+
+impl Drop for GossipTicket {
+    fn drop(&mut self) {
+        self.send(TransactionVerdict::Unjudged);
+    }
+}
+
+/// What a test ticket was answered with.
+#[doc(hidden)]
+pub struct TicketProbe(mpsc::Receiver<CheckedTransaction>);
+
+impl TicketProbe {
+    /// Every answer given so far — a correct ticket gives exactly one.
+    pub fn answers(&mut self) -> Vec<TransactionVerdict> {
+        std::iter::from_fn(|| self.0.try_recv().ok().map(|c| c.verdict)).collect()
+    }
+}
+
+/// What the node found when it checked a gossiped transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionVerdict {
+    /// Admitted — forward it.
+    Valid,
+    /// Its signature fails under its own key: no honest node can have written it. Not forwarded,
+    /// and its author is charged a strike.
+    Forged,
+    /// Not admitted for a reason that says nothing about its author — a spent nonce, a full
+    /// pool, a fee under this node's base fee, a queue that was full. Not forwarded, no strike.
+    Unjudged,
 }
 
 /// Commands sent TO the P2P network FROM the node
@@ -126,11 +228,6 @@ pub enum P2PCommand {
     /// so it won every `best_blocksync_peer` choice, which is precisely the wrong peer to prefer
     /// when a real validator needs to catch up.
     BlocksyncPeerOnAnotherChain(String),
-    /// The node checked a transaction this peer **wrote** and its signature does not verify
-    /// against the key it carries — provably forged, whatever the chain state (see
-    /// `MempoolError::ForgedSignature`). Charged as a misbehavior strike to that author, and only
-    /// if it is connected here; see `accountable_author` for why never the relay.
-    ForgedTransactionFrom(String),
     /// A synced batch is on disk and `tip_height` has moved — ask for the next one now instead of
     /// waiting out the rest of `blocksync_interval`.
     ///
@@ -528,107 +625,36 @@ impl P2PService {
         // how fast it can proceed. Cheap when idle — with nobody ahead of us it is one map scan.
         let mut blocksync_interval = tokio::time::interval(Duration::from_secs(2));
 
+        // Answers to the gossiped transactions this loop is holding back (#228) — see `GossipTicket`.
+        let (transaction_verdict_tx, mut transaction_verdicts) =
+            mpsc::channel::<CheckedTransaction>(TRANSACTION_VERDICT_QUEUE);
+
         loop {
             tokio::select! {
                 event = swarm.next() => {
                     let Some(event) = event else { break };
                     match event {
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Gossipsub(
-                            gossipsub::Event::Message { propagation_source, message, .. }
+                            gossipsub::Event::Message { propagation_source, message_id, message }
                         )) => {
-                            let peer_str = propagation_source.to_string();
-                            if reputation.is_banned(&peer_str) {
-                                continue;
-                            }
-
                             let topic = message.topic.as_str();
-
-                            let malformed = if topic == TOPIC_PEER_EXCHANGE {
-                                let outcome = handle_peer_exchange_message(
-                                    &message.data,
-                                    &mut known_addrs,
-                                    announced_self.as_deref(),
+                            // Decoded once, and not at all for a banned peer.
+                            let gossiped = (!reputation.is_banned(&propagation_source.to_string()))
+                                .then(|| decode_gossip(topic, &message.data));
+                            // Whether it may be forwarded: decided in one place and reported here,
+                            // before anything else touches the message and before the node is
+                            // involved (#228). A transaction waits for the node's signature check;
+                            // its ticket carries that obligation.
+                            if let Forwarding::Now(acceptance) = forwarding_of(gossiped.as_ref()) {
+                                report_forwarding(
                                     &mut swarm,
-                                    &mut peer_warnings,
-                                    tip_height.load(Ordering::Relaxed),
-                                    &our_genesis,
+                                    &message_id,
+                                    &propagation_source,
+                                    acceptance,
                                 );
-                                if let Some(range) = outcome.announced_range {
-                                    // Credit the tip to whoever *wrote* the announcement, not to
-                                    // whoever handed it to us. gossipsub floods, so
-                                    // `propagation_source` is merely the last hop, and
-                                    // `PeerExchangeMsg` carries no sender field of its own — so
-                                    // this used to file every relayed announcement under the
-                                    // relaying peer. For a node with a single connection (a fresh
-                                    // one behind the tunnel, which is exactly the node that needs
-                                    // catch-up) *every* announcement arrives that way, so its seed
-                                    // inherited the highest tip anyone in the network claimed.
-                                    // `best_blocksync_peer` picks by highest claim, so catch-up
-                                    // then asked that one peer for blocks it does not have, got a
-                                    // short or empty answer, and put its only usable peer on a 10s
-                                    // cooldown — on repeat.
-                                    //
-                                    // The set runs gossipsub with `MessageAuthenticity::Signed`
-                                    // and `ValidationMode::Strict`, so `message.source` is a
-                                    // signature-checked origin, not a self-declared one. Falling
-                                    // back to the relay keeps the old behaviour for the case the
-                                    // types allow but Strict rejects before it reaches us.
-                                    let origin = message.source.unwrap_or(propagation_source);
-                                    if record_peer_tip(
-                                        &mut peer_tips,
-                                        &foreign_by_evidence,
-                                        origin,
-                                        range.tip,
-                                        range.earliest,
-                                        TipSource::PeerExchange,
-                                    ) {
-                                        publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
-                                    }
-                                }
-                                if let Some(peer_tip) = outcome.serve_from_tip {
-                                    let _ = event_tx
-                                        .send(P2PEvent::PeerBehind { peer_tip })
-                                        .await;
-                                }
-                                // An unreadable peer-exchange message is an old build far more often
-                                // than it is an attack (#166), so it is counted per peer rather
-                                // than charged on sight — see `unreadable_peer_exchange`.
-                                //
-                                // Counted per *author*, like every strike (see
-                                // `accountable_author`): an honest relay forwarding an old
-                                // node's announcements is not the old node. And only for a
-                                // connected author — this map is never cleaned up.
-                                if outcome.malformed {
-                                    match accountable_author(message.source, |peer| {
-                                        swarm.is_connected(peer)
-                                    }) {
-                                        Some(author) => {
-                                            let seen = unreadable_peer_exchange_counts
-                                                .entry(author)
-                                                .and_modify(|n| *n += 1)
-                                                .or_insert(1);
-                                            let (text, strike) = unreadable_peer_exchange(
-                                                &author.to_string(),
-                                                *seen,
-                                            );
-                                            if let Some(text) = text {
-                                                warn!("{text}");
-                                            }
-                                            strike
-                                        }
-                                        None => false,
-                                    }
-                                } else {
-                                    false
-                                }
-                            } else {
-                                let outcome = handle_app_message(
-                                    topic,
-                                    &message.data,
-                                    message.source,
-                                    &event_tx,
-                                )
-                                .await;
+                            }
+                            let Some(gossiped) = gossiped else { continue };
+
                                 // A gossiped block is a live statement about its sender's height,
                                 // and it arrives with every block rather than once per
                                 // `peer_exchange_interval`. Without it `peer_tips` has exactly one
@@ -640,7 +666,7 @@ impl P2PService {
                                 // a peer holds and must stay able to *lower* a tip (a peer that
                                 // reset now claims less, #175); an old block replayed through the
                                 // mesh must never push a tip back up.
-                                if let Some(height) = outcome.observed_height {
+                                if let Some(height) = observed_height(&gossiped) {
                                     let origin = message.source.unwrap_or(propagation_source);
                                     if record_peer_tip(
                                         &mut peer_tips,
@@ -663,16 +689,135 @@ impl P2PService {
                                     // blocks we already hold, on every block. The interval picks
                                     // the tip up within 2s, which is the entire latency saved.
                                 }
-                                outcome.malformed
-                            };
 
-                            if malformed {
-                                charge_author(
-                                    &mut swarm,
-                                    &mut reputation,
-                                    message.source,
-                                    "unreadable gossip payload",
-                                );
+                            match gossiped {
+                                Gossiped::PeerExchange(msg) => {
+                                    let outcome = handle_peer_exchange_message(
+                                        msg,
+                                        &mut known_addrs,
+                                        announced_self.as_deref(),
+                                        &mut swarm,
+                                        &mut peer_warnings,
+                                        tip_height.load(Ordering::Relaxed),
+                                        &our_genesis,
+                                    );
+                                    if let Some(range) = outcome.announced_range {
+                                        // Credit the tip to whoever *wrote* the announcement, not to
+                                        // whoever handed it to us. gossipsub floods, so
+                                        // `propagation_source` is merely the last hop, and
+                                        // `PeerExchangeMsg` carries no sender field of its own — so
+                                        // this used to file every relayed announcement under the
+                                        // relaying peer. For a node with a single connection (a fresh
+                                        // one behind the tunnel, which is exactly the node that needs
+                                        // catch-up) *every* announcement arrives that way, so its seed
+                                        // inherited the highest tip anyone in the network claimed.
+                                        // `best_blocksync_peer` picks by highest claim, so catch-up
+                                        // then asked that one peer for blocks it does not have, got a
+                                        // short or empty answer, and put its only usable peer on a 10s
+                                        // cooldown — on repeat.
+                                        //
+                                        // The set runs gossipsub with `MessageAuthenticity::Signed`
+                                        // and `ValidationMode::Strict`, so `message.source` is a
+                                        // signature-checked origin, not a self-declared one. Falling
+                                        // back to the relay keeps the old behaviour for the case the
+                                        // types allow but Strict rejects before it reaches us.
+                                        let origin = message.source.unwrap_or(propagation_source);
+                                        if record_peer_tip(
+                                            &mut peer_tips,
+                                            &foreign_by_evidence,
+                                            origin,
+                                            range.tip,
+                                            range.earliest,
+                                            TipSource::PeerExchange,
+                                        ) {
+                                            publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
+                                        }
+                                    }
+                                    if let Some(peer_tip) = outcome.serve_from_tip {
+                                        let _ = event_tx
+                                            .send(P2PEvent::PeerBehind { peer_tip })
+                                            .await;
+                                    }
+                                }
+                                Gossiped::Proposal(proposal) => {
+                                    debug!(
+                                        height = proposal.block.height(),
+                                        round = proposal.round,
+                                        "Proposal from peer"
+                                    );
+                                    let _ = event_tx.send(P2PEvent::NewProposal(proposal)).await;
+                                }
+                                Gossiped::Vote(vote) => {
+                                    let _ = event_tx.send(P2PEvent::NewVote(vote)).await;
+                                }
+                                Gossiped::CommittedBlock(block, commit) => {
+                                    debug!(
+                                        height = block.height(),
+                                        commit_sigs = commit.len(),
+                                        "Committed block from peer"
+                                    );
+                                    let _ = event_tx
+                                        .send(P2PEvent::NewCommittedBlock(block, commit))
+                                        .await;
+                                }
+                                Gossiped::Transaction(tx) => {
+                                    let ticket = GossipTicket {
+                                        message_id,
+                                        propagation_source,
+                                        author: message.source,
+                                        answer_to: Some(transaction_verdict_tx.clone()),
+                                    };
+                                    // If the node cannot take it, the ticket is dropped with it
+                                    // and answers `Unjudged` by itself.
+                                    hand_over_transaction(&event_tx, tx, ticket);
+                                }
+                                Gossiped::Unreadable => {
+                                // An unreadable peer-exchange message is an old build far more often
+                                // than it is an attack (#166), so it is counted per peer rather
+                                // than charged on sight — see `unreadable_peer_exchange`.
+                                //
+                                // Counted per *author*, like every strike (see
+                                // `accountable_author`): an honest relay forwarding an old
+                                // node's announcements is not the old node. And only for a
+                                // connected author — this map is never cleaned up.
+                                    let strike = if topic == TOPIC_PEER_EXCHANGE {
+                                        match accountable_author(message.source, |peer| {
+                                            swarm.is_connected(peer)
+                                        }) {
+                                            Some(author) => {
+                                                let seen = unreadable_peer_exchange_counts
+                                                    .entry(author)
+                                                    .and_modify(|n| *n += 1)
+                                                    .or_insert(1);
+                                                let (text, strike) = unreadable_peer_exchange(
+                                                    &author.to_string(),
+                                                    *seen,
+                                                );
+                                                if let Some(text) = text {
+                                                    warn!("{text}");
+                                                }
+                                                strike
+                                            }
+                                            None => false,
+                                        }
+                                    } else {
+                                        warn!(
+                                            topic,
+                                            bytes = message.data.len(),
+                                            "Unreadable gossip payload — not forwarded"
+                                        );
+                                        true
+                                    };
+                                    if strike {
+                                        charge_author(
+                                            &mut swarm,
+                                            &mut reputation,
+                                            message.source,
+                                            "unreadable gossip payload",
+                                        );
+                                    }
+                                }
+                                Gossiped::UnknownTopic => {}
                             }
                         }
 
@@ -1114,6 +1259,28 @@ impl P2PService {
                     }
                 }
 
+                Some(checked) = transaction_verdicts.recv() => {
+                    let acceptance = match checked.verdict {
+                        TransactionVerdict::Valid => gossipsub::MessageAcceptance::Accept,
+                        TransactionVerdict::Forged => gossipsub::MessageAcceptance::Reject,
+                        TransactionVerdict::Unjudged => gossipsub::MessageAcceptance::Ignore,
+                    };
+                    report_forwarding(
+                        &mut swarm,
+                        &checked.message_id,
+                        &checked.propagation_source,
+                        acceptance,
+                    );
+                    if checked.verdict == TransactionVerdict::Forged {
+                        charge_author(
+                            &mut swarm,
+                            &mut reputation,
+                            checked.author,
+                            "transaction with a forged signature",
+                        );
+                    }
+                }
+
                 Some(cmd) = command_rx.recv() => {
                     match cmd {
                         P2PCommand::BroadcastProposal(proposal) => {
@@ -1280,15 +1447,6 @@ impl P2PService {
                                 Err(_) => warn!(peer = %peer, "Unparseable peer id in block-sync report"),
                             }
                         }
-                        P2PCommand::ForgedTransactionFrom(author) => match author.parse::<PeerId>() {
-                            Ok(author) => charge_author(
-                                &mut swarm,
-                                &mut reputation,
-                                Some(author),
-                                "transaction with a forged signature",
-                            ),
-                            Err(_) => warn!(peer = %author, "Unparseable peer id in forged-transaction report"),
-                        },
                         P2PCommand::BlocksyncBatchRejected(peer) => {
                             // The node verified the batch and threw it away. From the service's own
                             // view that is indistinguishable from success — it only ever sees a
@@ -1653,8 +1811,6 @@ fn foreign_chain_warning(theirs: &str, ours: &str, warned: &mut HashSet<String>)
 /// What the caller has to act on after a peer-exchange message.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PeerExchangeOutcome {
-    /// The message was malformed — the sender should be charged a misbehavior strike.
-    malformed: bool,
     /// The range of chain the sender claims, whenever the message parsed at all. Recorded per
     /// peer so the block-sync driver knows who is worth asking for blocks (#138) — and, since
     /// nodes may prune (#194), whether they can serve the part we actually need.
@@ -1757,10 +1913,11 @@ const UNREADABLE_PEER_EXCHANGE_TOLERANCE: u32 = 3;
 /// Who answers for a message that turned out to be bad: its **author**, and only if the author
 /// is connected to this node. Never the peer that relayed it.
 ///
-/// gossipsub here forwards every message whose envelope signature checks out *before* this node
-/// has read the payload (no application-level validation — `libp2p-gossipsub` 0.47,
-/// `handle_received_message`). So the peer that hands us a bad message is, more often than not,
-/// an honest node that relayed it one step earlier. Charging that peer was the rule until #225,
+/// Until #228 gossipsub here forwarded every message whose envelope signature checked out *before*
+/// this node had read the payload (no application-level validation — `libp2p-gossipsub` 0.47,
+/// `handle_received_message`). So the peer that hands us a bad message was, more often than not,
+/// an honest node that relayed it one step earlier — and still is wherever that node runs an
+/// older build: a network is never upgraded at once. Charging that peer was the rule until #225,
 /// and it was an attack: an outsider with no stake published ten garbage messages to one honest
 /// node, and the node's neighbour — which had never spoken to the outsider — banned the honest
 /// node (`tests/hostile_gossip.rs`, red before the fix). On a chain whose operators all reach
@@ -1777,9 +1934,9 @@ const UNREADABLE_PEER_EXCHANGE_TOLERANCE: u32 = 3;
 /// **The limit, stated because it is real:** that same attacker — one fresh author key per
 /// message — is never charged at all. What it can still do is what #224 already bounded: every
 /// bad message costs a decode or one signature check, inside a queue that drops when full. What it
-/// can no longer do is get an honest node disconnected. Stopping such messages from being relayed
-/// in the first place needs validation *before* forwarding (gossipsub's `validate_messages`),
-/// which is a larger change and not this one.
+/// can no longer do is get an honest node disconnected. Since #228 such messages are also no longer
+/// relayed by an honest node: gossipsub forwards only what `forwarding_of` or the node's verdict
+/// on a transaction accepted.
 fn accountable_author(
     author: Option<PeerId>,
     is_connected: impl Fn(&PeerId) -> bool,
@@ -1837,10 +1994,11 @@ fn unreadable_peer_exchange(peer: &str, seen: u32) -> (Option<String>, bool) {
     (message, strike)
 }
 
-/// Returns what the caller must act on: whether the sender misbehaved, and whether it is behind us
-/// and should be served the blocks it is missing.
+/// Returns what the caller must act on: the range of chain the sender claims, and whether it is
+/// behind us and should be served the blocks it is missing. Takes the message already decoded —
+/// a payload that does not decode never gets here (`decode_gossip`, #228).
 fn handle_peer_exchange_message(
-    data: &[u8],
+    msg: PeerExchangeMsg,
     known_addrs: &mut HashSet<String>,
     self_addr: Option<&str>,
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
@@ -1848,17 +2006,6 @@ fn handle_peer_exchange_message(
     our_tip: u64,
     our_genesis: &str,
 ) -> PeerExchangeOutcome {
-    let msg = match decode_peer_exchange(data) {
-        Some(m) => m,
-        None => {
-            return PeerExchangeOutcome {
-                malformed: true,
-                announced_range: None,
-                serve_from_tip: None,
-            };
-        }
-    };
-
     // Catch a peer that upgraded (or downgraded) while we keep running — the gap join-time
     // `peer_version_warning` cannot see (#109).
     if let Some(warning) =
@@ -1905,7 +2052,6 @@ fn tip_outcome(msg: &PeerExchangeMsg, our_tip: u64, our_genesis: &str) -> PeerEx
     // `Unknown` deliberately behaves like `Same`: see `PeerChain`.
     if peer_chain(&msg.genesis_hash, our_genesis) == PeerChain::Foreign {
         return PeerExchangeOutcome {
-            malformed: false,
             announced_range: None,
             serve_from_tip: None,
         };
@@ -1924,7 +2070,6 @@ fn tip_outcome(msg: &PeerExchangeMsg, our_tip: u64, our_genesis: &str) -> PeerEx
     }
 
     PeerExchangeOutcome {
-        malformed: false,
         announced_range: Some(PeerRange {
             tip: msg.tip_height,
             earliest: msg.earliest_block,
@@ -2340,30 +2485,123 @@ fn broadcast_known_addrs(
     }
 }
 
-// ─── Application message handler ─────────────────────────────────────────────
+// ─── Gossip: decode, decide forwarding, hand over ────────────────────────────
 
-/// What one gossiped application message told us.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct AppMessageOutcome {
-    /// The sender should be charged a misbehavior strike.
-    malformed: bool,
-    /// A height the *sender* provably holds, for `peer_tips`. `None` when the message says
-    /// nothing about its sender's chain (a transaction, a vote, an unknown topic).
-    observed_height: Option<u64>,
+/// A gossiped message, decoded and nothing else — no side effect has happened yet. Deciding
+/// whether to forward it (`forwarding_of`) and acting on it are separate steps, in that order.
+enum Gossiped {
+    Proposal(Proposal),
+    Vote(Vote),
+    CommittedBlock(Block, Vec<Vote>),
+    Transaction(Transaction),
+    PeerExchange(PeerExchangeMsg),
+    /// The topic is ours and the bytes are not a message of it.
+    Unreadable,
+    /// A topic this node does not speak.
+    UnknownTopic,
 }
 
-impl AppMessageOutcome {
-    fn malformed() -> Self {
-        AppMessageOutcome {
-            malformed: true,
-            observed_height: None,
-        }
-    }
+fn decode_gossip(topic: &str, data: &[u8]) -> Gossiped {
+    let decoded = if topic == TOPIC_BLOCKS {
+        bincode::deserialize(data).ok().map(Gossiped::Proposal)
+    } else if topic == TOPIC_VOTES {
+        bincode::deserialize(data).ok().map(Gossiped::Vote)
+    } else if topic == TOPIC_COMMITTED_BLOCKS {
+        bincode::deserialize::<(Block, Vec<Vote>)>(data)
+            .ok()
+            .map(|(block, commit)| Gossiped::CommittedBlock(block, commit))
+    } else if topic == TOPIC_TRANSACTIONS {
+        bincode::deserialize(data).ok().map(Gossiped::Transaction)
+    } else if topic == TOPIC_PEER_EXCHANGE {
+        decode_peer_exchange(data).map(Gossiped::PeerExchange)
+    } else {
+        return Gossiped::UnknownTopic;
+    };
+    decoded.unwrap_or(Gossiped::Unreadable)
+}
 
-    fn clean(observed_height: Option<u64>) -> Self {
-        AppMessageOutcome {
-            malformed: false,
-            observed_height,
+/// When gossipsub learns whether it may forward a message.
+#[derive(Debug)]
+enum Forwarding {
+    Now(gossipsub::MessageAcceptance),
+    /// After the node's signature check — the ticket travels with the transaction.
+    AfterTheNodeHasChecked,
+}
+
+/// Whether a received message may be forwarded — **the one place that decides it**, for every
+/// message, including one from a banned peer (`None`). Called before anything else happens to the
+/// message and reported at once, so the verdict never waits on the node (#228).
+///
+/// gossipsub runs with `validate_messages`: a message is forwarded only once it has been
+/// accepted, and one nobody reports on is never forwarded. In a hub-and-spoke network (#177) a
+/// topic that is never reported stops at the hub, and the chain with it. So there is no `_` arm:
+/// a new kind of message does not compile until somebody decides how it is forwarded.
+///
+/// - Consensus messages and peer exchange that decode: `Accept`, now. Whether a vote or a block is
+///   *valid* depends on height, round and chain state, and is the engine's call; relaying what
+///   decodes is what the network needs from a hub, and it is what it did before.
+/// - Bytes that do not decode: `Reject`. An honest node does not relay them any more.
+/// - A transaction: after the node's signature check, which is what stops a forged one from
+///   crossing every honest node (a transaction is cheap to hold back; a vote is not).
+/// - A banned peer's message, or a topic this node does not speak: `Ignore`.
+fn forwarding_of(message: Option<&Gossiped>) -> Forwarding {
+    use gossipsub::MessageAcceptance::{Accept, Ignore, Reject};
+    match message {
+        None => Forwarding::Now(Ignore),
+        Some(Gossiped::Proposal(_))
+        | Some(Gossiped::Vote(_))
+        | Some(Gossiped::CommittedBlock(..))
+        | Some(Gossiped::PeerExchange(_)) => Forwarding::Now(Accept),
+        Some(Gossiped::Transaction(_)) => Forwarding::AfterTheNodeHasChecked,
+        Some(Gossiped::Unreadable) => Forwarding::Now(Reject),
+        Some(Gossiped::UnknownTopic) => Forwarding::Now(Ignore),
+    }
+}
+
+/// Tell gossipsub whether a message may be forwarded. `Ok(false)` means it is no longer cached —
+/// it aged out before a verdict came — and there is nothing left to forward or lose.
+fn report_forwarding(
+    swarm: &mut libp2p::Swarm<HelixBehaviour>,
+    message_id: &gossipsub::MessageId,
+    propagation_source: &PeerId,
+    acceptance: gossipsub::MessageAcceptance,
+) {
+    if let Err(e) = swarm
+        .behaviour_mut()
+        .gossipsub
+        .report_message_validation_result(message_id, propagation_source, acceptance)
+    {
+        debug!(error = ?e, "Forwarding a checked message failed");
+    }
+}
+
+/// A height the *sender* provably holds, for `peer_tips`. A committed block is the sender's own
+/// finalized history; a proposal claims only the block below it (the proposer built on its tip
+/// and asks the set for the next one — reading it as the proposed height would have us request a
+/// block nobody has committed). Nothing else says anything about the sender's chain.
+fn observed_height(message: &Gossiped) -> Option<u64> {
+    match message {
+        Gossiped::CommittedBlock(block, _) => Some(block.height()),
+        Gossiped::Proposal(proposal) => proposal.block.height().checked_sub(1),
+        _ => None,
+    }
+}
+
+/// Hand a gossiped transaction to the node without ever waiting for room (#224): this runs inside
+/// the swarm loop, and a blocking send on a full channel stops the whole loop — every socket, every
+/// vote this node casts. A transaction the node cannot take is dropped here, ticket and all — and
+/// the dropped ticket answers `Unjudged` for itself, so it is not forwarded. Returns whether the
+/// node took it.
+fn hand_over_transaction(
+    event_tx: &mpsc::Sender<P2PEvent>,
+    tx: Transaction,
+    ticket: GossipTicket,
+) -> bool {
+    match event_tx.try_send(P2PEvent::NewTransaction(tx, Some(ticket))) {
+        Ok(()) => true,
+        Err(_) => {
+            note_dropped_peer_transaction();
+            false
         }
     }
 }
@@ -2382,102 +2620,6 @@ fn note_dropped_peer_transaction() {
              excess instead of stalling the network loop. Votes, proposals and blocks are never \
              dropped; a transaction dropped here is still held by the peers that sent it."
         );
-    }
-}
-
-/// Decode one gossiped message, hand it to the node, and report what it implies about the
-/// sender's height.
-///
-/// The two block topics are read conservatively, each for the strongest claim its message
-/// actually supports:
-///
-/// - A **committed block** at `h` means the sender finalized `h`, so its tip is at least `h`.
-/// - A **proposal** for `h` means the sender built on `h - 1`; it is claiming that as its tip,
-///   not `h`. Reading it as `h` would have us request a block nobody has committed yet, get a
-///   short answer, and cool down a peer for being honest.
-///
-/// Votes and transactions carry a height but say nothing about what their sender *holds* — a
-/// vote for `h` is a claim about the round, and a validator votes on the block it is being
-/// asked about. They contribute nothing here.
-async fn handle_app_message(
-    topic: &str,
-    data: &[u8],
-    author: Option<PeerId>,
-    event_tx: &mpsc::Sender<P2PEvent>,
-) -> AppMessageOutcome {
-    if topic == TOPIC_BLOCKS {
-        match bincode::deserialize::<Proposal>(data) {
-            Ok(proposal) => {
-                debug!(
-                    height = proposal.block.height(),
-                    round = proposal.round,
-                    "Proposal from peer"
-                );
-                let proposed = proposal.block.height();
-                let _ = event_tx.send(P2PEvent::NewProposal(proposal)).await;
-                AppMessageOutcome::clean(proposed.checked_sub(1))
-            }
-            Err(e) => {
-                warn!("Invalid proposal from peer: {}", e);
-                AppMessageOutcome::malformed()
-            }
-        }
-    } else if topic == TOPIC_TRANSACTIONS {
-        match bincode::deserialize::<Transaction>(data) {
-            Ok(tx) => {
-                // Never `send().await` a transaction. This runs inside the swarm loop — the loop
-                // that also reads every socket and sends every vote this node casts — and a
-                // blocking send on a full channel stops all of it. On 2026-09-23 a flood of 2000
-                // transactions did exactly that to three test validators: for 2.5 minutes every
-                // node heard nobody, while the node at the other end of the channel was still
-                // checking signatures. A transaction dropped here is still in every mempool the
-                // gossip reached and in its sender's node; a vote held up here costs the round.
-                // So transactions are best-effort, and proposals, votes and blocks are not.
-                // So transactions are best-effort, and proposals, votes and blocks are not.
-                if let Err(mpsc::error::TrySendError::Full(_)) =
-                    event_tx.try_send(P2PEvent::NewTransaction(tx, author.map(|a| a.to_string())))
-                {
-                    note_dropped_peer_transaction();
-                }
-                AppMessageOutcome::clean(None)
-            }
-            Err(e) => {
-                warn!("Invalid tx from peer: {}", e);
-                AppMessageOutcome::malformed()
-            }
-        }
-    } else if topic == TOPIC_VOTES {
-        match bincode::deserialize::<Vote>(data) {
-            Ok(vote) => {
-                let _ = event_tx.send(P2PEvent::NewVote(vote)).await;
-                AppMessageOutcome::clean(None)
-            }
-            Err(e) => {
-                warn!("Invalid vote from peer: {}", e);
-                AppMessageOutcome::malformed()
-            }
-        }
-    } else if topic == TOPIC_COMMITTED_BLOCKS {
-        match bincode::deserialize::<(Block, Vec<Vote>)>(data) {
-            Ok((block, commit)) => {
-                debug!(
-                    height = block.height(),
-                    commit_sigs = commit.len(),
-                    "Committed block from peer"
-                );
-                let committed = block.height();
-                let _ = event_tx
-                    .send(P2PEvent::NewCommittedBlock(block, commit))
-                    .await;
-                AppMessageOutcome::clean(Some(committed))
-            }
-            Err(e) => {
-                warn!("Invalid committed block from peer: {}", e);
-                AppMessageOutcome::malformed()
-            }
-        }
-    } else {
-        AppMessageOutcome::clean(None)
     }
 }
 
@@ -3185,10 +3327,6 @@ mod peer_exchange_tests {
             outcome.serve_from_tip, None,
             "nor make us serve blocks it cannot use"
         );
-        assert!(
-            !outcome.malformed,
-            "it is a well-formed message from a peer on another chain"
-        );
 
         // Positive control: the identical message from a peer on our chain still counts. Without
         // this, the test above would pass just as well if tips had stopped working altogether.
@@ -3438,6 +3576,10 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
                 // validator-set scale.
                 .heartbeat_interval(Duration::from_secs(1))
                 .validation_mode(gossipsub::ValidationMode::Strict)
+                // Nothing is forwarded until this node has said it may be (#228) — see
+                // `forwarding_of`. Without it gossipsub relays every message before the payload
+                // is read, and an honest node passes on whatever an attacker injects.
+                .validate_messages()
                 .message_id_fn(message_id_fn)
                 .max_transmit_size(max_msg_size)
                 .build()
@@ -3687,12 +3829,14 @@ mod blocksync_selection_tests {
 #[cfg(test)]
 mod observed_height_tests {
     use super::{
-        handle_app_message, P2PEvent, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_TRANSACTIONS,
-        TOPIC_VOTES,
+        decode_gossip, forwarding_of, hand_over_transaction, observed_height, Forwarding,
+        GossipTicket, Gossiped, P2PEvent, TransactionVerdict, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS,
+        TOPIC_PEER_EXCHANGE, TOPIC_TRANSACTIONS, TOPIC_VOTES,
     };
     use helix_consensus::proposal::Proposal;
     use helix_core::block::{genesis_block, Block};
     use helix_crypto::{Address, PublicKey, Signature};
+    use libp2p::gossipsub::MessageAcceptance;
     use tokio::sync::mpsc;
 
     fn block_at(height: u64) -> Block {
@@ -3707,56 +3851,8 @@ mod observed_height_tests {
         block
     }
 
-    /// A committed block is the sender's own finalized history: it holds at least that height.
-    #[tokio::test]
-    async fn a_committed_block_claims_its_own_height() {
-        let (tx, _rx) = mpsc::channel(4);
-        let data =
-            bincode::serialize(&(block_at(4_200), Vec::<helix_consensus::vote::Vote>::new()))
-                .unwrap();
-
-        let outcome = handle_app_message(TOPIC_COMMITTED_BLOCKS, &data, None, &tx).await;
-
-        assert!(!outcome.malformed);
-        assert_eq!(outcome.observed_height, Some(4_200));
-    }
-
-    /// A proposal is a claim about the block *below* it — the proposer built on its own tip and
-    /// is asking the set to accept the next one. Reading it as the proposed height would have us
-    /// request a block nobody has committed, take a short answer, and cool down an honest peer.
-    #[tokio::test]
-    async fn a_proposal_claims_only_the_height_below_it() {
-        let (tx, _rx) = mpsc::channel(4);
-        let data = bincode::serialize(&Proposal::fresh(0, block_at(4_200))).unwrap();
-
-        let outcome = handle_app_message(TOPIC_BLOCKS, &data, None, &tx).await;
-
-        assert!(!outcome.malformed);
-        assert_eq!(outcome.observed_height, Some(4_199));
-    }
-
-    /// And a proposal for height 0 claims nothing rather than underflowing.
-    #[tokio::test]
-    async fn a_proposal_at_the_genesis_height_claims_nothing() {
-        let (tx, _rx) = mpsc::channel(4);
-        let data = bincode::serialize(&Proposal::fresh(0, block_at(0))).unwrap();
-
-        let outcome = handle_app_message(TOPIC_BLOCKS, &data, None, &tx).await;
-
-        assert_eq!(outcome.observed_height, None);
-    }
-
-    /// The flood of 2026-09-23. The node could not keep up, the channel to it was full — and
-    /// this function runs inside the swarm loop, the loop that also reads every socket and sends
-    /// every vote this node casts. A `send().await` here stopped all of it: three validators
-    /// heard nobody for 2.5 minutes while their nodes were still checking signatures. A
-    /// transaction must be dropped when there is no room, never waited on.
-    #[tokio::test]
-    async fn a_transaction_never_holds_up_the_swarm_on_a_full_channel() {
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(P2PEvent::PeerConnected("already queued".into()))
-            .unwrap();
-        let transaction = helix_core::Transaction {
+    fn a_transaction() -> helix_core::Transaction {
+        helix_core::Transaction {
             version: 1,
             tx_type: helix_core::TxType::Transfer,
             from: Address::from_public_key(&PublicKey::from_bytes(vec![1; 32])),
@@ -3769,37 +3865,199 @@ mod observed_height_tests {
             chain_id: helix_crypto::Hash::digest(b"chain"),
             signature: Signature::from_bytes(vec![]),
             public_key: PublicKey::from_bytes(vec![1; 32]),
-        };
-        let data = bincode::serialize(&transaction).unwrap();
+        }
+    }
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            handle_app_message(TOPIC_TRANSACTIONS, &data, None, &tx),
-        )
+    /// A committed block is the sender's own finalized history: it holds at least that height.
+    #[test]
+    fn a_committed_block_claims_its_own_height() {
+        let data =
+            bincode::serialize(&(block_at(4_200), Vec::<helix_consensus::vote::Vote>::new()))
+                .unwrap();
+
+        let message = decode_gossip(TOPIC_COMMITTED_BLOCKS, &data);
+
+        assert!(matches!(message, Gossiped::CommittedBlock(..)));
+        assert_eq!(observed_height(&message), Some(4_200));
+    }
+
+    /// A proposal is a claim about the block *below* it — the proposer built on its own tip and
+    /// is asking the set to accept the next one. Reading it as the proposed height would have us
+    /// request a block nobody has committed, take a short answer, and cool down an honest peer.
+    #[test]
+    fn a_proposal_claims_only_the_height_below_it() {
+        let data = bincode::serialize(&Proposal::fresh(0, block_at(4_200))).unwrap();
+
+        let message = decode_gossip(TOPIC_BLOCKS, &data);
+
+        assert!(matches!(message, Gossiped::Proposal(_)));
+        assert_eq!(observed_height(&message), Some(4_199));
+    }
+
+    /// And a proposal for height 0 claims nothing rather than underflowing.
+    #[test]
+    fn a_proposal_at_the_genesis_height_claims_nothing() {
+        let data = bincode::serialize(&Proposal::fresh(0, block_at(0))).unwrap();
+
+        assert_eq!(observed_height(&decode_gossip(TOPIC_BLOCKS, &data)), None);
+    }
+
+    /// A vote carries a height, but it is a claim about the round being decided, not about what
+    /// the sender holds. And bytes on the vote topic that are not a vote are unreadable — which
+    /// is what gets them refused for forwarding and their author a strike.
+    #[test]
+    fn a_malformed_vote_is_unreadable_and_claims_no_height() {
+        let message = decode_gossip(TOPIC_VOTES, b"not a vote");
+
+        assert!(matches!(message, Gossiped::Unreadable));
+        assert_eq!(observed_height(&message), None);
+    }
+
+    /// Every verdict `forwarding_of` can give, against every kind of message it can be asked
+    /// about (#228). The consensus rows are the ones a mistake here costs the chain for: in a
+    /// hub-and-spoke network, a consensus topic that is not `Accept`ed at once stops at the hub.
+    #[test]
+    fn forwarding_is_decided_for_every_kind_of_message() {
+        use MessageAcceptance::{Accept, Ignore, Reject};
+        let proposal = bincode::serialize(&Proposal::fresh(0, block_at(7))).unwrap();
+        let pk = PublicKey::from_bytes(vec![7; 32]);
+        let vote = bincode::serialize(&helix_consensus::vote::Vote {
+            vote_type: helix_consensus::vote::VoteType::Prevote,
+            height: 7,
+            round: 0,
+            block_hash: helix_crypto::Hash::digest(b"a block"),
+            validator: Address::from_public_key(&pk),
+            public_key: pk,
+            crypto_version: helix_core::CryptoVersion::MlDsa,
+            signature: Signature::from_bytes(vec![1; 32]),
+        })
+        .unwrap();
+        let committed =
+            bincode::serialize(&(block_at(7), Vec::<helix_consensus::vote::Vote>::new())).unwrap();
+        let transaction = bincode::serialize(&a_transaction()).unwrap();
+        let peer_exchange = bincode::serialize(&super::PeerExchangeMsg {
+            peers: vec![],
+            version: "0.0.0".to_string(),
+            tip_height: 7,
+            genesis_hash: "6860abda".to_string(),
+            earliest_block: 0,
+        })
+        .unwrap();
+
+        let cases: Vec<(&str, Option<Gossiped>, Forwarding)> = vec![
+            (
+                "proposal",
+                Some(decode_gossip(TOPIC_BLOCKS, &proposal)),
+                Forwarding::Now(Accept),
+            ),
+            (
+                "vote",
+                Some(decode_gossip(TOPIC_VOTES, &vote)),
+                Forwarding::Now(Accept),
+            ),
+            (
+                "committed block",
+                Some(decode_gossip(TOPIC_COMMITTED_BLOCKS, &committed)),
+                Forwarding::Now(Accept),
+            ),
+            (
+                "peer exchange",
+                Some(decode_gossip(TOPIC_PEER_EXCHANGE, &peer_exchange)),
+                Forwarding::Now(Accept),
+            ),
+            (
+                "transaction",
+                Some(decode_gossip(TOPIC_TRANSACTIONS, &transaction)),
+                Forwarding::AfterTheNodeHasChecked,
+            ),
+            (
+                "garbage on a vote topic",
+                Some(decode_gossip(TOPIC_VOTES, b"x")),
+                Forwarding::Now(Reject),
+            ),
+            (
+                "garbage on the transaction topic",
+                Some(decode_gossip(TOPIC_TRANSACTIONS, b"x")),
+                Forwarding::Now(Reject),
+            ),
+            (
+                "a topic this node does not speak",
+                Some(decode_gossip("/helix/some-future-topic", &proposal)),
+                Forwarding::Now(Ignore),
+            ),
+            ("anything from a banned peer", None, Forwarding::Now(Ignore)),
+        ];
+        // `MessageAcceptance` has no `PartialEq`; its `Debug` names the variant.
+        for (what, message, expected) in cases {
+            assert_eq!(
+                format!("{:?}", forwarding_of(message.as_ref())),
+                format!("{expected:?}"),
+                "{what}"
+            );
+        }
+    }
+
+    /// A handed-over transaction carries its ticket to the node — without it, the node has
+    /// nothing to answer with, and the transaction is never forwarded.
+    #[test]
+    fn a_transaction_reaches_the_node_with_its_ticket() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (ticket, mut probe) = GossipTicket::for_test();
+
+        assert!(hand_over_transaction(&tx, a_transaction(), ticket));
+
+        match rx.try_recv() {
+            Ok(P2PEvent::NewTransaction(_, Some(carried))) => {
+                assert!(probe.answers().is_empty(), "nobody has answered yet");
+                carried.answer(TransactionVerdict::Valid);
+            }
+            other => panic!("expected the transaction with its ticket, got {other:?}"),
+        }
+        assert_eq!(probe.answers(), vec![TransactionVerdict::Valid]);
+    }
+
+    /// Exactly one answer per ticket, whichever way it ends: answered once and dropped after is
+    /// still one answer, and a ticket nobody answered answers `Unjudged` when it is dropped.
+    #[test]
+    fn a_ticket_answers_exactly_once_and_a_dropped_one_answers_for_itself() {
+        let (ticket, mut probe) = GossipTicket::for_test();
+        ticket.answer(TransactionVerdict::Forged);
+        assert_eq!(probe.answers(), vec![TransactionVerdict::Forged]);
+
+        let (ticket, mut probe) = GossipTicket::for_test();
+        drop(ticket);
+        assert_eq!(probe.answers(), vec![TransactionVerdict::Unjudged]);
+    }
+
+    /// The flood of 2026-09-23. The node could not keep up, the channel to it was full — and
+    /// this runs inside the swarm loop, the loop that also reads every socket and sends every
+    /// vote this node casts. A `send().await` here stopped all of it: three validators heard
+    /// nobody for 2.5 minutes while their nodes were still checking signatures. A transaction
+    /// must be dropped when there is no room, never waited on — and answered as it goes (#228).
+    #[tokio::test]
+    async fn a_transaction_never_holds_up_the_swarm_on_a_full_channel() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(P2PEvent::PeerConnected("already queued".into()))
+            .unwrap();
+        let (ticket, mut probe) = GossipTicket::for_test();
+
+        let handed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            hand_over_transaction(&tx, a_transaction(), ticket)
+        })
         .await
         .expect("handing on a transaction must not wait for room in the channel");
 
-        assert!(
-            !outcome.malformed,
-            "a well-formed transaction is not a strike"
+        assert!(!handed);
+        assert_eq!(
+            probe.answers(),
+            vec![TransactionVerdict::Unjudged],
+            "a dropped transaction is answered, so the swarm does not wait on it"
         );
         assert!(matches!(rx.try_recv(), Ok(P2PEvent::PeerConnected(_))));
         assert!(
             rx.try_recv().is_err(),
             "the transaction was dropped, not queued"
         );
-    }
-
-    /// A vote carries a height, but it is a claim about the round being decided, not about what
-    /// the sender holds — a validator votes on the block it is being asked about.
-    #[tokio::test]
-    async fn a_malformed_vote_is_a_strike_and_still_claims_no_height() {
-        let (tx, _rx) = mpsc::channel(4);
-
-        let outcome = handle_app_message(TOPIC_VOTES, b"not a vote", None, &tx).await;
-
-        assert!(outcome.malformed);
-        assert_eq!(outcome.observed_height, None);
     }
 }
 
