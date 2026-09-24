@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct P2PConfig {
@@ -87,6 +88,25 @@ pub struct P2PConfig {
     /// that remembered a previous run's peers would carry state between runs that are meant to be
     /// independent.
     pub peer_store_path: Option<std::path::PathBuf>,
+    /// How often every connection is pinged (`/ipfs/ping/1.0.0`), and how long one ping may take
+    /// before it counts as failed (#232). libp2p forgives the first failure, so a connection is
+    /// closed after the *second* in a row — roughly `2 × (interval + timeout)` after its far end
+    /// went away.
+    ///
+    /// Why it exists: a TCP connection can end on one side only — a home router or a proxy drops
+    /// its state, one node sees the close, the other does not. Nothing else here notices; the
+    /// half that survives stays open until some write happens to time out, measured at close to an
+    /// hour on the production node. And a half-dead connection is worse than none: gossipsub
+    /// counts the redial that follows as a *second* connection and never re-sends its topic
+    /// subscriptions over it, so the peer that lost the link publishes to nobody.
+    ///
+    /// Why the timeout is generous: a ping shares its connection with everything else, and on
+    /// the production tunnel (226 KB/s, #195) a proposal fan-out or a transaction flood can queue
+    /// ahead of it for seconds. A connection that cannot carry 32 bytes within a minute, twice in a
+    /// row, is no use to a consensus round of 30 seconds anyway — and a live connection closed by
+    /// mistake is closed on both sides, so it costs one redial, not a half-dead link.
+    pub ping_interval: Duration,
+    pub ping_timeout: Duration,
 }
 
 impl Default for P2PConfig {
@@ -104,6 +124,8 @@ impl Default for P2PConfig {
             max_connections_per_ip: 8,
             enable_mdns: true,
             peer_store_path: None,
+            ping_interval: Duration::from_secs(15),
+            ping_timeout: Duration::from_secs(60),
         }
     }
 }
