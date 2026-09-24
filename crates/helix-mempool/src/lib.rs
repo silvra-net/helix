@@ -508,9 +508,8 @@ impl Mempool {
     /// Take up to `max_count` highest-tip transactions for block inclusion.
     /// Does NOT remove them — call `remove_committed` after the block is finalized.
     ///
-    /// TXs are sorted by (sender, nonce) after the fee-priority pass so that a
-    /// sender's sequential nonces always land in the correct order in the block.
-    /// Without this, nonce N+1 arriving before N would be dropped by the executor.
+    /// Only transactions the block can actually apply: per sender, the unbroken run of nonces
+    /// from the one its account is on (#231) — see `take_within`.
     ///
     /// See [`Mempool::take_within`] for what `account_nonce` is and why it is a parameter.
     pub fn take(
@@ -558,26 +557,70 @@ impl Mempool {
     ) -> Vec<Transaction> {
         self.evict_expired();
         self.drop_spent_nonces(account_nonce);
-        let mut result = Vec::with_capacity(max_count.min(1024));
-        let mut bytes = 0u64;
-        'outer: for hashes in self.by_tip.values() {
-            for hash in hashes {
-                if result.len() >= max_count {
-                    break 'outer;
-                }
-                if let Some(tx) = self.by_hash.get(hash) {
-                    let size = tx.size_bytes();
-                    // Skip rather than stop: a single oversized transaction low in the tip order
-                    // must not shut the gate on everything cheaper behind it.
-                    if !result.is_empty() && bytes.saturating_add(size) > max_bytes {
-                        continue;
-                    }
-                    bytes = bytes.saturating_add(size);
-                    result.push(tx.clone());
-                }
+
+        // Per sender, only the unbroken run of nonces starting where its account is (#231). A
+        // transaction behind a gap cannot be applied in this block — the executor refuses it on
+        // the nonce, charges nothing, and the node then drops it from the pool as "committed", so
+        // it is gone for good and every later nonce of that sender is stuck behind the hole it
+        // left. Under a 2000-transaction flood that emptied whole blocks: 48 of 48 transactions
+        // failed, block after block. The first gap needs nothing unusual — a node that hears the
+        // same flood directly and through a relay admits it out of order.
+        //
+        // So selection walks heads, not the whole pool: each sender offers exactly one candidate,
+        // its next executable nonce, and the highest tip among the heads goes first. Taking a head
+        // makes that sender's next nonce its new head. A sender whose run starts with a gap
+        // offers nothing and simply waits in the pool, as a queued transaction should.
+        //
+        // Where the account nonce comes from: the caller's chain state, or — for a caller that
+        // has none (`None`) — the lowest nonce this pool holds for the sender. That guess can
+        // start too high; it can never cross a gap the pool itself can see.
+        let mut lowest_held: HashMap<&str, u64> = HashMap::new();
+        for (sender, nonce) in self.by_sender_nonce.keys() {
+            let lowest = lowest_held.entry(sender.as_str()).or_insert(*nonce);
+            *lowest = (*lowest).min(*nonce);
+        }
+        // Highest tip first; among equal tips, the one admitted earlier — the order the pool's
+        // tip buckets have always kept.
+        let priority = |hash: &String| {
+            (
+                self.tip_of.get(hash).copied().unwrap_or(0),
+                std::cmp::Reverse(self.entered_at.get(hash).copied()),
+                hash.clone(),
+            )
+        };
+        let mut heads = std::collections::BinaryHeap::new();
+        for (sender, lowest) in &lowest_held {
+            let start = account_nonce(sender).unwrap_or(*lowest);
+            if let Some(hash) = self.by_sender_nonce.get(&(sender.to_string(), start)) {
+                heads.push(priority(hash));
             }
         }
-        // Within a sender, nonces must be strictly ascending — sort to guarantee that.
+
+        let mut result = Vec::with_capacity(max_count.min(1024));
+        let mut bytes = 0u64;
+        while let Some((_, _, hash)) = heads.pop() {
+            if result.len() >= max_count {
+                break;
+            }
+            let Some(tx) = self.by_hash.get(&hash) else { continue };
+            let size = tx.size_bytes();
+            // Skip rather than stop: a single oversized transaction low in the tip order must not
+            // shut the gate on everything cheaper behind it. Skipping it skips its sender's later
+            // nonces too — they cannot go in without it.
+            if !result.is_empty() && bytes.saturating_add(size) > max_bytes {
+                continue;
+            }
+            bytes = bytes.saturating_add(size);
+            if let Some(next) = tx
+                .nonce
+                .checked_add(1)
+                .and_then(|n| self.by_sender_nonce.get(&(tx.from.to_string(), n)))
+            {
+                heads.push(priority(next));
+            }
+            result.push(tx.clone());
+        }
+        // Within a sender, nonces must be strictly ascending in the block — sort to guarantee it.
         result.sort_by(|a, b| {
             a.from.to_string().cmp(&b.from.to_string()).then_with(|| a.nonce.cmp(&b.nonce))
         });
@@ -598,10 +641,25 @@ impl Mempool {
         seen.into_iter().collect()
     }
 
-    /// Remove transactions that were committed in a block
-    pub fn remove_committed(&mut self, hashes: &[Hash]) {
+    /// Remove the transactions a committed block carried — except one that block could not apply
+    /// because its nonce was still ahead of its sender's (#231).
+    ///
+    /// Carried is not applied. A transaction packed behind a nonce gap is refused by the executor
+    /// on the nonce, uncharged, and is exactly as valid afterwards as before: dropping it here
+    /// loses it, and every later nonce of its sender then waits behind a hole nothing will fill.
+    /// This pool no longer packs across a gap, but proposers running older builds still do, and
+    /// their blocks reach this pool too. `account_nonce` is the chain *after* the block: a
+    /// transaction that applied, or failed and was charged, has a nonce below it and goes; one
+    /// still ahead of it stays.
+    pub fn remove_committed(&mut self, hashes: &[Hash], account_nonce: &dyn Fn(&str) -> Option<u64>) {
         for hash in hashes {
-            self.detach(&hash.to_hex());
+            let hex = hash.to_hex();
+            let still_ahead = self.by_hash.get(&hex).is_some_and(|tx| {
+                account_nonce(&tx.from.to_string()).is_some_and(|current| tx.nonce > current)
+            });
+            if !still_ahead {
+                self.detach(&hex);
+            }
         }
     }
 
@@ -725,6 +783,10 @@ mod tests {
     /// The positive control for the sweep above, and the reason it compares `<` and never `!=`:
     /// a nonce *above* the account's is an ordinary queued transaction waiting for the ones in
     /// front of it. Dropping those would break every wallet that sends two transactions in a row.
+    ///
+    /// Waiting means waiting, though (#231). This test used to demand that such a transaction
+    /// also be *offered* for the next block — where the executor refuses it on the nonce, and the
+    /// node drops it as committed: the very loss this test exists to prevent, one block later.
     #[test]
     fn a_transaction_queued_ahead_of_its_predecessors_survives_the_sweep() {
         let kp = KeyPair::generate();
@@ -737,8 +799,88 @@ mod tests {
 
         let taken = pool.take(10, &|addr| (addr == sender).then_some(3));
 
-        assert_eq!(taken.len(), 1, "a transaction waiting for its predecessors must still be offered");
-        assert!(pool.contains(&hash), "and must stay in the pool");
+        assert!(taken.is_empty(), "nonces 3 and 4 are missing: it cannot be applied yet, so it is not offered");
+        assert!(pool.contains(&hash), "and it must stay in the pool, waiting");
+    }
+
+    /// #231, the rule itself: per sender, only the unbroken run from the account nonce. Nonce 6
+    /// behind a missing 5 stays in the pool until 5 arrives.
+    #[test]
+    fn a_gap_in_a_senders_nonces_is_never_packed_across() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+        let sender = Address::from_public_key(&kp.public).to_string();
+        for nonce in [3, 4, 6, 7] {
+            pool.add(make_tx(&kp, 10_000, nonce), Hash::ZERO, Some(3)).unwrap();
+        }
+
+        let taken: Vec<u64> = pool.take(10, &|a| (a == sender).then_some(3)).iter().map(|t| t.nonce).collect();
+
+        assert_eq!(taken, vec![3, 4]);
+        assert_eq!(pool.len(), 4, "nothing is removed by taking — 6 and 7 wait for 5");
+    }
+
+    /// The flood of 2026-09-24, reduced to its cause: a node hears the same burst of one sender's
+    /// transactions directly and through a relay, and admits them out of order. The old selection
+    /// took the first 48 by admission among equal tips and sorted them — "48..60, 200..234" — and
+    /// the 35 behind the gap failed in the block and were lost. Only the run from the account's
+    /// nonce may go in.
+    #[test]
+    fn transactions_admitted_out_of_order_are_packed_only_from_the_account_nonce() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::with_limits(10_000, 1_000);
+        let sender = Address::from_public_key(&kp.public).to_string();
+        for nonce in (200..235).chain(48..61) {
+            pool.add(make_tx(&kp, 10_000, nonce), Hash::ZERO, Some(48)).unwrap();
+        }
+
+        let taken: Vec<u64> = pool.take(48, &|a| (a == sender).then_some(48)).iter().map(|t| t.nonce).collect();
+
+        assert_eq!(taken, (48..61).collect::<Vec<_>>());
+    }
+
+    /// #231, the other half: a block can carry a transaction it cannot apply — proposers running
+    /// older builds still pack across nonce gaps. Carried is not applied: the transaction is
+    /// exactly as valid after the block as before, and dropping it would lose it and strand every
+    /// later nonce of its sender. The one that did apply goes, as it always did.
+    #[test]
+    fn a_transaction_a_block_carried_but_could_not_apply_stays_in_the_pool() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+        let sender = Address::from_public_key(&kp.public).to_string();
+        let applied = make_tx(&kp, 10_000, 3);
+        let ahead = make_tx(&kp, 10_000, 9);
+        let (applied_hash, ahead_hash) = (applied.hash(), ahead.hash());
+        pool.add(applied, Hash::ZERO, Some(3)).unwrap();
+        pool.add(ahead, Hash::ZERO, Some(3)).unwrap();
+
+        // The block carried both: 3 applied, 9 was refused on its nonce. The account is on 4 now.
+        pool.remove_committed(&[applied_hash, ahead_hash], &|a| (a == sender).then_some(4));
+
+        assert!(!pool.contains(&applied_hash), "the applied one is done");
+        assert!(pool.contains(&ahead_hash), "the one still ahead of the account waits for 4..8");
+    }
+
+    /// Between senders the tip still decides — but a sender's generous later transaction cannot
+    /// jump its own cheaper earlier one: it becomes a candidate only once that one is in.
+    #[test]
+    fn between_senders_the_higher_tip_goes_first_and_within_one_the_nonce_order_holds() {
+        let x = KeyPair::generate();
+        let y = KeyPair::generate();
+        let mut pool = Mempool::new();
+        let x0 = make_tx(&x, 10_000, 0);
+        let x1 = make_tx(&x, 10_000_000, 1);
+        let y0 = make_tx(&y, 5_000_000, 0);
+        let (x0h, x1h, y0h) = (x0.hash(), x1.hash(), y0.hash());
+        for tx in [x0, x1, y0] {
+            pool.add(tx, Hash::ZERO, Some(0)).unwrap();
+        }
+
+        let taken: Vec<_> = pool.take(2, &|_| Some(0)).iter().map(|t| t.hash()).collect();
+
+        assert!(taken.contains(&y0h), "y's head outbids x's head");
+        assert!(taken.contains(&x0h), "x's first nonce is x's only candidate");
+        assert!(!taken.contains(&x1h), "x's richest transaction waits behind its own nonce 0");
     }
 
     /// A caller with no chain state to answer from — the node's own self-built transactions —
@@ -1116,7 +1258,7 @@ mod tests {
 
         assert!(pool.add(tx.clone(), Hash::ZERO, None).is_ok(), "affordable at the floor");
 
-        pool.remove_committed(&[tx.hash()]);
+        pool.remove_committed(&[tx.hash()], &|_| None);
         pool.set_base_fee_per_byte(2);
         let err = pool.add(tx, Hash::ZERO, None).unwrap_err();
         assert!(
@@ -1219,7 +1361,7 @@ mod tests {
         pool.add(tx, Hash::ZERO, None).unwrap();
 
         pool.set_base_fee_per_byte(2);
-        pool.remove_committed(&[hash]);
+        pool.remove_committed(&[hash], &|_| None);
 
         assert_eq!(pool.len(), 0);
         assert!(pool.by_tip.is_empty(), "a stale index entry survived the removal");
@@ -1298,7 +1440,7 @@ mod tests {
         let hash = tx.hash();
         pool.add(tx, Hash::ZERO, None).unwrap();
         assert_eq!(pool.len(), 1);
-        pool.remove_committed(&[hash]);
+        pool.remove_committed(&[hash], &|_| None);
         assert_eq!(pool.len(), 0);
     }
 
@@ -1330,7 +1472,7 @@ mod tests {
         let tx = make_tx(&kp, 10_000, 0);
         let hash = tx.hash();
         pool.add(tx, Hash::ZERO, None).unwrap();
-        pool.remove_committed(&[hash]);
+        pool.remove_committed(&[hash], &|_| None);
 
         let tx2 = make_tx(&kp, 12_000, 0);
         assert!(pool.add(tx2, Hash::ZERO, None).is_ok(), "slot should be free after commit");

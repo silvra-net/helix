@@ -1383,6 +1383,8 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
         .expect("genesis hash parses");
 
     let recipient = Address::from_public_key(&KeyPair::generate().public);
+    let flood_sender = Address::from_public_key(&kp_a.public).to_string();
+    let (flood_from_height, nonce_before) = height_and_nonce(TL_A_RPC, &flood_sender).await;
     let txs = sign_flood(&kp_a, &recipient, 2_000, chain_id, base_fee);
     let client = reqwest::Client::new();
     let mut accepted = 0u64;
@@ -1401,9 +1403,41 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
     assert!(accepted > 1_500, "only {accepted}/2000 transactions were accepted — the flood never happened");
 
     let loaded = measure_cadence(TL_A_RPC, 12, Duration::from_secs(300)).await;
+
+    // What the blocks carried of the flood against what the chain applied (#231). Every flood
+    // transaction a block carries must apply: a block that packs one it cannot apply wastes its
+    // space, and the transaction is then dropped from every pool as committed — lost, with every
+    // later nonce of its sender stuck behind the hole. Until #231 this test measured only block
+    // times and passed while whole blocks of the flood failed, 48 of 48, block after block.
+    let (flood_to_height, nonce_after) = height_and_nonce(TL_A_RPC, &flood_sender).await;
+    let mut carried = 0u64;
+    for h in (flood_from_height + 1)..=flood_to_height {
+        // The block at the state's height can reach the store a moment after the state: wait for
+        // it rather than count it as empty.
+        let mut body = None;
+        for _ in 0..50 {
+            body = block_body(TL_A_RPC, h).await.filter(|b| b["transactions"].is_array());
+            if body.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let body = body.unwrap_or_else(|| panic!("block {h} never became readable"));
+        carried += body["transactions"]
+            .as_array()
+            .map_or(0, |txs| txs.iter().filter(|t| t["from"] == flood_sender.as_str()).count() as u64);
+    }
+    let applied = nonce_after - nonce_before;
     eprintln!(
-        "link {} KB/s per node · idle: median {:.2}s p90 {:.2}s · under {accepted} tx: median {:.2}s p90 {:.2}s, fullest block {} tx",
+        "link {} KB/s per node · idle: median {:.2}s p90 {:.2}s · under {accepted} tx: median {:.2}s p90 {:.2}s, fullest block {} tx · flood carried {carried}, applied {applied}",
         LINK_BYTES_PER_SEC / 1024, idle.median, idle.p90, loaded.median, loaded.p90, loaded.fullest
+    );
+    assert!(carried > 0, "no block carried any of the flood — the comparison below would be empty");
+    assert_eq!(
+        applied, carried,
+        "the blocks carried {carried} of the flood's transactions and only {applied} applied: a \
+         proposer packed transactions it could not apply (a nonce gap), and each one a block \
+         carried was then dropped from every pool (#231)"
     );
 
     // The chain has to still be finalizing — that is the failure this exists to catch, and it is
@@ -1464,6 +1498,25 @@ async fn measure_cadence(rpc_port: u16, want: u64, timeout: Duration) -> Cadence
         blocks: gaps.len(),
         fullest,
     }
+}
+
+/// `address`'s nonce and the height of the state it was read from, so that no block can commit
+/// between the two: state height, nonce, state height again, until both agree. `state_height`,
+/// not `height` — the node writes the state before the block, so the store's height can trail the
+/// state a nonce is read from by one block.
+async fn height_and_nonce(rpc_port: u16, address: &str) -> (u64, u64) {
+    for _ in 0..50 {
+        let before = status(rpc_port).await.and_then(|s| s["state_height"].as_u64());
+        let nonce = account(rpc_port, address).await.and_then(|a| a["nonce"].as_u64());
+        let after = status(rpc_port).await.and_then(|s| s["state_height"].as_u64());
+        if let (Some(before), Some(nonce), Some(after)) = (before, nonce, after) {
+            if before == after {
+                return (before, nonce);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("could not read a height and a nonce from the same block on :{rpc_port}");
 }
 
 async fn block_body(rpc_port: u16, height: u64) -> Option<serde_json::Value> {

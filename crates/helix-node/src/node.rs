@@ -3435,6 +3435,8 @@ async fn apply_finalized_block(
     tip_certificate: &Arc<RwLock<TipCertificate>>,
 ) {
     let tx_hashes: Vec<_> = block.transactions.iter().map(|t| t.hash()).collect();
+    let tx_senders: std::collections::HashSet<String> =
+        block.transactions.iter().map(|t| t.from.to_string()).collect();
     let height = block.height();
     let block_hash = block.hash();
     let tx_count = block.tx_count();
@@ -3763,7 +3765,25 @@ async fn apply_finalized_block(
     // serve, since the block that would embed it (tip+1) does not exist yet.
     publish_tip_certificate(engine, tip_certificate, store, height, block_hash).await;
 
-    { mempool.write().await.remove_committed(&tx_hashes); }
+    // Nonces after this block, snapshotted before the pool lock for the same reason as in
+    // `block_production_loop`: a transaction the block carried but could not apply because its
+    // nonce was still ahead stays in the pool (#231).
+    let account_nonces: std::collections::HashMap<String, u64> = {
+        let chain = chain_state.read().await;
+        tx_senders
+            .into_iter()
+            .map(|s| {
+                let nonce = chain.accounts.get(s.as_str()).map_or(0, |a| a.nonce);
+                (s, nonce)
+            })
+            .collect()
+    };
+    {
+        mempool
+            .write()
+            .await
+            .remove_committed(&tx_hashes, &|addr: &str| account_nonces.get(addr).copied());
+    }
 
     if tx_count > 0 {
         info!(height, tx_count, "Block committed");
@@ -4735,11 +4755,17 @@ async fn block_production_loop(
         // Three sequential locks cost nothing here and cannot deadlock against a call site that
         // takes them the other way around.
         let senders = mempool.read().await.senders();
+        // A sender with no account is on nonce 0 — an answer, not an unknown: the pool packs
+        // only the unbroken run from here (#231), and "unknown" would let it start at whatever
+        // nonce it happens to hold.
         let account_nonces: std::collections::HashMap<String, u64> = {
             let chain = chain_state.read().await;
             senders
                 .into_iter()
-                .filter_map(|s| chain.accounts.get(s.as_str()).map(|a| (s, a.nonce)))
+                .map(|s| {
+                    let nonce = chain.accounts.get(s.as_str()).map_or(0, |a| a.nonce);
+                    (s, nonce)
+                })
                 .collect()
         };
         let txs = {
