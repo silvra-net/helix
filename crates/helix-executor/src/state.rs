@@ -1296,11 +1296,6 @@ impl ChainState {
         self.tagged_engine_set()
     }
 
-    /// Mark every probationary validator whose verified signature is in this block's `last_commit`
-    /// as having proved itself live this epoch. `signers` is the same validated set
-    /// `record_block_participation` scores against (see `execute_block`), so a proposer can neither
-    /// fabricate nor omit a probationer's liveness beyond what it can already do for any signature.
-    /// Accumulated across the probation epoch and consumed by `rotate_active_validators`.
     /// Whether `address` is serving probation *and* still owes the network its liveness proof.
     ///
     /// The single condition that bounds `TxType::ProbationHeartbeat`'s base-fee exemption: it is
@@ -1311,6 +1306,11 @@ impl ChainState {
         self.probationary_validators.contains(address) && !self.probation_seen.contains(address)
     }
 
+    /// Mark every probationary validator whose verified signature is in this block's `last_commit`
+    /// as having proved itself live this epoch. `signers` is the same validated set
+    /// `record_block_participation` scores against (see `execute_block`), so a proposer can neither
+    /// fabricate nor omit a probationer's liveness beyond what it can already do for any signature.
+    /// Accumulated across the probation epoch and consumed by `rotate_active_validators`.
     pub fn record_probation_liveness(
         &mut self,
         signers: &std::collections::HashSet<Address>,
@@ -1319,18 +1319,22 @@ impl ChainState {
         if self.probationary_validators.is_empty() {
             return;
         }
-        // Proposing is the proof that actually works. A probationer holds zero voting power, so its
-        // precommit is never awaited and — on a chain producing blocks — it usually receives the
-        // finished block before the proposal it would have voted on, and votes not at all. Two
-        // attempts to read liveness out of the vote stream failed on exactly that (backlog #141).
-        // A block's proposer, by contrast, is named in its signed header: on-chain, identical on
-        // every node, with no delivery window to miss. `ValidatorSet::probation_proof_proposer`
-        // gives each probationer the turns to produce one.
+        // A probationer that proposed a committed block demonstrably has a node running. Dormant:
+        // probationers never take a proposer turn (`ValidatorSet::proposer_for_round` skips them;
+        // proof slots were tried under #141/#143 and reverted — a probationer a few blocks behind
+        // proposed on a `prev_hash` nobody else had and stalled the chain), so this cannot fire
+        // today. This comment used to say the opposite, naming a `probation_proof_proposer` that
+        // no longer exists (found under #232). Kept, and pinned by
+        // `proposing_a_block_records_a_probationer_as_live`, because it is the right meaning should
+        // probationers ever propose again.
         if self.probationary_validators.contains(proposer) {
             self.probation_seen.insert(proposer.clone());
         }
-        // Signatures still count when they do arrive — a probationer that manages to co-sign has
-        // demonstrated the same thing, and there is no reason to make it wait for its own slot.
+        // A signature in the certificate proves the same thing. It often does not arrive — a
+        // probationer holds zero voting power, so its precommit is never awaited, and it usually
+        // receives the finished block before the proposal it would have voted on (#141) — which is
+        // why the proof that carries promotion is the heartbeat transaction
+        // (`TxType::ProbationHeartbeat`): it waits in the mempool and has no window to miss.
         for addr in signers {
             if self.probationary_validators.contains(addr) {
                 self.probation_seen.insert(addr.clone());
