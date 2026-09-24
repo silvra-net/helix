@@ -309,6 +309,60 @@ const HEARTBEAT_TICK_INTERVAL: u32 = 10;
 /// gossip mesh to finish forming before producing the first block, in a
 /// multi-validator set. See the startup gate in `block_production_loop`.
 const MESH_SETTLE_TICKS: u32 = 5;
+
+/// How recently a block must have been applied here for the chain to count as moving — the second
+/// kind of evidence `quorum_reachable` accepts. Three validators at 2 s move every few seconds, and
+/// even a round lost to an absent proposer costs ~16 s; a minute without a block is a chain that
+/// has stopped, and then the connection count is all there is to go on again.
+const CHAIN_PULSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether this node can reach enough validators to take part in rounds — the question behind the
+/// three peer gates in `block_production_loop`.
+///
+/// Counting direct connections used to be the whole rule, and on a relayed network it is wrong.
+/// The production node reaches every validator through its one peer, so by count it was short of
+/// quorum every minute of its life, and after every restart it held its own proposer turns for the
+/// full `PEER_WAIT_TIMEOUT_TICKS` — two minutes, each skipped turn a round of ~16 s lost, while
+/// the chain ran on around it (measured 2026-09-24, five rounds after one restart).
+///
+/// A chain that is finalizing blocks *here* is the better evidence: the validators quorum needs
+/// are up, and their votes reach this node by some path. And nobody is starting up at round 0 whom
+/// this node could run ahead of — which is all the gates protect (see `note_peer_wait_tick`).
+/// With no peer at all, nothing is reachable, whatever the chain did a minute ago.
+fn quorum_reachable(peers: usize, needed: usize, chain_moving: bool) -> bool {
+    needed == 0 || peers >= needed || (peers > 0 && chain_moving)
+}
+
+/// When this node last applied a block, as seen from the production loop — the "chain moving"
+/// half of `quorum_reachable`. Starts out not moving: a node that has just started has seen
+/// nothing yet, and the old count is the right rule until it has.
+struct ChainPulse {
+    height: u64,
+    advanced_at: Option<std::time::Instant>,
+}
+
+impl ChainPulse {
+    fn new(height: u64) -> Self {
+        ChainPulse {
+            height,
+            advanced_at: None,
+        }
+    }
+
+    /// Raise-only: an applied height never goes down, so a lower reading is noise, and taking it
+    /// would let climbing back to a height already seen pass for a block applied.
+    fn observe(&mut self, height: u64, now: std::time::Instant) {
+        if height > self.height {
+            self.height = height;
+            self.advanced_at = Some(now);
+        }
+    }
+
+    fn moving(&self, now: std::time::Instant) -> bool {
+        self.advanced_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= CHAIN_PULSE_WINDOW)
+    }
+}
 const MAX_TXS_PER_BLOCK: usize = 1_000;
 
 /// Transaction bytes this node packs into a block **it proposes**. Local policy, not a consensus
@@ -4510,6 +4564,8 @@ async fn block_production_loop(
     // either — a single attempt that lands in a moment of packet loss would cost a whole epoch,
     // and the whole point of this design is that it does not depend on catching one moment.
     let mut heartbeat_ticks: u32 = 0;
+    // When a block was last applied here — see `quorum_reachable`.
+    let mut pulse = ChainPulse::new(*last_applied_height.lock().await);
 
     loop {
         interval.tick().await;
@@ -4579,6 +4635,12 @@ async fn block_production_loop(
         }
         sync_wait_ticks = 0;
 
+        // `try_lock`, not `lock`: the catch-up paths hold this across a whole batch, and this loop
+        // must not wait on them to learn something it can learn next tick.
+        if let Ok(applied) = last_applied_height.try_lock() {
+            pulse.observe(*applied, std::time::Instant::now());
+        }
+        let chain_moving = pulse.moving(std::time::Instant::now());
 
         // Publish, for the health heartbeat, whether the chain is held up by missing validators
         // rather than by anything wrong with this node (backlog #150).
@@ -4619,10 +4681,25 @@ async fn block_production_loop(
 
         if !mesh_ready {
             let needed = engine.read().await.peers_needed_for_quorum();
+            let have = peer_count.load(std::sync::atomic::Ordering::Relaxed);
             if needed == 0 {
                 mesh_ready = true;
-            } else if peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed {
-                let have = peer_count.load(std::sync::atomic::Ordering::Relaxed);
+            } else if have < needed && quorum_reachable(have, needed, chain_moving) {
+                // Short by count, but blocks are being finalized and reaching this node — the
+                // validators are reachable through its peers, the mesh they vote over is plainly
+                // working, and there is no cold start to protect. Waiting out the grace period
+                // here cost the production node five of its own rounds after every restart.
+                engine.write().await.reset_peer_wait();
+                waited_ticks = 0;
+                info!(
+                    peers = have,
+                    needed,
+                    "Fewer validators are connected directly than quorum needs, but blocks are \
+                     being finalized and reaching this node — they are reachable through its \
+                     peers. Producing without waiting out the grace period."
+                );
+                mesh_ready = true;
+            } else if !quorum_reachable(have, needed, chain_moving) {
                 if !engine.write().await.note_peer_wait_tick() {
                     // Say what is happening. A stalled chain with a silent log is what makes an
                     // operator restart the node — which resets this counter and so lengthens
@@ -4705,7 +4782,8 @@ async fn block_production_loop(
             // `PEER_WAIT_TIMEOUT_TICKS`, stop waiting and tick anyway; see
             // `note_peer_wait_tick`'s doc comment.
             let needed = engine.read().await.peers_needed_for_quorum();
-            if peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed {
+            let have = peer_count.load(std::sync::atomic::Ordering::Relaxed);
+            if !quorum_reachable(have, needed, chain_moving) {
                 if !engine.write().await.note_peer_wait_tick() {
                     // Same silence #121 fixes in the mesh phase, one step later: a round is
                     // already open but validators dropped below quorum, so we hold it and say
@@ -4715,7 +4793,6 @@ async fn block_production_loop(
                     // minute is enough to be visible without flooding.
                     waited_ticks += 1;
                     if waited_ticks % 30 == 1 {
-                        let have = peer_count.load(std::sync::atomic::Ordering::Relaxed);
                         info!(
                             peers = have,
                             needed,
@@ -4753,8 +4830,11 @@ async fn block_production_loop(
             // meaningful in a multi-validator set; a sole validator (peers_needed == 0) always
             // proposes and never waits, so it skips this and produce_block finalizes as before.
             let needed = engine.read().await.peers_needed_for_quorum();
-            let under_connected =
-                peer_count.load(std::sync::atomic::Ordering::Relaxed) < needed;
+            let under_connected = !quorum_reachable(
+                peer_count.load(std::sync::atomic::Ordering::Relaxed),
+                needed,
+                chain_moving,
+            );
             // `needed == 0` alone used to skip the round clock entirely, on the reasoning that a
             // sole validator "always proposes and never waits". The first half of that is what
             // actually matters, and it is not implied by the second: a node whose own power meets
@@ -11457,6 +11537,171 @@ mod handle_p2p_event_tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         loop_handle.abort();
+    }
+
+    /// The production node after every restart until 2026-09-24: one direct peer, two validators
+    /// needed, so by count it was short of quorum and held its own proposer turns for the whole
+    /// grace period — five rounds of ~16 s lost after one restart, while the chain it was part of
+    /// finalized around it. Once blocks are being applied here, the validators are reachable
+    /// through its peer, and it has to take its turn.
+    ///
+    /// The first ten seconds are the control: with nothing applied, the gate must still hold
+    /// exactly as before — otherwise this test would pass for a loop that ignores the gate
+    /// altogether. `last_applied_height` stands in for a block arriving; it is the value the loop
+    /// reads, and every path that applies a block (consensus, gossip, block-sync) moves it.
+    #[tokio::test]
+    async fn a_node_short_of_direct_peers_takes_its_turn_once_blocks_are_applied_here() {
+        let kp = Arc::new(KeyPair::generate());
+        let addr = Address::from_public_key(&kp.public);
+        let a = Address::from_public_key(&KeyPair::generate().public);
+        let b = Address::from_public_key(&KeyPair::generate().public);
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
+        {
+            let mut cs = chain_state.write().await;
+            cs.governance_params.min_validator_stake = 1;
+            for who in [&addr, &a, &b] {
+                cs.update_account(who, |acc| acc.staked = 10_000_000);
+            }
+        }
+        // Index 1 proposes at height 1, round 0 — this node.
+        let vset = ValidatorSet::new(
+            vec![
+                Validator::new(a.clone(), 10_000_000, true),
+                Validator::new(addr.clone(), 10_000_000, true),
+                Validator::new(b.clone(), 10_000_000, true),
+            ],
+            0,
+        );
+        let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr.clone(), 0)));
+        {
+            let eng = engine.read().await;
+            assert_eq!(eng.peers_needed_for_quorum(), 2, "precondition: three equal, all needed");
+            assert!(eng.is_our_turn(), "precondition: height 1, round 0 is this node's turn");
+        }
+
+        let applied = Arc::new(Mutex::new(0u64));
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(256);
+        let loop_handle = tokio::spawn(block_production_loop(
+            store.clone(),
+            mempool.clone(),
+            chain_state.clone(),
+            kp.clone(),
+            engine.clone(),
+            applied.clone(),
+            p2p_tx.clone(),
+            // One direct peer against two needed: short by count, like the production node.
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            Arc::new(RwLock::new(TipCertificate::default())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ));
+
+        async fn proposed_within(rx: &mut mpsc::Receiver<P2PCommand>, window: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + window;
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(P2PCommand::BroadcastProposal(_))) => return true,
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => return false,
+                }
+            }
+        }
+
+        let early = proposed_within(&mut p2p_rx, Duration::from_secs(10)).await;
+        assert!(
+            !early,
+            "control: with no block applied, a node short of direct peers must still hold its turn \
+             — the gate still protects a cold start"
+        );
+
+        *applied.lock().await = 1;
+        let proposed = proposed_within(&mut p2p_rx, Duration::from_secs(20)).await;
+        loop_handle.abort();
+        assert!(
+            proposed,
+            "a block was applied here, so the validators are reachable through this node's peer — \
+             it must take its turn instead of waiting out the grace period"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quorum_reach_tests {
+    use super::{quorum_reachable, ChainPulse, CHAIN_PULSE_WINDOW};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn enough_direct_connections_are_enough_as_before() {
+        assert!(quorum_reachable(2, 2, false));
+        assert!(quorum_reachable(5, 2, false));
+        assert!(quorum_reachable(0, 0, false), "a set of one needs nobody");
+    }
+
+    /// The production node's shape: one peer, two needed.
+    #[test]
+    fn a_moving_chain_makes_validators_reachable_through_fewer_peers() {
+        assert!(
+            !quorum_reachable(1, 2, false),
+            "by count alone it is short, as before"
+        );
+        assert!(
+            quorum_reachable(1, 2, true),
+            "blocks arriving here show they are reachable"
+        );
+    }
+
+    /// With no peer, blocks that arrived a minute ago say nothing about now.
+    #[test]
+    fn with_no_peer_nothing_is_reachable_whatever_the_chain_did() {
+        assert!(!quorum_reachable(0, 2, true));
+    }
+
+    #[test]
+    fn a_fresh_pulse_is_not_moving_until_a_block_is_applied() {
+        let t0 = Instant::now();
+        let mut pulse = ChainPulse::new(100);
+        assert!(
+            !pulse.moving(t0),
+            "a node that just started has seen nothing yet"
+        );
+        pulse.observe(100, t0 + Duration::from_secs(1));
+        assert!(
+            !pulse.moving(t0 + Duration::from_secs(1)),
+            "the same height is not movement"
+        );
+        pulse.observe(101, t0 + Duration::from_secs(2));
+        assert!(pulse.moving(t0 + Duration::from_secs(2)));
+    }
+
+    /// A chain that stops goes back to the count — the gate is for exactly that situation.
+    #[test]
+    fn a_pulse_that_stops_is_not_moving_after_the_window() {
+        let t0 = Instant::now();
+        let mut pulse = ChainPulse::new(0);
+        pulse.observe(1, t0);
+        assert!(pulse.moving(t0 + CHAIN_PULSE_WINDOW));
+        assert!(!pulse.moving(t0 + CHAIN_PULSE_WINDOW + Duration::from_secs(1)));
+    }
+
+    /// An applied height never goes down, so a lower reading is not a block applied — and
+    /// climbing back to a height already seen is not one either.
+    #[test]
+    fn a_height_that_goes_down_and_back_is_not_movement() {
+        let t0 = Instant::now();
+        let mut pulse = ChainPulse::new(10);
+        pulse.observe(9, t0);
+        pulse.observe(10, t0 + Duration::from_secs(1));
+        assert!(!pulse.moving(t0 + Duration::from_secs(1)));
+        pulse.observe(11, t0 + Duration::from_secs(2));
+        assert!(pulse.moving(t0 + Duration::from_secs(2)), "a new height is");
     }
 }
 
