@@ -556,6 +556,11 @@ impl P2PService {
         // node's `peer_count` (`AtomicUsize`) to `usize::MAX` and make every quorum-peer check
         // trivially pass.
         let mut connected_peers: HashSet<PeerId> = HashSet::new();
+        // The address behind every connection this node dialed itself, while that connection is
+        // up — what `redial_targets` needs to leave alone (#233). Keyed by connection and emptied
+        // as each closes, so an address is only ever skipped while a link through it really
+        // exists.
+        let mut dialed_links: HashMap<libp2p::swarm::ConnectionId, Multiaddr> = HashMap::new();
         // Makes a peer that never stays connected visible (backlog #149).
         let mut flaps = FlapTracker::new(std::time::Instant::now());
         // One outstanding request at a time. Without this, every driver tick while a slow batch is
@@ -1040,7 +1045,16 @@ impl P2PService {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             info!(addr = %address, "P2P listening");
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        SwarmEvent::ConnectionEstablished {
+                            peer_id,
+                            connection_id,
+                            endpoint,
+                            ..
+                        } => {
+                            if endpoint.is_dialer() {
+                                dialed_links
+                                    .insert(connection_id, endpoint.get_remote_address().clone());
+                            }
                             let peer_str = peer_id.to_string();
                             let banned = match multiaddr_ip(endpoint.get_remote_address()) {
                                 Some(ip) => reputation.note_connection(&peer_str, &ip),
@@ -1109,7 +1123,13 @@ impl P2PService {
 
                             let _ = event_tx.send(P2PEvent::PeerConnected(peer_str)).await;
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                        SwarmEvent::ConnectionClosed {
+                            peer_id,
+                            connection_id,
+                            num_established,
+                            ..
+                        } => {
+                            dialed_links.remove(&connection_id);
                             // `num_established` is what is *left* to this peer. Dropping it (the
                             // `..` this replaces) treated one closing connection as the whole peer
                             // going away, tearing down state that several still-live connections
@@ -1233,10 +1253,11 @@ impl P2PService {
                     // Only while under the target, so a node with a working mesh never dials on
                     // a timer; one attempt per seed and at most `MAX_KNOWN_REDIALS_PER_TICK` known
                     // addresses per interval, so an address that stays down costs one connection
-                    // attempt per rotation and nothing else. Addresses of peers already connected
-                    // are dialed too: libp2p refuses the surplus before it is established (measured
-                    // under #147), which is cheaper than keeping a PeerId-to-address map that would
-                    // have to stay correct through every reconnect to avoid a *missed* dial.
+                    // attempt per rotation and nothing else. An address this node already holds a
+                    // link through — one it dialed — is skipped (`dialed_links`). It used to be
+                    // dialed too, on the belief that libp2p refuses the surplus before it is
+                    // established (#147); below `max_established_per_peer` it does not, and #233
+                    // counted 6 relay connections in a three-node test where 4–5 would do.
                     // `info!`, not `debug!`: an operator staring at `peer_count: 0` needs to see
                     // that the node is trying, and how often — the silent-wait failure mode from
                     // the peer/liveness windows is exactly what made this class of problem so
@@ -1266,7 +1287,14 @@ impl P2PService {
                             .into_iter()
                             .chain(announced_self.as_deref())
                             .collect();
-                        let targets = redial_targets(&seed_addrs, &known_addrs, &own, redial_rotation);
+                        let linked: HashSet<Multiaddr> = dialed_links.values().cloned().collect();
+                        let targets = redial_targets(
+                            &seed_addrs,
+                            &known_addrs,
+                            &own,
+                            &linked,
+                            redial_rotation,
+                        );
                         redial_rotation = redial_rotation.wrapping_add(1);
                         if !targets.is_empty() {
                             if verdict.log {
@@ -1744,16 +1772,23 @@ struct RedialVerdict {
 /// role: the concern there is a peer that gossips enough addresses to decide who this node talks
 /// to. At zero connections there is nobody to displace — any connection is strictly more than none
 /// — and every one of these addresses was already dialed once, when it was learned or at startup.
+///
+/// `linked` are the addresses this node already holds a connection through, one it dialed itself:
+/// dialing them again only opens a surplus connection to a peer it has (#233). Worse than useless
+/// since #232 showed what a surplus costs: it takes one of the two slots `max_established_per_peer`
+/// allows, and when both links to a peer die on one side only, the far side holds two dead halves
+/// and turns every redial away until its ping has condemned them.
 fn redial_targets(
     seeds: &[Multiaddr],
     known: &HashSet<String>,
     own: &[&str],
+    linked: &HashSet<Multiaddr>,
     rotation: usize,
 ) -> Vec<Multiaddr> {
     let own: HashSet<Multiaddr> = own.iter().filter_map(|a| a.parse().ok()).collect();
     let mut targets: Vec<Multiaddr> = Vec::new();
     for addr in seeds {
-        if !own.contains(addr) && !targets.contains(addr) {
+        if !own.contains(addr) && !linked.contains(addr) && !targets.contains(addr) {
             targets.push(addr.clone());
         }
     }
@@ -1762,7 +1797,7 @@ fn redial_targets(
     let mut rest: Vec<Multiaddr> = known
         .iter()
         .filter_map(|a| a.parse::<Multiaddr>().ok())
-        .filter(|a| !own.contains(a) && !targets.contains(a))
+        .filter(|a| !own.contains(a) && !linked.contains(a) && !targets.contains(a))
         .collect();
     rest.sort_by_key(|a| a.to_string());
     rest.dedup();
@@ -4532,7 +4567,7 @@ mod redial_target_tests {
     /// the seed — and redialed nobody for 7 h 36 min while seven addresses sat in its peer file.
     #[test]
     fn a_node_without_seeds_still_redials_the_addresses_it_knows() {
-        let targets = redial_targets(&[], &known(&[8546, 8547]), &[], 0);
+        let targets = redial_targets(&[], &known(&[8546, 8547]), &[], &HashSet::new(), 0);
         assert_eq!(
             targets.len(),
             2,
@@ -4552,6 +4587,7 @@ mod redial_target_tests {
             &[ma(443)],
             &known(&[443, 8546, 8548]),
             &[own_configured.as_str(), own_probed.as_str()],
+            &HashSet::new(),
             0,
         );
         assert_eq!(
@@ -4565,15 +4601,28 @@ mod redial_target_tests {
     /// which is the normal case, since every seed lands in `known_addrs` at startup.
     #[test]
     fn seeds_come_first_and_are_not_repeated() {
-        let targets = redial_targets(&[ma(9000)], &known(&[9000, 8546]), &[], 0);
+        let targets = redial_targets(&[ma(9000)], &known(&[9000, 8546]), &[], &HashSet::new(), 0);
         assert_eq!(targets, vec![ma(9000), ma(8546)]);
+    }
+
+    /// #233's side finding: a node under the peer target redialed every address it knew, including
+    /// the ones it was connected through, and each landed as a surplus connection to a peer it
+    /// already had. An address carrying a link this node dialed is left alone — seed or not.
+    #[test]
+    fn an_address_this_node_is_already_linked_through_is_not_dialed_again() {
+        let linked: HashSet<Multiaddr> = [ma(9000), ma(8546)].into();
+        let targets = redial_targets(&[ma(9000)], &known(&[9000, 8546, 8547]), &[], &linked, 0);
+        assert_eq!(targets, vec![ma(8547)]);
     }
 
     #[test]
     fn addresses_that_do_not_parse_are_skipped_rather_than_fatal() {
         let mut book = known(&[8546]);
         book.insert("not a multiaddr".to_string());
-        assert_eq!(redial_targets(&[], &book, &[], 0), vec![ma(8546)]);
+        assert_eq!(
+            redial_targets(&[], &book, &[], &HashSet::new(), 0),
+            vec![ma(8546)]
+        );
     }
 
     /// A dial has no timeout of its own, so a full address book dialed every 30 s would stack
@@ -4588,7 +4637,13 @@ mod redial_target_tests {
         let mut reached: HashSet<Multiaddr> = HashSet::new();
         let ticks = ports.len().div_ceil(MAX_KNOWN_REDIALS_PER_TICK);
         for tick in 0..ticks {
-            let targets = redial_targets(std::slice::from_ref(&seed), &book, &[], tick);
+            let targets = redial_targets(
+                std::slice::from_ref(&seed),
+                &book,
+                &[],
+                &HashSet::new(),
+                tick,
+            );
             assert_eq!(targets[0], seed, "the seed is dialed on every tick");
             assert!(
                 targets.len() <= 1 + MAX_KNOWN_REDIALS_PER_TICK,

@@ -90,6 +90,7 @@ fn a_vote(height: u64) -> helix_consensus::Vote {
 /// connection that leads nowhere. Links opened after a cut are relayed normally.
 struct Relay {
     generation: watch::Sender<u64>,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Relay {
@@ -97,6 +98,8 @@ impl Relay {
         let listener = TcpListener::bind(("127.0.0.1", listen)).await.unwrap();
         let (generation, _) = watch::channel(0u64);
         let generations = generation.clone();
+        let accepted: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let accepted_here = accepted.clone();
         // The target-side sockets of cut links. Held, never touched: dropping them would close
         // them, and a closed socket is exactly what the far end must *not* see.
         let silent: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
@@ -105,6 +108,7 @@ impl Relay {
                 let Ok((client, _)) = listener.accept().await else {
                     return;
                 };
+                accepted_here.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Ok(upstream) = TcpStream::connect(("127.0.0.1", target)).await else {
                     continue;
                 };
@@ -145,7 +149,15 @@ impl Relay {
                 });
             }
         });
-        Relay { generation }
+        Relay {
+            generation,
+            accepted,
+        }
+    }
+
+    /// How many links the relay has been asked to carry so far.
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn cut(&self) {
@@ -333,4 +345,50 @@ async fn a_node_can_publish_again_when_its_redial_beat_the_peers_ping() {
         1,
     )
     .await;
+}
+
+/// #233's side finding, measured where it happens: a node with fewer than three peers redials on
+/// every 30-second tick, and it used to redial the peer it was already connected to as well. Each
+/// such dial is a surplus link — and the first test above shows what surplus links cost when a
+/// link dies on one side only: the far side holds a dead half in every slot and turns the redial
+/// away. Once X is connected, the relay in front of Y must not be asked for another link.
+#[tokio::test]
+async fn a_node_does_not_redial_a_peer_it_is_already_connected_through() {
+    // The relay is Y's public address — the way `p2p.silvra.net` is the production node's — so
+    // that Y, learning it from X's peer exchange, knows it for its own and never dials it. Without
+    // that the relay would count Y dialing itself, and the measurement would be of the wrong node.
+    let (_y_commands, mut y_events) = spawn(P2PConfig {
+        public_addr: Some("/ip4/127.0.0.1/tcp/19789".to_string()),
+        ..config(19788, vec![], (1, 2))
+    });
+    let relay = Relay::spawn(19789, 19788).await;
+    let (_x_commands, mut x_events) = spawn(config(19787, vec![19789], (1, 2)));
+    tokio::spawn(async move { while y_events.recv().await.is_some() {} });
+
+    let connected = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = x_events.recv().await {
+            if matches!(event, P2PEvent::PeerConnected(_)) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(
+        connected,
+        Ok(true),
+        "X never connected to Y through the relay"
+    );
+    tokio::spawn(async move { while x_events.recv().await.is_some() {} });
+
+    // Past startup, where the first redial tick fires at once and may race the seed dial, and then
+    // across the next tick (30s): an X that dials connected peers asks the relay again here.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let settled = relay.accepted();
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert_eq!(
+        relay.accepted() - settled,
+        0,
+        "X redialed a peer it was already connected to ({settled} links before the window)"
+    );
 }
