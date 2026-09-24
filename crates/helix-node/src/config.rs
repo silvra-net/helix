@@ -20,6 +20,9 @@ pub struct NodeConfig {
     /// but never validate (BFT needs gossip). See `helix_p2p::P2PConfig::ws_listen_addr`.
     /// Overridable via `HELIX_P2P_WS_LISTEN`. Absent keeps the node raw-TCP-only.
     pub p2p_ws_listen_addr: Option<String>,
+    /// No longer read (#229) — the payout address is on-chain now (`helix tx set-reward-address`).
+    /// Kept so an existing `helix.toml` that sets it still parses (`deny_unknown_fields`); the
+    /// node warns at startup when it is set.
     pub reward_address: Option<String>,
     pub sync_peer: Option<String>,
     /// Set truthy (`1`/`true`/`yes`/`on`) to start/run a **standalone chain** instead of

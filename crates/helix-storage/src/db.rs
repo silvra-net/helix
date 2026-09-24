@@ -85,6 +85,12 @@ const MISSED_BLOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("missed
 /// stale-key pruning as `MISSED_BLOCKS` — without it, a validator that legitimately unjailed
 /// would come back jailed on the next node restart.
 const JAILED_UNTIL: TableDefinition<&str, &[u8]> = TableDefinition::new("jailed_until");
+/// validator address string → payout address string (#229) — see `ChainState::reward_addresses`.
+/// Removed when a validator clears its payout, so needs the same stale-key pruning as
+/// `JAILED_UNTIL`: insert-only persistence would bring a cleared payout back on this node's next
+/// restart, and this node alone would then pay the validator's rewards somewhere every other node
+/// has stopped paying them — a state fork from a restart.
+const REWARD_ADDRESSES: TableDefinition<&str, &str> = TableDefinition::new("reward_addresses");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// address string → (block height, tx index within block), both big-endian so a
 /// key's values sort in ascending chain order for free. Lets `address_transactions`
@@ -265,6 +271,7 @@ impl HelixDb {
         tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(REWARD_ADDRESSES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -408,6 +415,7 @@ impl HelixDb {
             let mut probation_seen = tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut missed_blocks = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut jailed_until = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut reward_addresses = tx.open_table(REWARD_ADDRESSES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut contract_storage = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut genesis_allocations = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -705,6 +713,30 @@ impl HelixDb {
                 jailed_until.insert(addr.as_str(), &height.to_le_bytes()[..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // Same stale-key pruning again — see REWARD_ADDRESSES' doc comment.
+            {
+                let current: std::collections::HashSet<&str> =
+                    state.reward_addresses.keys().map(|s| s.as_str()).collect();
+                let stale: Vec<String> = reward_addresses
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!current.contains(key.as_str())).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    reward_addresses
+                        .remove(key.as_str())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
+            for (validator, payout) in &state.reward_addresses {
+                reward_addresses
+                    .insert(validator.as_str(), payout.as_str())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
         }
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))
     }
@@ -732,6 +764,7 @@ impl HelixDb {
         let probation_seen_table = tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
         let missed_blocks_table = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         let jailed_until_table = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
+        let reward_addresses_table = tx.open_table(REWARD_ADDRESSES).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_allocations_table = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
@@ -940,6 +973,17 @@ impl HelixDb {
             jailed_until.insert(k.value().to_string(), u64::from_le_bytes(height_bytes));
         }
 
+        let mut reward_addresses = std::collections::HashMap::new();
+        for entry in reward_addresses_table.iter().map_err(|e| StorageError::Db(e.to_string()))? {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            // Written only after the executor checked it, so a value that does not parse is a
+            // damaged database — refused loudly rather than paying rewards to a string.
+            let payout = Address::from_str(v.value()).map_err(|e| {
+                StorageError::Serialization(format!("reward address for {}: {e}", k.value()))
+            })?;
+            reward_addresses.insert(k.value().to_string(), payout);
+        }
+
         let read_meta_u64 = |key: &str| -> Option<u64> {
             meta_table.get(key).ok().flatten().and_then(|v| {
                 let bytes: [u8; 8] = v.value().try_into().ok()?;
@@ -1005,6 +1049,7 @@ impl HelixDb {
             personhood_authorities,
             validator_pools,
             delegator_shares,
+            reward_addresses,
             redelegations,
             contract_storage,
             genesis_validator_stake,
@@ -2637,6 +2682,35 @@ mod tests {
             !loaded.jailed_until.contains_key(&addr(1).to_string()),
             "an unjailed validator came back jailed after reopening"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #229: a payout survives a restart — and a *cleared* payout stays cleared. This node alone
+    /// paying a validator's rewards to an address the rest of the network stopped paying is a
+    /// state fork, and a restart is all it would take.
+    #[test]
+    fn a_reward_address_survives_reopening_and_a_cleared_one_stays_cleared() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.reward_addresses.insert(addr(1).to_string(), addr(2));
+        state.reward_addresses.insert(addr(3).to_string(), addr(4));
+        db.save_chain_state(&state).unwrap();
+
+        // addr(3) takes its rewards back.
+        state.reward_addresses.remove(&addr(3).to_string());
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert_eq!(loaded.reward_addresses.get(&addr(1).to_string()), Some(&addr(2)));
+        assert!(
+            !loaded.reward_addresses.contains_key(&addr(3).to_string()),
+            "a cleared reward address came back after reopening"
+        );
+        assert_eq!(loaded.state_hash(), state.state_hash(), "and the reloaded state is the same state");
 
         let _ = std::fs::remove_file(&path);
     }

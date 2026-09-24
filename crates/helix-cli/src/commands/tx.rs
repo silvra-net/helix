@@ -138,6 +138,23 @@ pub enum TxCmd {
         #[arg(long)]
         nonce: Option<u64>,
     },
+    /// Pay this validator's own rewards to another address, e.g. a wallet whose key never
+    /// touches the server. Your delegators' share is not affected.
+    SetRewardAddress {
+        /// Address the rewards go to
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        address: Option<String>,
+        /// Pay rewards to this validator's own address again
+        #[arg(long)]
+        clear: bool,
+        #[arg(short, long, default_value = "wallet.json")]
+        key: PathBuf,
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
     /// Check transaction status
     Status {
         /// Transaction hash
@@ -171,6 +188,9 @@ pub async fn run(cmd: TxCmd, node: &str) -> Result<()> {
         }
         TxCmd::SetCommission { bps, key, fee, nonce } => {
             set_commission(bps, key, fee, nonce, node).await
+        }
+        TxCmd::SetRewardAddress { address, clear, key, fee, nonce } => {
+            set_reward_address(address, clear, key, fee, nonce, node).await
         }
         TxCmd::Status { hash } => tx_status(hash, node).await,
     }
@@ -466,6 +486,66 @@ async fn set_commission(
     submit_tx(&tx, node).await
 }
 
+/// `SetRewardAddress` (#229). `--clear` is the same transaction pointed at the validator itself —
+/// the chain has one rule for both, so the CLI does not invent a second.
+async fn set_reward_address(
+    address: Option<String>,
+    clear: bool,
+    key_path: PathBuf,
+    fee: Option<u64>,
+    nonce_override: Option<u64>,
+    node: &str,
+) -> Result<()> {
+    // Checked before the passphrase prompt: a typo should cost nobody a round of typing.
+    let payout = match (&address, clear) {
+        (Some(a), false) => Some(
+            Address::from_str(a).map_err(|e| anyhow::anyhow!("Invalid reward address: {}", e))?,
+        ),
+        _ => None,
+    };
+    let kf = KeyFile::load(&key_path)?;
+    let kp = if kf.is_encrypted() {
+        let pass = rpassword_read("Wallet passphrase: ")?;
+        kf.to_keypair(Some(&pass))?
+    } else {
+        kf.to_keypair(None)?
+    };
+    let from = Address::from_str(&kf.address)
+        .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
+    let payout = payout.unwrap_or_else(|| from.clone());
+    let nonce = match nonce_override {
+        Some(n) => n,
+        None => super::fetch_nonce(node, &kf.address).await?,
+    };
+    let mut tx = Transaction {
+        version: 1,
+        tx_type: TxType::SetRewardAddress,
+        from: from.clone(),
+        to: Some(payout.clone()),
+        amount: 0,
+        fee: 0, // replaced by price_and_sign below
+        nonce,
+        data: vec![],
+        crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
+        signature: Signature::from_bytes(vec![]),
+        public_key: kp.public.clone(),
+    };
+    price_and_sign(&mut tx, fee, &kp, node).await?;
+
+    println!("  Validator  : {}", kf.address);
+    if payout == from {
+        println!("  Rewards to : this validator's own address");
+    } else {
+        println!("  Rewards to : {}", payout);
+        println!("               Your own share and commission only — delegators keep theirs.");
+    }
+    println!("  Fee        : {} nano-HLX", tx.fee);
+    println!("  Nonce      : {}", nonce);
+
+    submit_tx(&tx, node).await
+}
+
 async fn submit_tx(tx: &Transaction, node: &str) -> Result<()> {
     let res = super::submit_tx(tx, node).await?;
     super::report_submitted(&res);
@@ -660,5 +740,44 @@ mod passphrase_tests {
         assert_eq!(as_typed(" leading".into()), " leading");
         assert_eq!(as_typed("pw\r\n".into()), "pw");
         assert_eq!(as_typed("pw\n".into()), "pw");
+    }
+}
+
+#[cfg(test)]
+mod set_reward_address_arguments {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        tx: TxCmd,
+    }
+
+    fn parse(args: &[&str]) -> std::result::Result<TxCmd, clap::Error> {
+        Cli::try_parse_from(std::iter::once("tx").chain(args.iter().copied())).map(|c| c.tx)
+    }
+
+    #[test]
+    fn an_address_or_clear_is_required_and_never_both() {
+        let addr = "hlxbx7oYT7n1nidYCxLrk1LUQ93CTXFrGWNt";
+        match parse(&["set-reward-address", addr]).expect("an address parses") {
+            TxCmd::SetRewardAddress { address, clear, .. } => {
+                assert_eq!(address.as_deref(), Some(addr));
+                assert!(!clear);
+            }
+            _ => panic!("wrong command"),
+        }
+        match parse(&["set-reward-address", "--clear"]).expect("--clear parses") {
+            TxCmd::SetRewardAddress { address, clear, .. } => {
+                assert_eq!(address, None);
+                assert!(clear);
+            }
+            _ => panic!("wrong command"),
+        }
+        // Neither: a bare command would otherwise quietly mean "clear", and a forgotten argument
+        // must not send rewards back to the hot key.
+        assert!(parse(&["set-reward-address"]).is_err());
+        assert!(parse(&["set-reward-address", addr, "--clear"]).is_err());
     }
 }

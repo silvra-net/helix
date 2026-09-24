@@ -414,6 +414,12 @@ pub struct ChainState {
     /// grow large per popular validator and is only read/written on delegate/undelegate.
     #[serde(default)]
     pub delegator_shares: HashMap<String, HashMap<String, u64>>,
+    /// Where a validator's own rewards are paid, set by `TxType::SetRewardAddress` (#229):
+    /// validator address -> payout address. Absent entry = paid to the validator itself.
+    /// Only the validator's own share moves — see `credit_validator_reward`, which finds the
+    /// delegation pool by the validator and never by this address.
+    #[serde(default)]
+    pub reward_addresses: HashMap<String, Address>,
     /// Capital moved straight from one validator's pool into another's via
     /// `TxType::Redelegate`, keyed by the **source** validator it is still slashable for.
     /// Absent entry = nothing is currently redelegating away from that validator.
@@ -611,6 +617,7 @@ impl ChainState {
             personhood_authorities: Vec::new(),
             validator_pools: HashMap::new(),
             delegator_shares: HashMap::new(),
+            reward_addresses: HashMap::new(),
             redelegations: HashMap::new(),
             contract_storage: HashMap::new(),
             genesis_validator_stake: 0,
@@ -623,6 +630,14 @@ impl ChainState {
             missed_blocks: HashMap::new(),
             jailed_until: HashMap::new(),
         }
+    }
+
+    /// Where `validator`'s own rewards are paid: its `SetRewardAddress` payout, or itself.
+    pub fn payout_address(&self, validator: &Address) -> Address {
+        self.reward_addresses
+            .get(validator.as_str())
+            .cloned()
+            .unwrap_or_else(|| validator.clone())
     }
 
     /// Read a value from `contract`'s own persistent storage. `None` if never set.
@@ -1430,6 +1445,9 @@ impl ChainState {
             // Nested HashMap -> HashMap, same non-determinism problem as everything else
             // here — flattened to a sorted map of maps rather than hashed as-is.
             delegator_shares: BTreeMap<&'a str, BTreeMap<&'a str, u64>>,
+            // Decides whose balance every block reward lands on, so it is consensus state like
+            // any other — a node that forgot a payout would credit a different account.
+            reward_addresses: BTreeMap<&'a str, &'a str>,
             // Only the outer map needs sorting: each `Vec<Redelegation>` is built by pushing
             // in transaction order and pruned with `retain`, both of which every node performs
             // identically, so the vector order is already consensus-deterministic.
@@ -1491,6 +1509,7 @@ impl ChainState {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.iter().map(|(dk, dv)| (dk.as_str(), *dv)).collect()))
                 .collect(),
+            reward_addresses: self.reward_addresses.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
             redelegations: self.redelegations.iter().map(|(k, v)| (k.as_str(), v)).collect(),
             contract_storage: self
                 .contract_storage

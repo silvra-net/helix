@@ -32,7 +32,6 @@ existing env-var-only setups keep working unchanged:
 # helix.toml
 rpc_bind = "0.0.0.0:8545"
 p2p_listen_addr = "0.0.0.0:8546"
-reward_address = "hlx..."
 # By default the node joins the public network via the built-in seed. Override the seed:
 sync_peer = "http://seed-host:8545"
 # ...or run a standalone chain instead (private devnet / a brand-new network's origin node):
@@ -50,7 +49,6 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | Variable | Default | Description |
 |---|---|---|
 | `HELIX_CONFIG` | `./helix.toml` | Path to the config file described above. |
-| `HELIX_REWARD_ADDRESS` | (validator address) | Address that receives the 50% validator fee reward. Set this to your app wallet address so fees land there instead of the signing key. Overrides `reward_address` in `helix.toml`. |
 | `HELIX_RPC_BIND` | `127.0.0.1:8545` | REST API bind address. Set to `0.0.0.0:8545` when the node isn't reached through a local reverse proxy/tunnel (e.g. running in a container). Overrides `rpc_bind` in `helix.toml`. |
 | `HELIX_P2P_LISTEN` | `0.0.0.0:8546` | P2P listen address (raw TCP). Overrides `p2p_listen_addr` in `helix.toml`. |
 | `HELIX_P2P_WS_LISTEN` | (none) | Extra P2P listen address that carries libp2p inside a **WebSocket** (e.g. `127.0.0.1:8547`), on top of the raw TCP above. Set this when the node's only route in from outside is an HTTPS reverse proxy or a Cloudflare tunnel, which forward WebSockets but not raw TCP — see "Validating from behind a reverse proxy / Cloudflare tunnel" below. Overrides `p2p_ws_listen_addr` in `helix.toml`. |
@@ -77,9 +75,11 @@ malformed file (bad TOML, or an unknown field) fails node startup.
 | `HELIX_NODE` | (auto) | Which node the **client** subcommands (`helix wallet`, `helix tx`, `helix chain`) talk to. Unset, they use a node running on this machine if one answers and the public network otherwise. Ignored by `helix start`, which configures itself from the variables above. |
 | `HELIX_P2P_DISABLE_MDNS` | (off) | Set truthy (`1`/`true`) to turn off mDNS LAN auto-discovery, leaving only seed peers + peer exchange. Needed only when two independent Helix networks share a LAN (mDNS would otherwise cross-wire them). Overrides `p2p_disable_mdns` in `helix.toml`. |
 
-```bash
-HELIX_REWARD_ADDRESS=hlx... ./target/release/helix start
-```
+**Paying rewards to another wallet is not a node setting.** `HELIX_REWARD_ADDRESS` and
+`reward_address` in `helix.toml` are no longer read — on a chain with other validators they never
+had an effect, and the node now says so at startup if you still set them. The payout address is
+on-chain: `helix tx set-reward-address <address> --key validator-key.json`, see
+[Staking, step 7](staking.md).
 
 ### Persistent Validator Key
 

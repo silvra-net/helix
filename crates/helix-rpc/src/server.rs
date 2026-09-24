@@ -1166,6 +1166,10 @@ async fn get_validator_pool(
             "effective_stake_hlx": chain.effective_stake(&address) as f64 / 1_000_000_000.0,
             "total_shares": pool.map(|p| p.total_shares).unwrap_or(0),
             "commission_bps": pool.map(|p| p.commission_bps),
+            // Where the validator's own share is paid (#229); `null` = to the validator itself.
+            // Shown to delegators because it is the one thing about a validator's rewards they
+            // could not otherwise see — their own share never follows it.
+            "reward_address": chain.reward_addresses.get(&address_str).map(|a| a.as_str()),
         })),
     )
 }
@@ -1216,6 +1220,7 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                 // `None` means the validator has never had a delegator and so has not set a
                 // rate — not that it takes zero. Rendering that difference is the client's job.
                 "commission_bps": pool.map(|p| p.commission_bps),
+                "reward_address": chain.reward_addresses.get(&key).map(|a| a.as_str()),
                 "accepts_delegation": pool.is_some(),
                 // `null` before the first rotation of a fresh chain: `active_validators` is
                 // empty then, and reporting `false` would call a validator that is visibly
@@ -1274,6 +1279,7 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                 "self_staked_hlx": chain.get(&addr).map(|a| a.staked).unwrap_or(0) as f64 / 1_000_000_000.0,
                 "delegated_stake_hlx": pool.map(|p| p.total_delegated_stake).unwrap_or(0) as f64 / 1_000_000_000.0,
                 "commission_bps": pool.map(|p| p.commission_bps),
+                "reward_address": chain.reward_addresses.get(key).map(|a| a.as_str()),
                 "accepts_delegation": pool.is_some(),
                 "active": false,
                 // Absent rather than zero: a jailed validator is not in the set at all, which is
@@ -2096,6 +2102,36 @@ mod tests {
             state.mempool.read().await.is_empty(),
             "the pool must stay empty — an admitted claim is what evicts honest transactions"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #229: a delegator can see where its validator's own rewards go — `null` when they go to
+    /// the validator itself, the address once `SetRewardAddress` pointed them elsewhere.
+    #[tokio::test]
+    async fn a_validators_reward_address_is_shown_to_delegators() {
+        let (state, path) = fresh_app_state();
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let payout = Address::from_public_key(&KeyPair::generate().public);
+
+        let read = |state: AppState| {
+            let validator = validator.to_string();
+            async move {
+                let response =
+                    get_validator_pool(State(state), Path(validator)).await.into_response();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["reward_address"].clone()
+            }
+        };
+
+        assert_eq!(read(state.clone()).await, serde_json::Value::Null);
+        state
+            .chain_state
+            .write()
+            .await
+            .reward_addresses
+            .insert(validator.to_string(), payout.clone());
+        assert_eq!(read(state.clone()).await, serde_json::json!(payout.to_string()));
 
         let _ = std::fs::remove_file(&path);
     }

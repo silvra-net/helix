@@ -148,6 +148,22 @@ pub enum TxType {
     /// one pays the full base fee like any other transaction, so there is no free lane here
     /// (compare `SubmitDoubleSignEvidence`, the other exempt type).
     ProbationHeartbeat,
+    /// `tx.from` names where its validator rewards are paid: `tx.to` (#229). `tx.to == tx.from`
+    /// clears it, and rewards go to `tx.from` again. No amount, no payload.
+    ///
+    /// What moves is the validator's **own** share only — the part of each block reward and
+    /// tip that belongs to its self-stake, plus its commission. Delegators' share still goes
+    /// into the pool, which is looked up by the validator, never by the payout address: a
+    /// validator cannot use this to divert what its delegators earn.
+    ///
+    /// Why it exists: the signing key sits on a server, and rewards credited to it are liquid
+    /// funds on the one machine an attacker most wants. Paying them to a wallet whose key never
+    /// touches that server takes them out of reach. It used to be the node setting
+    /// `HELIX_REWARD_ADDRESS` — local configuration deciding state, which every other node
+    /// could not know: in a multi-validator network it had to be ignored (and silently was),
+    /// and on a sole validator it made every follower compute a different state. On-chain,
+    /// every node applies the same payout, and delegators can see where it goes.
+    SetRewardAddress,
 }
 
 /// Payload embedded in `Transaction::data` for `TxType::ProvePersonhood`.

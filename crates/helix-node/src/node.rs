@@ -586,8 +586,6 @@ pub struct HelixNode {
     keypair: Arc<KeyPair>,
     address: Address,
     /// Where the validator's 50 % fee share lands.  Defaults to `address` when unset.
-    /// Configure via `reward_address` in `helix.toml` or the HELIX_REWARD_ADDRESS env var.
-    reward_address: Option<Address>,
     /// Resolved once at startup (env > `helix.toml` > unset) via `config::resolve`,
     /// then reused for both the startup sync and the runtime gap-fill fallback in
     /// `handle_p2p_event` — so a `sync_peer` set only in the config file also
@@ -664,19 +662,18 @@ impl HelixNode {
         let keypair = load_or_create_keypair(&key_path, scheme_for_new)?;
         let address = Address::from_public_key(&keypair.public);
 
-        // Optional reward address — fees land here instead of the validator address.
-        let reward_address = config::resolve("HELIX_REWARD_ADDRESS", &cfg.reward_address).and_then(|s| {
-            match Address::from_str(&s) {
-                Ok(addr) => {
-                    info!("Fee reward address : {} (HELIX_REWARD_ADDRESS / helix.toml)", addr);
-                    Some(addr)
-                }
-                Err(_) => {
-                    warn!("reward_address is set but invalid — fees go to validator address");
-                    None
-                }
-            }
-        });
+        // The payout address used to be read here and applied by this node alone — which on a
+        // chain with other validators had to be ignored, and was, silently (#229). It is on-chain
+        // now. Say so to anyone who still sets it, because silence is how it went unnoticed.
+        if let Some(configured) = config::resolve("HELIX_REWARD_ADDRESS", &cfg.reward_address) {
+            warn!(
+                configured = %configured,
+                "HELIX_REWARD_ADDRESS / `reward_address` is no longer read: this node's rewards \
+                 are paid to its own address. The payout address is set on-chain now, where every \
+                 node applies it — send `helix tx set-reward-address {configured}` from this \
+                 validator's key, then remove the setting"
+            );
+        }
 
         info!("Validator address : {}", address);
         info!("PK fingerprint    : {}", keypair.public.fingerprint());
@@ -1095,7 +1092,6 @@ impl HelixNode {
         Ok(HelixNode {
             keypair: Arc::new(keypair),
             address,
-            reward_address,
             sync_peer,
             store: shared_store,
             mempool: Arc::new(RwLock::new(mempool)),
@@ -1648,7 +1644,6 @@ impl HelixNode {
             engine,
             last_applied_height,
             self.p2p_command_tx.clone(),
-            self.reward_address.map(Arc::new),
             peer_count.clone(),
             self.syncing.clone(),
             signing_guard,
@@ -1789,14 +1784,7 @@ async fn apply_peer_proposal(
     match result {
         Ok(Some(block)) => {
             info!(height = block.height(), "Block finalized via peer proposal");
-            // `None`, not our own configured reward_address: this block was
-            // proposed by whichever validator's turn it was (see receive_proposal),
-            // not necessarily us. Passing our local override here would redirect
-            // that validator's reward to our own address, and — since reward_address
-            // is a per-node config, not part of the block — make every node compute
-            // a different balance for the same block. `None` lets execute_block fall
-            // back to `block.header.validator`, which is identical on every node.
-            apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
+            apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, last_applied_height, tip_certificate).await;
         }
         Ok(None) => {}
         Err(ConsensusError::UnknownValidator(_)) => {
@@ -1834,9 +1822,7 @@ async fn apply_peer_vote(
     match result {
         Ok(Some(block)) => {
             info!(height = block.height(), "Block finalized via peer votes");
-            // Same reasoning as the proposal path above: this block's proposer
-            // isn't necessarily us, so `None` — not our local reward_address.
-            apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
+            apply_finalized_block(block, true, vec![], store, mempool, chain_state, engine, p2p_tx, last_applied_height, tip_certificate).await;
         }
         Ok(None) => {}
         Err(ConsensusError::NoActiveRound) => {
@@ -2164,10 +2150,7 @@ async fn handle_p2p_event(
                         return;
                     }
                     info!(height = block_height, "Applying committed block from peer");
-                    // `None`, same reasoning as the NewProposal/NewVote arms above: this
-                    // block came from a peer, not our own block_production_loop, so our
-                    // local reward_address override must not apply to it.
-                    apply_finalized_block(block, false, commit_certificate, store, mempool, chain_state, engine, p2p_tx, None, last_applied_height, tip_certificate).await;
+                    apply_finalized_block(block, false, commit_certificate, store, mempool, chain_state, engine, p2p_tx, last_applied_height, tip_certificate).await;
 
                     // Say out loud that we adopted it (#141). On a busy chain this path — not
                     // proposal/vote — is how a validator sees most blocks, and a node that only
@@ -2344,7 +2327,7 @@ async fn apply_synced_batch(
         let mut s = store.write().await;
         let mut cs = chain_state.write().await;
         for block in &batch.blocks[..proven] {
-            execute_block(&mut cs, block, None);
+            execute_block(&mut cs, block);
             cs.applied_height = block.height();
             if let Err(e) = s.put_block(block.clone()) {
                 // The batch verified, so this is a local storage failure, not a bad peer. Stop here
@@ -3448,7 +3431,6 @@ async fn apply_finalized_block(
     chain_state: &Arc<RwLock<ChainState>>,
     engine: &Arc<RwLock<BftEngine>>,
     p2p_tx: &mpsc::Sender<P2PCommand>,
-    reward_address: Option<Arc<Address>>,
     last_applied_height: &Arc<Mutex<u64>>,
     tip_certificate: &Arc<RwLock<TipCertificate>>,
 ) {
@@ -3565,7 +3547,7 @@ async fn apply_finalized_block(
     // rejected transfer as `confirmed`.
     let (tx_receipts, newly_jailed_for_downtime, rotated_validators) = {
         let mut state = chain_state.write().await;
-        let receipt = execute_block(&mut state, &block, reward_address.as_deref());
+        let receipt = execute_block(&mut state, &block);
         if receipt.failed_txs() > 0 {
             warn!(height, failed = receipt.failed_txs(), "Tx execution failures");
         }
@@ -4391,7 +4373,6 @@ async fn block_production_loop(
     engine: Arc<RwLock<BftEngine>>,
     last_applied_height: Arc<Mutex<u64>>,
     p2p_tx: mpsc::Sender<P2PCommand>,
-    reward_address: Option<Arc<Address>>,
     peer_count: Arc<std::sync::atomic::AtomicUsize>,
     syncing: Arc<std::sync::atomic::AtomicBool>,
     signing_guard: Arc<std::sync::Mutex<SigningGuard>>,
@@ -4804,7 +4785,7 @@ async fn block_production_loop(
         };
         match produced {
             Ok(block) => {
-                apply_finalized_block(block, true, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, reward_address.clone(), &last_applied_height, &tip_certificate)
+                apply_finalized_block(block, true, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &tip_certificate)
                     .await;
             }
             Err(ConsensusError::AwaitingVotes { .. }) => {
@@ -6268,7 +6249,7 @@ async fn sync_blocks_from_peer(
                     total_applied
                 );
             }
-            execute_block(chain_state, block, None);
+            execute_block(chain_state, block);
             // Same stamp as the consensus path in `apply_finalized_block` — a node catching up
             // over RPC serves `/status` throughout, and a state height frozen at whatever it was
             // before the sync started would be worse than none at all. This function owns
@@ -7420,8 +7401,7 @@ mod sync_blocks_from_peer_tests {
         // Block 1 now arrives again through the other ingest path — gossip, a peer re-serving it,
         // a racing gap-fill. Nothing about it is malformed; it is simply a height we already have.
         apply_finalized_block(
-            blocks[0].clone(), false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx,
-            None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default())),
+            blocks[0].clone(), false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default())),
         )
         .await;
 
@@ -9212,15 +9192,14 @@ mod handle_p2p_event_tests {
         assert!(p2p_rx.try_recv().is_err());
     }
 
-    /// Regression test: a block finalized via a peer's proposal/votes/gossip must mint
-    /// its block reward to the block's own `header.validator`, never to this node's
-    /// locally configured `reward_address`. Before this fix, `handle_p2p_event` threaded
-    /// its own `reward_address` into every `apply_finalized_block` call, including these
-    /// peer-driven ones — a node with `HELIX_REWARD_ADDRESS` set would redirect every
-    /// other validator's block reward to itself, and any two nodes with different
-    /// configs would diverge on the resulting chain state.
+    /// A block finalized via a peer's proposal/votes/gossip mints its block reward to the block's
+    /// own `header.validator`, never to the node applying it. This once depended on every call
+    /// site passing `None` for a locally configured reward address — a node with
+    /// `HELIX_REWARD_ADDRESS` set redirected other validators' rewards to itself until they all
+    /// did. Since #229 there is no node-local input to `execute_block` at all; this pins the
+    /// outcome the call sites used to guarantee.
     #[tokio::test]
-    async fn new_committed_block_from_peer_mints_reward_to_block_validator_not_to_local_override() {
+    async fn new_committed_block_from_peer_mints_reward_to_the_block_validator_not_to_this_node() {
         let validator_kp = KeyPair::generate();
         let validator_addr = Address::from_public_key(&validator_kp.public);
         let block = signed_block(&validator_kp, 1, Hash::ZERO);
@@ -10319,7 +10298,7 @@ mod handle_p2p_event_tests {
 
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
-        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
+        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
 
         assert!(
             engine.read().await.validator_set.get(&bad_validator_addr).is_none(),
@@ -10387,7 +10366,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
 
-        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
+        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
 
         let receipt = store
             .read()
@@ -10418,13 +10397,13 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
 
-        apply_finalized_block(block.clone(), false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
+        apply_finalized_block(block.clone(), false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
         let issued_after_first = chain_state.read().await.total_issued;
         assert!(issued_after_first > 0, "the first application must mint the scheduled block reward");
 
         // A second application of the *same* block/height — as a racing duplicate ingestion
         // path would produce — must change nothing further.
-        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
+        apply_finalized_block(block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default()))).await;
         let issued_after_second = chain_state.read().await.total_issued;
         assert_eq!(issued_after_second, issued_after_first, "the block reward must not be minted twice for the same height");
         assert_eq!(store.read().await.latest_height(), 1, "the duplicate must not re-touch storage either");
@@ -10453,13 +10432,13 @@ mod handle_p2p_event_tests {
         let last_applied_height = Arc::new(Mutex::new(0u64));
         let cert = Arc::new(RwLock::new(TipCertificate::default()));
 
-        apply_finalized_block(first, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &cert).await;
+        apply_finalized_block(first, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &cert).await;
         assert_eq!(store.read().await.latest_height(), 1, "precondition: block 1 applied");
         let issued = chain_state.read().await.total_issued;
 
         // Height 2 — new, so the height guard is satisfied — but built on a parent we never had.
         let orphan = signed_block(&kp, 2, Hash::digest(b"a tip from some other branch"));
-        apply_finalized_block(orphan, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height, &cert).await;
+        apply_finalized_block(orphan, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &cert).await;
 
         assert_eq!(
             store.read().await.latest_height(),
@@ -10548,7 +10527,6 @@ mod handle_p2p_event_tests {
             &chain_state,
             &engine,
             &p2p_tx,
-            None,
             &last_applied_height,
             &Arc::new(RwLock::new(TipCertificate::default())),
         )
@@ -10669,7 +10647,6 @@ mod handle_p2p_event_tests {
             &chain_state,
             &engine,
             &p2p_tx,
-            None,
             &last_applied_height,
             &Arc::new(RwLock::new(TipCertificate::default())),
         )
@@ -10742,7 +10719,7 @@ mod handle_p2p_event_tests {
             );
             async move {
                 apply_finalized_block(
-                    block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, &last_applied_height,
+                    block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height,
                     &Arc::new(RwLock::new(TipCertificate::default())),
                 )
                 .await;
@@ -10837,7 +10814,7 @@ mod handle_p2p_event_tests {
         };
         let apply_one = async |block, last: &Arc<Mutex<u64>>| {
             apply_finalized_block(
-                block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, None, last,
+                block, false, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, last,
                 &Arc::new(RwLock::new(TipCertificate::default())),
             )
             .await;
@@ -11047,7 +11024,6 @@ mod handle_p2p_event_tests {
             engine.clone(),
             Arc::new(Mutex::new(0u64)),
             p2p_tx.clone(),
-            None,
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             syncing.clone(),
             Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
@@ -11100,7 +11076,6 @@ mod handle_p2p_event_tests {
             engine.clone(),
             last_applied.clone(),
             p2p_tx.clone(),
-            None,
             peer_count.clone(),
             syncing.clone(),
             Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
@@ -11201,7 +11176,6 @@ mod handle_p2p_event_tests {
             engine.clone(),
             Arc::new(Mutex::new(0u64)),
             p2p_tx.clone(),
-            None,
             Arc::new(std::sync::atomic::AtomicUsize::new(2)),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
@@ -11277,7 +11251,6 @@ mod handle_p2p_event_tests {
             engine.clone(),
             Arc::new(Mutex::new(0u64)),
             p2p_tx.clone(),
-            None,
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),

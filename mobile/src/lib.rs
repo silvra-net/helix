@@ -101,6 +101,7 @@ fn tx_type_from_str(s: &str) -> Result<TxType, MobileError> {
         "SetCommission" => TxType::SetCommission,
         "Unjail" => TxType::Unjail,
         "ProbationHeartbeat" => TxType::ProbationHeartbeat,
+        "SetRewardAddress" => TxType::SetRewardAddress,
         other => return Err(MobileError::UnknownTxType(other.to_string())),
     })
 }
@@ -220,7 +221,7 @@ mod tests {
             TxType::VoteProposal, TxType::ProvePersonhood, TxType::ClaimUnbonded,
             TxType::CancelRecoveryRequest, TxType::SubmitDoubleSignEvidence, TxType::Delegate,
             TxType::Undelegate, TxType::Redelegate, TxType::SetCommission, TxType::Unjail,
-            TxType::ProbationHeartbeat,
+            TxType::ProbationHeartbeat, TxType::SetRewardAddress,
         ];
         for variant in all {
             let name = match &variant {
@@ -245,6 +246,7 @@ mod tests {
                 TxType::SetCommission => "SetCommission",
                 TxType::Unjail => "Unjail",
                 TxType::ProbationHeartbeat => "ProbationHeartbeat",
+                TxType::SetRewardAddress => "SetRewardAddress",
             };
             assert_eq!(tx_type_from_str(name).unwrap(), variant);
         }

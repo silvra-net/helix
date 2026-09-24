@@ -38,14 +38,6 @@ pub enum ExecutionError {
 
 pub type ExecutionResult<T> = Result<T, ExecutionError>;
 
-/// Execute all transactions in a block, updating chain state in place.
-/// Skips invalid transactions (records failure in receipt) rather than
-/// reverting the whole block — validators earn fees even on failed txs.
-/// Execute all transactions in a block, distribute fees, and mint this
-/// block's scheduled issuance (see `genesis::scheduled_block_reward`).
-///
-/// `reward_address` — where the validator's 50 % fee share *and* the block reward land.
-/// Falls back to the block's validator address when `None`.
 /// Ceiling on the fuel one contract call may be granted, however large a fee it offers.
 ///
 /// Without it, `fuel_limit = tx.fee × fuel_per_fee_unit` had no upper bound at all: the fee is
@@ -70,13 +62,18 @@ pub const MAX_TX_FUEL: u64 = 100_000_000;
 /// behaviour than the problem warrants.
 pub const MAX_BLOCK_FUEL: u64 = 400_000_000;
 
-pub fn execute_block(
-    state: &mut ChainState,
-    block: &Block,
-    reward_address: Option<&Address>,
-) -> BlockReceipt {
+/// Execute all transactions in a block, updating chain state in place, distribute fees, and mint
+/// this block's scheduled issuance (see `genesis::scheduled_block_reward`). Skips invalid
+/// transactions (records failure in receipt) rather than reverting the whole block — validators
+/// earn fees even on failed txs.
+///
+/// Rewards are credited to `block.header.validator` and split with its delegation pool; its own
+/// share is paid wherever `TxType::SetRewardAddress` pointed it (`credit_validator_reward`).
+/// Nothing here depends on the node executing the block: it once took a locally configured
+/// reward address, and a node-local input to the state is a fork waiting for two configs (#229).
+pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
     let validator = block.header.validator.clone();
-    let fee_recipient = reward_address.unwrap_or(&validator);
+    let fee_recipient = &validator;
     let mut receipts = Vec::with_capacity(block.transactions.len());
     let mut total_burned = 0u64;
     let mut total_validator_reward = 0u64;
@@ -308,6 +305,7 @@ pub fn execute_transaction_metered(
         TxType::ProbationHeartbeat => {
             execute_probation_heartbeat(state, tx, validator, tx_hash, base_fee_amount)
         }
+        TxType::SetRewardAddress => execute_set_reward_address(state, tx, validator, tx_hash, base_fee_amount),
     };
 
     if receipt.success {
@@ -1097,6 +1095,48 @@ fn execute_set_commission(
             commission_bps: DEFAULT_COMMISSION_BPS,
         })
         .commission_bps = commission_bps;
+
+    state.update_account(&tx.from, |acc| {
+        acc.balance -= tx.fee;
+        acc.nonce += 1;
+    });
+
+    distribute_fee(state, validator, tx.fee, base_fee_amount)
+        .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
+        .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
+}
+
+/// `TxType::SetRewardAddress` (#229): point `tx.from`'s own rewards at `tx.to`, or back at itself
+/// when `tx.to == tx.from`. Every check comes before anything is written — a failed receipt is
+/// charged by the caller, never half-applied (#201).
+fn execute_set_reward_address(
+    state: &mut ChainState,
+    tx: &Transaction,
+    validator: &Address,
+    tx_hash: Hash,
+    base_fee_amount: u64,
+) -> Receipt {
+    let Some(payout) = &tx.to else {
+        return Receipt::failure(tx_hash, "no reward address given: set `to` (to your own address to clear it)", 0, 0);
+    };
+    // `Address` deserializes as a bare string, so nothing upstream has looked at it. A payout to
+    // a string no key can ever hash to is a reward nobody can spend — refuse it here, where the
+    // mistake is still the sender's to fix, rather than burn every future reward into it.
+    if Address::from_str(payout.as_str()).is_err() {
+        return Receipt::failure(tx_hash, &format!("not a valid address: {}", payout.as_str()), 0, 0);
+    }
+    if tx.amount != 0 {
+        return Receipt::failure(tx_hash, "setting a reward address moves no funds: amount must be 0", 0, 0);
+    }
+    if !tx.data.is_empty() {
+        return Receipt::failure(tx_hash, "setting a reward address carries no payload", 0, 0);
+    }
+
+    if payout == &tx.from {
+        state.reward_addresses.remove(tx.from.as_str());
+    } else {
+        state.reward_addresses.insert(tx.from.to_string(), payout.clone());
+    }
 
     state.update_account(&tx.from, |acc| {
         acc.balance -= tx.fee;
@@ -2048,27 +2088,31 @@ fn execute_prove_personhood(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
-/// Credit a validator reward (a block-reward mint or a fee's validator-half) to `recipient`,
-/// splitting it between the validator's own balance and its delegation pool (if it has one)
-/// — see `DelegationPool`'s doc comment for why this stays O(1) regardless of delegator
-/// count. `recipient` is normally the real block validator, but can be a
-/// `HELIX_REWARD_ADDRESS` override (see `execute_block`) — in that case a pool keyed to the
-/// *real* validator's address is correctly left untouched here (nobody delegates to a
-/// reward-redirect address, only to the validator identity itself), so this degrades safely
-/// to the pre-delegation 100%-to-recipient behavior in that one edge case.
-fn credit_validator_reward(state: &mut ChainState, recipient: &Address, amount: u64) {
+/// Credit a validator reward (a block-reward mint or a fee's validator-half) earned by
+/// `validator`, splitting it between the validator's own share and its delegation pool (if it
+/// has one) — see `DelegationPool`'s doc comment for why this stays O(1) regardless of delegator
+/// count.
+///
+/// **The pool is found by the validator, and only the validator's own share follows its payout
+/// address** (`TxType::SetRewardAddress`, #229). This order is the whole point: looking the pool
+/// up under the payout address instead finds no pool there, and credits 100% of the reward —
+/// the delegators' share included — to whatever address the validator chose. That is what the
+/// old `HELIX_REWARD_ADDRESS` override did, called "degrading safely"; it was only harmless
+/// because the override was never applied on a multi-validator chain.
+fn credit_validator_reward(state: &mut ChainState, validator: &Address, amount: u64) {
     if amount == 0 {
         return;
     }
-    let key = recipient.to_string();
+    let payout = state.payout_address(validator);
+    let key = validator.to_string();
     let Some(pool) = state.validator_pools.get(&key) else {
-        state.update_account(recipient, |acc| acc.balance = acc.balance.saturating_add(amount));
+        state.update_account(&payout, |acc| acc.balance = acc.balance.saturating_add(amount));
         return;
     };
     let self_stake = state.accounts.get(&key).map(|a| a.staked).unwrap_or(0) as u128;
     let total_stake = self_stake + pool.total_delegated_stake as u128;
     if total_stake == 0 {
-        state.update_account(recipient, |acc| acc.balance = acc.balance.saturating_add(amount));
+        state.update_account(&payout, |acc| acc.balance = acc.balance.saturating_add(amount));
         return;
     }
     let self_share = (amount as u128 * self_stake / total_stake) as u64;
@@ -2077,7 +2121,7 @@ fn credit_validator_reward(state: &mut ChainState, recipient: &Address, amount: 
     let pool_gain = delegated_share - commission;
     let validator_total = self_share + commission;
 
-    state.update_account(recipient, |acc| {
+    state.update_account(&payout, |acc| {
         acc.balance = acc.balance.saturating_add(validator_total)
     });
     if pool_gain > 0 {
@@ -5259,7 +5303,7 @@ mod tests {
         assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000);
     }
 
-    fn empty_block(validator: &Address, height: u64) -> Block {
+    pub(super) fn empty_block(validator: &Address, height: u64) -> Block {
         Block {
             header: BlockHeader {
                 version: 1,
@@ -5314,7 +5358,7 @@ mod tests {
         let mut block = empty_block(&validator, 1);
         block.transactions = vec![ok, doomed];
 
-        let first = execute_block(&mut state, &block, None);
+        let first = execute_block(&mut state, &block);
         assert!(first.tx_receipts[0].success, "the funded transfer must go through");
         assert!(!first.tx_receipts[1].success, "the 10 HLX transfer is unaffordable and must fail");
         assert_eq!(state.get(&sender).unwrap().nonce, 2, "both transactions consumed their nonce");
@@ -5324,7 +5368,7 @@ mod tests {
         let burned = state.total_burned;
 
         // The very same block again, exactly as the race would apply it.
-        let second = execute_block(&mut state, &block, None);
+        let second = execute_block(&mut state, &block);
 
         for r in &second.tx_receipts {
             assert!(!r.success, "no transaction may take effect twice");
@@ -5379,7 +5423,7 @@ mod tests {
         // Well past the jail threshold, and past a full epoch, with an empty `last_commit`
         // every time — under the old behaviour this jailed it at exactly 150.
         for height in 1..=(state::BLOCKS_OF_SILENCE_TO_JAIL as u64 + 20) {
-            execute_block(&mut state, &empty_block(&proposer, height), None);
+            execute_block(&mut state, &empty_block(&proposer, height));
         }
 
         assert!(
@@ -5446,7 +5490,7 @@ mod tests {
 
         let signing: Vec<&KeyPair> = witnesses.iter().collect();
         for height in 1..=state::BLOCKS_OF_SILENCE_TO_JAIL as u64 {
-            execute_block(&mut state, &block_with_commit(&proposer, height, &signing), None);
+            execute_block(&mut state, &block_with_commit(&proposer, height, &signing));
         }
 
         assert!(
@@ -5488,11 +5532,7 @@ mod tests {
         // Twice the threshold, every block proposed by the hostile validator and attesting only
         // itself — precisely the shape the live chain showed.
         for height in 1..=(state::BLOCKS_OF_SILENCE_TO_JAIL as u64 * 2) {
-            execute_block(
-                &mut state,
-                &block_with_commit(&hostile_addr, height, &[&hostile]),
-                None,
-            );
+            execute_block(&mut state, &block_with_commit(&hostile_addr, height, &[&hostile]));
         }
 
         assert!(
@@ -5528,7 +5568,7 @@ mod tests {
         let epoch = helix_consensus::EPOCH_LENGTH;
 
         // Rotation 1: the newcomer waits in pending, out of the signing set entirely.
-        let receipt = execute_block(&mut state, &empty_block(&proposer, epoch), None);
+        let receipt = execute_block(&mut state, &empty_block(&proposer, epoch));
         assert!(receipt.rotated_validators.is_some(), "an epoch boundary must report a rotation");
         assert!(
             state.pending_validators.contains(&newcomer) && !state.active_validators.contains(&newcomer),
@@ -5538,24 +5578,24 @@ mod tests {
 
         // Rotation 2: it enters probation — now signing (so it can prove a live node), but still
         // powerless and not active (backlog #132).
-        execute_block(&mut state, &empty_block(&proposer, epoch * 2), None);
+        execute_block(&mut state, &empty_block(&proposer, epoch * 2));
         assert!(
             state.probationary_validators.contains(&newcomer) && !state.active_validators.contains(&newcomer),
             "second rotation puts the newcomer on probation, not yet quorum-critical"
         );
 
         // It signs a block during its probation epoch — the on-chain proof of a live node.
-        execute_block(&mut state, &block_with_commit(&proposer, epoch * 2 + 1, &[&newcomer_kp]), None);
+        execute_block(&mut state, &block_with_commit(&proposer, epoch * 2 + 1, &[&newcomer_kp]));
         assert!(state.probation_seen.contains(&newcomer), "its signature is recorded as proof of liveness");
 
         // Rotation 3: proven live, promoted to full active membership.
-        execute_block(&mut state, &empty_block(&proposer, epoch * 3), None);
+        execute_block(&mut state, &empty_block(&proposer, epoch * 3));
         assert!(
             state.active_validators.contains(&newcomer),
             "third rotation activates the newcomer that proved itself live"
         );
 
-        let mid_epoch = execute_block(&mut state, &empty_block(&proposer, epoch * 3 + 1), None);
+        let mid_epoch = execute_block(&mut state, &empty_block(&proposer, epoch * 3 + 1));
         assert!(mid_epoch.rotated_validators.is_none(), "ordinary blocks must not rotate");
     }
 
@@ -5584,7 +5624,7 @@ mod tests {
 
         // Rotation 1: no active member yet — nobody is handed instant weight, both wait in pending
         // and the live set is left untouched (empty candidate list, a no-op for the engine).
-        let receipt = execute_block(&mut state, &empty_block(&sitting, epoch), None);
+        let receipt = execute_block(&mut state, &empty_block(&sitting, epoch));
         assert_eq!(
             receipt.rotated_validators.as_deref(),
             Some(&[][..]),
@@ -5593,15 +5633,15 @@ mod tests {
         assert!(!state.active_validators.contains(&phantom));
 
         // Rotation 2: both enter probation together.
-        execute_block(&mut state, &empty_block(&sitting, epoch * 2), None);
+        execute_block(&mut state, &empty_block(&sitting, epoch * 2));
         assert!(state.probationary_validators.contains(&sitting));
         assert!(state.probationary_validators.contains(&phantom));
 
         // Only `sitting` signs during the probation epoch; `phantom` has no node behind it.
-        execute_block(&mut state, &block_with_commit(&sitting, epoch * 2 + 1, &[&sitting_kp]), None);
+        execute_block(&mut state, &block_with_commit(&sitting, epoch * 2 + 1, &[&sitting_kp]));
 
         // Rotation 3: only the one that proved itself live is promoted.
-        execute_block(&mut state, &empty_block(&sitting, epoch * 3), None);
+        execute_block(&mut state, &empty_block(&sitting, epoch * 3));
         assert!(
             state.active_validators.contains(&sitting),
             "a validator that served its probation epoch and signed is promoted"
@@ -5622,7 +5662,7 @@ mod tests {
         let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
 
         let block = empty_block(&validator, 1);
-        let receipt = execute_block(&mut state, &block, None);
+        let receipt = execute_block(&mut state, &block);
 
         let expected = crate::genesis::scheduled_block_reward(1);
         assert_eq!(receipt.block_reward_minted, expected);
@@ -5673,7 +5713,7 @@ mod tests {
         block.header.base_fee_per_byte = 0;
 
         let issued_before = state.total_issued;
-        let receipt = execute_block(&mut state, &block, None);
+        let receipt = execute_block(&mut state, &block);
 
         assert_eq!(receipt.block_reward_minted, 0, "nothing may be minted after the schedule ends");
         assert_eq!(state.total_issued, issued_before, "and total supply must stop growing");
@@ -5775,7 +5815,7 @@ mod tests {
             100_000_000,
         );
         nonce += 1;
-        execute_block(&mut state, &next(vec![transfer], height), None);
+        execute_block(&mut state, &next(vec![transfer], height));
         assert_ledger_balances(&state, "a transfer with a burned base fee");
         height += 1;
 
@@ -5791,7 +5831,7 @@ mod tests {
             100_000_000,
         );
         nonce += 1;
-        execute_block(&mut state, &next(vec![stake], height), None);
+        execute_block(&mut state, &next(vec![stake], height));
         assert_ledger_balances(&state, "a stake");
         height += 1;
 
@@ -5807,7 +5847,7 @@ mod tests {
             0,
             100_000_000,
         );
-        execute_block(&mut state, &next(vec![delegate], height), None);
+        execute_block(&mut state, &next(vec![delegate], height));
         assert_ledger_balances(&state, "a delegation");
         height += 1;
 
@@ -5822,13 +5862,13 @@ mod tests {
             nonce,
             100_000_000,
         );
-        execute_block(&mut state, &next(vec![unstake], height), None);
+        execute_block(&mut state, &next(vec![unstake], height));
         assert_ledger_balances(&state, "an unstake into unbonding");
         height += 1;
 
         // And a stretch of empty blocks, which mint rewards and nothing else.
         for _ in 0..5 {
-            execute_block(&mut state, &next(vec![], height), None);
+            execute_block(&mut state, &next(vec![], height));
             assert_ledger_balances(&state, "an empty block minting its reward");
             height += 1;
         }
@@ -5849,19 +5889,6 @@ mod tests {
     }
 
     #[test]
-    fn execute_block_mints_to_reward_address_override_not_the_block_validator() {
-        let validator = Address::from_public_key(&KeyPair::generate().public);
-        let reward_addr = Address::from_public_key(&KeyPair::generate().public);
-        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
-
-        let block = empty_block(&validator, 1);
-        execute_block(&mut state, &block, Some(&reward_addr));
-
-        assert!(state.get(&validator).is_none(), "reward must not land on the block validator when an override is set");
-        assert!(state.get(&reward_addr).unwrap().balance > 0);
-    }
-
-    #[test]
     fn execute_block_never_mints_past_the_total_supply_cap() {
         let validator = Address::from_public_key(&KeyPair::generate().public);
         let cap = crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX;
@@ -5871,7 +5898,7 @@ mod tests {
         state.total_issued = cap - sliver;
 
         let block = empty_block(&validator, 1);
-        let receipt = execute_block(&mut state, &block, None);
+        let receipt = execute_block(&mut state, &block);
 
         assert_eq!(receipt.block_reward_minted, sliver, "must clamp to remaining headroom, not mint the full schedule");
         assert_eq!(state.total_issued, cap);
@@ -5879,7 +5906,7 @@ mod tests {
 
         // A second block at a fully exhausted cap must mint nothing at all.
         let block2 = empty_block(&validator, 2);
-        let receipt2 = execute_block(&mut state, &block2, None);
+        let receipt2 = execute_block(&mut state, &block2);
         assert_eq!(receipt2.block_reward_minted, 0);
         assert_eq!(state.total_issued, cap);
     }
@@ -5890,10 +5917,10 @@ mod tests {
         let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
 
         let first_era_block = empty_block(&validator, 1);
-        let r1 = execute_block(&mut state, &first_era_block, None).block_reward_minted;
+        let r1 = execute_block(&mut state, &first_era_block).block_reward_minted;
 
         let second_era_block = empty_block(&validator, crate::genesis::HALVING_INTERVAL_BLOCKS);
-        let r2 = execute_block(&mut state, &second_era_block, None).block_reward_minted;
+        let r2 = execute_block(&mut state, &second_era_block).block_reward_minted;
 
         assert_eq!(r1, crate::genesis::INITIAL_BLOCK_REWARD_HLX * crate::genesis::NANO_PER_HLX);
         assert_eq!(r2, r1 / 2, "reward must halve once height crosses a halving interval boundary");
@@ -5924,7 +5951,7 @@ mod tests {
 
         let mut expected: u128 = 0;
         for h in &heights {
-            let receipt = execute_block(&mut state, &empty_block(&validator, *h), None);
+            let receipt = execute_block(&mut state, &empty_block(&validator, *h));
             let scheduled = crate::genesis::scheduled_block_reward(*h);
             assert_eq!(
                 receipt.block_reward_minted, scheduled,
@@ -5967,7 +5994,7 @@ mod tests {
         let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
 
         for h in 1..=5u64 {
-            execute_block(&mut state, &empty_block(&validator, h), None);
+            execute_block(&mut state, &empty_block(&validator, h));
         }
 
         let held: u128 = state
@@ -6315,6 +6342,7 @@ mod tests {
             TxType::CreateProposal,
             TxType::VoteProposal,
             TxType::ProvePersonhood,
+            TxType::SetRewardAddress,
         ];
 
         for ty in all_types {
@@ -7396,6 +7424,7 @@ mod money_conservation_attacks {
             TxType::VoteProposal, TxType::ProvePersonhood, TxType::ClaimUnbonded,
             TxType::CancelRecoveryRequest, TxType::Delegate, TxType::Undelegate,
             TxType::Redelegate, TxType::SetCommission, TxType::Unjail,
+            TxType::SetRewardAddress,
         ];
 
         for tx_type in types {
@@ -7689,5 +7718,167 @@ mod contract_bridge_attacks {
             after <= before,
             "paying yourself must not increase the balance: {before} -> {after}"
         );
+    }
+}
+
+/// #229: where a validator's rewards go, and — the reason the design is what it is — where they
+/// must not.
+#[cfg(test)]
+mod reward_address_tests {
+    use super::tests::{empty_block, signed_tx};
+    use super::*;
+    use helix_crypto::KeyPair;
+
+    const HLX: u64 = 1_000_000_000;
+
+    fn fresh_state() -> ChainState {
+        ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX)
+    }
+
+    /// Send `SetRewardAddress` from `kp` pointing at `to`, and return the receipt.
+    fn set_reward_address(state: &mut ChainState, kp: &KeyPair, to: Option<Address>, nonce: u64) -> Receipt {
+        let from = Address::from_public_key(&kp.public);
+        state.update_account(&from, |acc| acc.balance = acc.balance.saturating_add(HLX));
+        let tx = signed_tx(kp, &from, TxType::SetRewardAddress, to, 0, vec![], nonce, 10_000);
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+        execute_transaction(state, &tx, &block_validator, 0, 0)
+    }
+
+    /// A validator with 100 HLX self-staked and a delegator's 300 in its pool, at the default
+    /// commission — 25% of every reward is the validator's own, 75% the delegators', of which the
+    /// validator keeps a tenth.
+    fn validator_with_delegators(state: &mut ChainState) -> (KeyPair, Address) {
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&kp.public);
+        state.update_account(&validator, |acc| acc.staked = 100 * HLX);
+        let delegator_kp = KeyPair::generate();
+        let delegator = Address::from_public_key(&delegator_kp.public);
+        state.update_account(&delegator, |acc| acc.balance = 1_000 * HLX);
+        let delegate =
+            signed_tx(&delegator_kp, &delegator, TxType::Delegate, Some(validator.clone()), 300 * HLX, vec![], 0, 10_000);
+        let fee_sink = Address::from_public_key(&KeyPair::generate().public);
+        assert!(execute_transaction(state, &delegate, &fee_sink, 0, 0).success);
+        (kp, validator)
+    }
+
+    fn pool_stake(state: &ChainState, validator: &Address) -> u64 {
+        state.validator_pools[validator.as_str()].total_delegated_stake
+    }
+
+    /// The attack the naive fix would have opened: the old override looked the delegation pool up
+    /// under the *payout* address, found none, and credited the whole reward there — delegators'
+    /// share included. A validator could have pointed its rewards anywhere and kept everything.
+    ///
+    /// Measured against the same validator without a payout address, so "the delegators got
+    /// their share" is not a number this test made up.
+    #[test]
+    fn a_reward_address_takes_only_the_validators_own_share_and_never_the_delegators() {
+        const REWARD: u64 = HLX;
+
+        let mut without = fresh_state();
+        let (_, v_without) = validator_with_delegators(&mut without);
+        let pool_before_without = pool_stake(&without, &v_without);
+        let own_before = without.get(&v_without).unwrap().balance;
+        credit_validator_reward(&mut without, &v_without, REWARD);
+        let delegators_without = pool_stake(&without, &v_without) - pool_before_without;
+        let validator_without = without.get(&v_without).unwrap().balance - own_before;
+
+        let mut with = fresh_state();
+        let (kp, v_with) = validator_with_delegators(&mut with);
+        let payout = Address::from_public_key(&KeyPair::generate().public);
+        assert!(set_reward_address(&mut with, &kp, Some(payout.clone()), 0).success);
+        let pool_before_with = pool_stake(&with, &v_with);
+        let own_before = with.get(&v_with).unwrap().balance;
+        credit_validator_reward(&mut with, &v_with, REWARD);
+
+        assert_eq!(
+            pool_stake(&with, &v_with) - pool_before_with,
+            delegators_without,
+            "the delegators' share must not depend on where the validator takes its own"
+        );
+        assert!(delegators_without > 0, "positive control: the delegators do earn something here");
+        assert_eq!(
+            with.get(&payout).map_or(0, |a| a.balance),
+            validator_without,
+            "the payout address receives exactly the validator's own share plus commission"
+        );
+        assert_eq!(with.get(&v_with).unwrap().balance, own_before, "and the signing key nothing");
+    }
+
+    /// End to end through `execute_block`: the block reward of a block this validator proposed
+    /// lands on its payout address.
+    #[test]
+    fn execute_block_pays_the_block_reward_to_the_reward_address() {
+        let mut state = fresh_state();
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&kp.public);
+        let payout = Address::from_public_key(&KeyPair::generate().public);
+        assert!(set_reward_address(&mut state, &kp, Some(payout.clone()), 0).success);
+        let before = state.get(&validator).unwrap().balance;
+
+        let receipt = execute_block(&mut state, &empty_block(&validator, 1));
+
+        assert!(receipt.block_reward_minted > 0);
+        assert_eq!(state.get(&payout).unwrap().balance, receipt.block_reward_minted);
+        assert_eq!(state.get(&validator).unwrap().balance, before);
+    }
+
+    /// `to == from` is how a validator takes its rewards back — and the entry goes, rather than
+    /// staying as a self-referencing row every node carries forever.
+    #[test]
+    fn pointing_the_reward_address_at_oneself_clears_it() {
+        let mut state = fresh_state();
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&kp.public);
+        let payout = Address::from_public_key(&KeyPair::generate().public);
+        assert!(set_reward_address(&mut state, &kp, Some(payout.clone()), 0).success);
+        assert_eq!(state.payout_address(&validator), payout);
+
+        assert!(set_reward_address(&mut state, &kp, Some(validator.clone()), 1).success);
+
+        assert!(state.reward_addresses.is_empty());
+        assert_eq!(state.payout_address(&validator), validator);
+    }
+
+    /// Every malformed request is refused before anything is written — and a refusal leaves the
+    /// payout where it was, so a typo cannot quietly send rewards back to the hot key either.
+    #[test]
+    fn a_malformed_reward_address_is_refused_and_changes_nothing() {
+        let mut state = fresh_state();
+        let kp = KeyPair::generate();
+        let validator = Address::from_public_key(&kp.public);
+        let payout = Address::from_public_key(&KeyPair::generate().public);
+        assert!(set_reward_address(&mut state, &kp, Some(payout.clone()), 0).success);
+
+        // `Address` deserializes as a bare string: this is what arrives when nobody checked.
+        let not_an_address: Address =
+            bincode::deserialize(&bincode::serialize("hlxNotAnAddressAtAll").unwrap()).unwrap();
+        let cases: Vec<(&str, Option<Address>, u64, Vec<u8>)> = vec![
+            ("no address", None, 0, vec![]),
+            ("not an address", Some(not_an_address), 0, vec![]),
+            ("with an amount", Some(validator.clone()), 5, vec![]),
+            ("with a payload", Some(validator.clone()), 0, vec![1]),
+        ];
+        for (nonce, (case, to, amount, data)) in cases.into_iter().enumerate() {
+            let tx = signed_tx(&kp, &validator, TxType::SetRewardAddress, to, amount, data, nonce as u64 + 1, 10_000);
+            let sink = Address::from_public_key(&KeyPair::generate().public);
+            let receipt = execute_transaction(&mut state, &tx, &sink, 0, 0);
+            assert!(!receipt.success, "{case}: must be refused");
+            assert_eq!(state.payout_address(&validator), payout, "{case}: the payout must not move");
+        }
+    }
+
+    /// Whose balance a reward lands on is consensus: two nodes that disagree about a payout
+    /// credit different accounts. `state_hash` lists its fields one by one, so a field left out
+    /// of it would be exactly that divergence, invisible.
+    #[test]
+    fn the_reward_address_is_part_of_the_state_hash() {
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let a = fresh_state();
+        let mut b = fresh_state();
+        b.reward_addresses
+            .insert(validator.to_string(), Address::from_public_key(&KeyPair::generate().public));
+
+        assert_ne!(a.state_hash(), b.state_hash());
     }
 }

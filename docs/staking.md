@@ -81,6 +81,19 @@ mutually exclusive:
    Capped at 5000 bps (50%) — not to stop you from legitimately charging more, but to bound
    the "advertise a low rate, raise it once delegators are locked in" rug-pull: even a
    maximally hostile change can never claim more than half of what delegators earn.
+7. **Pay your rewards to a wallet that is not on the server** (optional, recommended):
+   ```bash
+   helix tx set-reward-address hlx...yourColdWallet --key validator-key.json
+   helix tx set-reward-address --clear --key validator-key.json   # back to the validator key
+   ```
+   Your validator key has to live on the machine that runs the node, and rewards credited to it
+   are liquid funds on the one machine an attacker most wants. With a reward address set, your
+   block rewards, your share of fees and your commission go to a wallet whose key never touches
+   that server; the validator key keeps only its stake. **Your delegators' share is not
+   affected** — it goes into your pool exactly as before, and `GET /validators` shows every
+   validator's `reward_address` so they can see that for themselves. Double-check the address:
+   rewards paid to one you cannot open are gone. This replaces the old `HELIX_REWARD_ADDRESS`
+   node setting, which only ever worked on a chain with a single validator.
 
 **Slashing risk:** double-signing (proposing or voting for two different blocks at the same
 height/round) burns 5% of your stake *and* 5% of your delegators' pooled stake, and jails you
