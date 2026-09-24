@@ -1194,21 +1194,27 @@ const LINK_BYTES_PER_SEC: u64 = 890 * 1024;
 
 /// Forward TCP between two loopback ports at a fixed byte rate, in both directions.
 ///
-/// One relay stands for one node's link, so its rate is that node's bandwidth — shared by every
-/// peer talking to it, which is what a single uplink actually is.
+/// One relay stands for one node's link, so its rate is that node's bandwidth — **shared by every
+/// connection through it**, one budget per direction, which is what a single uplink actually is.
+/// It used to pace each connection on its own: every extra connection to the same node brought its
+/// own full rate with it, so a build that opened more connections (#197 redials at "too few peers",
+/// and gossipsub spills onto a second connection when the first one's queue is full) was handed
+/// more bandwidth by the test and measured as faster. That is not a property of the node.
 ///
-/// The sleep is *after* the write, not before: a relay that pauses first would add its whole
-/// quantum of latency to the very first byte of an idle connection, and consensus is full of
-/// small, urgent messages (a prevote is ~3.3 KB) that must not be charged for bandwidth they do
-/// not use. Charging after the fact bills the bytes that were really sent.
+/// A chunk goes out as soon as its direction of the link is free — at once on an idle link, so a
+/// small urgent message (a prevote is ~3.3 KB) is never charged for bandwidth it does not use —
+/// and otherwise after the chunks already booked ahead of it, whichever connection they belong to.
 fn spawn_link(listen: u16, target: u16, bytes_per_sec: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", listen)).await {
             Ok(l) => l,
             Err(e) => panic!("throttled link cannot bind {listen}: {e}"),
         };
+        let toward_node = Pacer::new(bytes_per_sec);
+        let from_node = Pacer::new(bytes_per_sec);
         loop {
             let Ok((inbound, _)) = listener.accept().await else { continue };
+            let (toward_node, from_node) = (toward_node.clone(), from_node.clone());
             tokio::spawn(async move {
                 let Ok(outbound) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await else {
                     return;
@@ -1220,13 +1226,37 @@ fn spawn_link(listen: u16, target: u16, bytes_per_sec: u64) -> tokio::task::Join
                 let _ = outbound.set_nodelay(true);
                 let (ri, wi) = inbound.into_split();
                 let (ro, wo) = outbound.into_split();
-                tokio::join!(pump(ri, wo, bytes_per_sec), pump(ro, wi, bytes_per_sec));
+                tokio::join!(pump(ri, wo, toward_node), pump(ro, wi, from_node));
             });
         }
     })
 }
 
-async fn pump<R, W>(mut r: R, mut w: W, bytes_per_sec: u64)
+/// One direction of one node's link, shared by every connection through its relay.
+struct Pacer {
+    next_free: tokio::sync::Mutex<tokio::time::Instant>,
+    bytes_per_sec: u64,
+}
+
+impl Pacer {
+    fn new(bytes_per_sec: u64) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Pacer {
+            next_free: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            bytes_per_sec,
+        })
+    }
+
+    /// When `n` bytes may start: now on an idle link, otherwise once the bytes booked before them
+    /// have gone out. Books the link for their duration.
+    async fn book(&self, n: usize) -> tokio::time::Instant {
+        let mut next = self.next_free.lock().await;
+        let start = (*next).max(tokio::time::Instant::now());
+        *next = start + Duration::from_secs_f64(n as f64 / self.bytes_per_sec as f64);
+        start
+    }
+}
+
+async fn pump<R, W>(mut r: R, mut w: W, link: std::sync::Arc<Pacer>)
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -1238,10 +1268,10 @@ where
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        tokio::time::sleep_until(link.book(n).await).await;
         if w.write_all(&buf[..n]).await.is_err() {
             break;
         }
-        tokio::time::sleep(Duration::from_secs_f64(n as f64 / bytes_per_sec as f64)).await;
     }
     let _ = w.shutdown().await;
 }
