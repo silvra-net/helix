@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use libp2p::{
     futures::StreamExt,
-    gossipsub, mdns, request_response,
+    gossipsub, mdns, ping, request_response,
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, SwarmBuilder,
 };
@@ -284,6 +284,9 @@ pub(crate) struct HelixBehaviour {
     /// exists because gossip refuses to re-publish a message it has already sent (see the
     /// `roundsync` module).
     roundsync: request_response::Behaviour<RoundSyncCodec>,
+    /// Pings every connection so a link whose far end is gone gets closed (#232). The behaviour
+    /// only reports; closing on failure happens in the swarm loop. See `P2PConfig::ping_interval`.
+    ping: ping::Behaviour,
 }
 
 pub struct P2PService {
@@ -628,6 +631,11 @@ impl P2PService {
         // Answers to the gossiped transactions this loop is holding back (#228) — see `GossipTicket`.
         let (transaction_verdict_tx, mut transaction_verdicts) =
             mpsc::channel::<CheckedTransaction>(TRANSACTION_VERDICT_QUEUE);
+
+        // Connected peers whose topic subscriptions have not arrived yet, and since when (#232) —
+        // see `peers_without_subscriptions`.
+        let mut subscription_watch = tokio::time::interval(SUBSCRIPTION_WATCH_INTERVAL);
+        let mut awaiting_subscriptions: HashMap<PeerId, std::time::Instant> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -1010,6 +1018,25 @@ impl P2PService {
                                 swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                             }
                         }
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Ping(ping::Event {
+                            peer,
+                            connection,
+                            result: Err(failure),
+                        })) => {
+                            // An older build without ping answers `Unsupported` and is otherwise a
+                            // perfectly good peer — only a ping that went unanswered says the link
+                            // is dead. libp2p reports the second failure in a row, not the first.
+                            if !matches!(failure, ping::Failure::Unsupported) {
+                                warn!(
+                                    peer = %peer,
+                                    err = %failure,
+                                    "A connection stopped answering — closing it so a redial \
+                                     starts both sides over instead of leaving one of them \
+                                     talking to a link that leads nowhere"
+                                );
+                                swarm.close_connection(connection);
+                            }
+                        }
                         SwarmEvent::NewListenAddr { address, .. } => {
                             info!(addr = %address, "P2P listening");
                         }
@@ -1256,6 +1283,31 @@ impl P2PService {
                                 let _ = swarm.dial(addr);
                             }
                         }
+                    }
+                }
+
+                _ = subscription_watch.tick() => {
+                    let subscribed: HashSet<PeerId> = swarm
+                        .behaviour()
+                        .gossipsub
+                        .all_peers()
+                        .filter(|(_, topics)| !topics.is_empty())
+                        .map(|(peer, _)| *peer)
+                        .collect();
+                    for peer in peers_without_subscriptions(
+                        &connected_peers,
+                        &subscribed,
+                        &mut awaiting_subscriptions,
+                        std::time::Instant::now(),
+                        SUBSCRIPTIONS_GRACE,
+                    ) {
+                        warn!(
+                            peer = %peer,
+                            "Connected to a peer whose topic subscriptions never arrived — \
+                             nothing this node publishes reaches it. Dropping every connection \
+                             to it so the redial starts both sides over"
+                        );
+                        let _ = swarm.disconnect_peer_id(peer);
                     }
                 }
 
@@ -2249,6 +2301,52 @@ fn peer_departed(remaining_connections: u32, was_announced: bool) -> bool {
     remaining_connections == 0 && was_announced
 }
 
+/// How long a connected peer may stay without a single known topic subscription before its
+/// connection is taken for broken (#232). A healthy peer's subscriptions are its first message on
+/// a new connection and arrive within a round trip; this is twenty seconds of that.
+const SUBSCRIPTIONS_GRACE: Duration = Duration::from_secs(20);
+
+/// How often the swarm loop looks for such peers.
+const SUBSCRIPTION_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Connected peers this node cannot publish to, because gossipsub never learned what they
+/// subscribe to — the ones to drop so a redial starts both sides over (#232).
+///
+/// gossipsub sends a node's subscriptions to a peer only on its *first* connection to that peer.
+/// When a link dies on one side only (a router or proxy drops it; one end sees the close, the
+/// other keeps a connection that leads nowhere), the side that lost it forgets the peer's
+/// subscriptions and redials — and to the other side that redial is merely a second connection,
+/// so the subscriptions never come again. From then on every publish fails with
+/// `InsufficientPeers` while the peer is plainly connected: on 2026-09-24 the production node
+/// spent an hour like that and the chain made 20 blocks. Nothing inside gossipsub repairs it;
+/// dropping the peer does, once the other side has given up its dead half (`ping`).
+///
+/// - `connected`: the peers this node reports as connected.
+/// - `subscribed`: the peers gossipsub knows at least one topic for.
+/// - `waiting_since`: when each unsubscribed peer was first seen that way. Kept by the caller
+///   across calls; a peer that subscribes or disconnects is forgotten, and one that is returned is
+///   forgotten too, so a reconnect gets a fresh grace period.
+fn peers_without_subscriptions(
+    connected: &HashSet<PeerId>,
+    subscribed: &HashSet<PeerId>,
+    waiting_since: &mut HashMap<PeerId, std::time::Instant>,
+    now: std::time::Instant,
+    grace: Duration,
+) -> Vec<PeerId> {
+    waiting_since.retain(|peer, _| connected.contains(peer) && !subscribed.contains(peer));
+    let mut overdue = Vec::new();
+    for peer in connected.difference(subscribed) {
+        let since = *waiting_since.entry(*peer).or_insert(now);
+        if now.saturating_duration_since(since) >= grace {
+            overdue.push(*peer);
+        }
+    }
+    for peer in &overdue {
+        waiting_since.remove(peer);
+    }
+    overdue
+}
+
 /// Pick the peer to ask for blocks: the highest claimed tip above ours, skipping anyone
 /// serving a cooldown and anyone we are **not currently connected to**.
 ///
@@ -2831,6 +2929,128 @@ mod peer_departure_tests {
     fn a_peer_we_never_announced_is_never_reported_gone() {
         assert!(!peer_departed(0, false));
         assert!(!peer_departed(2, false));
+    }
+}
+
+#[cfg(test)]
+mod subscription_watch_tests {
+    use super::peers_without_subscriptions;
+    use libp2p::PeerId;
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    const GRACE: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn a_peer_whose_subscriptions_arrived_is_never_dropped() {
+        let peer = PeerId::random();
+        let connected: HashSet<_> = [peer].into();
+        let mut waiting = HashMap::new();
+        let t0 = Instant::now();
+        for secs in [0, 30, 3_600] {
+            let dropped = peers_without_subscriptions(
+                &connected,
+                &connected,
+                &mut waiting,
+                t0 + Duration::from_secs(secs),
+                GRACE,
+            );
+            assert!(dropped.is_empty());
+        }
+        assert!(waiting.is_empty(), "nothing to wait for");
+    }
+
+    /// The case from 2026-09-24: connected, and gossipsub knows no topic for it. Dropped once the
+    /// grace period is over — not before, because every new connection starts out like this for
+    /// the round trip it takes the subscriptions to arrive.
+    #[test]
+    fn a_peer_without_subscriptions_is_dropped_after_the_grace_period_and_not_before() {
+        let peer = PeerId::random();
+        let connected: HashSet<_> = [peer].into();
+        let none = HashSet::new();
+        let mut waiting = HashMap::new();
+        let t0 = Instant::now();
+
+        assert!(peers_without_subscriptions(&connected, &none, &mut waiting, t0, GRACE).is_empty());
+        assert!(peers_without_subscriptions(
+            &connected,
+            &none,
+            &mut waiting,
+            t0 + GRACE - Duration::from_millis(1),
+            GRACE
+        )
+        .is_empty());
+        assert_eq!(
+            peers_without_subscriptions(&connected, &none, &mut waiting, t0 + GRACE, GRACE),
+            vec![peer]
+        );
+    }
+
+    /// The ordinary case this must never punish: a new connection's subscriptions arrive a moment
+    /// after it opens.
+    #[test]
+    fn subscriptions_arriving_within_the_grace_period_clear_the_wait() {
+        let peer = PeerId::random();
+        let connected: HashSet<_> = [peer].into();
+        let mut waiting = HashMap::new();
+        let t0 = Instant::now();
+
+        peers_without_subscriptions(&connected, &HashSet::new(), &mut waiting, t0, GRACE);
+        peers_without_subscriptions(
+            &connected,
+            &connected,
+            &mut waiting,
+            t0 + Duration::from_secs(1),
+            GRACE,
+        );
+        assert!(waiting.is_empty());
+        // Long after, with the subscriptions gone again, the clock starts from scratch rather than
+        // from the first sighting — otherwise a peer that briefly had none would be dropped at
+        // once.
+        let later = t0 + Duration::from_secs(600);
+        assert!(peers_without_subscriptions(
+            &connected,
+            &HashSet::new(),
+            &mut waiting,
+            later,
+            GRACE
+        )
+        .is_empty());
+    }
+
+    /// A dropped peer reconnects, and its new connection gets the full grace period again. Without
+    /// this the redial that is meant to repair the link would be cut off the instant it opened.
+    #[test]
+    fn a_dropped_peer_that_reconnects_gets_a_fresh_grace_period() {
+        let peer = PeerId::random();
+        let connected: HashSet<_> = [peer].into();
+        let none = HashSet::new();
+        let mut waiting = HashMap::new();
+        let t0 = Instant::now();
+
+        peers_without_subscriptions(&connected, &none, &mut waiting, t0, GRACE);
+        assert_eq!(
+            peers_without_subscriptions(&connected, &none, &mut waiting, t0 + GRACE, GRACE),
+            vec![peer]
+        );
+        let back = t0 + GRACE + Duration::from_secs(30);
+        assert!(
+            peers_without_subscriptions(&connected, &none, &mut waiting, back, GRACE).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_peer_that_disconnects_while_waiting_is_forgotten() {
+        let peer = PeerId::random();
+        let mut waiting = HashMap::new();
+        let t0 = Instant::now();
+
+        peers_without_subscriptions(&[peer].into(), &HashSet::new(), &mut waiting, t0, GRACE);
+        peers_without_subscriptions(&HashSet::new(), &HashSet::new(), &mut waiting, t0, GRACE);
+        assert!(
+            waiting.is_empty(),
+            "a map that only grows is a leak on a long-running node"
+        );
     }
 }
 
@@ -3635,6 +3855,12 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
                 request_response::Config::default().with_request_timeout(Duration::from_secs(5)),
             );
 
+            let ping = ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(config.ping_interval)
+                    .with_timeout(config.ping_timeout),
+            );
+
             HelixBehaviour {
                 gossipsub,
                 mdns,
@@ -3643,6 +3869,7 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
                 blocksync,
                 genesis_sync,
                 roundsync,
+                ping,
             }
         })
         .expect("behaviour setup never fails")

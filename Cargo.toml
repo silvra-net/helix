@@ -87,6 +87,11 @@ libp2p = { version = "0.54", features = [
     # Lets a node be reachable through an HTTPS reverse proxy / Cloudflare tunnel on
     # port 443, where raw TCP is not routable. See `P2PConfig::ws_listen_addr`.
     "websocket",
+    # A connection whose far end is gone is otherwise never noticed: nothing here writes on a
+    # schedule, so a link dropped by a router or proxy on one side stays open on the other until
+    # a write happens to time out — measured at close to an hour on 2026-09-24 (#232). Pinging
+    # every connection is what lets both sides give it up.
+    "ping",
 ] }
 void = "1"
 # Required to implement libp2p's `request_response::Codec`, which is declared `#[async_trait]`
