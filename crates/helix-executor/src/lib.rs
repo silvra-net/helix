@@ -6315,37 +6315,17 @@ mod tests {
     /// executors to carry no such check of their own — they used to, identically, eighteen times
     /// over, and that dead repetition was free to drift out of step with the real gate.
     ///
-    /// So this is the test that holds the removal up. It walks every type through both intrinsic
-    /// failures and demands the central verdict each time. Move the gate back down into the
-    /// executors, or drop a type out of its reach, and this fails for that type immediately.
+    /// So this is the test that holds the removal up. It walks every type through the central
+    /// gates and demands the central verdict each time. Move a gate back down into the executors,
+    /// or drop a type out of its reach, and this fails for that type immediately.
+    ///
+    /// "Every type" is `every_tx_type()`, which cannot fall behind the enum (#230). Its hand-kept
+    /// predecessor here said "every variant" and was missing `Unjail` and `ProbationHeartbeat`.
     #[test]
     fn no_transaction_type_can_slip_past_the_central_intrinsic_gate() {
-        // Every variant of `TxType`. RegisterIdentity is included deliberately even though its
-        // executor is a stub: the gate is what protects it, and that must stay true.
-        let all_types = [
-            TxType::Transfer,
-            TxType::Stake,
-            TxType::Unstake,
-            TxType::ClaimUnbonded,
-            TxType::Delegate,
-            TxType::Undelegate,
-            TxType::Redelegate,
-            TxType::SetCommission,
-            TxType::RegisterName,
-            TxType::RegisterIdentity,
-            TxType::RegisterGuardians,
-            TxType::ApproveRecovery,
-            TxType::CancelRecoveryRequest,
-            TxType::SubmitDoubleSignEvidence,
-            TxType::DeployContract,
-            TxType::CallContract,
-            TxType::CreateProposal,
-            TxType::VoteProposal,
-            TxType::ProvePersonhood,
-            TxType::SetRewardAddress,
-        ];
-
-        for ty in all_types {
+        // RegisterIdentity is included deliberately even though its executor is a stub: the gate
+        // is what protects it, and that must stay true.
+        for ty in every_tx_type() {
             let kp = KeyPair::generate();
             let addr = Address::from_public_key(&kp.public);
             let other = Address::from_public_key(&KeyPair::generate().public);
@@ -6373,7 +6353,7 @@ mod tests {
 
             // Right nonce, empty account: the fee it declares is one it cannot pay.
             let mut state = ChainState::new(0);
-            let tx = signed_tx(&kp, &addr, ty.clone(), Some(other), 1_000, vec![], 0, 10_000);
+            let tx = signed_tx(&kp, &addr, ty.clone(), Some(other.clone()), 1_000, vec![], 0, 10_000);
             let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
             assert!(!receipt.success, "{ty:?}: an unpayable fee must be refused");
@@ -6385,6 +6365,166 @@ mod tests {
             assert_eq!(receipt.fee_burned, 0, "{ty:?}: nothing can be burned from an empty account");
             assert_eq!(receipt.fee_to_validator, 0, "{ty:?}: nobody can be paid from an empty account");
             assert_eq!(state.get_or_default(&addr).nonce, 0, "{ty:?}: the nonce must not move");
+
+            // The base-fee gate — the one central gate where types are *meant* to differ, so each
+            // type's treatment is declared in `base_fee_gate` and checked here rather than assumed.
+            // Right nonce, money to burn, and a declared fee below this block's base fee.
+            const BASE_FEE_PER_BYTE: u64 = 1_000;
+            let tx = signed_tx(&kp, &addr, ty.clone(), Some(other.clone()), 1_000, vec![], 0, 10_000);
+            assert!(
+                BASE_FEE_PER_BYTE * tx.size_bytes() > tx.fee,
+                "{ty:?}: the declared fee must be below the base fee, or this checks nothing"
+            );
+            let refused_on_base_fee = |state: &mut ChainState| {
+                let receipt = execute_transaction(state, &tx, &validator, 0, BASE_FEE_PER_BYTE);
+                receipt.error.as_deref() == Some("fee below block base fee")
+            };
+            let fresh = || {
+                let mut state = ChainState::new(0);
+                state.update_account(&addr, |acc| acc.balance = 10_000_000);
+                state
+            };
+            match base_fee_gate(&ty) {
+                BaseFeeGate::Pays => {
+                    let mut state = fresh();
+                    assert!(refused_on_base_fee(&mut state), "{ty:?}: a fee below the base fee must be refused");
+                    assert_eq!(state.get(&addr).unwrap().balance, 10_000_000, "{ty:?}: and cost nothing");
+                    assert_eq!(state.get(&addr).unwrap().nonce, 0, "{ty:?}: nor move the nonce");
+                }
+                // Slashing evidence is exempt always: its ~16 KB two-vote payload would price every
+                // report out of the block at the floor base fee, and a report nobody can afford is
+                // slashing switched off (Lehre 6). The exemption must hold for any sender.
+                BaseFeeGate::AlwaysExempt => {
+                    assert!(
+                        !refused_on_base_fee(&mut fresh()),
+                        "{ty:?}: is exempt from the base fee and must pass the gate"
+                    );
+                }
+                // A heartbeat is exempt only while it is the one thing its sender needs: on
+                // probation with the proof still outstanding (#141). Both sides of the condition,
+                // because an exemption that held for anyone would be a free lane, and one that held
+                // for nobody would lock broke probationers out again.
+                BaseFeeGate::ExemptWhileItsProbationProofIsOutstanding => {
+                    let mut state = fresh();
+                    assert!(
+                        refused_on_base_fee(&mut state),
+                        "{ty:?}: from a sender that is not on probation, it pays like any other"
+                    );
+                    let mut state = fresh();
+                    state.probationary_validators.insert(addr.clone());
+                    assert!(
+                        !refused_on_base_fee(&mut state),
+                        "{ty:?}: from a probationer whose proof is outstanding, it is exempt"
+                    );
+                }
+            }
+        }
+    }
+
+    /// How a transaction type meets the base-fee gate in `execute_transaction` (#230).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BaseFeeGate {
+        /// Pays `base_fee_per_byte × size`, like any transaction.
+        Pays,
+        /// Never pays it — see the gate test for why.
+        AlwaysExempt,
+        /// Exempt only while its sender is on probation with the liveness proof outstanding.
+        ExemptWhileItsProbationProofIsOutstanding,
+    }
+
+    /// Every `TxType`, in declaration order (#230).
+    ///
+    /// Two tests in this file used to enumerate the variants by hand, each commented as complete,
+    /// and each missing some (`Unjail`, `ProbationHeartbeat`, `SubmitDoubleSignEvidence`). A
+    /// hand-kept list is complete about what its author thought of. This one cannot drift: the
+    /// `match` in `base_fee_gate` is exhaustive, so a new variant does not compile until someone
+    /// has decided how the central gate treats it — and then
+    /// `every_tx_type_is_listed_once_in_declaration_order` fails until it is listed here too.
+    pub(super) fn every_tx_type() -> Vec<TxType> {
+        vec![
+            TxType::Transfer,
+            TxType::Stake,
+            TxType::Unstake,
+            TxType::RegisterIdentity,
+            TxType::RegisterName,
+            TxType::RegisterGuardians,
+            TxType::ApproveRecovery,
+            TxType::DeployContract,
+            TxType::CallContract,
+            TxType::CreateProposal,
+            TxType::VoteProposal,
+            TxType::ProvePersonhood,
+            TxType::ClaimUnbonded,
+            TxType::CancelRecoveryRequest,
+            TxType::SubmitDoubleSignEvidence,
+            TxType::Delegate,
+            TxType::Undelegate,
+            TxType::Redelegate,
+            TxType::SetCommission,
+            TxType::Unjail,
+            TxType::ProbationHeartbeat,
+            TxType::SetRewardAddress,
+        ]
+    }
+
+    /// How the base-fee gate treats `ty` — mirrors the condition above `base_fee_amount` in
+    /// `execute_transaction`. No `_` arm: that is the point.
+    pub(super) fn base_fee_gate(ty: &TxType) -> BaseFeeGate {
+        match ty {
+            TxType::SubmitDoubleSignEvidence => BaseFeeGate::AlwaysExempt,
+            TxType::ProbationHeartbeat => BaseFeeGate::ExemptWhileItsProbationProofIsOutstanding,
+            TxType::Transfer
+            | TxType::Stake
+            | TxType::Unstake
+            | TxType::RegisterIdentity
+            | TxType::RegisterName
+            | TxType::RegisterGuardians
+            | TxType::ApproveRecovery
+            | TxType::DeployContract
+            | TxType::CallContract
+            | TxType::CreateProposal
+            | TxType::VoteProposal
+            | TxType::ProvePersonhood
+            | TxType::ClaimUnbonded
+            | TxType::CancelRecoveryRequest
+            | TxType::Delegate
+            | TxType::Undelegate
+            | TxType::Redelegate
+            | TxType::SetCommission
+            | TxType::Unjail
+            | TxType::SetRewardAddress => BaseFeeGate::Pays,
+        }
+    }
+
+    /// The exhaustive `match` above catches a variant nobody decided about; this catches one that
+    /// was decided about and never listed. The count comes from the enum's own derived
+    /// `Deserialize` — asked for an impossible variant index, it refuses with "expected variant
+    /// index 0 <= i < N" — so it is nobody's hand-kept number either, and it holds whether or not
+    /// a variant carries data.
+    #[test]
+    fn every_tx_type_is_listed_once_in_declaration_order() {
+        let listed = every_tx_type();
+        let refusal = bincode::deserialize::<TxType>(&u32::MAX.to_le_bytes())
+            .expect_err("no TxType has variant index u32::MAX")
+            .to_string();
+        let declared: usize = refusal
+            .rsplit("< ")
+            .next()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("could not read the variant count from {refusal:?}"));
+
+        assert_eq!(
+            listed.len(),
+            declared,
+            "TxType has {declared} variants and `every_tx_type` lists {} — add the new one there",
+            listed.len()
+        );
+        for (index, ty) in listed.iter().enumerate() {
+            assert_eq!(
+                bincode::serialize(ty).unwrap()[..4],
+                (index as u32).to_le_bytes(),
+                "{ty:?} is listed at position {index} but declared elsewhere — listed twice, or out of order"
+            );
         }
     }
 
@@ -7238,7 +7378,7 @@ mod money_conservation_attacks {
     // Borrowed from the neighbouring test module rather than copied: a second `signed_tx` that
     // drifted from the first would quietly stop signing what the executor verifies, and every
     // test here would pass by not really attacking anything.
-    use super::tests::signed_tx;
+    use super::tests::{every_tx_type, signed_tx};
     use helix_crypto::KeyPair;
 
     /// Every nano-HLX the chain has ever minted, as held by accounts right now.
@@ -7417,17 +7557,12 @@ mod money_conservation_attacks {
     #[test]
     fn no_execution_path_debits_before_deciding_to_fail() {
         let validator = Address::from_public_key(&KeyPair::generate().public);
-        let types = [
-            TxType::Transfer, TxType::Stake, TxType::Unstake, TxType::RegisterIdentity,
-            TxType::RegisterName, TxType::RegisterGuardians, TxType::ApproveRecovery,
-            TxType::DeployContract, TxType::CallContract, TxType::CreateProposal,
-            TxType::VoteProposal, TxType::ProvePersonhood, TxType::ClaimUnbonded,
-            TxType::CancelRecoveryRequest, TxType::Delegate, TxType::Undelegate,
-            TxType::Redelegate, TxType::SetCommission, TxType::Unjail,
-            TxType::SetRewardAddress,
-        ];
 
-        for tx_type in types {
+        // `every_tx_type()` (#230) — the hand-kept list here was missing `SubmitDoubleSignEvidence`
+        // and `ProbationHeartbeat`. Both exemptions from the base fee are moot here: this runs at a
+        // base fee of 0, where every type pays exactly its declared fee, so no type needs special
+        // handling. The exemptions themselves are checked in the central-gate test.
+        for tx_type in every_tx_type() {
             // Balance is *exactly* the fee: any debit at all on the way to a failure takes it
             // below what `charge_failed_transaction` then subtracts.
             const FEE: u64 = 10_000;
