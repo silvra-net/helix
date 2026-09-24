@@ -638,6 +638,35 @@ impl BftEngine {
             .count()
     }
 
+    /// Whether this node hears *no* other validator at all: every one it waits on — full members
+    /// with voting power, the same set `record_round_liveness` counts — has been silent long enough
+    /// to be named (#219).
+    ///
+    /// The one reading of `missed_rounds` that says something about *this* node. One validator
+    /// missing is most likely that validator, or its link; every validator missing at once, while
+    /// peers are connected, is either the whole rest of the set gone together or this node's links
+    /// carrying nothing — and from here those two look the same. The health line used to read it
+    /// as the first and tell the operator a restart would not help. On 2026-09-22 that was printed
+    /// ~2700 times over a 46-hour stall that ended when the node and its tunnel were restarted
+    /// together, and on 2026-09-24 the production node sat an hour connected to its only peer with
+    /// every publish failing (#232). Anything built on this must say "cannot tell which", never
+    /// "the others are down".
+    ///
+    /// False when there is nobody else to hear: a set of one waits on no one.
+    pub fn hears_no_other_validator(&self) -> bool {
+        let mut others = self
+            .validator_set
+            .full_members()
+            .filter(|v| v.address != self.address && v.voting_power > 0)
+            .peekable();
+        others.peek().is_some()
+            && others.all(|v| {
+                self.missed_rounds
+                    .get(&v.address)
+                    .is_some_and(|missed| *missed >= LIVENESS_SILENCE_WARN_ROUNDS)
+            })
+    }
+
     pub fn peers_needed_for_quorum(&self) -> usize {
         let quorum = self.validator_set.quorum_threshold();
         let my_power = self
@@ -4392,6 +4421,85 @@ mod tests {
             1,
             "sustained silence is exactly what the health line needs to know about"
         );
+    }
+
+    /// Three validators, this node one of them — the shape `hears_no_other_validator` has to tell
+    /// apart from "one of them is missing".
+    fn three_validators() -> (KeyPair, Address, KeyPair, KeyPair, ValidatorSet) {
+        let self_kp = KeyPair::generate();
+        let a_kp = KeyPair::generate();
+        let b_kp = KeyPair::generate();
+        let self_addr = Address::from_public_key(&self_kp.public);
+        let set = ValidatorSet::new(
+            [&a_kp, &self_kp, &b_kp]
+                .iter()
+                .map(|kp| {
+                    Validator::with_key(
+                        Address::from_public_key(&kp.public),
+                        Some(kp.public.clone()),
+                        1_000,
+                        true,
+                    )
+                })
+                .collect(),
+            0,
+        );
+        (self_kp, self_addr, a_kp, b_kp, set)
+    }
+
+    /// #219: nobody's votes arrive, and the node has to be able to say so as its own fact — the
+    /// state in which the cause may be this node's links, and the one the health line misread.
+    #[test]
+    fn a_node_that_hears_no_validator_at_all_knows_it() {
+        let (self_kp, self_addr, _a, _b, set) = three_validators();
+        let mut engine = BftEngine::new(set, self_addr, 0);
+        let _ = engine.produce_block(&self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
+        assert!(!engine.hears_no_other_validator(), "nothing has been missed yet");
+
+        for _ in 0..SILENT_ROUNDS {
+            tick_to_timeout_and_advance(&mut engine, &self_kp);
+        }
+        assert_eq!(engine.silent_peer_validators(), 2);
+        assert!(engine.hears_no_other_validator());
+    }
+
+    /// The other side, and the one that must not be misread as a broken link: a single vote from
+    /// any validator shows that votes do reach this node, so the remaining silence is about the
+    /// silent one.
+    #[test]
+    fn one_validator_heard_is_enough_to_not_be_hearing_nobody() {
+        let (self_kp, self_addr, a_kp, _b, set) = three_validators();
+        let mut engine = BftEngine::new(set, self_addr, 0);
+        let _ = engine.produce_block(&self_kp, Hash::digest(b"genesis"), engine.current_height(), Hash::ZERO, vec![]);
+        for _ in 0..SILENT_ROUNDS {
+            tick_to_timeout_and_advance(&mut engine, &self_kp);
+        }
+        assert!(engine.hears_no_other_validator(), "precondition: nobody heard yet");
+
+        let height = engine.current_height() + 1;
+        let round = engine.pending_round;
+        let block_hash = engine
+            .pending_proposal()
+            .map(|b| b.hash())
+            .unwrap_or_else(|| Hash::digest(b"whatever-is-in-flight"));
+        let _ = engine.add_vote(&self_kp, peer_vote(&a_kp, VoteType::Prevote, height, round, block_hash));
+
+        assert_eq!(engine.silent_peer_validators(), 1, "the other one is still silent");
+        assert!(!engine.hears_no_other_validator());
+    }
+
+    /// A set of one waits on nobody, so it never "hears nobody" — otherwise a sole validator would
+    /// be told its links are suspect for having no one to talk to.
+    #[test]
+    fn a_sole_validator_never_hears_nobody() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let set = ValidatorSet::new(
+            vec![Validator::with_key(addr.clone(), Some(kp.public.clone()), 1_000, true)],
+            0,
+        );
+        let engine = BftEngine::new(set, addr, 0);
+        assert!(!engine.hears_no_other_validator());
     }
 
     /// A returning validator has to stop being reported as silent the moment it participates

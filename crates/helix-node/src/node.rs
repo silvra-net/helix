@@ -1135,6 +1135,9 @@ impl HelixNode {
         // asking consensus: `/diagnostics` is most useful exactly when the consensus path is
         // wedged, so it must never wait on a lock that path holds (same reasoning as #150).
         let silent_peer_validators = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Whether every other validator is silent at once (#219) — see
+        // `BftEngine::hears_no_other_validator`.
+        let hears_no_validator = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rounds_lost_with_quorum_power = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let last_cosigned = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let last_cosigned_at_unix = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1629,6 +1632,7 @@ impl HelixNode {
             self.syncing.clone(),
             quorum_peers_missing.clone(),
             silent_peer_validators.clone(),
+            hears_no_validator.clone(),
             last_cosigned,
             last_cosigned_at_unix,
             production_ticks.clone(),
@@ -1650,6 +1654,7 @@ impl HelixNode {
             tip_certificate,
             quorum_peers_missing,
             silent_peer_validators,
+            hears_no_validator,
             rounds_lost_with_quorum_power,
             production_ticks,
         ));
@@ -3926,18 +3931,26 @@ fn chain_clause(height: u64, stalled_secs: Option<u64>, peers: usize) -> String 
 /// Separated out and tested because operators act on this sentence, and for months it said the
 /// same thing regardless of cause: "restarting the node re-establishes its round." That is right
 /// when this node alone is stuck, and wrong when the chain is waiting for *other* validators —
-/// where a restart achieves nothing. The block production loop reports that case correctly, so the
-/// two contradicted each other a minute apart in the same log.
+/// where a restart achieves nothing. The block production loop said the opposite in that case, so
+/// the two contradicted each other a minute apart in the same log.
 ///
 /// On 2026-08-04 an operator followed the actionable half. The restart was survivable; starting
 /// again with an empty chain database was not — it pinned that node at height 1 and turned a
 /// recoverable outage into a 21-hour stall (#147). Hence the explicit line about the data
 /// directory: the mistake that actually cost the time was not the restart.
+///
+/// And the rule the opposite mistake taught (#219): a sentence telling an operator that a restart
+/// will not help has to rest on something this node can know. "Fewer validators connected than
+/// quorum needs" is a count of this node's own connections, not a fact about anyone else — on
+/// 2026-09-22 it produced "this node is healthy … restarting will not speed that up" ~2700 times
+/// over a 46-hour stall, while this node heard no validator at all — and the stall ended the
+/// second the node and its tunnel were restarted together.
 fn not_validating_advice(
     peers: usize,
     behind_the_tip: bool,
     quorum_peers_missing: bool,
     silent_peer_validators: usize,
+    hears_no_validator: bool,
 ) -> &'static str {
     if peers == 0 {
         // Ahead of everything, because every branch below is a reading of what peers say or
@@ -3997,10 +4010,34 @@ fn not_validating_advice(
          the quorum. Block-sync should close this by itself; if this line keeps appearing, it is \
          not, and restarting THIS node is the fastest way back. Do NOT delete its chain data — \
          syncing from scratch takes far longer than the gap."
+    } else if hears_no_validator {
+        // Connected, and not one vote from any other validator arrives. From here "every other
+        // validator is down" and "this node's links carry nothing" look identical, and the second
+        // is not rare: a connection can stay open on one side after it died on the other, and
+        // gossipsub then leaves a node unable to send over a link it believes in (#232 — the
+        // production node, an hour, 2026-09-24). This node repairs that by itself (pings close dead
+        // links, a peer whose subscriptions never arrive is dropped, the redial follows), so the
+        // advice is to wait first — and then that a restart is safe and may be what helps, which is
+        // what the old "this node is healthy, restarting will not speed that up" denied for 46
+        // hours on 2026-09-22 (#219). Ranked below "behind the tip": a node below the tip also
+        // hears nobody, because every vote is for a height it is not deciding, and that branch
+        // names the cause.
+        "This node is connected but hears NO other validator — not one vote arrives. It cannot \
+         tell whether every other validator is down or its own links carry nothing: a connection \
+         can stay open on one side after it died on the other. It closes dead links and redials by \
+         itself within a few minutes; if this line keeps appearing, restart this node — that is \
+         safe and resets every link at once. Do NOT delete its chain data."
     } else if quorum_peers_missing {
-        "This node is healthy — the chain is waiting for other validators to reconnect, and \
-         restarting will not speed that up. Do NOT delete this node's chain data: a node that \
-         starts with an empty database has to sync from scratch and cannot vote until it does."
+        // Fewer validators *connected* than quorum needs — a count of this node's own connections,
+        // which says nothing about whether the others are up: relayed through one peer, a node can
+        // hear every validator while connected to none of them directly. So this does not call
+        // the node healthy, and it does not claim a restart cannot help; it says what is true
+        // either way.
+        "Fewer validators are connected to this node than quorum needs — they may be down, or \
+         reachable only through other peers; from here it cannot tell. It redials by itself every \
+         30s. Restarting this node is safe but does not bring back a validator that is down. Do \
+         NOT delete this node's chain data: a node that starts with an empty database has to sync \
+         from scratch and cannot vote until it does."
     } else if silent_peer_validators > 0 {
         // The gap #150 left open, found the hard way on 2026-08-06: peers *connected* but not
         // voting. The quorum-peers check only counts connections, so this case fell through to
@@ -4010,10 +4047,17 @@ fn not_validating_advice(
         // Phrased as "not seeing their votes" on purpose. This node cannot tell an absent peer
         // from a broken link to a healthy one, and saying otherwise sends the operator to blame
         // somebody whose node is fine (R2 — it happened, 596 times in one outage).
-        "This node is healthy and connected, but the round cannot close because votes from at \
-         least one other validator are not arriving here — see the 'Validator silent' lines above \
-         for which. Restarting THIS node will not help, and do NOT delete its chain data. If you \
-         run one of the other validators, check that it is up and co-signing."
+        //
+        // "Restarting THIS node will not help" was the line here until #219, and it is not
+        // something this node can know: when it holds the dead half of a link the silent peer
+        // lost, the peer's redial never received this node's subscriptions and cannot publish to
+        // it — and a restart of this node is exactly what starts that link over on both sides.
+        // What is known is that votes from others do arrive, so the likelier fault is elsewhere.
+        "This node is connected and hears other validators, but the round cannot close because \
+         votes from at least one of them are not arriving here — see the 'Validator silent' lines \
+         above for which. The fault is most likely on that validator's side or its link; \
+         restarting THIS node is rarely the fix (it is safe). Do NOT delete its chain data. If \
+         you run one of the other validators, check that it is up and co-signing."
     } else {
         "The process is up but not participating in consensus; restarting the node re-establishes \
          its round."
@@ -4167,6 +4211,9 @@ async fn validator_health_loop(
     // keep talking precisely when the consensus path is stuck (backlog #150).
     quorum_peers_missing: Arc<std::sync::atomic::AtomicBool>,
     silent_peer_validators: Arc<std::sync::atomic::AtomicUsize>,
+    // Whether this node hears no other validator at all, published by `block_production_loop`
+    // (#219) — the one reading that makes this node's own links a suspect.
+    hears_no_validator: Arc<std::sync::atomic::AtomicBool>,
     // Height this node last co-signed at, and when — published for `GET /diagnostics`. Filled
     // here because this loop already scans for it to write its own heartbeat line.
     last_cosigned: Arc<std::sync::atomic::AtomicU64>,
@@ -4269,6 +4316,7 @@ async fn validator_health_loop(
 
         let quorum_missing = quorum_peers_missing.load(Ordering::Relaxed);
         let silent_peers = silent_peer_validators.load(Ordering::Relaxed);
+        let hears_nobody = hears_no_validator.load(Ordering::Relaxed);
         // How far this node is below what its peers claim. `saturating_sub` because being *ahead*
         // is the ordinary state for whoever finalized first, and must read as zero rather than
         // wrap into an enormous "behind".
@@ -4357,8 +4405,9 @@ async fn validator_health_loop(
                 // used to end with "restarting the node re-establishes its round" no matter what
                 // — including when this node is fine and the chain is held up by *other*
                 // validators being absent, where a restart does nothing. The block production
-                // loop says so correctly in that case ("restarting this node does not speed it
-                // up"), so the two contradicted each other a minute apart in the same log.
+                // loop said the opposite in that case, so the two contradicted each other a
+                // minute apart in the same log. (What it said — "restarting this node does not
+                // speed it up" — later turned out to be more than it could know, #219.)
                 //
                 // That is not cosmetic: on 2026-08-04 an operator followed the actionable half and
                 // restarted with an empty chain database, pinning that node at height 1 and
@@ -4369,8 +4418,13 @@ async fn validator_health_loop(
                 // 2026-09-04 added the case that outranks all three: a node *below the tip*. The
                 // warning was accurate about the chain and wrong about who had to act, for 6 h
                 // 20 min.
-                let advice =
-                    not_validating_advice(peers, blocks_behind > 0, quorum_missing, silent_peers);
+                let advice = not_validating_advice(
+                    peers,
+                    blocks_behind > 0,
+                    quorum_missing,
+                    silent_peers,
+                    hears_nobody,
+                );
                 warn!(
                     "Health: ⚠ NOT validating — this node is an active validator but is not \
                      co-signing ({}, {}{}, peers {}). {}",
@@ -4401,6 +4455,7 @@ async fn block_production_loop(
     // health heartbeat so its advice matches what this loop already reports (backlog #150).
     quorum_peers_missing: Arc<std::sync::atomic::AtomicBool>,
     silent_peer_validators: Arc<std::sync::atomic::AtomicUsize>,
+    hears_no_validator: Arc<std::sync::atomic::AtomicBool>,
     // Rounds lost while enough voting power *was* heard (#192). Published from here for the same
     // reason as the two above: `/diagnostics` must never take a consensus lock, and this number is
     // worth reading exactly when the consensus path is stuck.
@@ -4528,12 +4583,12 @@ async fn block_production_loop(
         // Publish, for the health heartbeat, whether the chain is held up by missing validators
         // rather than by anything wrong with this node (backlog #150).
         //
-        // Every branch below already knows this and says so correctly — "restarting this node does
-        // not speed it up". The health loop is the one voice that did not know, and it appended
-        // "restarting the node re-establishes its round" unconditionally, including in exactly the
-        // case where a restart is useless. The two ran a minute apart in production and an
-        // operator, reading the actionable one, restarted with an empty chain database on
-        // 2026-08-04 — turning a recoverable outage into a 21-hour stall (#147).
+        // Every branch below knows when it is waiting on peers and says so. The health loop is the
+        // one voice that did not know, and it appended "restarting the node re-establishes its
+        // round" unconditionally, including in exactly the case where a restart is useless. The
+        // two ran a minute apart in production and an operator, reading the actionable one,
+        // restarted with an empty chain database on 2026-08-04 — turning a recoverable outage
+        // into a 21-hour stall (#147).
         //
         // An atomic rather than letting the health loop ask the engine: that loop exists to keep
         // reporting when the consensus loop is wedged, so it must never block on a lock the wedged
@@ -4546,6 +4601,10 @@ async fn block_production_loop(
                 .store(needed > 0 && have < needed, std::sync::atomic::Ordering::Relaxed);
             silent_peer_validators.store(
                 engine.read().await.silent_peer_validators(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            hears_no_validator.store(
+                engine.read().await.hears_no_other_validator(),
                 std::sync::atomic::Ordering::Relaxed,
             );
             // Published for the same reason and by the same route: `/diagnostics` must never ask
@@ -4574,9 +4633,10 @@ async fn block_production_loop(
                         info!(
                             peers = have,
                             needed,
-                            "Waiting for validators to connect before producing — the chain does \
-                             not advance until quorum is reachable. Restarting the node does not \
-                             speed this up; it starts the wait over."
+                            "Waiting for validators to connect before this node proposes — fewer \
+                             are connected directly than quorum needs, though they may be \
+                             reachable through other peers. Restarting does not shorten this \
+                             wait; it starts it over."
                         );
                     }
                     continue; // still waiting for enough validators to connect
@@ -4589,10 +4649,10 @@ async fn block_production_loop(
                 warn!(
                     peers = have,
                     needed,
-                    "Not enough validators connected after the grace period — starting rounds \
-                     anyway, but they cannot finalize without the missing validators. The chain \
-                     stays where it is until they reconnect; each round now names who is \
-                     missing. Nothing on this node can shorten that wait."
+                    "Fewer validators are connected directly than quorum needs, and the grace \
+                     period is over — starting rounds anyway. If the others are reachable through \
+                     the peers this node has, rounds finalize as usual; if not, each round now \
+                     names whose votes are missing."
                 );
                 // Past PEER_WAIT_TIMEOUT_TICKS — a validator that never connects at all
                 // would otherwise hold this node here forever (this gate runs before the
@@ -4659,9 +4719,9 @@ async fn block_production_loop(
                         info!(
                             peers = have,
                             needed,
-                            "Holding the open round — validators dropped below quorum. The chain \
-                             stays here until they reconnect; restarting this node does not speed \
-                             it up."
+                            "Holding the open round — fewer validators are connected directly \
+                             than quorum needs. This node redials by itself; restarting it starts \
+                             this wait over."
                         );
                     }
                     continue;
@@ -4722,9 +4782,9 @@ async fn block_production_loop(
                     info!(
                         peers = have,
                         needed,
-                        "Waiting for a proposal — validators are below quorum, so the round \
-                         cannot start. The chain stays here until they reconnect; restarting \
-                         this node does not speed it up."
+                        "Waiting for a proposal — fewer validators are connected directly than \
+                         quorum needs. This node redials by itself; restarting it starts this \
+                         wait over."
                     );
                 }
                 continue;
@@ -8349,12 +8409,18 @@ mod validator_health_tests {
     /// Backlog #150. The advice attached to "NOT validating" is the one line an operator acts on,
     /// and it used to be the same regardless of cause — telling someone to restart a node that is
     /// perfectly fine while the chain waits for absent validators.
+    ///
+    /// This test used to require "restarting will not speed that up" here. #219 disproved the
+    /// sentence, not the point: too few validators *connected* is a count of this node's own
+    /// links, so it can say that a restart does not bring back a validator that is down — never
+    /// that a restart cannot help.
     #[test]
-    fn a_node_held_up_by_missing_validators_is_not_told_to_restart() {
-        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 0);
+    fn a_node_short_of_connected_validators_is_not_told_a_restart_is_the_fix() {
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 0, false);
+        assert!(advice.contains("Fewer validators are connected"), "{advice}");
         assert!(
-            advice.contains("will not speed that up"),
-            "must say plainly that restarting does not help: {advice}"
+            advice.contains("does not bring back a validator that is down"),
+            "must say what a restart cannot do, conditionally: {advice}"
         );
         assert!(
             !advice.contains("re-establishes its round"),
@@ -8366,7 +8432,7 @@ mod validator_health_tests {
     /// chain database, which pinned that node at height 1 (#147). The restart was survivable.
     #[test]
     fn the_waiting_advice_warns_against_deleting_chain_data() {
-        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 0);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 0, false);
         assert!(
             advice.contains("Do NOT delete"),
             "must warn against wiping the data directory: {advice}"
@@ -8453,7 +8519,7 @@ mod validator_health_tests {
     /// above and leave a genuinely wedged validator with nothing to do.
     #[test]
     fn a_node_that_is_itself_stuck_is_still_told_to_restart() {
-        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 0);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 0, false);
         assert!(
             advice.contains("re-establishes its round"),
             "a genuinely stuck node must still be told to restart: {advice}"
@@ -8470,17 +8536,22 @@ mod validator_health_tests {
     /// one that had stopped.
     #[test]
     fn a_node_waiting_on_a_silent_peer_is_not_told_to_restart_either() {
-        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 1);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 1, false);
         assert!(
-            advice.contains("will not help"),
-            "must say plainly that restarting this node is not the answer: {advice}"
+            advice.contains("rarely the fix"),
+            "must say that restarting this node is not the likely answer: {advice}"
+        );
+        assert!(
+            !advice.contains("will not help"),
+            "and must not claim it cannot be — when this node holds the dead half of the silent \
+             peer's link, a restart here is what starts that link over (#219): {advice}"
         );
         assert!(
             !advice.contains("re-establishes its round"),
             "must not also carry the opposite recommendation: {advice}"
         );
         assert!(
-            advice.contains("do NOT delete its chain data"),
+            advice.contains("Do NOT delete its chain data"),
             "the restart was survivable on 2026-08-04; wiping the chain was not: {advice}"
         );
     }
@@ -8491,7 +8562,7 @@ mod validator_health_tests {
     /// happened 596 times in one outage on 2026-07-29.
     #[test]
     fn the_advice_does_not_claim_the_other_validator_is_down() {
-        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 2).to_lowercase();
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 2, false).to_lowercase();
         assert!(
             advice.contains("not arriving here"),
             "must describe what this node observes, not what the peer is doing: {advice}"
@@ -8509,8 +8580,8 @@ mod validator_health_tests {
     /// decides which line an operator reads.
     #[test]
     fn disconnected_peers_keep_their_own_more_specific_advice() {
-        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 3);
-        assert!(advice.contains("waiting for other validators to reconnect"), "{advice}");
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 3, false);
+        assert!(advice.contains("Fewer validators are connected"), "{advice}");
     }
 
     /// Being behind outranks every other diagnosis, and this is the case that has actually cost
@@ -8523,7 +8594,7 @@ mod validator_health_tests {
     /// reproduces that outage exactly.
     #[test]
     fn a_node_below_the_tip_is_told_it_is_the_one_that_is_behind() {
-        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, true, true, 3);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, true, true, 3, true);
         assert!(
             advice.contains("BEHIND the tip"),
             "a node below the tip must be told so before anything else — got: {advice}"
@@ -8544,7 +8615,7 @@ mod validator_health_tests {
     /// with its peers must still get the diagnosis that points outward.
     #[test]
     fn a_node_level_with_its_peers_still_gets_the_outward_diagnosis() {
-        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 1);
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 1, false);
         assert!(
             !advice.contains("BEHIND the tip"),
             "a node that is not behind must never be told it is: {advice}"
@@ -8558,7 +8629,7 @@ mod validator_health_tests {
     /// without it and it was jailed. With no peers, that is the one thing this node cannot know.
     #[test]
     fn a_node_with_no_peers_is_not_told_the_chain_is_waiting_for_others() {
-        let advice = not_validating_advice(0, false, true, 3);
+        let advice = not_validating_advice(0, false, true, 3, true);
         assert!(advice.contains("NO peers"), "{advice}");
         assert!(
             advice.contains("cannot tell a stalled chain from"),
@@ -8577,7 +8648,7 @@ mod validator_health_tests {
     /// went away, so with none left it is stale, and the no-peers line is the more basic fact.
     #[test]
     fn having_no_peers_outranks_being_behind() {
-        let advice = not_validating_advice(0, true, true, 3);
+        let advice = not_validating_advice(0, true, true, 3, true);
         assert!(advice.contains("NO peers"), "{advice}");
         assert!(!advice.contains("BEHIND the tip"), "{advice}");
     }
@@ -8588,7 +8659,7 @@ mod validator_health_tests {
     /// its own peer file the whole time.
     #[test]
     fn a_node_holding_too_few_peers_is_told_that_before_it_is_sent_to_blame_others() {
-        let advice = not_validating_advice(1, false, true, 3);
+        let advice = not_validating_advice(1, false, true, 3, false);
         assert!(advice.contains("FEWER PEERS"), "{advice}");
         for forbidden in ["waiting for other validators", "is healthy", "will not speed that up"] {
             assert!(
@@ -8604,7 +8675,7 @@ mod validator_health_tests {
     /// warning on the count alone would fire on a chain that is finalizing normally (R2).
     #[test]
     fn too_few_peers_alone_is_not_a_finding_while_quorum_is_reachable() {
-        let advice = not_validating_advice(1, false, false, 1);
+        let advice = not_validating_advice(1, false, false, 1, false);
         assert!(
             !advice.contains("FEWER PEERS"),
             "a connected-but-silent-peer diagnosis must survive a low peer count: {advice}"
@@ -8616,16 +8687,88 @@ mod validator_health_tests {
     /// branches that send the operator to somebody else's machine.
     #[test]
     fn no_peers_outranks_too_few_peers() {
-        assert!(not_validating_advice(0, false, true, 3).contains("NO peers"));
-        assert!(!not_validating_advice(0, false, true, 3).contains("FEWER PEERS"));
+        assert!(not_validating_advice(0, false, true, 3, true).contains("NO peers"));
+        assert!(!not_validating_advice(0, false, true, 3, true).contains("FEWER PEERS"));
     }
 
     /// The control: a node at the target reads the chain fine, and the existing diagnoses must be
     /// untouched — a peer-count branch that swallowed them would pass the tests above.
     #[test]
     fn a_node_with_peers_keeps_the_existing_diagnoses() {
-        assert!(not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 0).contains("waiting for other validators"));
-        assert!(not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, true, true, 3).contains("BEHIND the tip"));
+        assert!(not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 0, false)
+            .contains("Fewer validators are connected"));
+        assert!(not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, true, true, 3, true).contains("BEHIND the tip"));
+    }
+
+    /// #219, with every flag the way it was on 2026-09-22: peers connected, fewer than quorum
+    /// needs, not behind, every other validator silent — this node heard no one. The line said
+    /// "This node is healthy — the chain is waiting for other validators to reconnect, and
+    /// restarting will not speed that up" about 2700 times over a 46-hour stall — which ended the
+    /// second the node and its tunnel were restarted together (which of the two did it is not
+    /// known). Hearing no one is the one reading in which this node's own links are a suspect, so
+    /// the advice must say it cannot tell, and that a restart is safe.
+    #[test]
+    fn a_node_that_hears_no_validator_is_not_told_a_restart_will_not_help() {
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, true, 4, true);
+        assert!(advice.contains("hears NO other validator"), "{advice}");
+        assert!(advice.contains("cannot tell"), "both readings are open: {advice}");
+        assert!(
+            advice.contains("restart this node") && advice.contains("safe"),
+            "a restart resets every link at once and must be offered: {advice}"
+        );
+        assert!(advice.contains("Do NOT delete its chain data"), "{advice}");
+        for forbidden in ["is healthy", "waiting for other validators", "will not"] {
+            assert!(!advice.contains(forbidden), "({forbidden}): {advice}");
+        }
+    }
+
+    /// Hearing nobody is *not* the diagnosis when a single other validator is still heard: votes
+    /// reach this node, so its links work, and the outward diagnosis stands.
+    #[test]
+    fn hearing_one_validator_keeps_the_outward_diagnosis() {
+        let advice = not_validating_advice(helix_p2p::MIN_HEALTHY_PEERS, false, false, 1, false);
+        assert!(!advice.contains("hears NO other validator"), "{advice}");
+        assert!(advice.contains("not arriving here"), "{advice}");
+    }
+
+    /// The rule #219 wrote, over every input this function can get, so a future branch cannot
+    /// quietly bring the sentence back: no advice may tell an operator that a restart cannot help
+    /// or that this node is healthy. The first is not something any of these inputs can show — a
+    /// restart is what resets this node's links — and the second was printed through a 46-hour
+    /// stall that ended when the node and its tunnel were restarted.
+    #[test]
+    fn no_advice_ever_claims_a_restart_cannot_help() {
+        for peers in [0, 1, helix_p2p::MIN_HEALTHY_PEERS, helix_p2p::MIN_HEALTHY_PEERS + 3] {
+            for behind in [false, true] {
+                for quorum_missing in [false, true] {
+                    for silent in [0, 1, 4] {
+                        for hears_nobody in [false, true] {
+                            let advice = not_validating_advice(
+                                peers,
+                                behind,
+                                quorum_missing,
+                                silent,
+                                hears_nobody,
+                            );
+                            for forbidden in [
+                                "will not help",
+                                "will not speed",
+                                "does not speed",
+                                "nothing on this node",
+                                "is healthy",
+                            ] {
+                                assert!(
+                                    !advice.to_lowercase().contains(forbidden),
+                                    "({forbidden}) for peers={peers} behind={behind} \
+                                     quorum_missing={quorum_missing} silent={silent} \
+                                     hears_nobody={hears_nobody}: {advice}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The same distinction in the first half of the line, which is what an operator reads first.
@@ -11056,6 +11199,7 @@ mod handle_p2p_event_tests {
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ticks.clone(),
         ));
@@ -11108,6 +11252,7 @@ mod handle_p2p_event_tests {
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
@@ -11131,16 +11276,6 @@ mod handle_p2p_event_tests {
         loop_handle.abort();
     }
 
-    /// Backlog #143. This node's own power meets quorum (`peers_needed_for_quorum() == 0`), but
-    /// the round it is on belongs to a *different* validator — one small enough to be below the
-    /// 1 % cap, so it is not needed for quorum, yet still takes its proposer turns. That other
-    /// validator produces nothing this node will accept: offline, or (the live case) behind and
-    /// proposing on a `prev_hash` we reject. Either way this node sits in the no-active-round
-    /// wait.
-    ///
-    /// The bug: `needed == 0` skipped the round clock outright, so the timeout never fired, the
-    /// round never advanced, and the height stopped for good — measured on a three-node devnet
-    /// 2026-07-30, twice out of twice, ten minutes with no progress. The chain has to reach the
     /// The wiring, not the rule. `not_validating_advice` is a pure function and stays green
     /// whether or not anything ever fills `silent_peer_validators` — and an advice branch that is
     /// never reached is exactly as useless as the wrong advice it replaced. This is the same gap
@@ -11150,6 +11285,10 @@ mod handle_p2p_event_tests {
     /// The engine is driven to the point where it already considers the other validator silent
     /// (rounds time out on tick counts, not wall-clock, which is what makes this affordable), then
     /// the production loop is started and must publish that number for the health loop to read.
+    ///
+    /// The other validator is the only one, so this is also the state in which this node hears
+    /// nobody at all (#219) — and that must reach the health loop by the same route, or the branch
+    /// that stops telling operators a restart cannot help is never taken.
     #[tokio::test]
     async fn the_production_loop_publishes_how_many_validators_have_gone_silent() {
         let kp = Arc::new(KeyPair::generate());
@@ -11193,6 +11332,7 @@ mod handle_p2p_event_tests {
         }
 
         let silent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hears_nobody = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (p2p_tx, _rx) = mpsc::channel(64);
         let loop_handle = tokio::spawn(block_production_loop(
             store.clone(),
@@ -11208,6 +11348,7 @@ mod handle_p2p_event_tests {
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             silent.clone(),
+            hears_nobody.clone(),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
@@ -11222,9 +11363,27 @@ mod handle_p2p_event_tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        while !hears_nobody.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the production loop never published that this node hears no validator at all, so \
+                 the health loop goes on telling the operator that a restart will not help (#219)"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         loop_handle.abort();
     }
 
+    /// Backlog #143. This node's own power meets quorum (`peers_needed_for_quorum() == 0`), but
+    /// the round it is on belongs to a *different* validator — one small enough to be below the
+    /// 1 % cap, so it is not needed for quorum, yet still takes its proposer turns. That other
+    /// validator produces nothing this node will accept: offline, or (the live case) behind and
+    /// proposing on a `prev_hash` we reject. Either way this node sits in the no-active-round
+    /// wait.
+    ///
+    /// The bug: `needed == 0` skipped the round clock outright, so the timeout never fired, the
+    /// round never advanced, and the height stopped for good — measured on a three-node devnet
+    /// 2026-07-30, twice out of twice, ten minutes with no progress. The chain has to reach the
     /// next round on its own and produce there.
     ///
     /// `block_production_waits_for_the_initial_sync` above is the control for the other half:
@@ -11283,6 +11442,7 @@ mod handle_p2p_event_tests {
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));

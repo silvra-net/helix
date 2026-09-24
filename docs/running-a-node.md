@@ -225,23 +225,40 @@ scratch, and until it does it cannot vote — so a validator that wipes its data
 the quorum for as long as the sync takes, on top of whatever stopped the chain in the first place.
 This has happened, and it turned a recoverable outage into a 21-hour one.
 
-Read the node's own health line first — it distinguishes the two cases:
+Read the node's own health line first. It says what this node can actually observe, and a
+restart that keeps the chain data is always safe — the line tells you when it is likely to help:
 
 - **"This node has NO peers, so it cannot see the chain"** — your node is cut off, and the chain
   may well be running without it: the other validators keep finalizing if they still hold a
   quorum, and a validator that stays away long enough is jailed (it then needs `helix tx unjail`).
   The node redials its seeds and every peer address it remembers every 30 seconds by itself, so
   if this line persists, look at this machine's network path — firewall, tunnel, proxy.
-- **"the chain is waiting for other validators to reconnect"** — your node is fine. Nothing you do
-  locally will help; the chain resumes when enough validators are back. Restarting is harmless but
-  pointless, and it restarts the internal wait timers.
-- **"votes from at least one other validator are not arriving here"** — your node is healthy and
-  connected, but somebody else's is not voting. Restarting yours will not help; the "Validator
-  silent" lines just above name whose votes are missing. If you run one of those validators, that
-  is the node to look at.
+- **"This node has FEWER PEERS than it wants and cannot reach quorum"** — the votes it is missing
+  may simply have no path to it. It redials every 30 seconds by itself; give it a minute. If the
+  line persists, look at this machine's network path, or at whether the other validators are
+  reachable from it at all.
+- **"This node is BEHIND the tip its peers report"** — the missing votes are most likely your own:
+  a validator below the tip cannot vote on the next height. Block-sync closes the gap by itself;
+  if the line keeps appearing, restart this node.
+- **"This node is connected but hears NO other validator"** — not a single vote arrives. From the
+  node's side, every other validator being down looks exactly like its own links carrying nothing
+  — a connection can stay open on one side after it died on the other. The node closes dead links
+  and redials within a few minutes by itself; if the line persists, restart it. That resets every
+  link at once.
+- **"Fewer validators are connected to this node than quorum needs"** — the missing ones may be
+  down, or reachable only through other peers. The node redials by itself. Restarting yours is
+  safe but will not bring back a validator that is down.
+- **"votes from at least one of them are not arriving here"** — your node hears other validators,
+  so its links work; somebody's votes are not reaching it. The "Validator silent" lines just above
+  name whose. The fault is most likely on that validator's side or its link, so restarting yours
+  is rarely the fix; if you run one of those validators, that is the node to look at.
 - **"restarting the node re-establishes its round"** — this node is the stuck one. Restart it
   (`pm2 restart <name>`, `systemctl restart …`, or however you run it). Your chain data and
   validator key stay where they are; that is exactly what makes the restart safe.
+
+Two of these lines used to say that restarting "will not help". A node cannot know that: on
+2026-09-22 one said so for 46 hours while it heard no other validator, and the stall ended the
+moment the node and its tunnel were restarted.
 
 A stalled chain is normal when the validator set is small: consensus needs more than two-thirds of
 voting power, so with three validators all three must be online. The chain does not lose anything
