@@ -67,6 +67,7 @@ pub fn run() {
             commands::restore_wallet,
             commands::unlock_wallet,
             commands::lock_wallet,
+            commands::change_passphrase,
             commands::touch_wallet,
             commands::get_network,
             commands::get_overview,
@@ -79,6 +80,7 @@ pub fn run() {
             commands::undelegate,
             commands::redelegate,
             commands::set_commission,
+            commands::set_reward_address,
             commands::get_delegations,
             commands::get_validator_pool,
             commands::list_validators,
@@ -113,4 +115,38 @@ pub fn run() {
                 let _ = node_process::node_stop(app_handle.state::<NodeProcessState>());
             }
         });
+}
+
+#[cfg(test)]
+mod command_names {
+    /// Every command name lives twice — registered here, invoked by name in `api.ts` — and a typo
+    /// on either side compiles on both, then fails only when someone clicks the button. The two
+    /// lists must be the same list.
+    #[test]
+    fn the_frontend_invokes_exactly_the_commands_registered_here() {
+        use std::collections::BTreeSet;
+        let lib = include_str!("lib.rs");
+        let start = lib.find("generate_handler![").expect("the handler list");
+        let end = start + lib[start..].find("])").expect("its end");
+        let registered: BTreeSet<&str> = lib[start + "generate_handler![".len()..end]
+            .split(',')
+            .filter_map(|entry| entry.trim().rsplit("::").next())
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        let api = include_str!("../../src/api.ts");
+        let invoked: BTreeSet<&str> = api
+            .split("invoke<")
+            .skip(1)
+            .filter_map(|rest| rest.split("(\"").nth(1)?.split('"').next())
+            .collect();
+
+        // Positive control: both parsers found the lists at all.
+        assert!(registered.len() >= 40, "registered: {registered:?}");
+        assert!(invoked.len() >= 40, "invoked: {invoked:?}");
+        let unknown: Vec<_> = invoked.difference(&registered).collect();
+        let unused: Vec<_> = registered.difference(&invoked).collect();
+        assert!(unknown.is_empty(), "api.ts invokes commands nobody registered: {unknown:?}");
+        assert!(unused.is_empty(), "registered commands api.ts never invokes: {unused:?}");
+    }
 }

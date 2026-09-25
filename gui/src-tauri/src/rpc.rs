@@ -93,6 +93,10 @@ pub struct ValidatorPool {
     pub effective_stake_hlx: f64,
     pub total_shares: u64,
     pub commission_bps: Option<u16>,
+    /// Where this validator's own share and commission go, when not to itself (#229). Absent on
+    /// a node that predates it, which reads as "to itself" — true there, since it could not be set.
+    #[serde(default)]
+    pub reward_address: Option<String>,
 }
 
 /// One row of transaction history — mirrors the node's `TxHistoryEntry`, including the honest

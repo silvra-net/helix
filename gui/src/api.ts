@@ -37,6 +37,10 @@ export const api = {
 
   lockWallet: () => invoke<void>("lock_wallet"),
 
+  // Set or change the wallet's passphrase. `current` is empty for a wallet that has none.
+  changePassphrase: (current: string, next: string) =>
+    invoke<void>("change_passphrase", { current: current || null, next }),
+
   // Somebody is using the wallet — restarts the backend's idle lock. See `idle.ts`.
   touchWallet: () => invoke<void>("touch_wallet"),
 
@@ -74,6 +78,10 @@ export const api = {
 
   setCommission: (node: string, bps: number) =>
     invoke<SubmitResult>("set_commission", { node, bps }),
+
+  // Pay this validator's own rewards to `address`, or to this wallet again with `null`.
+  setRewardAddress: (node: string, address: string | null) =>
+    invoke<SubmitResult>("set_reward_address", { node, address }),
 
   getDelegations: (node: string) => invoke<Delegation[]>("get_delegations", { node }),
 

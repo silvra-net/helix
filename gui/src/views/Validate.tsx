@@ -353,8 +353,17 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
               <div className="metric-value">{pool.commission_bps == null ? "—" : (pool.commission_bps / 100).toFixed(2) + "%"}</div>
             </div>
           </div>
+          <div className="kv" style={{ marginTop: 10 }}>
+            <span className="muted">Your rewards go to</span>
+            <span className="mono" style={{ wordBreak: "break-all", textAlign: "right" }}>
+              {pool.reward_address ?? "this wallet"}
+            </span>
+          </div>
           <div className="row-actions" style={{ marginTop: 12 }}>
             <button onClick={() => setAction({ kind: "commission" })}>Set commission</button>
+            <button onClick={() => setAction({ kind: "rewardAddress", current: pool.reward_address ?? null })}>
+              Change where rewards go
+            </button>
           </div>
         </div>
       )}

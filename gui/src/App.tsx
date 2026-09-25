@@ -317,7 +317,9 @@ export default function App() {
           {route === "earn" && <Earn node={node} />}
           {route === "identity" && <Identity node={node} address={meta.address ?? ""} />}
           {route === "governance" && <Governance node={node} chainHeight={net?.height ?? 0} />}
-          {route === "settings" && <Settings address={meta.address ?? ""} />}
+          {route === "settings" && (
+            <Settings address={meta.address ?? ""} encrypted={meta.encrypted} onPassphraseChanged={refreshMeta} />
+          )}
         </section>
 
         <footer className="statusbar">

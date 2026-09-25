@@ -88,6 +88,38 @@ pub fn load_at(path: &Path, passphrase: Option<&str>) -> Result<(KeyPair, String
     Ok((kp, address))
 }
 
+/// Give the wallet at `path` a new passphrase — its first, or a replacement — after opening it
+/// with `current` (`None` for a wallet that has none).
+///
+/// Asking for the current passphrase even though the wallet is already unlocked is the point:
+/// a window left open for a minute must not be enough to lock its owner out under a passphrase
+/// they never chose. An empty `new` is refused — this is the way to protect a wallet, and
+/// removing a passphrase stays with `helix wallet encrypt --remove`, out of reach of an
+/// unattended window.
+///
+/// The new file is opened with the new passphrase and checked against the key before it
+/// replaces the old one, and it replaces it in one step (`KeyFile::replace`: written beside it,
+/// then renamed) — this file is the only copy of the key.
+pub fn change_passphrase_at(path: &Path, current: Option<&str>, new: &str) -> Result<String, String> {
+    if new.is_empty() {
+        return Err("an empty passphrase protects nothing — nothing was changed".into());
+    }
+    let kf = KeyFile::load(path).map_err(e)?;
+    // A wallet encrypted under the empty passphrase (the CLI made those until 2026-09-23) opens
+    // with "" and nothing else; the frontend sends nothing for an empty field.
+    let current = if kf.is_encrypted() { Some(current.unwrap_or("")) } else { None };
+    let kp = kf
+        .to_keypair(current)
+        .map_err(|err| format!("the current passphrase does not open this wallet — nothing was changed ({err})"))?;
+    let new_kf = KeyFile::from_keypair_encrypted(&kp, new).map_err(e)?;
+    let reopened = new_kf.to_keypair(Some(new)).map_err(e)?;
+    if reopened.public != kp.public {
+        return Err("the re-encrypted wallet did not open to the same key — nothing was changed".into());
+    }
+    new_kf.replace(path).map_err(e)?;
+    Ok(new_kf.address.clone())
+}
+
 fn encode(kp: &KeyPair, passphrase: Option<&str>) -> Result<KeyFile, String> {
     match passphrase {
         Some(p) if !p.is_empty() => KeyFile::from_keypair_encrypted(kp, p).map_err(e),
@@ -159,6 +191,70 @@ mod tests {
         assert!(is_encrypted_at(&path).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("helix-gui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("wallet.json")
+    }
+
+    /// The case #226 left open: a wallet made without a passphrase gets one, from the app.
+    #[test]
+    fn a_wallet_without_a_passphrase_gets_one() {
+        let path = scratch("pass-first");
+        let created = create_at(&path, None).unwrap();
+        assert!(!is_encrypted_at(&path).unwrap());
+
+        assert_eq!(change_passphrase_at(&path, None, "hunter2").unwrap(), created.address);
+        assert!(is_encrypted_at(&path).unwrap());
+        assert!(load_at(&path, None).is_err(), "it must no longer open without one");
+        let (kp, address) = load_at(&path, Some("hunter2")).unwrap();
+        assert_eq!(address, created.address);
+        assert_eq!(kp.public, created.keypair.public);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_passphrase_is_replaced_and_the_old_one_stops_working() {
+        let path = scratch("pass-change");
+        let created = create_at(&path, Some("old")).unwrap();
+        change_passphrase_at(&path, Some("old"), "new").unwrap();
+        assert!(load_at(&path, Some("old")).is_err());
+        assert_eq!(load_at(&path, Some("new")).unwrap().1, created.address);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Every refusal leaves the file exactly as it was — byte for byte, because it is the only
+    /// copy of the key.
+    #[test]
+    fn a_refused_change_leaves_the_file_untouched() {
+        let path = scratch("pass-refused");
+        create_at(&path, Some("old")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let wrong = change_passphrase_at(&path, Some("not it"), "new").unwrap_err();
+        assert!(wrong.contains("does not open"), "{wrong}");
+        let missing = change_passphrase_at(&path, None, "new").unwrap_err();
+        assert!(missing.contains("does not open"), "{missing}");
+        let empty = change_passphrase_at(&path, Some("old"), "").unwrap_err();
+        assert!(empty.contains("protects nothing"), "{empty}");
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A wallet the CLI encrypted under the empty passphrase before 2026-09-23 opens with ""
+    /// alone — and the frontend sends nothing for an empty field.
+    #[test]
+    fn a_wallet_encrypted_under_the_empty_passphrase_can_be_given_a_real_one() {
+        let path = scratch("pass-empty-old");
+        let kp = KeyPair::generate();
+        KeyFile::from_keypair_encrypted(&kp, "").unwrap().save(&path).unwrap();
+        change_passphrase_at(&path, None, "hunter2").unwrap();
+        assert_eq!(load_at(&path, Some("hunter2")).unwrap().0.public, kp.public);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// The phrase must reproduce the exact wallet, and it must match the *other* implementation:

@@ -111,6 +111,32 @@ pub fn unlock_wallet(app: AppHandle, state: State<'_, WalletState>, passphrase: 
     Ok(address)
 }
 
+/// Set or change the passphrase of the wallet on disk (see `wallet::change_passphrase_at`). Only
+/// from an unlocked wallet, and never logging either passphrase.
+#[tauri::command]
+pub fn change_passphrase(
+    app: AppHandle,
+    state: State<'_, WalletState>,
+    current: Option<String>,
+    next: String,
+) -> Result<(), String> {
+    let unlocked = state.address().ok_or("wallet is locked")?;
+    let path = wallet_path(&app)?;
+    let address = wallet::change_passphrase_at(&path, current.as_deref(), &next).inspect_err(|e| {
+        log::error!("passphrase change failed: {e}");
+    })?;
+    if address != unlocked {
+        // The file on disk is not the wallet this window has open — say so rather than let the
+        // screen go on describing one while the passphrase protects the other.
+        log::error!("passphrase changed on {address}, but {unlocked} is the unlocked wallet");
+        return Err(format!(
+            "the wallet file holds {address}, not the unlocked {unlocked} — its passphrase was changed"
+        ));
+    }
+    log::info!("wallet passphrase changed: {address}");
+    Ok(())
+}
+
 #[tauri::command]
 pub fn lock_wallet(state: State<'_, WalletState>) {
     *state.inner.lock().unwrap() = None;
@@ -321,6 +347,26 @@ pub async fn set_commission(state: State<'_, WalletState>, node: String, bps: u1
     build_sign_submit(&state, &node, TxType::SetCommission, None, 0, bps.to_le_bytes().to_vec(), None).await
 }
 
+/// Where `set_reward_address` pays: the address given, or this wallet's own when there is none
+/// (an empty field included). Only a plain address — no name lookup: a name is resolved by the
+/// node, and this is where a validator's income goes.
+fn reward_payout(own: &str, address: Option<&str>) -> Result<Address, String> {
+    match address.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => Address::from_str(a).map_err(|e| format!("not a valid address: {e}")),
+        None => Address::from_str(own).map_err(|e| e.to_string()),
+    }
+}
+
+/// Pay this validator's own rewards — its self-stake share and its commission — to another
+/// address, e.g. a wallet whose key never touches the machine running the node; `None` pays them
+/// to this wallet again. Delegators' share is not affected (#229).
+#[tauri::command]
+pub async fn set_reward_address(state: State<'_, WalletState>, node: String, address: Option<String>) -> Result<rpc::SubmitResult, String> {
+    let own = state.address().ok_or("wallet is locked")?;
+    let payout = reward_payout(&own, address.as_deref())?;
+    build_sign_submit(&state, &node, TxType::SetRewardAddress, Some(payout), 0, vec![], None).await
+}
+
 #[tauri::command]
 pub async fn get_delegations(state: State<'_, WalletState>, node: String) -> Result<Vec<rpc::Delegation>, String> {
     let address = state.address().ok_or("wallet is locked")?;
@@ -498,4 +544,36 @@ pub async fn get_validator_status(state: State<'_, WalletState>, node: String) -
         blocks_proposed,
         window,
     })
+}
+
+#[cfg(test)]
+mod reward_address_tests {
+    use super::*;
+
+    fn own() -> String {
+        Address::from_public_key(&helix_crypto::KeyPair::generate().public).to_string()
+    }
+
+    /// Nothing given, or an empty field, pays this wallet again — the way back, not an error.
+    #[test]
+    fn no_address_pays_this_wallet() {
+        let me = own();
+        assert_eq!(reward_payout(&me, None).unwrap().to_string(), me);
+        assert_eq!(reward_payout(&me, Some("  ")).unwrap().to_string(), me);
+    }
+
+    #[test]
+    fn an_address_is_taken_as_given_and_a_broken_one_is_refused() {
+        let me = own();
+        let cold = own();
+        assert_eq!(reward_payout(&me, Some(&format!(" {cold} "))).unwrap().to_string(), cold);
+        // One character off fails the checksum instead of paying a stranger.
+        let mut typo = cold.clone();
+        let last = typo.pop().unwrap();
+        typo.push(if last == 'a' { 'b' } else { 'a' });
+        assert!(reward_payout(&me, Some(&typo)).is_err());
+        // A name is not looked up here: resolving it would mean trusting the node with where a
+        // validator's income goes.
+        assert!(reward_payout(&me, Some("alice.hlx")).is_err());
+    }
 }

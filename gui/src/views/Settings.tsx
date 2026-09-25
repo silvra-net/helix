@@ -2,12 +2,29 @@ import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { api } from "../api";
 import { getThemePref, setThemePref, type ThemePref } from "../theme";
+import { newPassphraseProblem } from "../passphraseChange";
 
 // Settings: the deliberate backup path. A wallet created before you wrote the 24 words down would
 // otherwise have no recovery — here you can re-reveal the phrase (re-authenticating with the
 // passphrase), and read the address / public key you hand to guardians for social recovery.
-export default function Settings({ address }: { address: string }) {
+export default function Settings({
+  address,
+  encrypted,
+  onPassphraseChanged,
+}: {
+  address: string;
+  encrypted: boolean;
+  onPassphraseChanged: () => void;
+}) {
   const [passphrase, setPassphrase] = useState("");
+  // The passphrase form (#226) — separate from the reveal field above, which asks for the
+  // current passphrase for a different purpose.
+  const [currentPass, setCurrentPass] = useState("");
+  const [nextPass, setNextPass] = useState("");
+  const [repeatPass, setRepeatPass] = useState("");
+  const [passBusy, setPassBusy] = useState(false);
+  const [passError, setPassError] = useState<string | null>(null);
+  const [passDone, setPassDone] = useState<string | null>(null);
   const [words, setWords] = useState<string[] | null>(null);
   const [pubkey, setPubkey] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -42,6 +59,31 @@ export default function Settings({ address }: { address: string }) {
       setError(String(e));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const passProblem = newPassphraseProblem(nextPass, repeatPass);
+
+  const changePassphrase = async () => {
+    setPassBusy(true);
+    setPassError(null);
+    setPassDone(null);
+    try {
+      await api.changePassphrase(currentPass, nextPass);
+      setPassDone(
+        encrypted
+          ? "Passphrase changed. From now on only the new one opens this wallet."
+          : "Passphrase set. From now on this wallet opens only with it."
+      );
+      onPassphraseChanged();
+    } catch (e) {
+      setPassError(String(e));
+    } finally {
+      // Never left in the fields, whatever happened.
+      setCurrentPass("");
+      setNextPass("");
+      setRepeatPass("");
+      setPassBusy(false);
     }
   };
 
@@ -110,6 +152,54 @@ export default function Settings({ address }: { address: string }) {
             </div>
           </>
         )}
+      </div>
+
+      <div className="card">
+        <div className="section-title">Passphrase</div>
+        {encrypted ? (
+          <p className="muted small" style={{ marginTop: -4 }}>
+            This wallet is protected by a passphrase and locks itself after 10 minutes without use.
+          </p>
+        ) : (
+          <div className="warn-inline">
+            This wallet has no passphrase. It still locks itself after 10 minutes without use, but
+            unlocking it is a single click — anyone at this computer can send from it. Set a
+            passphrase to make the lock mean something.
+          </div>
+        )}
+        {passDone && <div className="notice">{passDone}</div>}
+        {passError && <div className="error">{passError}</div>}
+        {encrypted && (
+          <label className="field">
+            <span>Current passphrase</span>
+            <input type="password" value={currentPass} onChange={(e) => setCurrentPass(e.target.value)} />
+          </label>
+        )}
+        <label className="field">
+          <span>New passphrase</span>
+          <input type="password" value={nextPass} onChange={(e) => setNextPass(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>New passphrase, again</span>
+          <input
+            type="password"
+            value={repeatPass}
+            onChange={(e) => setRepeatPass(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && !passBusy && passProblem == null && changePassphrase()}
+          />
+        </label>
+        {nextPass !== "" && repeatPass !== "" && passProblem && (
+          <p className="muted small">{passProblem}</p>
+        )}
+        <p className="muted small">
+          A forgotten passphrase cannot be reset — only the 24-word phrase above brings the wallet
+          back. Make sure you have it written down first.
+        </p>
+        <div className="row-actions end">
+          <button className="primary" disabled={passBusy || passProblem != null} onClick={changePassphrase}>
+            {passBusy ? "…" : encrypted ? "Change passphrase" : "Set passphrase"}
+          </button>
+        </div>
       </div>
 
       <div className="card">

@@ -61,6 +61,8 @@ export interface ValidatorPool {
   effective_stake_hlx: number;
   total_shares: number;
   commission_bps: number | null;
+  /** Where this validator's own share and commission go; null means to itself. */
+  reward_address: string | null;
 }
 
 export interface HistoryEntry {
