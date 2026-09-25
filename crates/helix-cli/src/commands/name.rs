@@ -1,13 +1,10 @@
-use std::path::PathBuf;
-
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
 use crate::fee::price_and_sign;
-use crate::keyfile::KeyFile;
-use crate::passphrase::unlock_key;
+use crate::passphrase::Signer;
 
 #[derive(Subcommand)]
 pub enum NameCmd {
@@ -15,9 +12,8 @@ pub enum NameCmd {
     Register {
         /// Name to register (without the .hlx suffix)
         name: String,
-        /// Wallet key file
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX (default: 10000)
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
@@ -32,14 +28,13 @@ pub enum NameCmd {
 
 pub async fn run(cmd: NameCmd, node: &str) -> Result<()> {
     match cmd {
-        NameCmd::Register { name, key, fee } => register(name, key, fee, node).await,
+        NameCmd::Register { name, signer, fee } => register(name, signer, fee, node).await,
         NameCmd::Resolve { name } => resolve(name, node).await,
     }
 }
 
-async fn register(name: String, key_path: PathBuf, fee: Option<u64>, node: &str) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+async fn register(name: String, signer: Signer, fee: Option<u64>, node: &str) -> Result<()> {
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
 

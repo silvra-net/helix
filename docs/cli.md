@@ -60,7 +60,22 @@ The file is used exactly as it is, minus one trailing newline (so `echo secret >
 spaces belong to the passphrase. An empty file is refused rather than giving you a wallet
 without one, and a file other users can read gets a warning. The same two options work on
 `wallet restore`, `wallet import-node-key` and (as `--passphrase-file`) `wallet encrypt`.
-Unlocking — every `tx` command — still asks on the terminal; there is no file option for it yet.
+
+**Opening an encrypted wallet to sign** works the same way. Every command that signs — the `tx`
+commands, `name register`, `identity attest`, `recovery register-guardians|approve`, `contract
+deploy|call`, `governance propose|vote` — asks on the terminal, or reads `--passphrase-file`:
+
+```bash
+helix tx send hlx... 10 --key bot.json --passphrase-file /run/secrets/helix-bot
+```
+
+A script has nobody to answer a prompt, so with a file there is none: a passphrase that does not
+open the wallet is an error naming the file, and an empty file says it is empty (usually a secret
+that never arrived). Without a terminal and without the option, the error says to use
+`--passphrase-file`. A file given for a wallet that has no passphrase is not read — the command
+signs, and tells you the wallet is unencrypted. The `wallet` commands that open an existing
+wallet (`address --verify`, `encrypt`) still ask on the terminal; there, `--passphrase-file`
+means the *new* passphrase.
 
 **What the CLI does to protect that file:**
 - `wallet new`, `wallet restore` and `wallet import-node-key` **never overwrite** an existing

@@ -6,7 +6,7 @@ use clap::Subcommand;
 use helix_crypto::{Address, CryptoScheme, KeyPair};
 
 use crate::keyfile::KeyFile;
-use crate::passphrase::{ask_on_terminal, read_passphrase_file, unlock_key};
+use crate::passphrase::{ask_on_terminal, read_passphrase_file, rpassword_read, unlock_key};
 
 /// Where a new wallet's passphrase comes from — never from the command line itself.
 ///
@@ -330,7 +330,7 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
         WalletCmd::Address { key, verify } => {
             let kf = KeyFile::load(&key)?;
             if verify {
-                let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+                let kp = unlock_key(&kf, None, "Wallet passphrase: ", &mut |p| rpassword_read(p))?;
                 println!("{}", Address::from_public_key(&kp.public));
             } else {
                 println!("{}", kf.address);
@@ -391,7 +391,7 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
             refuse_encrypt_argument(passphrase_on_command_line.as_deref())?;
             let kf = KeyFile::load(&key)?;
             // The current passphrase first, so a wrong one fails before a new one is typed twice.
-            let kp = unlock_key(&kf, "Current passphrase: ")?;
+            let kp = unlock_key(&kf, None, "Current passphrase: ", &mut |p| rpassword_read(p))?;
             let new_passphrase =
                 resolve_encrypt_target(passphrase_file.as_deref(), remove, &mut |p| {
                     ask_on_terminal(p)

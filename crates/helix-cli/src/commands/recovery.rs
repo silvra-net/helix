@@ -1,13 +1,10 @@
-use std::path::PathBuf;
-
 use anyhow::Result;
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
 use crate::fee::price_and_sign;
-use crate::keyfile::KeyFile;
-use crate::passphrase::unlock_key;
+use crate::passphrase::Signer;
 
 #[derive(Subcommand)]
 pub enum RecoveryCmd {
@@ -16,9 +13,8 @@ pub enum RecoveryCmd {
         /// Guardian addresses (3-10)
         #[arg(required = true, num_args = 1..)]
         guardians: Vec<String>,
-        /// Wallet key file of the account owner
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX (default: 10000)
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
@@ -30,9 +26,8 @@ pub enum RecoveryCmd {
         target: String,
         /// New controlling public key (hex-encoded ML-DSA public key)
         new_public_key: String,
-        /// Wallet key file of the guardian
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX (default: 10000)
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
@@ -47,27 +42,26 @@ pub enum RecoveryCmd {
 
 pub async fn run(cmd: RecoveryCmd, node: &str) -> Result<()> {
     match cmd {
-        RecoveryCmd::RegisterGuardians { guardians, key, fee } => {
-            register_guardians(guardians, key, fee, node).await
+        RecoveryCmd::RegisterGuardians { guardians, signer, fee } => {
+            register_guardians(guardians, signer, fee, node).await
         }
         RecoveryCmd::Approve {
             target,
             new_public_key,
-            key,
+            signer,
             fee,
-        } => approve(target, new_public_key, key, fee, node).await,
+        } => approve(target, new_public_key, signer, fee, node).await,
         RecoveryCmd::Status { address } => status(address, node).await,
     }
 }
 
 async fn register_guardians(
     guardians: Vec<String>,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     node: &str,
 ) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
 
@@ -108,12 +102,11 @@ async fn register_guardians(
 async fn approve(
     target: String,
     new_public_key_hex: String,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     node: &str,
 ) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let target_addr = Address::from_str(&target)

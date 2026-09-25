@@ -1,13 +1,10 @@
-use std::path::PathBuf;
-
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
 use crate::fee::{hlx_to_nano, price_and_sign};
-use crate::keyfile::KeyFile;
-use crate::passphrase::unlock_key;
+use crate::passphrase::Signer;
 
 
 #[derive(Subcommand)]
@@ -18,9 +15,8 @@ pub enum TxCmd {
         to: String,
         /// Amount in HLX (e.g. 1.5)
         amount: f64,
-        /// Wallet key file
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -32,9 +28,8 @@ pub enum TxCmd {
     Stake {
         /// Amount in HLX to stake
         amount: f64,
-        /// Wallet key file
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -45,9 +40,8 @@ pub enum TxCmd {
     Unstake {
         /// Amount in HLX to unstake
         amount: f64,
-        /// Wallet key file
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -59,9 +53,8 @@ pub enum TxCmd {
     /// automatic on purpose: submit this once your node is actually back and connected,
     /// not before, or you'll just get jailed again once the same downtime resumes counting.
     Unjail {
-        /// Wallet key file
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -70,9 +63,8 @@ pub enum TxCmd {
     },
     /// Claim unbonded stake back to liquid balance (after 7-day unbonding period)
     ClaimUnbonded {
-        /// Wallet key file
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -86,8 +78,8 @@ pub enum TxCmd {
         validator: String,
         /// Amount in HLX to delegate
         amount: f64,
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -101,8 +93,8 @@ pub enum TxCmd {
         validator: String,
         /// Amount in HLX to undelegate (its current value, not raw shares)
         amount: f64,
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -119,8 +111,8 @@ pub enum TxCmd {
         to_validator: String,
         /// Amount in HLX to move (its current value, not raw shares)
         amount: f64,
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -131,8 +123,8 @@ pub enum TxCmd {
     SetCommission {
         /// Commission in basis points (0-5000, i.e. 0%-50%)
         bps: u16,
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -148,8 +140,8 @@ pub enum TxCmd {
         /// Pay rewards to this validator's own address again
         #[arg(long)]
         clear: bool,
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -165,33 +157,36 @@ pub enum TxCmd {
 
 pub async fn run(cmd: TxCmd, node: &str) -> Result<()> {
     match cmd {
-        TxCmd::Send { to, amount, key, fee, nonce } => {
-            send(to, amount, key, fee, nonce, node).await
+        TxCmd::Send { to, amount, signer, fee, nonce } => {
+            send(to, amount, signer, fee, nonce, node).await
         }
-        TxCmd::Stake { amount, key, fee, nonce } => {
-            simple_amount_tx(TxType::Stake, amount, key, fee, nonce, node).await
+        TxCmd::Stake { amount, signer, fee, nonce } => {
+            simple_amount_tx(TxType::Stake, amount, signer, fee, nonce, node).await
         }
-        TxCmd::Unstake { amount, key, fee, nonce } => {
-            simple_amount_tx(TxType::Unstake, amount, key, fee, nonce, node).await
+        TxCmd::Unstake { amount, signer, fee, nonce } => {
+            simple_amount_tx(TxType::Unstake, amount, signer, fee, nonce, node).await
         }
-        TxCmd::Unjail { key, fee, nonce } => zero_amount_tx(TxType::Unjail, key, fee, nonce, node).await,
-        TxCmd::ClaimUnbonded { key, fee, nonce } => {
-            zero_amount_tx(TxType::ClaimUnbonded, key, fee, nonce, node).await
+        TxCmd::Unjail { signer, fee, nonce } => {
+            zero_amount_tx(TxType::Unjail, signer, fee, nonce, node).await
         }
-        TxCmd::Delegate { validator, amount, key, fee, nonce } => {
-            targeted_amount_tx(TxType::Delegate, validator, amount, key, fee, nonce, node).await
+        TxCmd::ClaimUnbonded { signer, fee, nonce } => {
+            zero_amount_tx(TxType::ClaimUnbonded, signer, fee, nonce, node).await
         }
-        TxCmd::Undelegate { validator, amount, key, fee, nonce } => {
-            targeted_amount_tx(TxType::Undelegate, validator, amount, key, fee, nonce, node).await
+        TxCmd::Delegate { validator, amount, signer, fee, nonce } => {
+            targeted_amount_tx(TxType::Delegate, validator, amount, signer, fee, nonce, node).await
         }
-        TxCmd::Redelegate { from_validator, to_validator, amount, key, fee, nonce } => {
-            redelegate(from_validator, to_validator, amount, key, fee, nonce, node).await
+        TxCmd::Undelegate { validator, amount, signer, fee, nonce } => {
+            targeted_amount_tx(TxType::Undelegate, validator, amount, signer, fee, nonce, node)
+                .await
         }
-        TxCmd::SetCommission { bps, key, fee, nonce } => {
-            set_commission(bps, key, fee, nonce, node).await
+        TxCmd::Redelegate { from_validator, to_validator, amount, signer, fee, nonce } => {
+            redelegate(from_validator, to_validator, amount, signer, fee, nonce, node).await
         }
-        TxCmd::SetRewardAddress { address, clear, key, fee, nonce } => {
-            set_reward_address(address, clear, key, fee, nonce, node).await
+        TxCmd::SetCommission { bps, signer, fee, nonce } => {
+            set_commission(bps, signer, fee, nonce, node).await
+        }
+        TxCmd::SetRewardAddress { address, clear, signer, fee, nonce } => {
+            set_reward_address(address, clear, signer, fee, nonce, node).await
         }
         TxCmd::Status { hash } => tx_status(hash, node).await,
     }
@@ -200,13 +195,12 @@ pub async fn run(cmd: TxCmd, node: &str) -> Result<()> {
 async fn send(
     to: String,
     amount_hlx: f64,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let to_addr = Address::from_str(&to)
@@ -251,13 +245,12 @@ async fn send(
 async fn simple_amount_tx(
     tx_type: TxType,
     amount_hlx: f64,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let amount_nano = hlx_to_nano(amount_hlx)?;
@@ -287,13 +280,12 @@ async fn simple_amount_tx(
 /// Transactions with no amount (ClaimUnbonded, etc.)
 async fn zero_amount_tx(
     tx_type: TxType,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let nonce = match nonce_override {
@@ -325,13 +317,12 @@ async fn targeted_amount_tx(
     tx_type: TxType,
     validator: String,
     amount_hlx: f64,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let validator_addr = Address::from_str(&validator)
@@ -370,13 +361,12 @@ async fn redelegate(
     from_validator: String,
     to_validator: String,
     amount_hlx: f64,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let src = Address::from_str(&from_validator)
@@ -420,13 +410,12 @@ async fn redelegate(
 
 async fn set_commission(
     bps: u16,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let nonce = match nonce_override {
@@ -462,7 +451,7 @@ async fn set_commission(
 async fn set_reward_address(
     address: Option<String>,
     clear: bool,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
@@ -474,8 +463,7 @@ async fn set_reward_address(
         ),
         _ => None,
     };
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let payout = payout.unwrap_or_else(|| from.clone());

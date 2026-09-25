@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
@@ -7,8 +5,7 @@ use helix_crypto::{Address, Signature};
 use helix_executor::governance::{encode_proposal, encode_vote, GovernanceParam};
 
 use crate::fee::price_and_sign;
-use crate::keyfile::KeyFile;
-use crate::passphrase::unlock_key;
+use crate::passphrase::Signer;
 
 #[derive(Clone, clap::ValueEnum)]
 pub enum GovParamArg {
@@ -71,9 +68,8 @@ pub enum GovernanceCmd {
         param: GovParamArg,
         /// New value: HLX for min-validator-stake, a plain count for fuel-per-fee-unit
         new_value: f64,
-        /// Wallet key file of the proposer
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX (default: 10000)
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
@@ -83,9 +79,8 @@ pub enum GovernanceCmd {
     Vote {
         /// Proposal id
         proposal_id: u64,
-        /// Wallet key file of the voter
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX (default: 10000)
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
@@ -104,10 +99,12 @@ pub enum GovernanceCmd {
 
 pub async fn run(cmd: GovernanceCmd, node: &str) -> Result<()> {
     match cmd {
-        GovernanceCmd::Propose { param, new_value, key, fee } => {
-            propose(param, new_value, key, fee, node).await
+        GovernanceCmd::Propose { param, new_value, signer, fee } => {
+            propose(param, new_value, signer, fee, node).await
         }
-        GovernanceCmd::Vote { proposal_id, key, fee } => vote(proposal_id, key, fee, node).await,
+        GovernanceCmd::Vote { proposal_id, signer, fee } => {
+            vote(proposal_id, signer, fee, node).await
+        }
         GovernanceCmd::Show { proposal_id } => show(proposal_id, node).await,
         GovernanceCmd::List => list(node).await,
         GovernanceCmd::Params => params(node).await,
@@ -117,7 +114,7 @@ pub async fn run(cmd: GovernanceCmd, node: &str) -> Result<()> {
 async fn propose(
     param: GovParamArg,
     new_value: f64,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     node: &str,
 ) -> Result<()> {
@@ -125,8 +122,7 @@ async fn propose(
     // nothing, not a fee and a block (see `on_chain_value`).
     let (new_value, shown) = on_chain_value(&param, new_value)?;
 
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
 
@@ -163,9 +159,8 @@ async fn propose(
     Ok(())
 }
 
-async fn vote(proposal_id: u64, key_path: PathBuf, fee: Option<u64>, node: &str) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+async fn vote(proposal_id: u64, signer: Signer, fee: Option<u64>, node: &str) -> Result<()> {
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
 

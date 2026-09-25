@@ -6,18 +6,17 @@ use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
 use crate::fee::{hlx_to_nano, price_and_sign};
-use crate::keyfile::KeyFile;
-use crate::passphrase::unlock_key;
+use crate::passphrase::Signer;
 
 #[derive(Subcommand)]
 pub enum ContractCmd {
-    /// Deploy a WASM contract — its exported `call` function becomes the entry point
+    /// Deploy a WASM contract — its exported `call` function becomes the entry point, and the
+    /// deploying wallet's address becomes the contract account
     Deploy {
         /// Path to a compiled .wasm module
         wasm: PathBuf,
-        /// Wallet key file (the deployer's address becomes the contract account)
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX (default: 10000)
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
@@ -37,9 +36,8 @@ pub enum ContractCmd {
         /// import, as a UTF-8 string — the contract's own bytecode decides what this means
         #[arg(long)]
         data: Option<String>,
-        /// Wallet key file
-        #[arg(short, long, default_value = "wallet.json")]
-        key: PathBuf,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX — also doubles as the WASM execution fuel budget (default: 10000)
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
@@ -61,9 +59,11 @@ pub enum ContractCmd {
 
 pub async fn run(cmd: ContractCmd, node: &str) -> Result<()> {
     match cmd {
-        ContractCmd::Deploy { wasm, key, fee, nonce } => deploy(wasm, key, fee, nonce, node).await,
-        ContractCmd::Call { address, amount, data, key, fee, nonce } => {
-            call(address, amount, data, key, fee, nonce, node).await
+        ContractCmd::Deploy { wasm, signer, fee, nonce } => {
+            deploy(wasm, signer, fee, nonce, node).await
+        }
+        ContractCmd::Call { address, amount, data, signer, fee, nonce } => {
+            call(address, amount, data, signer, fee, nonce, node).await
         }
         ContractCmd::Storage { address, key } => storage(address, key, node).await,
     }
@@ -71,7 +71,7 @@ pub async fn run(cmd: ContractCmd, node: &str) -> Result<()> {
 
 async fn deploy(
     wasm_path: PathBuf,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
@@ -79,8 +79,7 @@ async fn deploy(
     let bytecode = std::fs::read(&wasm_path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {}", wasm_path.display(), e))?;
 
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
 
@@ -121,13 +120,12 @@ async fn call(
     address: String,
     amount_hlx: f64,
     data: Option<String>,
-    key_path: PathBuf,
+    signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
     node: &str,
 ) -> Result<()> {
-    let kf = KeyFile::load(&key_path)?;
-    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
+    let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let to_addr = Address::from_str(&address)
