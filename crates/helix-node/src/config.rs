@@ -117,11 +117,25 @@ pub fn resolve(env_var: &str, config_val: &Option<String>) -> Option<String> {
 /// `u64` setting. An env var present but not parseable as `u64` is ignored (falls
 /// through to the config file value) rather than erroring — keeps this consistent
 /// with `resolve`'s "never fail on optional settings" behavior.
+///
+/// Ignored, but not silently: the operator set it on purpose, and a value that quietly does
+/// nothing is how a typo lives for weeks. Settings whose fallback is dangerous rather than merely
+/// different — the disk limits — are refused at startup instead (`check_disk_budget_settings`).
 pub fn resolve_u64(env_var: &str, config_val: Option<u64>) -> Option<u64> {
-    std::env::var(env_var)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .or(config_val)
+    let Ok(raw) = std::env::var(env_var) else {
+        return config_val;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                using = ?config_val,
+                "{env_var} is set but is not a whole number — ignoring it"
+            );
+            config_val
+        }
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +200,23 @@ mod tests {
         let env_var = "HELIX_TEST_RESOLVE_U64_UNPARSEABLE";
         std::env::set_var(env_var, "not-a-number");
         assert_eq!(resolve_u64(env_var, Some(7)), Some(7));
+        std::env::remove_var(env_var);
+    }
+
+    /// Unset is not unreadable: the config file's value applies, and nothing is logged.
+    #[test]
+    fn resolve_u64_takes_the_config_file_value_when_the_env_var_is_unset() {
+        let env_var = "HELIX_TEST_RESOLVE_U64_UNSET_WITH_FILE";
+        std::env::remove_var(env_var);
+        assert_eq!(resolve_u64(env_var, Some(7)), Some(7));
+    }
+
+    /// Operators paste values with the whitespace around them.
+    #[test]
+    fn resolve_u64_reads_a_number_with_whitespace_around_it() {
+        let env_var = "HELIX_TEST_RESOLVE_U64_WHITESPACE";
+        std::env::set_var(env_var, " 42 ");
+        assert_eq!(resolve_u64(env_var, Some(7)), Some(42));
         std::env::remove_var(env_var);
     }
 

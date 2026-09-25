@@ -487,19 +487,6 @@ fn keep_blocks_for_budget(db_bytes: u64, retained_blocks: u64, budget_bytes: u64
     Some((budget_bytes / per_block).max(MIN_KEEP_BLOCKS))
 }
 
-/// `HELIX_KEEP_BYTES` — a disk budget for the chain database, e.g. `120G`, `4096M`, or plain bytes.
-///
-/// **What the number means, precisely: it budgets the content, and the file lands on the next
-/// power of two above it.** redb extends its file in doubling steps and never returns space, so a
-/// database holding just over 64 GB occupies 128. Measured end to end on 2026-09-18: an 80 MB
-/// budget settled at a 129 MB file, having pruned down from 1764 blocks to 1099. So `120G` is the
-/// right way to ask for "never more than 128 GB", and `128G` is not — it leaves the content free
-/// to cross 128 and take the file to 256.
-///
-/// Unset is 0, meaning "no byte budget": the node then obeys `HELIX_KEEP_BLOCKS` exactly as before.
-/// Unparseable is also 0 rather than some default, for the reason `HELIX_DB_CACHE_MB` does the
-/// same — a typo must not silently switch on a limit the operator did not choose, nor switch off
-/// one they did.
 /// Parse a comma-separated list of personhood authority public keys, keeping only the ones that
 /// really are keys.
 ///
@@ -540,24 +527,77 @@ fn parse_personhood_authorities(raw: &str) -> Vec<helix_crypto::PublicKey> {
         .collect()
 }
 
+/// `HELIX_KEEP_BYTES` — a disk budget for the chain database, e.g. `120G`, `4096M`, or plain bytes.
+///
+/// **What the number means, precisely: it budgets the content, and the file lands on the next
+/// power of two above it.** redb extends its file in doubling steps and never returns space, so a
+/// database holding just over 64 GB occupies 128. Measured end to end on 2026-09-18: an 80 MB
+/// budget settled at a 129 MB file, having pruned down from 1764 blocks to 1099. So `120G` is the
+/// right way to ask for "never more than 128 GB", and `128G` is not — it leaves the content free
+/// to cross 128 and take the file to 256.
+///
+/// Unset is 0, meaning "no byte budget": the node then obeys `HELIX_KEEP_BLOCKS` exactly as before.
+/// A value this node cannot read never gets here — [`check_disk_budget_settings`] refuses the
+/// start instead — so the `0` below is only ever "unset".
 fn configured_keep_bytes() -> u64 {
-    let Ok(raw) = std::env::var("HELIX_KEEP_BYTES") else {
-        return 0;
-    };
-    parse_byte_budget(&raw)
+    std::env::var("HELIX_KEEP_BYTES").ok().and_then(|raw| parse_byte_budget(&raw)).unwrap_or(0)
 }
 
-/// Parse `120G` / `500M` / `1024K` / plain bytes. Case-insensitive, `B` suffix tolerated.
-fn parse_byte_budget(raw: &str) -> u64 {
-    let raw = raw.trim().trim_end_matches(['b', 'B']);
-    let (digits, scale) = match raw.chars().last() {
-        Some(c @ ('g' | 'G')) => (&raw[..raw.len() - c.len_utf8()], 1024 * 1024 * 1024),
-        Some(c @ ('m' | 'M')) => (&raw[..raw.len() - c.len_utf8()], 1024 * 1024),
-        Some(c @ ('k' | 'K')) => (&raw[..raw.len() - c.len_utf8()], 1024),
-        _ => (raw, 1),
+/// Parse a size: plain bytes, or a whole number with a unit — `K`, `M`, `G`, `T`, each also as
+/// `KB`/`KiB` and so on, in any case, with or without a space before it. Every unit is binary
+/// (`1G` = 1024³ bytes), whichever way it is written: an operator who types `120GB` and one who
+/// types `120GiB` mean the same limit, and neither should find out which one the node picked.
+///
+/// `None` for anything else, and for a size beyond `u64` — the caller decides what an unreadable
+/// budget means, and it is not "no budget".
+fn parse_byte_budget(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    let digits_end = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
+    let (digits, unit) = raw.split_at(digits_end);
+    let n: u64 = digits.parse().ok()?;
+    let scale: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        "t" | "tb" | "tib" => 1 << 40,
+        _ => return None,
     };
-    digits.trim().parse::<u64>().ok().map_or(0, |n| n.saturating_mul(scale))
+    n.checked_mul(scale)
 }
+
+/// Refuses a disk limit this node cannot read, before anything is created or opened.
+///
+/// `HELIX_KEEP_BLOCKS` and `HELIX_KEEP_BYTES` exist to keep the disk from filling, and a full disk
+/// is not a slow node: on 2026-09-24 it left a validator with a redb file whose region header was
+/// zeroed, which no build can open, and the chain one validator short for days. Both settings used
+/// to read a typo as "unset" — `500_000`, `500k`, `120GiB` — so an operator's explicit limit
+/// became no limit, silently, to be found out when the disk ran full. A node that will not start
+/// is noticed the minute it is restarted, by the person who just changed the setting.
+fn check_disk_budget_settings(keep_blocks: Option<&str>, keep_bytes: Option<&str>) -> Result<()> {
+    if let Some(raw) = keep_blocks {
+        if raw.trim().parse::<u64>().is_err() {
+            bail!(
+                "HELIX_KEEP_BLOCKS={raw:?} is not a whole number of blocks. Write it as digits \
+                 only, e.g. HELIX_KEEP_BLOCKS=500000 — no separators, no units. It is the limit \
+                 that keeps this node's disk from filling, so the node does not start without \
+                 understanding it. Unset it to keep every block (an archive node)."
+            );
+        }
+    }
+    if let Some(raw) = keep_bytes {
+        if parse_byte_budget(raw).is_none() {
+            bail!(
+                "HELIX_KEEP_BYTES={raw:?} is not a size this node can read. Write a whole number, \
+                 optionally with a unit: 120G, 120GiB, 500M, or plain bytes (units are binary, \
+                 1G = 1024³ bytes). It is the limit that keeps this node's disk from filling, so \
+                 the node does not start without understanding it. Unset it for no byte budget."
+            );
+        }
+    }
+    Ok(())
+}
+
 
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
 /// Validator health heartbeat cadence and thresholds (see `validator_health_loop`).
@@ -704,6 +744,10 @@ impl HelixNode {
         // params below; env vars still take precedence over the file, see
         // `config::resolve`.
         let cfg = config::load_node_config()?;
+        check_disk_budget_settings(
+            std::env::var("HELIX_KEEP_BLOCKS").ok().as_deref(),
+            std::env::var("HELIX_KEEP_BYTES").ok().as_deref(),
+        )?;
 
         let key_path = resolve_validator_key_path(&cfg);
         // Double-sign state lives beside the key it protects: validator-key.json ->
@@ -9099,17 +9143,53 @@ mod body_cap_tests {
 
     #[test]
     fn a_byte_budget_is_read_with_or_without_a_unit() {
-        assert_eq!(parse_byte_budget("120G"), 120 * 1024 * 1024 * 1024);
-        assert_eq!(parse_byte_budget("120g"), 120 * 1024 * 1024 * 1024);
-        assert_eq!(parse_byte_budget("120GB"), 120 * 1024 * 1024 * 1024);
-        assert_eq!(parse_byte_budget(" 500M "), 500 * 1024 * 1024);
-        assert_eq!(parse_byte_budget("1024K"), 1024 * 1024);
-        assert_eq!(parse_byte_budget("4096"), 4096);
-        // A typo must not switch the limit on *or* off by accident — 0 means "no byte budget",
-        // and the caller then follows HELIX_KEEP_BLOCKS exactly as it did before.
-        assert_eq!(parse_byte_budget("lots"), 0);
-        assert_eq!(parse_byte_budget("12X"), 0);
-        assert_eq!(parse_byte_budget(""), 0);
+        let gib = 1024 * 1024 * 1024;
+        for spelled in ["120G", "120g", "120GB", "120GiB", "120gib", "120 G", " 120 GiB "] {
+            assert_eq!(parse_byte_budget(spelled), Some(120 * gib), "{spelled:?}");
+        }
+        assert_eq!(parse_byte_budget(" 500M "), Some(500 * 1024 * 1024));
+        assert_eq!(parse_byte_budget("500MiB"), Some(500 * 1024 * 1024));
+        assert_eq!(parse_byte_budget("1024K"), Some(1024 * 1024));
+        assert_eq!(parse_byte_budget("2T"), Some(2 * 1024 * gib));
+        assert_eq!(parse_byte_budget("4096"), Some(4096));
+        assert_eq!(parse_byte_budget("4096B"), Some(4096));
+    }
+
+    /// Unreadable is not "no budget". Each of these used to come back as 0, which the node reads
+    /// as "unset" — an operator's explicit limit silently switched off.
+    #[test]
+    fn a_byte_budget_that_cannot_be_read_is_not_taken_for_none() {
+        for unreadable in ["lots", "12X", "", "G", "1.5G", "120 GiBs", "-5G", "99999999999T"] {
+            assert_eq!(parse_byte_budget(unreadable), None, "{unreadable:?}");
+        }
+    }
+
+    /// The node refuses to start on a disk limit it cannot read, and names the setting and how
+    /// to write it. Unset, and every readable value, start as before.
+    #[test]
+    fn a_disk_limit_the_node_cannot_read_stops_the_start() {
+        assert!(check_disk_budget_settings(None, None).is_ok(), "unset keeps everything");
+        assert!(check_disk_budget_settings(Some("500000"), Some("120GiB")).is_ok());
+        assert!(check_disk_budget_settings(Some(" 500000 "), None).is_ok());
+
+        for (blocks, bytes, named) in [
+            (Some("500_000"), None, "HELIX_KEEP_BLOCKS"),
+            (Some("500k"), None, "HELIX_KEEP_BLOCKS"),
+            (Some(""), None, "HELIX_KEEP_BLOCKS"),
+            (None, Some("120 gigs"), "HELIX_KEEP_BYTES"),
+            (None, Some("1.5G"), "HELIX_KEEP_BYTES"),
+            (Some("500000"), Some("lots"), "HELIX_KEEP_BYTES"),
+        ] {
+            let msg = check_disk_budget_settings(blocks, bytes)
+                .expect_err("an unreadable disk limit must stop the start")
+                .to_string();
+            assert!(msg.starts_with(named), "must name the setting first: {msg}");
+            assert!(msg.contains("disk from filling"), "must say why it matters: {msg}");
+            assert!(
+                msg.contains("e.g.") || msg.contains("120G"),
+                "must show how to write it: {msg}"
+            );
+        }
     }
 
     /// The sync cap is derived from the protocol, never guessed: whatever a batch may legitimately
