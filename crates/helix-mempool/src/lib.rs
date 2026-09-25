@@ -113,6 +113,33 @@ pub struct Mempool {
     base_fee_per_byte: u64,
 }
 
+/// A transaction whose signature has been checked against its own public key — the one expensive
+/// check the pool makes (a full ML-DSA verification, ~0.2 ms in release on the production host),
+/// and the only one that needs no chain state.
+///
+/// Checked before the pool's lock is taken: every block this node proposes has to take that lock
+/// to pack its transactions, and the lock is fair, so a proposer waits behind every writer queued
+/// before it. Verified under the lock, as it was, each submission held it for a whole
+/// verification — and submitting costs nothing, since a transaction that is refused pays no fee
+/// (#238). The RPC takes one lock per request, so the proposer waited for as many verifications
+/// as there were requests in flight.
+///
+/// Only [`CheckedSignature::check`] makes one, so a `CheckedSignature` is a transaction whose
+/// signature verified — the type is the proof, and `add_checked` cannot be handed anything else.
+pub struct CheckedSignature(Transaction);
+
+impl CheckedSignature {
+    pub fn check(tx: Transaction) -> MempoolResult<Self> {
+        tx.verify_own_signature()
+            .map_err(|e| MempoolError::ForgedSignature(e.to_string()))?;
+        Ok(CheckedSignature(tx))
+    }
+
+    pub fn transaction(&self) -> &Transaction {
+        &self.0
+    }
+}
+
 impl Mempool {
     pub fn new() -> Self {
         Mempool {
@@ -340,7 +367,7 @@ impl Mempool {
         chain_id: Hash,
         account_nonce: Option<u64>,
     ) -> MempoolResult<()> {
-        self.add_inner(tx, None, chain_id, account_nonce)
+        self.add_inner(tx, None, chain_id, account_nonce, false)
     }
 
     /// Like `add`, but for a sender whose control was ever rotated by social-recovery
@@ -358,15 +385,31 @@ impl Mempool {
         chain_id: Hash,
         account_nonce: Option<u64>,
     ) -> MempoolResult<()> {
-        self.add_inner(tx, recovery_key, chain_id, account_nonce)
+        self.add_inner(tx, recovery_key, chain_id, account_nonce, false)
     }
 
+    /// Like `add_with_recovery_key`, for a transaction whose signature was checked before the
+    /// caller took the pool's lock — see [`CheckedSignature`].
+    pub fn add_checked(
+        &mut self,
+        tx: CheckedSignature,
+        recovery_key: Option<&PublicKey>,
+        chain_id: Hash,
+        account_nonce: Option<u64>,
+    ) -> MempoolResult<()> {
+        self.add_inner(tx.0, recovery_key, chain_id, account_nonce, true)
+    }
+
+    /// `signature_checked`: the caller came through `add_checked`, whose `CheckedSignature` can
+    /// only exist once the signature verified. Every other caller keeps the old order — cheap
+    /// refusals first, the verification after them, where it has always been.
     fn add_inner(
         &mut self,
         tx: Transaction,
         recovery_key: Option<&PublicKey>,
         chain_id: Hash,
         account_nonce: Option<u64>,
+        signature_checked: bool,
     ) -> MempoolResult<()> {
         self.evict_expired();
 
@@ -433,8 +476,11 @@ impl Mempool {
         // `verify_signature_with_recovery_key`.
         tx.verify_sender_key(recovery_key)
             .map_err(|e| MempoolError::Invalid(e.to_string()))?;
-        tx.verify_own_signature()
-            .map_err(|e| MempoolError::ForgedSignature(e.to_string()))?;
+        // Already done, outside the lock, when the transaction came through `add_checked` (#238).
+        if !signature_checked {
+            tx.verify_own_signature()
+                .map_err(|e| MempoolError::ForgedSignature(e.to_string()))?;
+        }
 
         // Another chain's transaction cannot execute here, so holding it wastes a pool slot and,
         // once a proposer packs it, block space — for free, since a transaction that fails this
@@ -729,6 +775,59 @@ mod tests {
             err.to_string().starts_with("Invalid transaction: "),
             "{err}"
         );
+    }
+
+    /// #238. `CheckedSignature::check` is the same verification, only earlier — outside the
+    /// pool's lock — and it refuses a forgery the same way.
+    #[test]
+    fn a_checked_signature_is_only_made_from_a_signature_that_verifies() {
+        let kp = KeyPair::generate();
+        let mut forged = make_tx(&kp, 10_000, 0);
+        forged.signature = kp.sign(b"a different message").unwrap();
+        assert!(matches!(
+            CheckedSignature::check(forged),
+            Err(MempoolError::ForgedSignature(_))
+        ));
+        let honest = make_tx(&kp, 10_000, 0);
+        let hash = honest.hash();
+        let checked = CheckedSignature::check(honest).unwrap();
+        assert_eq!(checked.transaction().hash(), hash);
+    }
+
+    /// Only the signature is skipped for a checked transaction — every other door still applies,
+    /// or the type would be a way around them. The one door that must not move is the sender key:
+    /// a checked signature proves the transaction's own key signed it, not that the key may speak
+    /// for `from`.
+    #[test]
+    fn a_checked_transaction_still_meets_every_other_rule() {
+        let kp = KeyPair::generate();
+        let mut pool = Mempool::new();
+        let other_chain = Hash::digest(b"another chain");
+        let wrong_chain = CheckedSignature::check(make_tx(&kp, 10_000, 0)).unwrap();
+        assert!(matches!(
+            pool.add_checked(wrong_chain, None, other_chain, Some(0)),
+            Err(MempoolError::ForeignChain { .. })
+        ));
+        let spent = CheckedSignature::check(make_tx(&kp, 10_000, 3)).unwrap();
+        assert!(matches!(
+            pool.add_checked(spent, None, Hash::ZERO, Some(5)),
+            Err(MempoolError::NonceSpent { .. })
+        ));
+
+        let owner = KeyPair::generate();
+        let stranger = KeyPair::generate();
+        let mut not_theirs = make_tx(&owner, 10_000, 0);
+        not_theirs.public_key = stranger.public.clone();
+        not_theirs.signature = stranger.sign(not_theirs.signing_hash().as_bytes()).unwrap();
+        let checked = CheckedSignature::check(not_theirs).expect("its own key did sign it");
+        assert!(matches!(
+            pool.add_checked(checked, None, Hash::ZERO, Some(0)),
+            Err(MempoolError::Invalid(_))
+        ));
+
+        let fine = CheckedSignature::check(make_tx(&kp, 10_000, 0)).unwrap();
+        pool.add_checked(fine, None, Hash::ZERO, Some(0)).unwrap();
+        assert_eq!(pool.len(), 1);
     }
 
     /// The other half, and the reason for the split: a key that is not entitled to `from` depends

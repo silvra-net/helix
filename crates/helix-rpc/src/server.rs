@@ -1912,8 +1912,17 @@ async fn submit_transaction(
             Json(json!({ "error": "sender cannot pay the declared fee" })),
         );
     }
+    // The signature before the pool's lock, never under it (#238): a proposer packing a block
+    // waits for that lock behind every request queued before it, and a refused submission costs
+    // its sender nothing.
+    let checked = match helix_mempool::CheckedSignature::check(tx.clone()) {
+        Ok(checked) => checked,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() })));
+        }
+    };
     let mut mempool = state.mempool.write().await;
-    let result = mempool.add_with_recovery_key(tx.clone(), recovery_key.as_ref(), chain_id, Some(account_nonce));
+    let result = mempool.add_checked(checked, recovery_key.as_ref(), chain_id, Some(account_nonce));
     drop(mempool);
     match result {
         Ok(()) => {
@@ -2688,6 +2697,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_forged_submission_is_refused_without_taking_the_pools_lock() {
+        // The fixture has to clear every cheaper door first, or the test passes on one of those
+        // and says nothing about the lock: a funded sender, a fee over the base fee, its own
+        // public key — and a signature that does not verify.
+        let (state, _path) = fresh_app_state();
+        let keypair = KeyPair::generate();
+        let alice = Address::from_public_key(&keypair.public);
+        state.chain_state.write().await.update_account(&alice, |acc| acc.balance = 1_000_000);
+        let mut forged = Transaction {
+            fee: 10_000,
+            public_key: keypair.public.clone(),
+            ..tx(&alice, &addr(2), 1, 0)
+        };
+        let mut signature = keypair.sign(forged.signing_hash().as_bytes()).unwrap().as_bytes().to_vec();
+        signature[10] ^= 1;
+        forged.signature = helix_crypto::Signature::from_bytes(signature);
+
+        // Held the way a proposer packing a block holds it. Verified under the lock, the refusal
+        // would have to wait for it — and so, in production, did every block (#238).
+        let pool = state.mempool.clone();
+        let held = pool.write().await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            submit_transaction(State(state.clone()), Json(forged)),
+        )
+        .await
+        .expect("the forged submission waited for the pool's lock — it was verified under it")
+        .into_response();
+        drop(held);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.mempool.read().await.len(), 0);
     }
 
     /// Regression test for a bug found by actually running a multi-node local testnet
