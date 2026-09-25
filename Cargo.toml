@@ -100,7 +100,10 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 
 # ZK-STARK proofs (NIST finalist — ZK Proof of Personhood)
-winterfell = "0.13"
+# Pinned exactly: `helix-zkp` walks winterfell's proof serialisation before winterfell reads it
+# (`proof_is_well_formed`), because winterfell sizes its buffers from lengths inside the proof. A
+# different version may lay the bytes out differently, and that must be a decision, not an update.
+winterfell = "=0.13.1"
 
 # Persistence
 redb = "2.1"

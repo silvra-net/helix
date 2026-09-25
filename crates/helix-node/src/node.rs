@@ -2040,18 +2040,25 @@ async fn admission_verdict(
         warn!(from = %tx.from, "Rejected peer tx: gossiped without its public key");
         return TransactionVerdict::Unjudged;
     }
-    let (recovery_key, recorded_key, can_pay, chain_id, account_nonce) = {
+    let (recovery_key, recorded_key, can_pay, refusal, chain_id, account_nonce) = {
         let chain = chain_state.read().await;
         (
             chain.recovery_key(&tx.from).cloned(),
             chain.account_key(&tx.from).cloned(),
             helix_executor::can_pay_fee(&chain, &tx),
+            helix_executor::admission_refusal(&chain, &tx),
             chain.chain_id,
             // Same gate as the RPC submit path, and for the same reason it exists there:
             // a spent nonce is refused at the pool rather than inside a block.
             chain.accounts.get(tx.from.as_str()).map_or(0, |a| a.nonce),
         )
     };
+    // A transaction this chain can never apply is not pooled, and so not forwarded (#228) or
+    // packed either. See `helix_executor::admission_refusal`.
+    if let Some(reason) = refusal {
+        warn!(from = %tx.from, "Rejected peer tx: {reason}");
+        return TransactionVerdict::Unjudged;
+    }
     // The same gate the RPC submit path applies. Without it here, the RPC's rate limiter
     // would be the only thing between an unfunded fee claim and the pool — and a peer
     // reaches this path without ever touching the RPC. See `helix_executor::can_pay_fee`.
@@ -13316,6 +13323,30 @@ mod forged_transaction_tests {
         let mut tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
         tx.public_key = None;
         assert_rejected_and_unjudged(f, tx, "gossiped without its key").await;
+    }
+
+    /// #246: a proof of personhood on a chain with no authority can never apply, so it is not
+    /// pooled — and, answered `Unjudged`, not forwarded — and it is not held against its author:
+    /// nothing about it is forged. With an authority, admission has no say (positive control).
+    #[tokio::test]
+    async fn personhood_without_an_authority_is_refused_and_not_held_against_the_author() {
+        let personhood = |f: &Fixture| {
+            let mut tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
+            tx.tx_type = TxType::ProvePersonhood;
+            tx.to = None;
+            tx.amount = 0;
+            tx.data = vec![7; 64];
+            tx.signature = f.kp.sign(tx.signing_hash().as_bytes()).unwrap();
+            tx
+        };
+        let with_authority = fixture(Mempool::new());
+        with_authority.chain_state.write().await.personhood_authorities.push(KeyPair::generate().public);
+        let tx = personhood(&with_authority);
+        assert_eq!(admit(&with_authority, tx).await, vec![TransactionVerdict::Valid]);
+
+        let f = fixture(Mempool::new());
+        let tx = personhood(&f);
+        assert_rejected_and_unjudged(f, tx, "personhood without an authority").await;
     }
 
     /// The other half: a known sender's gossiped transaction carries its key on the wire and

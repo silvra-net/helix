@@ -234,8 +234,10 @@ earlier, unauthenticated "3 peers vouch for you" attestation path existed and wa
 (the transaction now unconditionally rejects) once it became clear it bypassed the
 authority-gated proof entirely.
 
-Verified personhood matters for one thing: it raises your voting-power cap as a validator
-from 0.5% to 1% of the network (see [Consensus](internals.md#consensus)).
+Verified personhood matters for one thing: a validator's full stake counts toward its voting
+power instead of half of it. The cap is the same for everyone — 1% of all stake — so
+personhood helps only a validator below it; one already at the cap gains nothing (see
+[Consensus](internals.md#consensus)).
 It is not required to hold, send, or stake HLX.
 
 ### Social Recovery

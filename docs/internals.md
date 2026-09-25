@@ -63,9 +63,12 @@ still waiting out its one-epoch activation delay (see [Staking](staking.md#staki
 yet — nothing solicits its precommit and none would be counted — so those blocks are not held
 against it. The wait the protocol imposes never counts as downtime.
 
-**Proof of Personhood** caps how much voting power a single identity can accumulate:
-- Without verification: voting power capped at 0.5% of the network
-- With verification: voting power capped at 1% of the network
+**Voting power** is capped at 1% of all stake for every validator (`total_stake / 100`).
+**Proof of Personhood** changes what goes into the cap, not the cap:
+- Without verification: half the validator's stake, up to the cap
+- With verification: the full stake, up to the cap
+
+So personhood helps only a validator below the cap; one already at it gains nothing.
 
 > **Maturity note (please read before relying on it).** The public Helix network currently
 > runs a small validator set. The vote-counting, equivocation detection, double-sign slashing, and

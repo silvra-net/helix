@@ -1904,7 +1904,7 @@ async fn submit_transaction(
     Json(mut tx): Json<Transaction>,
 ) -> impl IntoResponse {
     let tx_hash = tx.hash().to_hex();
-    let (recovery_key, recorded_key, can_pay, chain_id, account_nonce) = {
+    let (recovery_key, recorded_key, can_pay, refusal, chain_id, account_nonce) = {
         let chain = state.chain_state.read().await;
         (
             chain.recovery_key(&tx.from).cloned(),
@@ -1912,6 +1912,7 @@ async fn submit_transaction(
             // the pool store this transaction without its own, and lets a wallet leave it out.
             chain.account_key(&tx.from).cloned(),
             helix_executor::can_pay_fee(&chain, &tx),
+            helix_executor::admission_refusal(&chain, &tx),
             chain.chain_id,
             // The nonce the executor will measure this transaction against. Read here, where the
             // state is already open, so the pool can refuse a spent nonce instead of letting it
@@ -1928,6 +1929,10 @@ async fn submit_transaction(
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "sender cannot pay the declared fee" })),
         );
+    }
+    // A transaction this chain can never apply — see `helix_executor::admission_refusal`.
+    if let Some(reason) = refusal {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": reason })));
     }
     // The signature before the pool's lock, never under it (#238): a proposer packing a block
     // waits for that lock behind every request queued before it, and a refused submission costs
@@ -2237,6 +2242,45 @@ mod tests {
             state.mempool.read().await.is_empty(),
             "the pool must stay empty — an admitted claim is what evicts honest transactions"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #246: a proof of personhood on a chain with no authority can never apply — refused at the
+    /// door with the reason, never pooled. With an authority the door has no say.
+    #[tokio::test]
+    async fn personhood_without_an_authority_is_refused_at_the_door() {
+        let (state, path) = fresh_app_state();
+        let kp = KeyPair::generate();
+        let from = Address::from_public_key(&kp.public);
+        state.chain_state.write().await.update_account(&from, |acc| acc.balance = 1_000_000_000);
+        let chain_id = state.chain_state.read().await.chain_id;
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::ProvePersonhood,
+            from,
+            to: None,
+            amount: 0,
+            fee: 1_000_000,
+            nonce: 0,
+            data: vec![7; 64],
+            crypto_version: CryptoVersion::MlDsa,
+            chain_id,
+            signature: Signature::from_bytes(vec![]),
+            public_key: Some(kp.public.clone()),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+
+        let response = submit_transaction(State(state.clone()), Json(tx.clone())).await.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("no personhood authority"), "{}", String::from_utf8_lossy(&body));
+        assert!(state.mempool.read().await.is_empty());
+
+        state.chain_state.write().await.personhood_authorities.push(KeyPair::generate().public);
+        let response = submit_transaction(State(state.clone()), Json(tx)).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "with an authority, admission has no say");
+        assert_eq!(state.mempool.read().await.len(), 1);
 
         let _ = std::fs::remove_file(&path);
     }

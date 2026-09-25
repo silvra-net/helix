@@ -386,6 +386,20 @@ pub fn can_pay_fee(state: &ChainState, tx: &Transaction) -> bool {
     state.get_or_default(&tx.from).balance >= tx.fee
 }
 
+/// Why this chain can never apply `tx`, whoever packs it and whenever — or `None`. Asked by the
+/// same two callers as [`can_pay_fee`], so such a transaction is neither pooled, nor forwarded,
+/// nor packed by this node.
+///
+/// Today one kind: `ProvePersonhood` on a chain with no personhood authority, which
+/// `execute_prove_personhood` fails every time. Unlike a balance or a nonce, nothing a block does
+/// can change that — the authorities are fixed at genesis — so this verdict and the executor's
+/// cannot drift apart. It also keeps proof bytes anyone can write away from this node's STARK
+/// verifier on every chain that has never used it (every chain so far).
+pub fn admission_refusal(state: &ChainState, tx: &Transaction) -> Option<&'static str> {
+    (tx.tx_type == TxType::ProvePersonhood && state.personhood_authorities.is_empty())
+        .then_some("personhood is disabled on this chain: it has no personhood authority")
+}
+
 /// Verify a transaction's signature against the key the chain says may sign for `tx.from` —
 /// see [`Transaction::signing_key`]: the active recovery key if the account was socially
 /// recovered (the address no longer needs to derive from it, which is the point of recovery),
@@ -2036,11 +2050,14 @@ fn execute_prove_personhood(
         Err(_) => return Receipt::failure(tx_hash, "invalid personhood proof payload", 0, 0),
     };
 
-    let proof = helix_zkp::PersonhoodProof::from_bytes(payload.proof_bytes);
-    if !helix_zkp::verify_personhood(&proof, payload.commitment) {
-        return Receipt::failure(tx_hash, "ZK personhood proof verification failed", 0, 0);
-    }
-
+    // Everything that does not read the proof comes first. The STARK verifier is the one check
+    // that parses bytes anyone can write (winterfell reserved memory from lengths in them and
+    // aborted the process — #246); the authority is who vouches for the claimant, so its
+    // signature is asked before the proof is looked at. On a chain with no authority — every
+    // chain so far — no proof reaches the verifier at all. Every refusal below returns before
+    // anything is written, so the order changes which reason a failing transaction is given and
+    // nothing else.
+    //
     // The ZK proof alone only shows knowledge of *some* secret matching `commitment` —
     // helix_zkp::prove_personhood will generate a valid proof for any secret the caller
     // picks, with no external gatekeeping. Without an authority's signature, anyone could
@@ -2075,9 +2092,17 @@ fn execute_prove_personhood(
     // it isn't bound to `tx.from`. Once submitted, `commitment`+`proof_bytes` are
     // public on-chain, so without this check anyone could copy them into a
     // ProvePersonhood tx from a different address and get the same free pass.
-    if !state.used_personhood_commitments.insert(payload.commitment) {
+    // Asked here, recorded only once the proof has verified: a proof that fails must not use up
+    // the commitment it names.
+    if state.used_personhood_commitments.contains(&payload.commitment) {
         return Receipt::failure(tx_hash, "personhood commitment already claimed", 0, 0);
     }
+
+    let proof = helix_zkp::PersonhoodProof::from_bytes(payload.proof_bytes);
+    if !helix_zkp::verify_personhood(&proof, payload.commitment) {
+        return Receipt::failure(tx_hash, "ZK personhood proof verification failed", 0, 0);
+    }
+    state.used_personhood_commitments.insert(payload.commitment);
 
     // Mark account as ZK-STARK personhood-verified in chain state.
     //
@@ -4854,6 +4879,79 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
         assert!(receipt.success, "signature from any configured authority must be accepted, got: {:?}", receipt.error);
         assert!(state.has_personhood(&addr));
+    }
+
+    /// #246: the proof is the one part of the payload the STARK verifier parses, and anyone
+    /// writes it — a single changed byte once made winterfell reserve 45 petabytes and abort
+    /// every node executing the block. So the proof is read last, after the checks that need
+    /// none of it: the authority must exist and have vouched for this claimant, and the
+    /// commitment must be unclaimed. Each case below carries that proof and must be refused for
+    /// the earlier reason; the last shows a failing proof leaves its commitment unused.
+    #[test]
+    fn a_personhood_proof_is_read_only_after_the_authority_has_vouched() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let authority_kp = KeyPair::generate();
+        let (proof, commitment) = helix_zkp::prove_personhood([3u8; 16]);
+        let mut hostile = proof.as_bytes().to_vec();
+        hostile[36] = 0x01; // the byte that made `Proof::from_bytes` ask for 45 PB
+        let funded = || {
+            let mut state = ChainState::new(0);
+            state.update_account(&addr, |acc| acc.balance = 1_000_000);
+            state
+        };
+        let reason = |state: &mut ChainState, payload: &PersonhoodProofPayload| {
+            let nonce = state.get_or_default(&addr).nonce;
+            let receipt =
+                execute_transaction(state, &signed_personhood_tx(&kp, &addr, payload, nonce, 10_000), &validator, 1, 0);
+            receipt.error.unwrap_or_else(|| "succeeded".into())
+        };
+
+        // No authority: every chain so far.
+        let mut state = funded();
+        let payload = personhood_payload(&authority_kp, commitment, hostile.clone(), &addr);
+        assert_eq!(reason(&mut state, &payload), "no personhood authority configured");
+
+        // An authority, but not the one that signed.
+        let mut state = funded();
+        state.personhood_authorities.push(KeyPair::generate().public);
+        assert_eq!(reason(&mut state, &payload), "personhood authority signature verification failed");
+
+        // Vouched for, but the commitment is taken.
+        let mut state = funded();
+        state.personhood_authorities.push(authority_kp.public.clone());
+        state.used_personhood_commitments.insert(commitment);
+        assert_eq!(reason(&mut state, &payload), "personhood commitment already claimed");
+
+        // Vouched for and unclaimed: now the proof is read, and fails — without using up the
+        // commitment, which the honest proof then claims.
+        let mut state = funded();
+        state.personhood_authorities.push(authority_kp.public.clone());
+        assert_eq!(reason(&mut state, &payload), "ZK personhood proof verification failed");
+        assert!(!state.used_personhood_commitments.contains(&commitment));
+        let honest = personhood_payload(&authority_kp, commitment, proof.as_bytes().to_vec(), &addr);
+        assert_eq!(reason(&mut state, &honest), "succeeded");
+        assert!(state.has_personhood(&addr));
+    }
+
+    /// Refused at admission exactly where execution always fails: no authority. With one, and
+    /// for every other type, admission has no say.
+    #[test]
+    fn admission_refuses_personhood_only_on_a_chain_without_an_authority() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let authority_kp = KeyPair::generate();
+        let payload = personhood_payload(&authority_kp, [0u8; 16], vec![1, 2, 3], &addr);
+        let personhood = signed_personhood_tx(&kp, &addr, &payload, 0, 10_000);
+        let mut other = personhood.clone();
+        other.tx_type = TxType::Transfer;
+
+        let mut state = ChainState::new(0);
+        assert!(admission_refusal(&state, &personhood).is_some());
+        assert_eq!(admission_refusal(&state, &other), None);
+        state.personhood_authorities.push(authority_kp.public.clone());
+        assert_eq!(admission_refusal(&state, &personhood), None);
     }
 
     #[test]

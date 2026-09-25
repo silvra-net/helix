@@ -1549,6 +1549,8 @@ dependencies = [
  "bincode",
  "serde",
  "thiserror 1.0.69",
+ "winter-air",
+ "winter-utils",
  "winterfell",
 ]
 
