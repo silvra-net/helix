@@ -6,6 +6,7 @@
 pub mod commands;
 pub mod fee;
 pub mod keyfile;
+mod passphrase;
 
 use anyhow::Result;
 use clap::Subcommand;

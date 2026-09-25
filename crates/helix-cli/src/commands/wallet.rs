@@ -5,8 +5,8 @@ use bip39::Mnemonic;
 use clap::Subcommand;
 use helix_crypto::{Address, CryptoScheme, KeyPair};
 
-use crate::commands::tx::rpassword_read;
 use crate::keyfile::KeyFile;
+use crate::passphrase::{ask_on_terminal, read_passphrase_file, unlock_key};
 
 /// Where a new wallet's passphrase comes from — never from the command line itself.
 ///
@@ -73,39 +73,6 @@ fn ask_new_passphrase_twice(ask: &mut dyn FnMut(&str) -> Result<String>) -> Resu
     Ok(first)
 }
 
-/// A passphrase from a file: exactly its contents, minus one trailing line ending — which
-/// `echo secret > file` adds and nobody means — and nothing else (#223: spaces are the
-/// passphrase's own). An empty file is refused: a secret that failed to mount must not quietly
-/// produce an unencrypted wallet.
-fn read_passphrase_file(path: &std::path::Path) -> Result<String> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("could not read the passphrase file {}", path.display()))?;
-    let passphrase = raw
-        .strip_suffix("\r\n")
-        .or_else(|| raw.strip_suffix('\n'))
-        .unwrap_or(&raw)
-        .to_string();
-    if passphrase.is_empty() {
-        bail!(
-            "The passphrase file {} is empty, so no passphrase was set and nothing was written.",
-            path.display()
-        );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            if meta.is_file() && meta.permissions().mode() & 0o077 != 0 {
-                eprintln!(
-                    "  ⚠  {} can be read by other users on this machine — `chmod 600` it.",
-                    path.display()
-                );
-            }
-        }
-    }
-    Ok(passphrase)
-}
-
 /// `wallet encrypt` used to take the new passphrase as its argument. Refuse it, and say why —
 /// or, for the old empty argument, what replaced it.
 fn refuse_encrypt_argument(passphrase_on_command_line: Option<&str>) -> Result<()> {
@@ -114,18 +81,6 @@ fn refuse_encrypt_argument(passphrase_on_command_line: Option<&str>) -> Result<(
         Some(_) => bail!(PASSPHRASE_ON_COMMAND_LINE),
         None => Ok(()),
     }
-}
-
-/// Ask for a new passphrase on the terminal. Without one — a script, a pipe, `< /dev/null` —
-/// rpassword cannot open `/dev/tty` and says only "No such device or address (os error 6)"; for a
-/// new passphrase there is a way round that, so the error names it.
-fn ask_on_terminal(prompt: &str) -> Result<String> {
-    rpassword_read(prompt).map_err(|e| {
-        anyhow::anyhow!(
-            "Could not ask for a passphrase: there is no terminal to type it into ({e}). In a \
-             script, use --passphrase-file <path>."
-        )
-    })
 }
 
 /// What `wallet encrypt` should do: `Some(passphrase)` to encrypt, `None` to remove encryption.
@@ -375,12 +330,7 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
         WalletCmd::Address { key, verify } => {
             let kf = KeyFile::load(&key)?;
             if verify {
-                let pass = if kf.is_encrypted() {
-                    Some(rpassword_read("Wallet passphrase: ")?)
-                } else {
-                    None
-                };
-                let kp = kf.to_keypair(pass.as_deref())?;
+                let kp = unlock_key(&kf, "Wallet passphrase: ")?;
                 println!("{}", Address::from_public_key(&kp.public));
             } else {
                 println!("{}", kf.address);
@@ -441,12 +391,7 @@ pub async fn run(cmd: WalletCmd) -> Result<()> {
             refuse_encrypt_argument(passphrase_on_command_line.as_deref())?;
             let kf = KeyFile::load(&key)?;
             // The current passphrase first, so a wrong one fails before a new one is typed twice.
-            let pass = if kf.is_encrypted() {
-                Some(rpassword_read("Current passphrase: ")?)
-            } else {
-                None
-            };
-            let kp = kf.to_keypair(pass.as_deref())?;
+            let kp = unlock_key(&kf, "Current passphrase: ")?;
             let new_passphrase =
                 resolve_encrypt_target(passphrase_file.as_deref(), remove, &mut |p| {
                     ask_on_terminal(p)

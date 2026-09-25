@@ -7,7 +7,7 @@ use helix_crypto::{Address, Signature};
 
 use crate::fee::{hlx_to_nano, price_and_sign};
 use crate::keyfile::KeyFile;
-use crate::commands::tx::rpassword_read;
+use crate::passphrase::unlock_key;
 
 #[derive(Subcommand)]
 pub enum ContractCmd {
@@ -80,12 +80,7 @@ async fn deploy(
         .map_err(|e| anyhow::anyhow!("failed to read {}: {}", wasm_path.display(), e))?;
 
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
 
@@ -132,12 +127,7 @@ async fn call(
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let to_addr = Address::from_str(&address)

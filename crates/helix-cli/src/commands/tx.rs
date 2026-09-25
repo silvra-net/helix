@@ -7,6 +7,7 @@ use helix_crypto::{Address, Signature};
 
 use crate::fee::{hlx_to_nano, price_and_sign};
 use crate::keyfile::KeyFile;
+use crate::passphrase::unlock_key;
 
 
 #[derive(Subcommand)]
@@ -205,12 +206,7 @@ async fn send(
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let to_addr = Address::from_str(&to)
@@ -261,12 +257,7 @@ async fn simple_amount_tx(
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let amount_nano = hlx_to_nano(amount_hlx)?;
@@ -302,12 +293,7 @@ async fn zero_amount_tx(
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let nonce = match nonce_override {
@@ -345,12 +331,7 @@ async fn targeted_amount_tx(
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let validator_addr = Address::from_str(&validator)
@@ -395,12 +376,7 @@ async fn redelegate(
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let src = Address::from_str(&from_validator)
@@ -450,12 +426,7 @@ async fn set_commission(
     node: &str,
 ) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let nonce = match nonce_override {
@@ -504,12 +475,7 @@ async fn set_reward_address(
         _ => None,
     };
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let payout = payout.unwrap_or_else(|| from.clone());
@@ -550,37 +516,6 @@ async fn submit_tx(tx: &Transaction, node: &str) -> Result<()> {
     let res = super::submit_tx(tx, node).await?;
     super::report_submitted(&res);
     Ok(())
-}
-
-/// Read a passphrase without echoing it. The one implementation for the whole CLI — import it,
-/// do not write another.
-///
-/// Named `rpassword_read` and taking a `_prompt` it ignored, this used to be a plain
-/// `stdin().read_line` — so every wallet passphrase was typed in clear text and left sitting in
-/// the terminal's scrollback. The name described the intent; nothing implemented it.
-///
-/// Fixing it here fixed one of six call sites. `identity`, `name`, `recovery`, `contract` and
-/// `governance` each carried their own byte-identical copy of the broken version, so five
-/// commands went on echoing the passphrase — and, because the ignored `_prompt` was never
-/// printed, gave no sign they were waiting for one. Found on 2026-07-22 while walking the
-/// governance path end to end. Hence `pub(crate)` and this note: a private duplicate cannot be
-/// fixed once and stay fixed. (It did not stay fixed: `wallet encrypt` carried a sixth copy under
-/// another name, `rpassword_prompt`, until 2026-09-23 — a grep for this name could not find it.)
-pub(crate) fn rpassword_read(prompt: &str) -> Result<String> {
-    Ok(as_typed(rpassword::prompt_password(prompt)?))
-}
-
-/// The passphrase exactly as typed, minus only a line ending.
-///
-/// This used to `trim()`, which also stripped spaces at either end — spaces the person typed on
-/// purpose. Nothing else trims: `wallet new --passphrase`, the desktop wallet and the node's
-/// `HELIX_VALIDATOR_KEY_PASSPHRASE` all take it byte for byte. So a passphrase with a space at
-/// its edge — one pasted from a password manager is enough — opened in the desktop wallet and
-/// never here, with "wrong passphrase?" as the only explanation. rpassword stops reading at the
-/// Enter key and does not return it; the line ending is stripped anyway, in case a future
-/// version or another input path does.
-fn as_typed(line: String) -> String {
-    line.trim_end_matches(['\r', '\n']).to_string()
 }
 
 /// The one command that talks to a node without going through `super::get_optional`, on purpose:
@@ -727,19 +662,6 @@ mod tx_status_tests {
         let err = tx_status("cd".repeat(32), &node).await.unwrap_err().to_string();
 
         assert!(err.starts_with("Not found:"), "{err}");
-    }
-}
-
-#[cfg(test)]
-mod passphrase_tests {
-    use super::*;
-
-    #[test]
-    fn a_passphrase_keeps_the_spaces_that_were_typed() {
-        assert_eq!(as_typed("correct horse ".into()), "correct horse ");
-        assert_eq!(as_typed(" leading".into()), " leading");
-        assert_eq!(as_typed("pw\r\n".into()), "pw");
-        assert_eq!(as_typed("pw\n".into()), "pw");
     }
 }
 

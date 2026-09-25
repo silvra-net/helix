@@ -8,7 +8,7 @@ use helix_executor::governance::{encode_proposal, encode_vote, GovernanceParam};
 
 use crate::fee::price_and_sign;
 use crate::keyfile::KeyFile;
-use crate::commands::tx::rpassword_read;
+use crate::passphrase::unlock_key;
 
 #[derive(Clone, clap::ValueEnum)]
 pub enum GovParamArg {
@@ -126,12 +126,7 @@ async fn propose(
     let (new_value, shown) = on_chain_value(&param, new_value)?;
 
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
 
@@ -170,12 +165,7 @@ async fn propose(
 
 async fn vote(proposal_id: u64, key_path: PathBuf, fee: Option<u64>, node: &str) -> Result<()> {
     let kf = KeyFile::load(&key_path)?;
-    let kp = if kf.is_encrypted() {
-        let pass = rpassword_read("Wallet passphrase: ")?;
-        kf.to_keypair(Some(&pass))?
-    } else {
-        kf.to_keypair(None)?
-    };
+    let kp = unlock_key(&kf, "Wallet passphrase: ")?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
 
