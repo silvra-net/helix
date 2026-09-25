@@ -748,6 +748,7 @@ impl HelixNode {
             std::env::var("HELIX_KEEP_BLOCKS").ok().as_deref(),
             std::env::var("HELIX_KEEP_BYTES").ok().as_deref(),
         )?;
+        check_seed_peers(&configured_seed_peers(&cfg))?;
 
         let key_path = resolve_validator_key_path(&cfg);
         // Double-sign state lives beside the key it protects: validator-key.json ->
@@ -1087,11 +1088,7 @@ impl HelixNode {
             // (`/dns4/host/tcp/443/tls/ws`), whose transport and port the plain host+raw-TCP-port
             // form below cannot express. Anything else is treated as a bare host, with this
             // node's raw TCP P2P port appended — the original, still-common case.
-            let addr = if value.starts_with('/') {
-                value
-            } else {
-                format!("/{}/{value}/tcp/{}", multiaddr_kind(&value), p2p_config.listen_addr.port())
-            };
+            let addr = announced_public_addr(&value, p2p_config.listen_addr.port())?;
             info!(multiaddr = %addr, "Announcing our own P2P address via peer exchange");
             p2p_config.public_addr = Some(addr);
         }
@@ -1100,7 +1097,8 @@ impl HelixNode {
         // on top of the one derived from `sync_peer`. Lets an operator wire a validator set
         // into a full mesh (every validator dials every other) rather than hub-and-spoke,
         // which both survives any single node's outage and gives consensus vote gossip more
-        // than one relay path. Malformed entries are dialed-and-ignored by the P2P layer.
+        // than one relay path. An entry that is not a multiaddr stopped the start already
+        // (`check_seed_peers`) — the P2P layer would drop it without a word.
         p2p_config.seed_peers.extend(configured_seed_peers(&cfg));
 
         // mDNS LAN auto-discovery is on by default (zero-config peering). Disable it for
@@ -5177,6 +5175,75 @@ fn configured_seed_peers(cfg: &config::NodeConfig) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Refuses a seed peer that is not a P2P address, naming what it probably meant.
+///
+/// The P2P layer parses each entry as a multiaddr and used to drop the ones that are not — without
+/// a word, while still passing them on to every peer through peer exchange. `203.0.113.7:8546` is
+/// how everyone writes an address and is not a multiaddr, so the most natural way to wire a
+/// validator to the others left it wired to none of them. For a validator the seed list is how it
+/// finds the rest of the set, and a node that cannot reach them stalls a chain with no slack.
+fn check_seed_peers(seeds: &[String]) -> Result<()> {
+    for entry in seeds {
+        if entry.parse::<libp2p::Multiaddr>().is_ok() {
+            continue;
+        }
+        let hint = match suggested_multiaddr(entry) {
+            Some(fixed) => format!(" Did you mean {fixed}?"),
+            None => String::new(),
+        };
+        bail!(
+            "HELIX_P2P_SEED_PEERS (p2p_seed_peers in helix.toml) contains {entry:?}, which is not \
+             a P2P address. Seed peers are multiaddrs, e.g. /ip4/203.0.113.7/tcp/8546 or \
+             /dns4/node.example.org/tcp/8546, separated by commas.{hint} The node does not start \
+             with a seed it would skip."
+        );
+    }
+    Ok(())
+}
+
+/// What a `host:port` written where a multiaddr belongs was meant to be.
+fn suggested_multiaddr(entry: &str) -> Option<String> {
+    let (host, port) = entry.trim().rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() || host.contains('/') {
+        return None;
+    }
+    Some(format!("/{}/{host}/tcp/{port}", multiaddr_kind(host)))
+}
+
+/// The address this node announces for itself, from `HELIX_P2P_PUBLIC_ADDR`: a full multiaddr
+/// used as it is (the form a node behind an HTTPS proxy or tunnel needs,
+/// `/dns4/host/tcp/443/tls/ws`), or a bare host with this node's P2P port appended — the
+/// original, still-common case.
+///
+/// Checked, because it is handed to every peer: an address that does not parse, or a host with a
+/// port stuck to it (`/dns4/203.0.113.7:8546/tcp/8546` parses — a DNS name can hold almost
+/// anything), is one no peer can dial, and the node that announced it would wonder why nobody does.
+fn announced_public_addr(value: &str, listen_port: u16) -> Result<String> {
+    let value = value.trim();
+    let addr = if value.starts_with('/') {
+        value.to_string()
+    } else {
+        if value.contains(':') && value.parse::<std::net::Ipv6Addr>().is_err() {
+            bail!(
+                "HELIX_P2P_PUBLIC_ADDR={value:?} has a port in it. Give the host alone (e.g. \
+                 203.0.113.7 or node.example.org) and this node appends its P2P port, \
+                 {listen_port} — or, if the outside port differs, the full form, e.g. {}",
+                suggested_multiaddr(value).unwrap_or_else(|| "/ip4/203.0.113.7/tcp/8546".into())
+            );
+        }
+        format!("/{}/{value}/tcp/{listen_port}", multiaddr_kind(value))
+    };
+    addr.parse::<libp2p::Multiaddr>().map_err(|e| {
+        anyhow::anyhow!(
+            "HELIX_P2P_PUBLIC_ADDR={value:?} is not an address peers can dial ({e}). Give a host \
+             (203.0.113.7, node.example.org) or a full multiaddr (/ip4/203.0.113.7/tcp/8546)."
+        )
+    })?;
+    Ok(addr)
+}
+
 /// The HTTP client every outbound peer request uses.
 ///
 /// Carries an honest `User-Agent` (`helix/<version>`). reqwest sends none at all by default, and
@@ -6004,10 +6071,6 @@ fn multiaddr_kind(host: &str) -> &'static str {
     }
 }
 
-/// Skips genesis (height 0) — either loaded from this node's own existing data or, for a
-/// genuinely fresh node, adopted from this same peer via `fetch_genesis_from_peer` before
-/// this function is ever called.
-/// Returns the number of blocks successfully applied.
 /// Fetch one batch of blocks, in the compact encoding when the peer speaks it.
 ///
 /// `binary` is the caller's memory across the whole sync: tried once, and once a peer has refused
@@ -6248,9 +6311,12 @@ async fn snapshot_sync_from_peer(
         let mut db = store.write().await;
         db.put_block(anchor.clone())?;
         db.save_chain_state(&cs)?;
-        // Without this, a read of block 0 answers `BlockNotFound` and the next startup concludes
-        // the directory is empty — then writes a genesis over a chain that starts at the
-        // checkpoint. `BlockPruned` is the honest answer and the one that stops it.
+        // History here starts at the checkpoint, and peers and `/diagnostics` are told so (the
+        // horizon in peer exchange, `earliest_block`). On the join path the peer's genesis is
+        // already stored, so block 0 still reads and a restart loads this chain — checked with
+        // two real processes on 2026-09-25. Were block 0 ever missing, the mark makes the read
+        // answer `BlockPruned`, which the startup guard refuses rather than taking the directory
+        // for empty and writing a genesis over this chain.
         db.mark_history_starts_at(checkpoint.height)?;
     }
     info!(
@@ -6261,6 +6327,10 @@ async fn snapshot_sync_from_peer(
     Ok(checkpoint.height)
 }
 
+/// Skips genesis (height 0) — either loaded from this node's own existing data or, for a
+/// genuinely fresh node, adopted from this same peer via `fetch_genesis_from_peer` before
+/// this function is ever called.
+/// Returns the number of blocks successfully applied.
 async fn sync_blocks_from_peer(
     peer_url: &str,
     local_tip: u64,
@@ -12856,5 +12926,71 @@ mod forged_transaction_tests {
             vec![TransactionVerdict::Valid]
         );
         assert_eq!(f.mempool.read().await.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod p2p_address_setting_tests {
+    use super::*;
+
+    #[test]
+    fn seed_peers_that_are_multiaddrs_pass() {
+        let seeds = [
+            "/ip4/203.0.113.7/tcp/8546".to_string(),
+            "/dns4/p2p.silvra.net/tcp/443/tls/ws".to_string(),
+            "/ip6/2001:db8::1/tcp/8546".to_string(),
+        ];
+        assert!(check_seed_peers(&seeds).is_ok());
+        assert!(check_seed_peers(&[]).is_ok(), "none configured is not an error");
+    }
+
+    /// `host:port` is how people write addresses; the refusal says which multiaddr they meant.
+    #[test]
+    fn a_seed_written_as_host_and_port_is_refused_with_the_multiaddr_it_meant() {
+        for (entry, meant) in [
+            ("203.0.113.7:8546", "/ip4/203.0.113.7/tcp/8546"),
+            ("p2p.example.org:8546", "/dns4/p2p.example.org/tcp/8546"),
+            ("[2001:db8::1]:8546", "/ip6/2001:db8::1/tcp/8546"),
+        ] {
+            let msg = check_seed_peers(&["/ip4/198.51.100.1/tcp/8546".into(), entry.into()])
+                .expect_err("a seed the P2P layer would drop must stop the start")
+                .to_string();
+            assert!(msg.contains(&format!("{entry:?}")), "must name the entry: {msg}");
+            assert!(msg.contains(&format!("Did you mean {meant}?")), "{msg}");
+        }
+        let msg = check_seed_peers(&["not an address".into()]).unwrap_err().to_string();
+        assert!(msg.contains("/ip4/203.0.113.7/tcp/8546"), "shows the form anyway: {msg}");
+    }
+
+    #[test]
+    fn the_announced_address_is_a_host_with_this_nodes_port_or_a_full_multiaddr() {
+        assert_eq!(
+            announced_public_addr("203.0.113.7", 8546).unwrap(),
+            "/ip4/203.0.113.7/tcp/8546"
+        );
+        assert_eq!(
+            announced_public_addr("node.example.org", 8546).unwrap(),
+            "/dns4/node.example.org/tcp/8546"
+        );
+        assert_eq!(
+            announced_public_addr("2001:db8::1", 8546).unwrap(),
+            "/ip6/2001:db8::1/tcp/8546"
+        );
+        assert_eq!(
+            announced_public_addr("/dns4/p2p.silvra.net/tcp/443/tls/ws", 8546).unwrap(),
+            "/dns4/p2p.silvra.net/tcp/443/tls/ws",
+            "production's form, used as it is"
+        );
+    }
+
+    /// Both would be announced to every peer and dialed by none.
+    #[test]
+    fn an_announced_address_no_peer_could_dial_stops_the_start() {
+        let msg = announced_public_addr("203.0.113.7:8546", 8546).unwrap_err().to_string();
+        assert!(msg.contains("has a port in it"), "{msg}");
+        assert!(msg.contains("/ip4/203.0.113.7/tcp/8546"), "and the full form it meant: {msg}");
+        let msg =
+            announced_public_addr("/ip4/203.0.113.7/tcpp/8546", 8546).unwrap_err().to_string();
+        assert!(msg.contains("not an address peers can dial"), "{msg}");
     }
 }

@@ -675,55 +675,65 @@ async fn fund_and_stake(
     assert!(staked, "{addr}'s stake never took effect on chain");
 }
 
-/// A disk limit the node cannot read stops the start, before anything is created.
+/// A setting the node would otherwise drop without a word stops the start, before anything is
+/// created: a disk limit it cannot read (#240) and a seed peer that is not a multiaddr (#241).
 ///
 /// `HELIX_KEEP_BYTES=120 gigs` used to read as "no byte budget" — the operator's explicit limit
-/// switched off, found out when the disk ran full. Checked at the process, because the rule is
-/// tested in the binary's own unit tests and only this shows it is applied at all.
+/// switched off, found out when the disk ran full — and `203.0.113.7:8546` as a seed was skipped,
+/// leaving a validator wired to nobody. Checked at the process, because the rules are tested in
+/// the binary's own unit tests and only this shows they are applied at all.
 #[tokio::test]
-async fn a_node_will_not_start_on_a_disk_limit_it_cannot_read() {
+async fn a_node_will_not_start_on_a_setting_it_would_ignore() {
     const RPC: u16 = 29_753;
     const P2P: u16 = 29_754;
     let _serialized = NODE_TEST_LOCK.lock().await;
-    assert_port_free(RPC, "disk-limit RPC");
-    assert_port_free(P2P, "disk-limit P2P");
-    let dir = tempdir::TempDir::new().expect("temp dir");
+    assert_port_free(RPC, "startup-refusal RPC");
+    assert_port_free(P2P, "startup-refusal P2P");
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_helix"));
-    cmd.arg("start")
-        .current_dir(dir.path())
-        .env("HELIX_RPC_BIND", format!("127.0.0.1:{RPC}"))
-        .env("HELIX_P2P_LISTEN", format!("127.0.0.1:{P2P}"))
-        .env("HELIX_P2P_DISABLE_MDNS", "1")
-        .env("HELIX_NEW_CHAIN", "1")
-        .env("HELIX_KEEP_BYTES", "120 gigs")
-        .env("RUST_LOG", "error")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let mut guard = NodeGuard { child: cmd.spawn().expect("spawn helix"), work_dir: None };
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let exit = loop {
-        if let Some(exit) = guard.child.try_wait().expect("wait on the node") {
-            break exit;
-        }
+    for (setting, value) in
+        [("HELIX_KEEP_BYTES", "120 gigs"), ("HELIX_P2P_SEED_PEERS", "203.0.113.7:8546")]
+    {
+        let dir = tempdir::TempDir::new().expect("temp dir");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_helix"));
+        cmd.arg("start")
+            .current_dir(dir.path())
+            .env("HELIX_RPC_BIND", format!("127.0.0.1:{RPC}"))
+            .env("HELIX_P2P_LISTEN", format!("127.0.0.1:{P2P}"))
+            .env("HELIX_P2P_DISABLE_MDNS", "1")
+            .env("HELIX_NEW_CHAIN", "1")
+            .env(setting, value)
+            .env("RUST_LOG", "error")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut guard = NodeGuard { child: cmd.spawn().expect("spawn helix"), work_dir: None };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let exit = loop {
+            if let Some(exit) = guard.child.try_wait().expect("wait on the node") {
+                break exit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a node with {setting}={value:?} is still running — it ignored a setting it \
+                 cannot use instead of refusing it"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(guard.child.stderr.as_mut().expect("piped"), &mut stderr)
+            .expect("read stderr");
+        drop(guard);
+        assert!(!exit.success(), "{setting}: the refusal has to be an error exit, got {exit}");
+        assert!(stderr.contains(setting), "must name the setting: {stderr}");
+        assert!(stderr.contains(&format!("{value:?}")), "and the value: {stderr}");
+        let created: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read work dir")
+            .map(|e| e.expect("dir entry").file_name())
+            .collect();
         assert!(
-            std::time::Instant::now() < deadline,
-            "a node with HELIX_KEEP_BYTES=\"120 gigs\" is still running — it took an unreadable \
-             disk limit for no limit"
+            created.is_empty(),
+            "{setting}: refused before anything was created, found {created:?}"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    let mut stderr = String::new();
-    std::io::Read::read_to_string(guard.child.stderr.as_mut().expect("piped"), &mut stderr)
-        .expect("read stderr");
-    drop(guard);
-    assert!(!exit.success(), "the refusal has to be an error exit, got {exit}: {stderr}");
-    assert!(stderr.contains("HELIX_KEEP_BYTES=\"120 gigs\""), "must name the setting: {stderr}");
-    let created: Vec<_> = std::fs::read_dir(dir.path())
-        .expect("read work dir")
-        .map(|e| e.expect("dir entry").file_name())
-        .collect();
-    assert!(created.is_empty(), "refused before anything was created, found {created:?}");
+    }
 }
 
 /// A database from another chain stops the node at startup instead of being run.
