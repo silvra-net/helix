@@ -83,6 +83,12 @@ a terminal. This is what makes the GUI a full validator setup on its own: start/
 watch it sync and propose blocks, stake toward the entry threshold, and — if it ever gets jailed
 for downtime — unjail it, all from the same window as the wallet.
 
+The bundled node is set up for a desktop rather than a server: it keeps about **4 GB of recent
+chain history** (`HELIX_KEEP_BYTES=4G`, a file of at most 8 GB) instead of every block since
+genesis, which on this chain grows by ~1.7 GB a day, and runs with `MALLOC_ARENA_MAX=2` so it does
+not grow in memory for days on Linux. Start the wallet with `HELIX_KEEP_BYTES` or
+`HELIX_KEEP_BLOCKS` in its environment to choose your own limit — the wallet then adds none.
+
 ## Diagnostics / logging
 
 Two independent logging layers, for two different questions:

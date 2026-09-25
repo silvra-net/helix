@@ -60,6 +60,31 @@ pub struct NodeStartConfig {
     pub sync_peer: Option<String>,
 }
 
+/// Settings the bundled node gets unless the environment the wallet was started from already has
+/// them. The node's own defaults are a server's, and a desktop is not one.
+///
+/// - `HELIX_KEEP_BYTES=4G`. The node keeps every block unless told otherwise — somebody has to,
+///   and a default must not be what discards history for a network. On this chain that is about
+///   1.7 GB a day: a laptop's disk, full within weeks, and a full disk can leave the database
+///   unreadable (#240). 4 GiB of content settles at a file of at most 8 GB (redb grows in
+///   doublings) and still holds days of blocks — enough for a peer that fell behind to catch up
+///   from this node.
+/// - `MALLOC_ARENA_MAX=2`. Without it glibc keeps freed memory in per-thread arenas and a node
+///   left running on Linux grows to gigabytes (#193). Where glibc is not the allocator, nothing
+///   reads it.
+///
+/// Whoever set a disk limit of their own — either one — keeps it, and gets no second one added.
+fn desktop_node_defaults(inherited: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+    let mut defaults = Vec::new();
+    if !inherited("HELIX_KEEP_BYTES") && !inherited("HELIX_KEEP_BLOCKS") {
+        defaults.push(("HELIX_KEEP_BYTES", "4G"));
+    }
+    if !inherited("MALLOC_ARENA_MAX") {
+        defaults.push(("MALLOC_ARENA_MAX", "2"));
+    }
+    defaults
+}
+
 /// Start `helix start` as a child process, streaming its output as `node-log` events until it
 /// exits or `node_stop` kills it. Errors (rather than panicking) if a node is already running
 /// under this app instance — one at a time, since two processes racing the same
@@ -118,6 +143,9 @@ pub async fn node_start(
     }
     if let Some(peer) = &config.sync_peer {
         cmd = cmd.env("HELIX_SYNC_PEER", peer);
+    }
+    for (name, value) in desktop_node_defaults(|name| std::env::var_os(name).is_some()) {
+        cmd = cmd.env(name, value);
     }
 
     let (mut rx, child) = cmd.spawn().map_err(|e| {
@@ -228,4 +256,34 @@ pub async fn node_reset_chain(
     log::info!("chain database moved aside to {}", backup.display());
 
     Ok(backup.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod desktop_defaults_tests {
+    use super::desktop_node_defaults;
+
+    #[test]
+    fn a_desktop_node_keeps_a_bounded_history_and_a_flat_heap_by_default() {
+        assert_eq!(
+            desktop_node_defaults(|_| false),
+            vec![("HELIX_KEEP_BYTES", "4G"), ("MALLOC_ARENA_MAX", "2")]
+        );
+    }
+
+    /// A limit the user chose — in either unit — is theirs; adding a second would override it
+    /// wherever it is the looser one.
+    #[test]
+    fn a_disk_limit_set_by_the_user_is_left_alone() {
+        for theirs in ["HELIX_KEEP_BYTES", "HELIX_KEEP_BLOCKS"] {
+            let set = desktop_node_defaults(|name| name == theirs);
+            assert!(
+                set.iter().all(|(name, _)| !name.starts_with("HELIX_KEEP")),
+                "{theirs} set by the user, and the wallet added {set:?}"
+            );
+        }
+        assert_eq!(
+            desktop_node_defaults(|name| name == "MALLOC_ARENA_MAX"),
+            vec![("HELIX_KEEP_BYTES", "4G")]
+        );
+    }
 }
