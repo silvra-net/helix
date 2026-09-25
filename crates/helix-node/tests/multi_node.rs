@@ -1893,6 +1893,19 @@ async fn proposer_of(rpc_port: u16, height: u64) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The addresses in block `height`'s `last_commit` — who certified the block below it.
+async fn commit_signers(rpc_port: u16, height: u64) -> Option<Vec<String>> {
+    let header = block_header(rpc_port, height).await?;
+    Some(
+        header
+            .get("last_commit")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
 /// **A hub and three validators that can only reach it — the shape of the production network.**
 ///
 /// Four validators of equal power, quorum three of four (the production set of 2026-09-22). The
@@ -2097,6 +2110,36 @@ async fn a_star_around_one_hub_heals_a_one_sided_cut_and_a_restart_by_itself() {
          another path to the hub, and this measured nothing",
         longest_stall.as_secs_f64()
     );
+
+    // "Healthy" above is a cadence, and three of four carry one. The fourth may still be waiting
+    // for the hub's ping to give up its dead halves — 90–150 s after the cut, depending on where in
+    // the 15-s cycle the cut fell, and independently for each operator. Stopping P1 then leaves two
+    // of four and the chain stands (2026-09-25: 339 → 339 over the five seconds below, healthy
+    // 110.7 s after the cut). So the restart waits until every validator signs again — which is
+    // also the half of #232 a cadence cannot show: every operator comes back, not only enough.
+    // Signers are read as a union over recent certificates, because a certificate may carry just
+    // the quorum while all four are up.
+    let everyone: HashSet<String> = residue.keys().cloned().collect();
+    let all_back_after = loop {
+        let now = std::time::Instant::now();
+        let tip = height_of(STAR_HUB_RPC).await.unwrap_or(0);
+        let mut signed: HashSet<String> = HashSet::new();
+        for h in tip.saturating_sub(7)..=tip {
+            signed.extend(commit_signers(STAR_HUB_RPC, h).await.unwrap_or_default());
+        }
+        if everyone.is_subset(&signed) {
+            break now.duration_since(cut_at);
+        }
+        let missing: Vec<&String> = everyone.difference(&signed).collect();
+        assert!(
+            now.duration_since(cut_at) < STAR_HEAL_BUDGET,
+            "{}s after the cut the chain runs, but {missing:?} has not signed one of the last eight \
+             blocks: an operator that never comes back after a one-sided cut is #232 again",
+            STAR_HEAL_BUDGET.as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    eprintln!("all four signing again {:.1}s after the cut", all_back_after.as_secs_f64());
 
     // ── 2. A validator restarts while the chain runs on without it. ──
     let settled = height_of(STAR_HUB_RPC).await.expect("hub height") + 10;
