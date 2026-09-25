@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,14 +111,6 @@ impl GenesisCheckpoint {
     }
 }
 
-/// Whether a failed read of block 0 means "this data directory is empty" — the only answer that
-/// permits writing a fresh genesis into it.
-///
-/// A pure function because the whole safety argument is which errors are *excluded*, and that
-/// list is one `|` away from turning a startup refusal back into silent data loss. `BlockNotFound`
-/// is the only error a genuinely empty directory produces. Everything else — a block that will
-/// not deserialize, one below a prune horizon, a database-level failure — says the chain is there
-/// and this build cannot see it, which is the opposite conclusion.
 /// How many recent blocks this node keeps: `HELIX_KEEP_BLOCKS`, or 0 for an archive node.
 ///
 /// One definition because two callers need the answer — the pruning loop, which acts on it, and
@@ -129,6 +121,14 @@ fn configured_keep_blocks() -> u64 {
     config::resolve_u64("HELIX_KEEP_BLOCKS", None).unwrap_or(0)
 }
 
+/// Whether a failed read of block 0 means "this data directory is empty" — the only answer that
+/// permits writing a fresh genesis into it.
+///
+/// A pure function because the whole safety argument is which errors are *excluded*, and that
+/// list is one `|` away from turning a startup refusal back into silent data loss. `BlockNotFound`
+/// is the only error a genuinely empty directory produces. Everything else — a block that will
+/// not deserialize, one below a prune horizon, a database-level failure — says the chain is there
+/// and this build cannot see it, which is the opposite conclusion.
 fn empty_data_directory(e: &helix_storage::StorageError) -> bool {
     matches!(e, helix_storage::StorageError::BlockNotFound(_))
 }
@@ -835,7 +835,12 @@ impl HelixNode {
             }
         }
 
-        let chain_state = if genesis_probe.is_ok() {
+        let chain_state = if let Ok(stored_genesis) = &genesis_probe {
+            let expected_genesis = expected_genesis_hash(
+                config::resolve("HELIX_GENESIS_HASH", &cfg.genesis_hash),
+                sync_peer.as_deref(),
+            );
+            verify_stored_genesis(expected_genesis.as_ref(), stored_genesis, &db_path)?;
             info!("Loaded existing chain state from {}", db_path.display());
             store.load_chain_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX)?
         } else if let Some(peer_url) = &sync_peer {
@@ -5577,6 +5582,65 @@ fn verify_genesis_checkpoint(
              block explorer, or a node you already run), then either upgrade or set \
              HELIX_GENESIS_HASH to it. Nothing has been written.",
             version = env!("CARGO_PKG_VERSION"),
+        ),
+    }
+}
+
+/// Whether this node may carry on with the chain already in its data directory.
+///
+/// The join path checks a peer's genesis before it writes anything ([`verify_genesis_checkpoint`]).
+/// A node that already holds a chain never took that path again — so after a reset it loaded the
+/// old chain and ran on it. Its startup sync fails on the first block that does not chain, its
+/// peers are on another chain (#175), and as a validator it keeps proposing to a set that is not
+/// there any more; nothing tells the operator. On 2026-08-27 a node was still gossiping from a
+/// chain two resets old. And a release that asks every operator to rename their data directory
+/// otherwise relies on nobody forgetting.
+///
+/// Refuses only where this node knows which chain it is meant to be on: an explicit
+/// `HELIX_GENESIS_HASH`, or the compiled-in hash when it joins the public network. A private
+/// chain and the origin node (`HELIX_NEW_CHAIN`) have no such expectation and are left alone —
+/// the same condition, from the same function, as the join path uses.
+fn verify_stored_genesis(
+    checkpoint: Option<&GenesisCheckpoint>,
+    stored: &Block,
+    db_path: &Path,
+) -> Result<()> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
+    };
+    let actual = stored.hash().to_hex();
+    let expected = checkpoint.hash().trim();
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+
+    let db = db_path.display();
+    let peers = db_path.with_file_name("helix-peers.txt");
+    let rename = format!(
+        "To join the current network: stop this node, rename the database (do NOT delete it — \
+         e.g. `mv {db} {db}.pre-reset.bak`, and the peer file {peers} beside it) and start again; \
+         the node then fetches the current genesis from the network. Keep validator-key.json: the \
+         key carries over, only the chain is new. In the desktop wallet: Validate → \"Reset local \
+         chain\".",
+        peers = peers.display(),
+    );
+    match checkpoint {
+        GenesisCheckpoint::CompiledIn(_) => bail!(
+            "{db} holds the chain whose genesis is {actual}, but Helix {version} joins the public \
+             network, whose genesis is {expected} — compiled into this binary. Most likely the \
+             network was reset and this database holds the old chain, on which this node would \
+             never see another block. The chain data has not been touched.\n\
+             {rename}\n\
+             Only if you know this database IS the network's current chain (a release that \
+             shipped an outdated hash): start it with HELIX_GENESIS_HASH={actual}.",
+            version = env!("CARGO_PKG_VERSION"),
+        ),
+        GenesisCheckpoint::Configured(_) => bail!(
+            "{db} holds the chain whose genesis is {actual}, but this node is configured \
+             (HELIX_GENESIS_HASH or genesis_hash) to be on the chain whose genesis is {expected}. \
+             The chain data has not been touched.\n\
+             If the configured hash is out of date — a reset publishes a new one — correct it. If \
+             it is right, this database belongs to another chain. {rename}"
         ),
     }
 }
@@ -11838,6 +11902,73 @@ mod genesis_verification_tests {
         assert!(GenesisCheckpoint::configured(Some(String::new())).is_none());
         assert!(GenesisCheckpoint::configured(Some("   ".into())).is_none());
         assert!(GenesisCheckpoint::configured(None).is_none());
+    }
+
+    /// The chain already on disk is held to the same expectation as a peer's genesis: a node told
+    /// which chain it is on — compiled in for the public network, or configured — refuses to run
+    /// on a database from another one, and says how to get out of it without losing anything.
+    #[test]
+    fn a_stored_chain_that_is_not_the_expected_one_stops_the_node() {
+        let stored = some_genesis(1);
+        let current = some_genesis(2);
+        let db = std::path::Path::new("data/helix-data.redb");
+
+        let msg = verify_stored_genesis(
+            Some(&GenesisCheckpoint::CompiledIn(current.hash().to_hex())),
+            &stored,
+            db,
+        )
+        .expect_err("a database from another chain must stop a node joining the public network")
+        .to_string();
+        assert!(msg.contains(&stored.hash().to_hex()), "must name what is on disk: {msg}");
+        assert!(msg.contains(&current.hash().to_hex()), "must name what was expected: {msg}");
+        assert!(msg.contains(env!("CARGO_PKG_VERSION")), "must name the build: {msg}");
+        assert!(msg.contains("has not been touched"), "must say nothing was lost: {msg}");
+        assert!(
+            msg.contains("mv data/helix-data.redb data/helix-data.redb.pre-reset.bak"),
+            "the way out has to be the rename of this very database, not a delete: {msg}"
+        );
+        assert!(msg.contains("data/helix-peers.txt"), "and the peer file beside it: {msg}");
+        assert!(msg.contains("Keep validator-key.json"), "the key is not part of the chain: {msg}");
+        assert!(
+            msg.contains(&format!("HELIX_GENESIS_HASH={}", stored.hash().to_hex())),
+            "a release that shipped a stale hash must not strand a node on the right chain — the \
+             override names the hash that is on disk: {msg}"
+        );
+
+        let configured = verify_stored_genesis(
+            Some(&GenesisCheckpoint::Configured(current.hash().to_hex())),
+            &stored,
+            db,
+        )
+        .expect_err("an explicitly configured chain is held to the same rule")
+        .to_string();
+        assert!(configured.contains("configured"), "{configured}");
+        assert!(
+            !configured.contains("compiled into this binary"),
+            "a configured hash must not be blamed on the build, and the other way round: \
+             {configured}"
+        );
+    }
+
+    #[test]
+    fn a_stored_chain_that_is_the_expected_one_or_unpinned_carries_on() {
+        let stored = some_genesis(1);
+        let hex = stored.hash().to_hex();
+        let db = std::path::Path::new("helix-data.redb");
+        for checkpoint in [
+            GenesisCheckpoint::CompiledIn(hex.clone()),
+            GenesisCheckpoint::Configured(hex.to_uppercase()),
+            GenesisCheckpoint::Configured(format!("  {hex}  ")),
+        ] {
+            assert!(
+                verify_stored_genesis(Some(&checkpoint), &stored, db).is_ok(),
+                "{checkpoint:?}"
+            );
+        }
+        // A private chain, or the origin node (`HELIX_NEW_CHAIN`): nothing says which chain this
+        // is meant to be, so there is nothing to refuse — the same condition the join path uses.
+        assert!(verify_stored_genesis(None, &stored, db).is_ok());
     }
 
     fn peer_genesis_with(validator_stake: u64, state_hash: Option<String>) -> PeerGenesis {

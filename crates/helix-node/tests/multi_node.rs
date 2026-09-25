@@ -675,6 +675,93 @@ async fn fund_and_stake(
     assert!(staked, "{addr}'s stake never took effect on chain");
 }
 
+/// A database from another chain stops the node at startup instead of being run.
+///
+/// After a reset every operator is asked to rename their data directory. One who forgot used to
+/// get a node that loaded the old chain and ran on it — its sync failing on the first block that
+/// does not chain, its peers on another chain — with nothing saying so. A node that knows which
+/// chain it is meant to be on (here `HELIX_GENESIS_HASH`; on the public network the compiled-in
+/// hash) now refuses and names the rename. The control restarts the same directory with its own
+/// hash: what stops the node is the mismatch, not the restart, and the refusal left the chain as
+/// it was.
+#[tokio::test]
+async fn a_node_refuses_to_run_on_a_database_from_another_chain() {
+    const RPC: u16 = 29_751;
+    const P2P: u16 = 29_752;
+    let _serialized = NODE_TEST_LOCK.lock().await;
+    assert_port_free(RPC, "other-chain RPC");
+    assert_port_free(P2P, "other-chain P2P");
+    let fast = [("HELIX_BLOCK_TIME_MS", "300")];
+
+    let dir = tempdir::TempDir::new().expect("temp dir");
+    let node = start_node_in(dir, RPC, P2P, None, &fast);
+    wait_until_reachable(RPC, Duration::from_secs(30)).await;
+    wait_for_height(RPC, 2, Duration::from_secs(60)).await;
+    let own_genesis = block_header(RPC, 0).await.expect("genesis header")["hash"]
+        .as_str()
+        .expect("genesis hash")
+        .to_string();
+    // Read before the stop, so at most lower than what the directory holds: the control below
+    // has to find at least this much again.
+    let stopped_at = status(RPC).await.expect("status")["height"].as_u64().expect("height");
+    let dir = node.stop().await;
+
+    // Another chain's hash — any value but this directory's own genesis.
+    let other = "00".repeat(32);
+    let mut refused = Command::new(env!("CARGO_BIN_EXE_helix"));
+    refused
+        .arg("start")
+        .current_dir(dir.path())
+        .env("HELIX_RPC_BIND", format!("127.0.0.1:{RPC}"))
+        .env("HELIX_P2P_LISTEN", format!("127.0.0.1:{P2P}"))
+        .env("HELIX_P2P_DISABLE_MDNS", "1")
+        .env("HELIX_NEW_CHAIN", "1")
+        .env("HELIX_GENESIS_HASH", &other)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut guard = NodeGuard { child: refused.spawn().expect("spawn helix"), work_dir: None };
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let exit = loop {
+        if let Some(exit) = guard.child.try_wait().expect("wait on the node") {
+            break exit;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a node configured for chain {other} is still running a minute after it was started \
+             on a database of chain {own_genesis} — it runs the other chain instead of refusing"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(guard.child.stderr.as_mut().expect("piped"), &mut stderr)
+        .expect("read stderr");
+    drop(guard);
+    assert!(!exit.success(), "the refusal has to be an error exit, got {exit}: {stderr}");
+    assert!(
+        stderr.contains(&format!("holds the chain whose genesis is {own_genesis}")),
+        "the refusal must name the chain on disk: {stderr}"
+    );
+    assert!(stderr.contains("has not been touched"), "{stderr}");
+
+    // Control: the same directory with its own hash — and in another casing, as operators copy
+    // it — starts, and the chain is where it was.
+    let own_upper = own_genesis.to_uppercase();
+    let control = start_node_in(dir, RPC, P2P, None, &[("HELIX_GENESIS_HASH", &own_upper)]);
+    wait_until_reachable(RPC, Duration::from_secs(30)).await;
+    let height = status(RPC).await.expect("status")["height"].as_u64().expect("height");
+    assert!(
+        height >= stopped_at,
+        "the refusal must not have cost a block: {height} < {stopped_at}"
+    );
+    let genesis = block_header(RPC, 0).await.expect("genesis header")["hash"]
+        .as_str()
+        .expect("genesis hash")
+        .to_string();
+    assert_eq!(genesis, own_genesis, "and the chain is still the one it was");
+    drop(control);
+}
+
 #[tokio::test]
 async fn three_nodes_converge_on_identical_height_hash_and_state() {
     let _serialized = NODE_TEST_LOCK.lock().await;
