@@ -131,13 +131,36 @@ const CONVERGENCE_GRACE: Duration = Duration::from_secs(60);
 /// subsequent run on the same machine fails to bind and gives a confusing, unrelated error.
 struct NodeGuard {
     child: Child,
-    _work_dir: tempdir::TempDir,
+    /// `None` only after `stop` has handed it back.
+    work_dir: Option<tempdir::TempDir>,
 }
 
 impl Drop for NodeGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl NodeGuard {
+    /// Stop the node the way pm2 and systemd do — SIGTERM, then SIGKILL if it has not exited
+    /// within ten seconds — and hand back its working directory, so it can be started again
+    /// (`start_node_in`) on its own chain database, key and peer file.
+    ///
+    /// Async on purpose: the test's relays run on the same single-threaded runtime, and a blocking
+    /// wait here would freeze every link in the test while one node shuts down.
+    async fn stop(mut self) -> tempdir::TempDir {
+        signal_node(self.child.id(), "TERM");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.work_dir.take().expect("a running node owns its work dir")
     }
 }
 
@@ -191,6 +214,34 @@ fn spawn_node_with(
             .save(&work_dir.path().join("validator-key.json"))
             .expect("pre-write validator key file");
     }
+    // A fresh node starts a fresh log; `start_node_in` appends, so a restarted node's second run
+    // lands after its first instead of over it.
+    if let Some(path) = node_log_path(rpc_port) {
+        let _ = std::fs::File::create(path);
+    }
+    start_node_in(work_dir, rpc_port, p2p_port, sync_peer_rpc_port, extra_env)
+}
+
+/// Where a node's output goes when `HELIX_TEST_LOG_DIR` is set: `<dir>/node-<rpc_port>.log`.
+fn node_log_path(rpc_port: u16) -> Option<std::path::PathBuf> {
+    match std::env::var("HELIX_TEST_LOG_DIR") {
+        Ok(dir) if !dir.is_empty() => {
+            let _ = std::fs::create_dir_all(&dir);
+            Some(std::path::Path::new(&dir).join(format!("node-{rpc_port}.log")))
+        }
+        _ => None,
+    }
+}
+
+/// Start a node in `work_dir` — a new one from `spawn_node_with`, or one a previous run left behind
+/// (`NodeGuard::stop`), with its chain database, key and peer file.
+fn start_node_in(
+    work_dir: tempdir::TempDir,
+    rpc_port: u16,
+    p2p_port: u16,
+    sync_peer_rpc_port: Option<u16>,
+    extra_env: &[(&str, &str)],
+) -> NodeGuard {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_helix"));
     cmd.arg("start");
     cmd.current_dir(work_dir.path())
@@ -216,15 +267,17 @@ fn spawn_node_with(
     // `<dir>/node-<rpc_port>.log`. Without this, diagnosing a failure that only reproduces across
     // three real processes means re-running blind: the panic message is all there is, and the node
     // that misbehaved has already been killed by `NodeGuard::drop`.
-    match std::env::var("HELIX_TEST_LOG_DIR") {
-        Ok(dir) if !dir.is_empty() => {
-            let path = std::path::Path::new(&dir).join(format!("node-{rpc_port}.log"));
-            let _ = std::fs::create_dir_all(&dir);
-            let file = std::fs::File::create(&path).expect("create node log file");
+    match node_log_path(rpc_port) {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("open node log file");
             let dup = file.try_clone().expect("clone node log handle");
             cmd.stdout(Stdio::from(file)).stderr(Stdio::from(dup));
         }
-        _ => {
+        None => {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
     }
@@ -235,7 +288,7 @@ fn spawn_node_with(
         cmd.env(key, value);
     }
     let child = cmd.spawn().expect("spawn helix node binary");
-    NodeGuard { child, _work_dir: work_dir }
+    NodeGuard { child, work_dir: Some(work_dir) }
 }
 
 async fn block_header(rpc_port: u16, height: u64) -> Option<serde_json::Value> {
@@ -1556,4 +1609,414 @@ async fn block_body(rpc_port: u16, height: u64) -> Option<serde_json::Value> {
         .json()
         .await
         .ok()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// The production topology (2026-09-25)
+//
+// Every test above lets each node reach every other one directly. Production never has: one node
+// sits behind a tunnel (`p2p.silvra.net`), the others dial it and cannot be dialed themselves, so
+// the network is a star around it (#177) — and the two faults that cost the chain most in
+// September lived in exactly that shape. A link that died on one side only left the hub unable to
+// hear anyone for an hour (#232), and a validator that restarted with one direct peer sat out its
+// own turns for two minutes, because by count it could not reach a quorum it plainly reached
+// through the hub (#234). Both fixes have unit tests and transport tests; neither had been run
+// through whole nodes in the shape that produced them, at the production ping settings.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+const STAR_HUB_RPC: u16 = 29_705;
+const STAR_HUB_P2P: u16 = 29_706;
+/// The hub's tunnel: every link into the hub runs through this relay, as every link into the
+/// production node runs through `p2p.silvra.net`.
+const STAR_HUB_LINK: u16 = 29_707;
+const STAR_P1_RPC: u16 = 29_715;
+const STAR_P1_P2P: u16 = 29_716;
+/// What P1 announces as its address — a port nothing listens on, so a peer that learns it cannot
+/// dial P1, as nobody can dial an operator behind NAT. Announcing *something* is deliberate: left
+/// unset, P1 would ask the hub's `/whoami`, be found reachable on loopback, and announce its real
+/// port — and the star would quietly become a triangle.
+const STAR_P1_CLOSED: u16 = 29_717;
+const STAR_P2_RPC: u16 = 29_725;
+const STAR_P2_P2P: u16 = 29_726;
+const STAR_P2_CLOSED: u16 = 29_727;
+const STAR_P3_RPC: u16 = 29_735;
+const STAR_P3_P2P: u16 = 29_736;
+const STAR_P3_CLOSED: u16 = 29_737;
+
+/// Hub plus three operators: quorum is three of four, so the chain runs on while one operator
+/// restarts — the case the restart below is about.
+const STAR_VALIDATORS: u64 = 4;
+
+/// How long the chain may take to recover from a one-sided cut. At the production ping settings
+/// (15 s interval, 60 s timeout, the second failure closes) the hub gives up its dead half of a
+/// link about 135–150 s after the cut; the operator's watchdog (20 s) and redial (30 s) come on top.
+const STAR_HEAL_BUDGET: Duration = Duration::from_secs(360);
+
+/// A healed chain: this many blocks inside `STAR_HEALED_WINDOW`. Deliberately far below the idle
+/// cadence (about one block a second here) and far above what a chain carried only by pulled votes
+/// manages — a crawl is not a recovery.
+const STAR_HEALED_BLOCKS: u64 = 10;
+const STAR_HEALED_WINDOW: Duration = Duration::from_secs(20);
+
+/// A TCP relay whose links can be cut the way a tunnel or a NAT drops them (#232): `cut()` closes
+/// every link it carries at that moment on the *dialing* side — which sees the connection end —
+/// and leaves the target's side open and silent. Nothing is read from it or written to it again,
+/// so the target keeps believing in a connection that leads nowhere. Links opened after a cut are
+/// relayed normally.
+///
+/// A copy of the relay in `helix-p2p/tests/half_open_transport.rs`: test binaries cannot share
+/// helpers without a common module, and forty lines are cheaper than one.
+struct CuttableLink {
+    generation: tokio::sync::watch::Sender<u64>,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CuttableLink {
+    async fn spawn(listen: u16, target: u16) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen))
+            .await
+            .unwrap_or_else(|e| panic!("cuttable link cannot bind {listen}: {e}"));
+        let (generation, _) = tokio::sync::watch::channel(0u64);
+        let generations = generation.clone();
+        let accepted: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let accepted_here = accepted.clone();
+        // The target-side sockets of cut links. Held and never touched: dropping one would close
+        // it, and a closed socket is exactly what the target must *not* see.
+        let silent: std::sync::Arc<tokio::sync::Mutex<Vec<tokio::net::TcpStream>>> = Default::default();
+        tokio::spawn(async move {
+            loop {
+                let Ok((client, _)) = listener.accept().await else { return };
+                accepted_here.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Ok(upstream) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await else {
+                    continue;
+                };
+                let mut cut = generations.subscribe();
+                let born = *cut.borrow_and_update();
+                let silent = silent.clone();
+                tokio::spawn(async move {
+                    let (mut client, mut upstream) = (client, upstream);
+                    let (mut up_buf, mut down_buf) = (vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]);
+                    loop {
+                        tokio::select! {
+                            n = client.read(&mut up_buf) => match n {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => if upstream.write_all(&up_buf[..n]).await.is_err() { return },
+                            },
+                            n = upstream.read(&mut down_buf) => match n {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => if client.write_all(&down_buf[..n]).await.is_err() { return },
+                            },
+                            changed = cut.changed() => {
+                                if changed.is_err() { return }
+                                if *cut.borrow() > born {
+                                    drop(client);
+                                    silent.lock().await.push(upstream);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        CuttableLink { generation, accepted }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn cut(&self) {
+        self.generation.send_modify(|g| *g += 1);
+    }
+}
+
+async fn height_of(rpc_port: u16) -> Option<u64> {
+    status(rpc_port).await.and_then(|s| s["height"].as_u64())
+}
+
+/// Who proposed block `height`.
+async fn proposer_of(rpc_port: u16, height: u64) -> Option<String> {
+    block_header(rpc_port, height)
+        .await?
+        .get("validator")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// **A hub and three validators that can only reach it — the shape of the production network.**
+///
+/// Four validators of equal power, quorum three of four (the production set of 2026-09-22). The
+/// hub is reachable only through `CuttableLink`, its tunnel; the other three announce addresses
+/// nobody can dial, so each holds exactly one connection, to the hub — one short of the two other
+/// validators its share of a quorum needs. Production ping settings throughout — the node does not
+/// expose them.
+///
+/// 1. **The tunnel drops its links on one side only (#232).** The three validators see their links
+///    end and redial; the hub keeps its halves of the old links, open and silent. Before #232 that
+///    was the end of it: to the hub a redial is a *second* connection, gossipsub sends its
+///    subscriptions only on the first, and a validator that knows of no subscriber publishes its
+///    votes to nobody. On the production node it took an hour to wear off. Here the chain has
+///    `STAR_HEAL_BUDGET` to run at a healthy cadence again, by itself.
+/// 2. **A validator restarts while the chain runs on without it (#234).** It comes back with one
+///    direct peer against the two the count asks for, so by count it cannot reach quorum and held
+///    its own proposer turns for the full grace period — each one a round lost while the chain ran
+///    on around it (five of them after one restart on 2026-09-24). Counted here the same way:
+///    which of its own turns after it caught up did it take? Every one but possibly the first —
+///    `ChainPulse` starts out not moving on purpose (blocks a startup sync applied prove only that
+///    history exists, not that the chain is moving now), so a turn that falls before the first
+///    block applied after the restart is held, as a node with enough direct peers holds it for
+///    `MESH_SETTLE_TICKS`. Measured: the turn right after catching up, lost by a tick.
+///
+/// Four and not three for the second part: with three of three the chain stands while any one of
+/// them is down and only moves again once the restarted node votes, which here took up to 13 s of
+/// the 18 s grace period (60 ticks at the test's 300 ms). Left one turn to lose — a test that tells
+/// the fix from its absence by one turn is a coin toss.
+#[tokio::test]
+#[ignore = "four validator processes in a star around a relayed hub, two activation epochs, a one-sided cut healed at production ping settings and a restart (~5-8 min) — run with --ignored --nocapture"]
+async fn a_star_around_one_hub_heals_a_one_sided_cut_and_a_restart_by_itself() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
+    for (port, label) in [
+        (STAR_HUB_RPC, "hub rpc"), (STAR_HUB_P2P, "hub p2p"), (STAR_HUB_LINK, "hub link"),
+        (STAR_P1_RPC, "P1 rpc"), (STAR_P1_P2P, "P1 p2p"), (STAR_P1_CLOSED, "P1 announced"),
+        (STAR_P2_RPC, "P2 rpc"), (STAR_P2_P2P, "P2 p2p"), (STAR_P2_CLOSED, "P2 announced"),
+        (STAR_P3_RPC, "P3 rpc"), (STAR_P3_P2P, "P3 p2p"), (STAR_P3_CLOSED, "P3 announced"),
+    ] {
+        assert_port_free(port, label);
+    }
+
+    let link = CuttableLink::spawn(STAR_HUB_LINK, STAR_HUB_P2P).await;
+
+    let kp_hub = KeyPair::generate();
+    let kp_1 = KeyPair::generate();
+    let kp_2 = KeyPair::generate();
+    let kp_3 = KeyPair::generate();
+    let addr_1 = Address::from_public_key(&kp_1.public).to_string();
+    let addr_2 = Address::from_public_key(&kp_2.public).to_string();
+    let addr_3 = Address::from_public_key(&kp_3.public).to_string();
+
+    let ma = |port: u16| format!("/ip4/127.0.0.1/tcp/{port}");
+    let fast = ("HELIX_BLOCK_TIME_MS", JOIN_BLOCK_TIME_MS);
+    // The hub announces its tunnel, so the other two — which derive their seed from the hub's
+    // `/status` — dial the tunnel and not the hub's port.
+    let hub_addr = ma(STAR_HUB_LINK);
+    let closed_1 = ma(STAR_P1_CLOSED);
+    let closed_2 = ma(STAR_P2_CLOSED);
+    let closed_3 = ma(STAR_P3_CLOSED);
+    let env_1 = [fast, ("HELIX_P2P_PUBLIC_ADDR", closed_1.as_str())];
+    let env_2 = [fast, ("HELIX_P2P_PUBLIC_ADDR", closed_2.as_str())];
+    let env_3 = [fast, ("HELIX_P2P_PUBLIC_ADDR", closed_3.as_str())];
+
+    let _hub = spawn_node_with(STAR_HUB_RPC, STAR_HUB_P2P, None,
+        &[fast, ("HELIX_P2P_PUBLIC_ADDR", &hub_addr)], Some(&kp_hub));
+    wait_until_reachable(STAR_HUB_RPC, Duration::from_secs(15)).await;
+    wait_for_height(STAR_HUB_RPC, 2, Duration::from_secs(30)).await;
+
+    let p1 = spawn_node_with(STAR_P1_RPC, STAR_P1_P2P, Some(STAR_HUB_RPC), &env_1, Some(&kp_1));
+    let _p2 = spawn_node_with(STAR_P2_RPC, STAR_P2_P2P, Some(STAR_HUB_RPC), &env_2, Some(&kp_2));
+    let _p3 = spawn_node_with(STAR_P3_RPC, STAR_P3_P2P, Some(STAR_HUB_RPC), &env_3, Some(&kp_3));
+    wait_until_reachable(STAR_P1_RPC, Duration::from_secs(30)).await;
+    wait_until_reachable(STAR_P2_RPC, Duration::from_secs(30)).await;
+    wait_until_reachable(STAR_P3_RPC, Duration::from_secs(30)).await;
+
+    let (_kd_hub, key_hub) = temp_keyfile(&kp_hub);
+    let (_kd_1, key_1) = temp_keyfile(&kp_1);
+    let (_kd_2, key_2) = temp_keyfile(&kp_2);
+    let (_kd_3, key_3) = temp_keyfile(&kp_3);
+    fund_and_stake(STAR_HUB_RPC, &key_hub, &kp_1, &key_1).await;
+    fund_and_stake(STAR_HUB_RPC, &key_hub, &kp_2, &key_2).await;
+    fund_and_stake(STAR_HUB_RPC, &key_hub, &kp_3, &key_3).await;
+    assert!(
+        wait_for_validator_active(STAR_HUB_RPC, &addr_1, Duration::from_secs(600)).await,
+        "P1 staked but never activated — activation stalled"
+    );
+    assert!(
+        wait_for_validator_active(STAR_HUB_RPC, &addr_2, Duration::from_secs(600)).await,
+        "P2 staked but never activated — activation stalled"
+    );
+    assert!(
+        wait_for_validator_active(STAR_HUB_RPC, &addr_3, Duration::from_secs(600)).await,
+        "P3 staked but never activated — activation stalled"
+    );
+
+    // Positive control on the topology: without it, a pass below could come from two validators
+    // that found each other directly and never needed the hub's links at all.
+    let star_by = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let peers = |s: Option<serde_json::Value>| s.and_then(|s| s["peer_count"].as_u64());
+        let got = [
+            peers(status(STAR_HUB_RPC).await),
+            peers(status(STAR_P1_RPC).await),
+            peers(status(STAR_P2_RPC).await),
+            peers(status(STAR_P3_RPC).await),
+        ];
+        if got == [Some(3), Some(1), Some(1), Some(1)] {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < star_by,
+            "not a star: peers hub, P1, P2, P3 = {got:?} (want 3, 1, 1, 1)"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(link.accepted() >= 3, "the validators never reached the hub through its tunnel");
+
+    let idle = measure_cadence(STAR_HUB_RPC, 12, Duration::from_secs(120)).await;
+    // Every validator takes its turns in the star — P1, P2 and P3 hold one direct peer each, one
+    // short of what the count says quorum needs (#234).
+    //
+    // The same blocks also say whose turn each height is. The round-`r` proposer of height `h` is
+    // `full[(h + r) % n]` (`ValidatorSet::proposer_for_round`), so on a healthy chain every
+    // validator proposes at one fixed residue of `h mod n` — read here rather than assumed from
+    // the set's order. The RPC does not carry the round a block was finalized in (`last_commit`
+    // comes back as addresses only), and the residue is how the restart below tells a turn taken
+    // from a turn lost.
+    let tip = height_of(STAR_HUB_RPC).await.expect("hub height");
+    let n = STAR_VALIDATORS;
+    let mut seen: std::collections::HashMap<String, [u32; STAR_VALIDATORS as usize]> = Default::default();
+    for h in tip.saturating_sub(39)..=tip {
+        if let Some(v) = proposer_of(STAR_HUB_RPC, h).await {
+            seen.entry(v).or_default()[(h % n) as usize] += 1;
+        }
+    }
+    let residue: std::collections::HashMap<String, u64> = seen
+        .iter()
+        .map(|(v, counts)| {
+            let r = (0..n).max_by_key(|r| counts[*r as usize]).unwrap_or(0);
+            (v.clone(), r)
+        })
+        .collect();
+    let distinct: HashSet<u64> = residue.values().copied().collect();
+    assert!(
+        [&addr_1, &addr_2, &addr_3].iter().all(|a| residue.contains_key(*a))
+            && residue.len() == n as usize
+            && distinct.len() == n as usize,
+        "not every validator took its own turns in the last 40 blocks (proposals by residue of \
+         h mod {n}: {seen:?})"
+    );
+
+    // ── 1. The tunnel drops its links on one side only. ──
+    let accepted_before_cut = link.accepted();
+    let h_cut = height_of(STAR_HUB_RPC).await.expect("hub height");
+    let cut_at = std::time::Instant::now();
+    link.cut();
+    let mut samples: Vec<(std::time::Instant, u64)> = vec![(cut_at, h_cut)];
+    let healed_after = loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = std::time::Instant::now();
+        let Some(h) = height_of(STAR_HUB_RPC).await else { continue };
+        samples.push((now, h));
+        let window_start = samples
+            .iter()
+            .find(|(t, _)| now.duration_since(*t) <= STAR_HEALED_WINDOW)
+            .map(|(_, h)| *h)
+            .unwrap_or(h);
+        if now.duration_since(cut_at) >= STAR_HEALED_WINDOW && h >= window_start + STAR_HEALED_BLOCKS {
+            break now.duration_since(cut_at);
+        }
+        assert!(
+            now.duration_since(cut_at) < STAR_HEAL_BUDGET,
+            "the chain did not recover within {STAR_HEAL_BUDGET:?} of the tunnel dropping its links \
+             on one side only: height {h_cut} at the cut, {h} now, the validators redialed {} times. \
+             The hub keeps its dead halves; to it every redial is a second connection, over which \
+             gossipsub never sends its subscriptions, so the validators publish their votes to \
+             nobody (#232)",
+            link.accepted() - accepted_before_cut
+        );
+    };
+    // The longest stretch without a block after the cut. Positive control: a cut that did not
+    // stop the chain proves nothing about how it recovers.
+    let mut longest_stall = Duration::ZERO;
+    let (mut last_block_at, mut last_height) = (cut_at, h_cut);
+    for &(at, h) in &samples {
+        if h > last_height {
+            longest_stall = longest_stall.max(at.duration_since(last_block_at));
+            (last_block_at, last_height) = (at, h);
+        }
+    }
+    eprintln!(
+        "idle median {:.2}s p90 {:.2}s · cut at {h_cut}: longest stall {:.1}s, healthy again {:.1}s after the cut, {} redials through the tunnel",
+        idle.median,
+        idle.p90,
+        longest_stall.as_secs_f64(),
+        healed_after.as_secs_f64(),
+        link.accepted() - accepted_before_cut
+    );
+    assert!(
+        longest_stall >= Duration::from_secs(10),
+        "the chain barely noticed the cut (longest stall {:.1}s) — the validators must have had \
+         another path to the hub, and this measured nothing",
+        longest_stall.as_secs_f64()
+    );
+
+    // ── 2. A validator restarts while the chain runs on without it. ──
+    let settled = height_of(STAR_HUB_RPC).await.expect("hub height") + 10;
+    wait_for_height(STAR_HUB_RPC, settled, Duration::from_secs(60)).await;
+    let work_dir = p1.stop().await;
+    let h_stopped = height_of(STAR_HUB_RPC).await.expect("hub height");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let h_restart = height_of(STAR_HUB_RPC).await.expect("hub height");
+    // Positive control: the others finalized without P1, so P1 comes back into a chain that is
+    // moving — the only case in which the blocks it applies can tell it anything.
+    assert!(
+        h_restart >= h_stopped + 3,
+        "the chain did not move while P1 was down ({h_stopped} → {h_restart}): three of four \
+         should carry it, and without that there is nothing for P1 to come back to"
+    );
+    let _p1 = start_node_in(work_dir, STAR_P1_RPC, STAR_P1_P2P, Some(STAR_HUB_RPC), &env_1);
+    // Counted from the moment P1 has caught up: before that it could not have proposed on the
+    // current height whatever the gate said.
+    let caught_up_by = std::time::Instant::now() + Duration::from_secs(60);
+    let h0 = loop {
+        let (hub, p1) = (height_of(STAR_HUB_RPC).await, height_of(STAR_P1_RPC).await);
+        if let (Some(hub), Some(p1)) = (hub, p1) {
+            if p1 >= hub {
+                break hub;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < caught_up_by,
+            "P1 did not catch up within 60 s of its restart"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let first = h0 + 1;
+    let last = h0 + 16;
+    wait_for_height(STAR_HUB_RPC, last, Duration::from_secs(180)).await;
+    let (mut turns, mut kept, mut lost, mut rows) = (0u64, 0u64, 0u64, Vec::new());
+    let mut missed_after_first = Vec::new();
+    for h in first..=last {
+        let proposer = proposer_of(STAR_HUB_RPC, h).await.expect("header of a committed block");
+        // Rounds this height took, modulo the set size — enough here, where a height losing four
+        // rounds in a row would take every validator missing its turn.
+        let round = (residue[&proposer] + n - h % n) % n;
+        lost += round;
+        if h % n == residue[&addr_1] {
+            turns += 1;
+            if proposer == addr_1 {
+                kept += 1;
+            } else if turns > 1 {
+                missed_after_first.push(h);
+            }
+        }
+        let who = [(&addr_1, "P1"), (&addr_2, "P2"), (&addr_3, "P3")]
+            .iter()
+            .find(|(a, _)| **a == proposer)
+            .map_or("hub", |(_, w)| *w);
+        rows.push(format!("{h}:{who}/r{round}"));
+    }
+    eprintln!(
+        "P1 stopped at {h_stopped}, back at {h_restart}, caught up at {h0}: it took {kept} of its \
+         {turns} turns in blocks {first}..={last}, {lost} rounds lost — {}",
+        rows.join(" ")
+    );
+    assert!(turns >= 3, "only {turns} of P1's turns in the window — too few to tell anything");
+    assert!(
+        missed_after_first.is_empty(),
+        "after its restart P1 took {kept} of its {turns} turns in blocks {first}..={last} \
+         ({lost} rounds lost), missing {missed_after_first:?} after its first: it sat out its own \
+         turns. It has one direct peer against the two the count asks for, and it reaches quorum \
+         through the hub — the blocks it applies say so (#234)"
+    );
 }
