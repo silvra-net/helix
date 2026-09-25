@@ -1405,14 +1405,12 @@ const LINK_BYTES_PER_SEC: u64 = 890 * 1024;
 /// A chunk goes out as soon as its direction of the link is free — at once on an idle link, so a
 /// small urgent message (a prevote is ~3.3 KB) is never charged for bandwidth it does not use —
 /// and otherwise after the chunks already booked ahead of it, whichever connection they belong to.
-fn spawn_link(listen: u16, target: u16, bytes_per_sec: u64) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", listen)).await {
-            Ok(l) => l,
-            Err(e) => panic!("throttled link cannot bind {listen}: {e}"),
-        };
-        let toward_node = Pacer::new(bytes_per_sec);
-        let from_node = Pacer::new(bytes_per_sec);
+fn spawn_link(listen: u16, target: u16, bytes_per_sec: u64) -> ThrottledLink {
+    let listener = bind_relay_listener(listen, "throttled link");
+    let (into_node, out_of_node) = (Pacer::new(bytes_per_sec), Pacer::new(bytes_per_sec));
+    let (toward_node, from_node) = (into_node.clone(), out_of_node.clone());
+    let _task = relay_runtime().spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("relay listener");
         loop {
             let Ok((inbound, _)) = listener.accept().await else { continue };
             let (toward_node, from_node) = (toward_node.clone(), from_node.clone());
@@ -1430,13 +1428,137 @@ fn spawn_link(listen: u16, target: u16, bytes_per_sec: u64) -> tokio::task::Join
                 tokio::join!(pump(ri, wo, toward_node), pump(ro, wi, from_node));
             });
         }
-    })
+    });
+    ThrottledLink { _task, into_node, out_of_node }
+}
+
+/// One node's link, and what it has carried in each direction.
+struct ThrottledLink {
+    _task: tokio::task::JoinHandle<()>,
+    into_node: std::sync::Arc<Pacer>,
+    out_of_node: std::sync::Arc<Pacer>,
+}
+
+impl ThrottledLink {
+    /// Bytes relayed so far, into the node and out of it.
+    fn carried(&self) -> (u64, u64) {
+        (self.into_node.carried(), self.out_of_node.carried())
+    }
+}
+
+/// How busy each link was between two `carried()` readings, as a share of its rate: the number
+/// that says whether a slow block time is the link's or something else's.
+fn link_use(before: &[(u64, u64)], after: &[(u64, u64)], over: Duration, rate: u64) -> String {
+    let capacity = rate as f64 * over.as_secs_f64();
+    ["A", "B", "C"]
+        .iter()
+        .zip(before.iter().zip(after))
+        .map(|(name, (b, a))| {
+            let into = (a.0 - b.0) as f64;
+            let out = (a.1 - b.1) as f64;
+            format!(
+                "{name} in {:.0}% ({:.1} MB) out {:.0}% ({:.1} MB)",
+                100.0 * into / capacity,
+                into / 1e6,
+                100.0 * out / capacity,
+                out / 1e6
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The runtime every relay in this file runs on — threads of its own, not the test's.
+///
+/// `#[tokio::test]` runs a test on one thread, and a relay spawned there shares it with the test
+/// body: whatever the body does synchronously stops every link at once. Measured 2026-09-25 with
+/// `ss` beside the flood test: while it signed its 2000 transactions (twice each, debug ML-DSA),
+/// all three relays stopped reading for about 100 s — the nodes' send queues empty, the relays'
+/// receive queues frozen — until A's ping gave up both connections. Every flood run before this
+/// began on a network that had just torn itself down and was re-forming. `run_cli`, which waits
+/// on the CLI with `Command::status`, froze the links the same way while funding validators. An
+/// instrument must not share a thread with the code that drives the experiment, so this one does
+/// not, whatever a test body does later.
+fn relay_runtime() -> &'static tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("test-relay")
+                .enable_all()
+                .build()
+                .expect("relay runtime")
+        })
+        .handle()
+}
+
+/// Bound before this returns, so a node started right after never dials a port nobody listens
+/// on. Non-blocking, as `tokio::net::TcpListener::from_std` requires.
+fn bind_relay_listener(port: u16, what: &str) -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("{what} cannot bind {port}: {e}"));
+    listener.set_nonblocking(true).expect("non-blocking relay listener");
+    listener
+}
+
+/// The relays keep carrying bytes while a test body blocks its own thread — the property whose
+/// absence froze every link of the flood test for about 100 s (see `relay_runtime`).
+#[tokio::test]
+async fn a_relay_keeps_relaying_while_the_test_thread_is_busy() {
+    use std::io::{Read, Write};
+    const TARGET: u16 = 29_761;
+    const LINK: u16 = 29_762;
+    assert_port_free(TARGET, "relay test target");
+    assert_port_free(LINK, "relay test link");
+
+    // An echo server on a thread of its own, standing in for a node.
+    let echo = std::net::TcpListener::bind(("127.0.0.1", TARGET)).expect("bind echo");
+    std::thread::spawn(move || {
+        for conn in echo.incoming() {
+            let Ok(mut conn) = conn else { return };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                while let Ok(n @ 1..) = conn.read(&mut buf) {
+                    if conn.write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let _link = spawn_link(LINK, TARGET, 10 * 1024 * 1024);
+    // Let anything the link spawned onto this thread get going first — otherwise a relay that
+    // still shared this thread would fail by never having started, not by being frozen.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A peer on its own thread pings through the link while the test thread is blocked.
+    // `None` when no answer came within three seconds.
+    let peer = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(200));
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", LINK)).expect("connect link");
+        conn.set_read_timeout(Some(Duration::from_secs(3))).expect("read timeout");
+        let sent = std::time::Instant::now();
+        conn.write_all(b"ping").expect("send");
+        let mut back = [0u8; 4];
+        conn.read_exact(&mut back).ok().map(|()| sent.elapsed())
+    });
+    // What signing the flood did: two seconds in which this thread runs no task at all.
+    std::thread::sleep(Duration::from_secs(2));
+    let round_trip = peer.join().expect("peer thread");
+    assert!(
+        round_trip.is_some_and(|rtt| rtt < Duration::from_millis(500)),
+        "a ping through the relay took {round_trip:?} (None: no answer in 3 s) while the test \
+         thread was busy — the relay shares that thread, and every link in a test stops whenever \
+         its body computes"
+    );
 }
 
 /// One direction of one node's link, shared by every connection through its relay.
 struct Pacer {
     next_free: tokio::sync::Mutex<tokio::time::Instant>,
     bytes_per_sec: u64,
+    carried: std::sync::atomic::AtomicU64,
 }
 
 impl Pacer {
@@ -1444,12 +1566,18 @@ impl Pacer {
         std::sync::Arc::new(Pacer {
             next_free: tokio::sync::Mutex::new(tokio::time::Instant::now()),
             bytes_per_sec,
+            carried: Default::default(),
         })
+    }
+
+    fn carried(&self) -> u64 {
+        self.carried.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// When `n` bytes may start: now on an idle link, otherwise once the bytes booked before them
     /// have gone out. Books the link for their duration.
     async fn book(&self, n: usize) -> tokio::time::Instant {
+        self.carried.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         let mut next = self.next_free.lock().await;
         let start = (*next).max(tokio::time::Instant::now());
         *next = start + Duration::from_secs_f64(n as f64 / self.bytes_per_sec as f64);
@@ -1549,9 +1677,11 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
     // The links come up first: a node that dials a relay which is not listening yet simply fails
     // that dial and waits for the next redial tick, which costs 30 s of the test's budget for no
     // reason.
-    let _link_a = spawn_link(TL_A_LINK, TL_A_P2P, LINK_BYTES_PER_SEC);
-    let _link_b = spawn_link(TL_B_LINK, TL_B_P2P, LINK_BYTES_PER_SEC);
-    let _link_c = spawn_link(TL_C_LINK, TL_C_P2P, LINK_BYTES_PER_SEC);
+    let links = [
+        spawn_link(TL_A_LINK, TL_A_P2P, LINK_BYTES_PER_SEC),
+        spawn_link(TL_B_LINK, TL_B_P2P, LINK_BYTES_PER_SEC),
+        spawn_link(TL_C_LINK, TL_C_P2P, LINK_BYTES_PER_SEC),
+    ];
 
     let kp_a = KeyPair::generate();
     let kp_b = KeyPair::generate();
@@ -1618,6 +1748,8 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
     let (flood_from_height, nonce_before) = height_and_nonce(TL_A_RPC, &flood_sender).await;
     let txs = sign_flood(&kp_a, &recipient, 2_000, chain_id, base_fee);
     let client = reqwest::Client::new();
+    let flood_started = std::time::Instant::now();
+    let carried_before: Vec<(u64, u64)> = links.iter().map(ThrottledLink::carried).collect();
     let mut accepted = 0u64;
     for tx in &txs {
         let ok = client
@@ -1634,6 +1766,12 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
     assert!(accepted > 1_500, "only {accepted}/2000 transactions were accepted — the flood never happened");
 
     let loaded = measure_cadence(TL_A_RPC, 12, Duration::from_secs(300)).await;
+    let carried_after: Vec<(u64, u64)> = links.iter().map(ThrottledLink::carried).collect();
+    eprintln!(
+        "link use over the {:.0} s of the flood: {}",
+        flood_started.elapsed().as_secs_f64(),
+        link_use(&carried_before, &carried_after, flood_started.elapsed(), LINK_BYTES_PER_SEC)
+    );
 
     // What the blocks carried of the flood against what the chain applied (#231). Every flood
     // transaction a block carries must apply: a block that packs one it cannot apply wastes its
@@ -1822,9 +1960,7 @@ struct CuttableLink {
 impl CuttableLink {
     async fn spawn(listen: u16, target: u16) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen))
-            .await
-            .unwrap_or_else(|e| panic!("cuttable link cannot bind {listen}: {e}"));
+        let listener = bind_relay_listener(listen, "cuttable link");
         let (generation, _) = tokio::sync::watch::channel(0u64);
         let generations = generation.clone();
         let accepted: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
@@ -1832,7 +1968,10 @@ impl CuttableLink {
         // The target-side sockets of cut links. Held and never touched: dropping one would close
         // it, and a closed socket is exactly what the target must *not* see.
         let silent: std::sync::Arc<tokio::sync::Mutex<Vec<tokio::net::TcpStream>>> = Default::default();
-        tokio::spawn(async move {
+        // On the relay runtime, like `spawn_link`: see `relay_runtime` for what sharing the test's
+        // thread did to the links.
+        relay_runtime().spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("relay listener");
             loop {
                 let Ok((client, _)) = listener.accept().await else { return };
                 accepted_here.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
