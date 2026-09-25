@@ -80,7 +80,10 @@ pub fn finalize_and_sign(tx: &mut Transaction, explicit_fee: Option<u64>, base_f
     // The one wallet pricing rule, shared with the CLI — and its 1-HLX ceiling: the base fee
     // came from the node, and this wallet has no fee field, so a node reporting an absurd one
     // would otherwise be the one deciding what the user pays.
-    tx.fee = helix_core::fee::wallet_auto_fee(base_fee_per_byte, tx.size_bytes()).map_err(|e| {
+    // Priced on the bytes the block will carry: without the key once the account has a
+    // transaction behind it (#243).
+    let size = helix_core::fee::wallet_priced_size(tx);
+    tx.fee = helix_core::fee::wallet_auto_fee(base_fee_per_byte, size).map_err(|e| {
         format!(
             "Not sent: {e}. If the network really is that busy, wait for it to calm down, or \
              send from the command line with an explicit --fee."
@@ -145,5 +148,23 @@ mod tests {
         );
         finalize_and_sign(&mut tx, None, 1, &kp).unwrap();
         assert_eq!(tx.fee, 2 * tx.size_bytes());
+
+        // #243: with a transaction behind it the account pays for the bytes the block carries,
+        // which leave the key out.
+        let mut later = build_tx(
+            TxType::Transfer,
+            Address::from_public_key(&kp.public),
+            Some(Address::from_public_key(&KeyPair::generate().public)),
+            1,
+            3,
+            vec![],
+            helix_core::default_chain_id(),
+            &kp,
+        );
+        finalize_and_sign(&mut later, None, 1, &kp).unwrap();
+        let mut carried = later.clone();
+        carried.public_key = None;
+        assert_eq!(later.fee, 2 * carried.size_bytes());
+        assert!(later.verify_signature().is_ok());
     }
 }

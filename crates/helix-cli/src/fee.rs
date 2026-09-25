@@ -116,7 +116,8 @@ pub async fn price_and_sign(
 /// and a 1-HLX ceiling) and sign it again. Above the ceiling nothing is signed at that fee — the
 /// base fee came from a node, and a node is not someone whose word should spend your money.
 fn sign_at_base_fee(tx: &mut Transaction, base_fee_per_byte: u64, kp: &KeyPair) -> Result<()> {
-    tx.fee = helix_core::fee::wallet_auto_fee(base_fee_per_byte, tx.size_bytes()).map_err(|e| {
+    let size = helix_core::fee::wallet_priced_size(tx);
+    tx.fee = helix_core::fee::wallet_auto_fee(base_fee_per_byte, size).map_err(|e| {
         anyhow::anyhow!(
             "Not sent: {e}. If the fee is real, pass it explicitly with --fee <nano-HLX>."
         )
@@ -178,6 +179,22 @@ mod tests {
             signature: helix_crypto::Signature::from_bytes(vec![]),
             public_key: Some(kp.public.clone()),
         }
+    }
+
+    /// #243: an account with a transaction behind it pays for the bytes the block carries —
+    /// without its key. The wallet still sends the key; the chain just no longer charges for it.
+    #[test]
+    fn a_later_transaction_is_priced_without_its_key() {
+        let kp = KeyPair::generate();
+        let mut tx = unsigned_transfer(&kp);
+        tx.nonce = 3;
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        sign_at_base_fee(&mut tx, 1, &kp).unwrap();
+        let mut carried = tx.clone();
+        carried.public_key = None;
+        assert_eq!(tx.fee, 2 * carried.size_bytes());
+        assert!(tx.public_key.is_some(), "the wallet still sends its key");
+        assert!(tx.verify_signature().is_ok(), "and signs the fee it priced");
     }
 
     #[test]

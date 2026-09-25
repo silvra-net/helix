@@ -141,6 +141,29 @@ pub fn wallet_auto_fee(base_fee_per_byte: u64, size_bytes: u64) -> Result<u64, A
     Ok(fee)
 }
 
+/// The size a wallet prices a transaction by: the bytes the block that includes it will carry.
+///
+/// A block carries a known sender's transaction without its public key (#243), and the base fee
+/// is charged on those bytes. A transaction with `nonce > 0` can only apply after one from the
+/// same account has — which put the key on record, or the account signs with a recovery key that
+/// the pool strips the same way — so its block form is the one without the key, ~1.9 KB smaller.
+/// Pricing the full form is not refused; it tips the validator a third of the fee for bytes
+/// nobody carries.
+///
+/// The one case this prices low is a transaction admitted *before* its predecessor applied: the
+/// pool keeps its key, and the block charges the full size. With
+/// [`WALLET_FEE_HEADROOM_PERCENT`] on the smaller size it still covers the full one at a base fee
+/// up to ~28% above today's — two busy blocks of headroom instead of six, for the second of two
+/// transactions sent back to back.
+pub fn wallet_priced_size(tx: &crate::Transaction) -> u64 {
+    if tx.nonce == 0 || tx.public_key.is_none() {
+        return tx.size_bytes();
+    }
+    let mut carried = tx.clone();
+    carried.public_key = None;
+    carried.size_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +246,54 @@ mod tests {
         assert_eq!(nano_as_hlx(10_820), "0.00001082");
         assert_eq!(nano_as_hlx(1_000_000_000), "1");
         assert_eq!(nano_as_hlx(1_500_000_001), "1.500000001");
+    }
+
+    fn transfer(nonce: u64) -> crate::Transaction {
+        let kp = helix_crypto::KeyPair::generate();
+        let from = helix_crypto::Address::from_public_key(&kp.public);
+        let mut tx = crate::Transaction {
+            version: 1,
+            tx_type: crate::TxType::Transfer,
+            from: from.clone(),
+            to: Some(from),
+            amount: 1,
+            fee: 0,
+            nonce,
+            data: vec![],
+            crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
+            signature: helix_crypto::Signature::from_bytes(vec![]),
+            public_key: Some(kp.public.clone()),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    /// #243: a wallet prices the form the block carries. The first transaction of an account
+    /// carries its key into the block — nothing is on record yet — and every later one does not.
+    #[test]
+    fn a_wallet_prices_the_bytes_the_block_will_carry() {
+        let first = transfer(0);
+        assert_eq!(wallet_priced_size(&first), first.size_bytes(), "the first one carries its key");
+
+        let later = transfer(1);
+        let mut carried = later.clone();
+        carried.public_key = None;
+        assert_eq!(wallet_priced_size(&later), carried.size_bytes());
+        assert!(wallet_priced_size(&later) + 1900 < later.size_bytes(), "about a third less");
+    }
+
+    /// The case the rule prices low — a transaction the pool took before its predecessor applied
+    /// keeps its key into the block — is still covered, at a base fee well above the one it was
+    /// priced at; just not six busy blocks above. The number in the doc comment, measured.
+    #[test]
+    fn a_transaction_priced_without_its_key_still_covers_the_full_size_through_two_busy_blocks() {
+        let tx = transfer(1);
+        let base = 1_000;
+        let fee = wallet_auto_fee(base, wallet_priced_size(&tx)).unwrap();
+        let two_rises = base * 1_125 * 1_125 / 1_000_000;
+        let three_rises = two_rises * 1_125 / 1_000;
+        assert!(fee >= two_rises * tx.size_bytes(), "two rises of 12.5% are covered at full size");
+        assert!(fee < three_rises * tx.size_bytes(), "and three are not — the doc comment says so");
     }
 }
