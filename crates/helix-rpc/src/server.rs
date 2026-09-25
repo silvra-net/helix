@@ -388,30 +388,34 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
     })
 }
 
-async fn get_latest_block(State(state): State<AppState>) -> impl IntoResponse {
+async fn get_latest_block(State(state): State<AppState>) -> axum::response::Response {
     let store = state.store.read().await;
     let height = store.latest_height();
     match store.get_block_by_height(height) {
-        Ok(block) => (StatusCode::OK, Json(json!(block_response(&block, &store)))),
-        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))),
+        // Straight from the struct, not through `json!` — a full block's view is a thousand
+        // transactions, and the `Value` tree would be several times its size (#237).
+        Ok(block) => (StatusCode::OK, Json(block_response(&block, &store))).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))).into_response(),
     }
 }
 
 async fn get_block_by_height(
     State(state): State<AppState>,
     Path(n): Path<u64>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let store = state.store.read().await;
     match store.get_block_by_height(n) {
-        Ok(block) => (StatusCode::OK, Json(json!(block_response(&block, &store)))),
-        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))),
+        // Straight from the struct, not through `json!` — a full block's view is a thousand
+        // transactions, and the `Value` tree would be several times its size (#237).
+        Ok(block) => (StatusCode::OK, Json(block_response(&block, &store))).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))).into_response(),
     }
 }
 
 async fn get_block_by_hash(
     State(state): State<AppState>,
     Path(hash_hex): Path<String>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let hash = match Hash::from_hex(&hash_hex) {
         Ok(h) => h,
         Err(_) => {
@@ -419,12 +423,15 @@ async fn get_block_by_hash(
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "invalid hash format" })),
             )
+                .into_response()
         }
     };
     let store = state.store.read().await;
     match store.get_block_by_hash(&hash) {
-        Ok(block) => (StatusCode::OK, Json(json!(block_response(&block, &store)))),
-        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))),
+        // Straight from the struct, not through `json!` — a full block's view is a thousand
+        // transactions, and the `Value` tree would be several times its size (#237).
+        Ok(block) => (StatusCode::OK, Json(block_response(&block, &store))).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))).into_response(),
     }
 }
 
@@ -947,7 +954,8 @@ async fn get_state_snapshot(
 /// and proceeds with an empty one, exactly as before this endpoint existed.
 async fn get_tip_certificate(State(state): State<AppState>) -> impl IntoResponse {
     let cert = state.tip_certificate.read().await;
-    (StatusCode::OK, Json(json!(*cert)))
+    // Every signature byte would be a `Value` node of its own through `json!` (#237).
+    (StatusCode::OK, Json(cert.clone()))
 }
 
 /// Header-only view of a block — for light clients that sync the chain of
