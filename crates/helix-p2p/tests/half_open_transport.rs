@@ -392,3 +392,39 @@ async fn a_node_does_not_redial_a_peer_it_is_already_connected_through() {
         "X redialed a peer it was already connected to ({settled} links before the window)"
     );
 }
+
+/// At startup the seed is dialed once (#236). The first redial tick fires the moment the service
+/// starts, before that dial has become a connection, and it used to dial the seed a second time —
+/// every operator node held two links to the hub, which is what lets a hub stand at its per-peer
+/// limit with two dead halves after a one-sided cut (#232). The relay counts what reaches it.
+#[tokio::test]
+async fn a_node_dials_its_seed_once_at_startup() {
+    let (_y_commands, mut y_events) = spawn(P2PConfig {
+        public_addr: Some("/ip4/127.0.0.1/tcp/19796".to_string()),
+        ..config(19795, vec![], (1, 2))
+    });
+    let relay = Relay::spawn(19796, 19795).await;
+    let (_x_commands, mut x_events) = spawn(config(19794, vec![19796], (1, 2)));
+    tokio::spawn(async move { while y_events.recv().await.is_some() {} });
+
+    let connected = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = x_events.recv().await {
+            if matches!(event, P2PEvent::PeerConnected(_)) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(connected, Ok(true), "X never connected to Y through the relay");
+    tokio::spawn(async move { while x_events.recv().await.is_some() {} });
+
+    // Well within the first redial period (30 s), and long past the startup race.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        relay.accepted(),
+        1,
+        "X dialed its seed more than once at startup — the first redial tick did not know the \
+         startup dial was still in flight"
+    );
+}

@@ -513,8 +513,10 @@ impl P2PService {
             );
         }
 
+        // Dials still in flight, by the connection they will become — see `dial_tracked`.
+        let mut pending_dials: HashMap<libp2p::swarm::ConnectionId, Multiaddr> = HashMap::new();
         for addr in seed_addrs.iter().chain(remembered.iter()) {
-            let _ = swarm.dial(addr.clone());
+            dial_tracked(&mut swarm, addr.clone(), &mut pending_dials);
         }
 
         info!(listen = %config.listen_addr, peer_id = %local_peer_id, "P2P service started");
@@ -1112,6 +1114,7 @@ impl P2PService {
                             endpoint,
                             ..
                         } => {
+                            pending_dials.remove(&connection_id);
                             if endpoint.is_dialer() {
                                 dialed_links
                                     .insert(connection_id, endpoint.get_remote_address().clone());
@@ -1223,6 +1226,9 @@ impl P2PService {
                             let _ = event_tx
                                 .send(P2PEvent::PeerDisconnected(peer_id.to_string()))
                                 .await;
+                        }
+                        SwarmEvent::OutgoingConnectionError { connection_id, .. } => {
+                            pending_dials.remove(&connection_id);
                         }
                         _ => {}
                     }
@@ -1350,7 +1356,14 @@ impl P2PService {
                             .into_iter()
                             .chain(announced_self.as_deref())
                             .collect();
-                        let linked: HashSet<Multiaddr> = dialed_links.values().cloned().collect();
+                        // A dial still in flight counts as a link: at startup the first tick comes
+                        // before the seed dial has become a connection, and dialed the seed a
+                        // second time — every operator held two links to the hub (#236).
+                        let linked: HashSet<Multiaddr> = dialed_links
+                            .values()
+                            .chain(pending_dials.values())
+                            .cloned()
+                            .collect();
                         let targets = redial_targets(
                             &seed_addrs,
                             &known_addrs,
@@ -1371,7 +1384,7 @@ impl P2PService {
                                 );
                             }
                             for addr in targets {
-                                let _ = swarm.dial(addr);
+                                dial_tracked(&mut swarm, addr, &mut pending_dials);
                             }
                         }
                     }
@@ -1827,6 +1840,27 @@ fn proposal_reached_the_network(
 struct RedialVerdict {
     dial: bool,
     log: bool,
+}
+
+/// Dial `addr` and remember the attempt until it ends, as a connection or as an error.
+///
+/// `dialed_links` learns an address only once its connection is up, and the first redial tick
+/// fires the moment the service starts — before the startup dial of the seed has become a
+/// connection. So that tick dialed the seed a second time, and every operator node held two links
+/// to the hub (measured in the production-topology test, #236): harmless until a link dies on one
+/// side only, when the hub then holds two dead halves and turns every redial away (#232).
+fn dial_tracked(
+    swarm: &mut libp2p::Swarm<HelixBehaviour>,
+    addr: Multiaddr,
+    pending: &mut HashMap<libp2p::swarm::ConnectionId, Multiaddr>,
+) {
+    let opts = libp2p::swarm::dial_opts::DialOpts::unknown_peer_id()
+        .address(addr.clone())
+        .build();
+    let id = opts.connection_id();
+    if swarm.dial(opts).is_ok() {
+        pending.insert(id, addr);
+    }
 }
 
 /// Everything to dial on one tick while this node has no connection at all (backlog #196): every
