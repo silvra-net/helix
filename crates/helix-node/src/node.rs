@@ -2616,6 +2616,31 @@ fn genesis_validator_of(store: &HelixDb) -> Option<Address> {
     store.get_block_by_height(0).ok().map(|b| b.header.validator)
 }
 
+/// Whether `block` was built on the state this node holds (#194) — the one check a node can make
+/// against its *own* execution of the chain. Callers ask only when `block` follows the height the
+/// state was executed to; anywhere else the two roots belong to different heights.
+///
+/// Both bulk paths apply it to the first block of each batch — the P2P block-sync and the RPC
+/// sync. That is enough: once the starting state agrees, every state after it is determined by
+/// execution, and a disagreement later in a batch is caught as the first block of the next one.
+fn check_builds_on_our_state(chain_state: &ChainState, block: &Block) -> Result<(), String> {
+    let ours = chain_state.state_hash();
+    if block.header.prev_state_root == ours {
+        return Ok(());
+    }
+    Err(format!(
+        "block {} was built on state {} but this node computed {} for height {}. Either this node \
+         executed the chain wrongly — in which case no peer can serve it and it needs its data \
+         rebuilt — or this peer is on another history, or this build follows different rules \
+         than the chain it syncs (a development build against the public network). Each is a \
+         reason to apply nothing.",
+        block.height(),
+        block.header.prev_state_root,
+        ours,
+        chain_state.applied_height,
+    ))
+}
+
 /// Verify a batch of blocks offered by a peer *before* a single one of them is written (#138).
 ///
 /// The whole batch rests on one proof: a BFT quorum certificate for its **last** block. Given an
@@ -2670,19 +2695,7 @@ fn verify_block_batch(
     // Skipped whenever the parent height is not the one this node has executed — the store can sit
     // ahead of the executed state for the moment between writing a block and stamping it.
     if chain_state.applied_height + 1 == expected_first_height {
-        let ours = chain_state.state_hash();
-        if first.header.prev_state_root != ours {
-            return Err(format!(
-                "block {} was built on state {} but this node computed {} for height {}. \
-                 Either this node executed the chain wrongly — in which case no peer can serve it \
-                 and it needs its data rebuilt — or this peer is on another history. Both are \
-                 reasons to apply nothing.",
-                first.height(),
-                first.header.prev_state_root,
-                ours,
-                chain_state.applied_height,
-            ));
-        }
+        check_builds_on_our_state(chain_state, first)?;
     }
 
     let mut expected_prev = expected_prev_hash;
@@ -6440,6 +6453,19 @@ async fn sync_blocks_from_peer(
                     total_applied
                 );
             }
+            // The first block of each batch has to build on the state this node holds — the rule
+            // the P2P block-sync applies too. Without it this path executed the whole history on
+            // whatever rules this build has, and a node whose execution disagreed with the chain's
+            // (#145, or a development build against the public network) synced to a wrong state
+            // without a word, to fail later somewhere that no longer names the cause.
+            if idx == 0 && chain_state.applied_height + 1 == h {
+                if let Err(why) = check_builds_on_our_state(chain_state, block) {
+                    store.save_chain_state(chain_state)?;
+                    anyhow::bail!(
+                        "{why} — aborting sync, {total_applied} block(s) already applied"
+                    );
+                }
+            }
             // A self-consistent signature only proves the embedded public key matches
             // the declared `validator` address, not that this address held any stake
             // at the time. Check it against the stakers recorded in `chain_state` as
@@ -6802,6 +6828,16 @@ mod sync_blocks_from_peer_tests {
         block
     }
 
+    /// `signed_block`, built on `state` — the root the sync checks on the first block of a batch
+    /// (#194). For hand-built blocks whose test is about something else; the chain builders below
+    /// compute the roots themselves.
+    fn signed_block_on(kp: &KeyPair, height: u64, prev_hash: Hash, state: &ChainState) -> Block {
+        let mut block = signed_block(kp, height, prev_hash);
+        block.header.prev_state_root = state.state_hash();
+        block.header.signature = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
+        block
+    }
+
     /// A store holding a genesis block signed by `kp` — which is what every real node has, and
     /// what the bootstrap window measures its anchor against (`bootstrap_verdict`).
     ///
@@ -6842,13 +6878,23 @@ mod sync_blocks_from_peer_tests {
     }
 
     /// Builds `heights.len()` blocks that properly chain from `Hash::ZERO` (a
-    /// fresh store's initial tip) through each other in order.
+    /// fresh store's initial tip) through each other in order, on the state `base` — the one the
+    /// syncing node starts from.
     ///
     /// Each block carries a commit certificate for its predecessor, as a real chain does — the
     /// sync path verifies a block's quorum from its successor's `last_commit` (#136), so blocks
     /// without one describe a chain that could never have been produced.
-    fn chained_blocks(kp: &KeyPair, heights: &[u64]) -> Vec<Block> {
-        chained_blocks_certified_by(kp, &[kp], heights)
+    fn chained_blocks(kp: &KeyPair, heights: &[u64], base: &ChainState) -> Vec<Block> {
+        chained_blocks_certified_by(kp, &[kp], heights, base)
+    }
+
+    /// The state most sync tests start from: nothing but `stakers`, staked.
+    fn staked_state(total_supply: u64, stakers: &[&KeyPair]) -> ChainState {
+        let mut state = ChainState::new(total_supply);
+        for kp in stakers {
+            stake_validator(&mut state, kp);
+        }
+        state
     }
 
     /// `chained_blocks_certified_by`, but the **first** block declares `parent_state_root` as the
@@ -6893,27 +6939,9 @@ mod sync_blocks_from_peer_tests {
         proposer: &KeyPair,
         certifiers: &[&KeyPair],
         heights: &[u64],
+        base: &ChainState,
     ) -> Vec<Block> {
-        let mut prev_hash = Hash::ZERO;
-        let mut prev_height: Option<u64> = None;
-        heights
-            .iter()
-            .map(|&h| {
-                let mut block = signed_block(proposer, h, prev_hash);
-                if let Some(ph) = prev_height {
-                    block.header.last_commit = certifiers
-                        .iter()
-                        .map(|c| commit_sig_for(c, ph, &prev_hash))
-                        .collect();
-                    // Re-sign: the certificate is folded into the header's signing hash.
-                    block.header.signature =
-                        proposer.sign(block.header.signing_hash().as_bytes()).unwrap();
-                }
-                prev_hash = block.hash();
-                prev_height = Some(h);
-                block
-            })
-            .collect()
+        chained_blocks_with_short_certificates(proposer, certifiers, heights, &[], base)
     }
 
     /// Like `chained_blocks_certified_by`, but the certificate for every height named in
@@ -6924,31 +6952,62 @@ mod sync_blocks_from_peer_tests {
     /// it holds for that block, and on the live chain on 2026-08-27 that was one signature on
     /// **20 % of all blocks**. A sync path that demands a quorum from every single block therefore
     /// refuses a perfectly honest chain.
+    ///
+    /// **Every block carries the state root a node that started from `base` holds on reaching
+    /// it**, computed by executing the blocks on a copy of `base` with the `execute_block` the
+    /// sync runs. The RPC sync checks that root (#194), and a fixture with made-up roots would
+    /// fail for a reason no test is about — or pass a rejection test for the wrong reason.
     fn chained_blocks_with_short_certificates(
         proposer: &KeyPair,
         certifiers: &[&KeyPair],
         heights: &[u64],
         short_for: &[u64],
+        base: &ChainState,
     ) -> Vec<Block> {
-        let mut prev_hash = Hash::ZERO;
-        let mut prev_height: Option<u64> = None;
-        heights
-            .iter()
-            .map(|&h| {
-                let mut block = signed_block(proposer, h, prev_hash);
-                if let Some(ph) = prev_height {
-                    let signers: &[&KeyPair] =
-                        if short_for.contains(&ph) { &certifiers[..1] } else { certifiers };
-                    block.header.last_commit =
-                        signers.iter().map(|c| commit_sig_for(c, ph, &prev_hash)).collect();
-                    block.header.signature =
-                        proposer.sign(block.header.signing_hash().as_bytes()).unwrap();
-                }
-                prev_hash = block.hash();
-                prev_height = Some(h);
-                block
-            })
-            .collect()
+        let mut state = base.clone();
+        let mut tip = (Hash::ZERO, None);
+        extend_chain(proposer, certifiers, heights, short_for, &mut state, &mut tip)
+    }
+
+    /// The builder the others use: blocks at `heights` on top of `tip` (hash and height of the
+    /// block before), executed on `state` as they are built, so each carries the root the syncing
+    /// node holds on reaching it. Both are left where the chain ends — a test that changes the
+    /// state between two stretches (a `Stake` modelled directly, say) continues from there with
+    /// the same change applied here.
+    fn extend_chain(
+        proposer: &KeyPair,
+        certifiers: &[&KeyPair],
+        heights: &[u64],
+        short_for: &[u64],
+        state: &mut ChainState,
+        tip: &mut (Hash, Option<u64>),
+    ) -> Vec<Block> {
+        let (mut prev_hash, mut prev_height) = *tip;
+        let mut blocks = Vec::with_capacity(heights.len());
+        for &h in heights {
+            let mut block = genesis_block(
+                Address::from_public_key(&proposer.public),
+                proposer.public.clone(),
+                Sig::from_bytes(vec![]),
+                0,
+            );
+            block.header.height = h;
+            block.header.prev_hash = prev_hash;
+            block.header.prev_state_root = state.state_hash();
+            if let Some(ph) = prev_height {
+                let signers: &[&KeyPair] =
+                    if short_for.contains(&ph) { &certifiers[..1] } else { certifiers };
+                block.header.last_commit =
+                    signers.iter().map(|c| commit_sig_for(c, ph, &prev_hash)).collect();
+            }
+            block.header.signature = proposer.sign(block.header.signing_hash().as_bytes()).unwrap();
+            helix_executor::execute_block(state, &block);
+            prev_hash = block.hash();
+            prev_height = Some(h);
+            blocks.push(block);
+        }
+        *tip = (prev_hash, prev_height);
+        blocks
     }
 
     /// A peer that answers both halves of a snapshot sync: the stored snapshot at a height, and
@@ -7429,10 +7488,65 @@ mod sync_blocks_from_peer_tests {
         chain_state.set_validator_key(&addr, kp.public.clone());
     }
 
+    /// A peer whose chain was built on another state is refused at its first block, with nothing
+    /// applied — the check the P2P block-sync always made and this path did not (#194).
+    #[tokio::test]
+    async fn a_chain_built_on_another_state_is_refused_before_anything_is_applied() {
+        let kp = KeyPair::generate();
+        let stranger = KeyPair::generate();
+        // The peer's chain starts from a state with one more staker than this node holds.
+        let blocks = chained_blocks(&kp, &[1, 2, 3], &staked_state(0, &[&kp, &stranger]));
+        let peer_url = serve_blocks(blocks).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(staked_state(0, &[&kp])));
+        let err = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state)
+            .await
+            .expect_err("a chain built on another state must not be applied");
+
+        assert!(err.to_string().contains("was built on state"), "{err}");
+        assert!(err.to_string().contains("0 block(s) already applied"), "{err}");
+        assert_eq!(store.read().await.latest_height(), 0, "nothing may be applied");
+    }
+
+    /// Execution that disagrees *part-way* — the case of a build with other rules than the chain
+    /// it syncs: both start from the same state, and the peer's chain carries a change from its
+    /// middle on that this node's execution does not produce. Before, the sync ran to the tip on
+    /// the wrong state without a word. Now it stops at the next batch it fetches.
+    #[tokio::test]
+    async fn a_sync_whose_execution_parts_from_the_chain_stops_instead_of_reaching_the_tip() {
+        let kp = KeyPair::generate();
+        let other = KeyPair::generate();
+        let base = staked_state(0, &[&kp]);
+        let heights: Vec<u64> = (1..=helix_consensus::EPOCH_LENGTH * 4).collect();
+        let (first, second) = heights.split_at((helix_consensus::EPOCH_LENGTH * 2) as usize);
+        let mut state = base.clone();
+        let mut tip = (Hash::ZERO, None);
+        let mut blocks = extend_chain(&kp, &[&kp], first, &[], &mut state, &mut tip);
+        // What this node's execution will never produce: a stake that appears in the peer's state
+        // halfway through, as if the two ran different rules from here on.
+        stake_validator(&mut state, &other);
+        blocks.extend(extend_chain(&kp, &[&kp], second, &[], &mut state, &mut tip));
+        let peer_url = serve_blocks(blocks).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(base));
+        let err = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state)
+            .await
+            .expect_err("a sync whose states part from the chain's must not complete");
+
+        assert!(err.to_string().contains("was built on state"), "{err}");
+        let reached = store.read().await.latest_height();
+        assert!(
+            reached < helix_consensus::EPOCH_LENGTH * 4,
+            "the sync reached the tip at {reached} on a state the chain never had"
+        );
+    }
+
     #[tokio::test]
     async fn applies_all_validly_signed_blocks() {
         let kp = KeyPair::generate();
-        let blocks = chained_blocks(&kp, &[1, 2, 3]);
+        let blocks = chained_blocks(&kp, &[1, 2, 3], &staked_state(0, &[&kp]));
         let peer_url = serve_blocks(blocks).await;
 
         let store = Arc::new(RwLock::new(fresh_store()));
@@ -7469,22 +7583,24 @@ mod sync_blocks_from_peer_tests {
         // genesis window defers everyone once, then a real rotation promotes the joiner. Every
         // block is produced by the genesis validator, exactly as a real solo chain looks right up
         // to the joiner's activation.
-        let heights: Vec<u64> = (1..=helix_consensus::EPOCH_LENGTH * 2).collect();
-        let blocks = chained_blocks(&genesis_kp, &heights);
-        let peer_url = serve_blocks(blocks).await;
-
         // The joiner's node state: both validators are staked (the joiner's `Stake` tx is already
         // part of the chain it is about to sync). The genesis validator has been active since
         // block 0 (`Genesis::apply` seeds `active_validators`), so it holds its seat across the
-        // rotations while the joiner walks the tiers.
-        let store = Arc::new(RwLock::new(fresh_store()));
-        let chain_state = {
+        // rotations while the joiner walks the tiers. Built first: the blocks carry the state
+        // roots a node starting from it computes (#194).
+        let base = {
             let mut cs = ChainState::new(0);
             stake_validator(&mut cs, &genesis_kp);
             stake_validator(&mut cs, &joiner_kp);
             cs.active_validators.insert(genesis_addr.clone());
-            Arc::new(RwLock::new(cs))
+            cs
         };
+        let heights: Vec<u64> = (1..=helix_consensus::EPOCH_LENGTH * 2).collect();
+        let blocks = chained_blocks(&genesis_kp, &heights, &base);
+        let peer_url = serve_blocks(blocks).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(base));
 
         // The engine the joiner built at startup, before it was ever active: the bootstrap
         // fallback set (just the genesis validator it syncs behind), with itself as its identity.
@@ -7581,15 +7697,9 @@ mod sync_blocks_from_peer_tests {
         // Certified by both sitting validators: with A and B equally weighted, one precommit is
         // half the power and short of quorum — a real chain's `last_commit` carries both.
         let certifiers = [&genesis_kp, &kp_b];
-        let (phase1, phase2): (Vec<Block>, Vec<Block>) =
-            chained_blocks_certified_by(&genesis_kp, &certifiers, &heights)
-            .into_iter()
-            .partition(|b| b.height() <= helix_consensus::EPOCH_LENGTH * 2);
-        let peer1 = serve_blocks(phase1).await;
-        let peer2 = serve_blocks(phase2).await;
-
-        let store = Arc::new(RwLock::new(fresh_store()));
-        let chain_state = {
+        // The joiner's state, built first: the blocks carry the state roots a node starting from
+        // it computes (#194).
+        let base = {
             let mut cs = ChainState::new(0);
             stake_validator(&mut cs, &genesis_kp); // A
             stake_validator(&mut cs, &kp_b); // B — C is deliberately NOT staked yet
@@ -7597,8 +7707,21 @@ mod sync_blocks_from_peer_tests {
             // `active_validators`) — the realistic state a third operator joins into.
             cs.active_validators.insert(addr_a.clone());
             cs.active_validators.insert(addr_b.clone());
-            Arc::new(RwLock::new(cs))
+            cs
         };
+        // Two stretches, with C's `Stake` between them — the test applies it to the node's state
+        // directly before phase 2, and the blocks of phase 2 were built on a chain that has it.
+        let (first, second) = heights.split_at((helix_consensus::EPOCH_LENGTH * 2) as usize);
+        let mut state = base.clone();
+        let mut tip = (Hash::ZERO, None);
+        let phase1 = extend_chain(&genesis_kp, &certifiers, first, &[], &mut state, &mut tip);
+        stake_validator(&mut state, &kp_c);
+        let phase2 = extend_chain(&genesis_kp, &certifiers, second, &[], &mut state, &mut tip);
+        let peer1 = serve_blocks(phase1).await;
+        let peer2 = serve_blocks(phase2).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(base));
         // C's engine at startup: the bootstrap fallback set (just the validator it syncs behind),
         // with its own identity. C is a plain follower so far, in nobody's set.
         let stale = ValidatorSet::new(vec![Validator::new(addr_a.clone(), 1_000_000, false)], 0);
@@ -7723,7 +7846,8 @@ mod sync_blocks_from_peer_tests {
         let kp = KeyPair::generate();
         let addr = Address::from_public_key(&kp.public);
         // Block 2 is tampered with, so the sync applies block 1 and then aborts.
-        let mut blocks = chained_blocks(&kp, &[1, 2]);
+        let mut blocks =
+            chained_blocks(&kp, &[1, 2], &staked_state(TOTAL_SUPPLY_HLX * NANO_PER_HLX, &[&kp]));
         blocks[1].header.height = 99;
         let peer_url = serve_blocks(blocks.clone()).await;
 
@@ -7887,7 +8011,7 @@ mod sync_blocks_from_peer_tests {
     #[tokio::test]
     async fn an_aborted_sync_reports_how_many_blocks_it_really_applied() {
         let kp = KeyPair::generate();
-        let mut blocks = chained_blocks(&kp, &[1, 2, 3, 4]);
+        let mut blocks = chained_blocks(&kp, &[1, 2, 3, 4], &staked_state(0, &[&kp]));
         // Block 4 is signed by nobody in the set — the sync must stop there, having applied 1-3.
         let stranger = KeyPair::generate();
         blocks[3] = signed_block(&stranger, 4, blocks[2].hash());
@@ -7922,7 +8046,12 @@ mod sync_blocks_from_peer_tests {
     async fn the_chain_tip_is_certified_from_the_peers_tip_certificate() {
         let a = KeyPair::generate();
         let b = KeyPair::generate();
-        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
+        let blocks = chained_blocks_certified_by(
+            &a,
+            &[&a, &b],
+            &[1, 2, 3],
+            &staked_state(0, &[&a, &b]),
+        );
         let peer_url = serve_blocks_with_tip_certificate(blocks, &[&a, &b]).await;
 
         let store = Arc::new(RwLock::new(fresh_store()));
@@ -7955,7 +8084,12 @@ mod sync_blocks_from_peer_tests {
     async fn a_tip_whose_certificate_is_short_of_quorum_is_applied_with_a_warning() {
         let a = KeyPair::generate();
         let b = KeyPair::generate();
-        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
+        let blocks = chained_blocks_certified_by(
+            &a,
+            &[&a, &b],
+            &[1, 2, 3],
+            &staked_state(0, &[&a, &b]),
+        );
         // Tip certificate signed by A alone — half the power, short of the threshold.
         let peer_url = serve_blocks_with_tip_certificate(blocks, &[&a]).await;
 
@@ -7984,7 +8118,12 @@ mod sync_blocks_from_peer_tests {
         let b = KeyPair::generate();
 
         let short = {
-            let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
+            let blocks = chained_blocks_certified_by(
+                &a,
+                &[&a, &b],
+                &[1, 2, 3],
+                &staked_state(0, &[&a, &b]),
+            );
             let peer = serve_blocks_with_tip_certificate(blocks, &[&a]).await;
             let store = Arc::new(RwLock::new(fresh_store()));
             let cs = Arc::new(RwLock::new(ChainState::new(0)));
@@ -7996,7 +8135,12 @@ mod sync_blocks_from_peer_tests {
         };
 
         let none = {
-            let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3]);
+            let blocks = chained_blocks_certified_by(
+                &a,
+                &[&a, &b],
+                &[1, 2, 3],
+                &staked_state(0, &[&a, &b]),
+            );
             // `serve_blocks` has no `/sync/tip-certificate` route at all — the peer serves none.
             let peer = serve_blocks(blocks).await;
             let store = Arc::new(RwLock::new(fresh_store()));
@@ -8040,7 +8184,13 @@ mod sync_blocks_from_peer_tests {
         let b = KeyPair::generate();
         // Heights 2 and 4 are certified by one signer only — short of the two-validator quorum.
         let blocks =
-            chained_blocks_with_short_certificates(&a, &[&a, &b], &[1, 2, 3, 4, 5, 6], &[2, 4]);
+            chained_blocks_with_short_certificates(
+                &a,
+                &[&a, &b],
+                &[1, 2, 3, 4, 5, 6],
+                &[2, 4],
+                &staked_state(0, &[&a, &b]),
+            );
         let peer_url = serve_blocks_with_tip_certificate(blocks, &[&a, &b]).await;
 
         let store = Arc::new(RwLock::new(fresh_store()));
@@ -8069,11 +8219,17 @@ mod sync_blocks_from_peer_tests {
 
         // Heights 1..5. Every certificate is a real quorum except the one for height 3, so the
         // last block a successor certifies is height 4 — index 3.
-        let blocks = chained_blocks_with_short_certificates(&a, &[&a, &b], &[1, 2, 3, 4, 5], &[3]);
+        let blocks = chained_blocks_with_short_certificates(
+            &a,
+            &[&a, &b],
+            &[1, 2, 3, 4, 5],
+            &[3],
+            &ChainState::new(0),
+        );
         assert_eq!(last_quorum_certified_index(&blocks, &chain_state), Some(3));
 
         // Nothing certified at all: the caller must refuse the batch rather than apply any of it.
-        let unproven = chained_blocks_certified_by(&a, &[&a], &[1, 2, 3]);
+        let unproven = chained_blocks_certified_by(&a, &[&a], &[1, 2, 3], &ChainState::new(0));
         assert_eq!(
             last_quorum_certified_index(&unproven, &chain_state),
             None,
@@ -8217,7 +8373,12 @@ mod sync_blocks_from_peer_tests {
     async fn the_compact_encoding_yields_byte_identical_blocks() {
         let a = KeyPair::generate();
         let b = KeyPair::generate();
-        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3, 4, 5]);
+        let blocks = chained_blocks_certified_by(
+            &a,
+            &[&a, &b],
+            &[1, 2, 3, 4, 5],
+            &staked_state(0, &[&a, &b]),
+        );
         let expected: Vec<Hash> = blocks.iter().map(|blk| blk.hash()).collect();
         let (peer_url, asked) = serve_blocks_counting_encoding(blocks, true).await;
 
@@ -8246,7 +8407,12 @@ mod sync_blocks_from_peer_tests {
         let b = KeyPair::generate();
         // Long enough to need several batches, so "asked once" is a real claim.
         let heights: Vec<u64> = (1..=450).collect();
-        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &heights);
+        let blocks = chained_blocks_certified_by(
+            &a,
+            &[&a, &b],
+            &heights,
+            &staked_state(0, &[&a, &b]),
+        );
         let (peer_url, asked) = serve_blocks_counting_encoding(blocks, false).await;
 
         let store = Arc::new(RwLock::new(fresh_store()));
@@ -8273,7 +8439,12 @@ mod sync_blocks_from_peer_tests {
 
         // Well-formed blocks, correctly chained, signed by a genuine set member — but certified
         // only by itself.
-        let blocks = chained_blocks_certified_by(&attacker, &[&attacker], &[1, 2, 3]);
+        let blocks = chained_blocks_certified_by(
+            &attacker,
+            &[&attacker],
+            &[1, 2, 3],
+            &staked_state(0, &[&attacker, &honest]),
+        );
         let peer_url = serve_blocks(blocks).await;
 
         let store = Arc::new(RwLock::new(fresh_store()));
@@ -8303,7 +8474,12 @@ mod sync_blocks_from_peer_tests {
     async fn an_honestly_certified_chain_still_syncs() {
         let a = KeyPair::generate();
         let b = KeyPair::generate();
-        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &[1, 2, 3, 4, 5]);
+        let blocks = chained_blocks_certified_by(
+            &a,
+            &[&a, &b],
+            &[1, 2, 3, 4, 5],
+            &staked_state(0, &[&a, &b]),
+        );
         let peer_url = serve_blocks(blocks).await;
 
         let store = Arc::new(RwLock::new(fresh_store()));
@@ -8324,7 +8500,7 @@ mod sync_blocks_from_peer_tests {
     #[tokio::test]
     async fn rejects_tampered_block_and_aborts_cleanly() {
         let kp = KeyPair::generate();
-        let mut blocks = chained_blocks(&kp, &[1, 2, 3]);
+        let mut blocks = chained_blocks(&kp, &[1, 2, 3], &staked_state(0, &[&kp]));
         blocks[1].header.height = 99; // invalidates the signature without re-signing
         let peer_url = serve_blocks(blocks).await;
 
@@ -8360,7 +8536,7 @@ mod sync_blocks_from_peer_tests {
         // proposer signed this node's genesis block, not because nobody has staked.
         let kp = KeyPair::generate();
         let (db, genesis_hash) = store_with_genesis_by(&kp);
-        let blocks = vec![signed_block(&kp, 1, genesis_hash)];
+        let blocks = vec![signed_block_on(&kp, 1, genesis_hash, &ChainState::new(0))];
         let peer_url = serve_blocks(blocks).await;
 
         let store = Arc::new(RwLock::new(db));
@@ -8404,7 +8580,7 @@ mod sync_blocks_from_peer_tests {
         // with no stake must still be rejected — the bootstrap fallback above only ever
         // applies while stakers() is genuinely empty, not as a general bypass.
         let real_kp = KeyPair::generate();
-        let block1 = signed_block(&real_kp, 1, Hash::ZERO);
+        let block1 = signed_block_on(&real_kp, 1, Hash::ZERO, &staked_state(0, &[&real_kp]));
         let attacker_kp = KeyPair::generate();
         let mut block2 = signed_block(&attacker_kp, 2, block1.hash());
         // Block 2 certifies block 1 honestly — otherwise block 1 is rejected for want of a quorum
@@ -8431,7 +8607,7 @@ mod sync_blocks_from_peer_tests {
         // Both blocks are validly signed by a real staker, but block 2's prev_hash
         // doesn't match block 1's actual hash (e.g. peer serving a different branch).
         let kp = KeyPair::generate();
-        let block1 = signed_block(&kp, 1, Hash::ZERO);
+        let block1 = signed_block_on(&kp, 1, Hash::ZERO, &staked_state(0, &[&kp]));
         let mut non_chaining_block2 = signed_block(&kp, 2, Hash::ZERO); // should be block1.hash()
         // Certifies block 1, so this test reaches the continuity check rather than stopping at
         // block 1 for want of a quorum (#136).
@@ -11057,9 +11233,16 @@ mod handle_p2p_event_tests {
         // (`bootstrap_verdict`), which is what a real node in this situation also has.
         let (db, genesis_hash) = store_with_genesis_by(&kp);
         let mut prev_hash = genesis_hash;
+        // The first block names the state this node starts from — the gap is filled through the
+        // RPC sync, which checks it (#194).
+        let starting_root = ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX).state_hash();
         let chained: Vec<Block> = (1u64..=3)
             .map(|h| {
-                let b = signed_block(&kp, h, prev_hash);
+                let mut b = signed_block(&kp, h, prev_hash);
+                if h == 1 {
+                    b.header.prev_state_root = starting_root;
+                    b.header.signature = kp.sign(b.header.signing_hash().as_bytes()).unwrap();
+                }
                 prev_hash = b.hash();
                 b
             })

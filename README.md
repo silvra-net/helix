@@ -172,6 +172,28 @@ cargo build --release
 # single binary: target/release/helix (node + client)
 ```
 
+**`master` is ahead of the public network.** It carries the next version's rules — changes to
+consensus, state and transaction format that the running chain does not have. A node built from
+`master` and pointed at the public network verifies the genesis and starts syncing, and as soon
+as the state it computes parts from the chain's it stops with an error that says so; a validator
+running it drops out of the set. To **join the public network**, build the release it runs:
+
+```bash
+git checkout v0.15.2   # the latest release tag
+cargo build --release
+```
+
+To **try `master`**, run it on a chain of its own — a single node:
+
+```bash
+HELIX_NEW_CHAIN=1 ./target/release/helix start
+```
+
+or several on one machine, each in its own directory with its own ports, pointing the others
+at the first with `HELIX_SYNC_PEER=http://127.0.0.1:<its RPC port>` (see
+[running a node](docs/running-a-node.md) for the settings). The public network moves to the
+new rules with the next release, together with a reset.
+
 ---
 
 ## Desktop wallet
