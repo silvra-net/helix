@@ -640,6 +640,8 @@ impl P2PService {
         // Connected peers whose topic subscriptions have not arrived yet, and since when (#232) —
         // see `peers_without_subscriptions`.
         let mut subscription_watch = tokio::time::interval(SUBSCRIPTION_WATCH_INTERVAL);
+        // Messages gossipsub had to drop per peer, reported at most once a minute each.
+        let mut slow_peers = SlowPeerLog::default();
         let mut awaiting_subscriptions: HashMap<PeerId, std::time::Instant> = HashMap::new();
 
         loop {
@@ -1021,6 +1023,23 @@ impl P2PService {
                         )) => {
                             for (peer_id, _) in peers {
                                 swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                            }
+                        }
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Gossipsub(
+                            gossipsub::Event::SlowPeer { peer_id, failed_messages },
+                        )) => {
+                            let dropped = failed_messages.priority + failed_messages.non_priority;
+                            if let Some(total) =
+                                slow_peers.note(peer_id, dropped, std::time::Instant::now())
+                            {
+                                warn!(
+                                    peer = %peer_id,
+                                    dropped = total,
+                                    "Messages to this peer were dropped — its send queue was full \
+                                     or they waited too long to go out. The link to it is not \
+                                     keeping up with what this node sends, and votes and proposals \
+                                     share that queue with transactions"
+                                );
                             }
                         }
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Ping(ping::Event {
@@ -2336,6 +2355,43 @@ fn peer_departed(remaining_connections: u32, was_announced: bool) -> bool {
     remaining_connections == 0 && was_announced
 }
 
+/// How often a peer whose messages gossipsub keeps dropping is reported, at most.
+const SLOW_PEER_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Messages gossipsub dropped on their way to a peer, per peer, reported at most once per
+/// `SLOW_PEER_REPORT_INTERVAL`.
+///
+/// gossipsub 0.48+ bounds each connection's send queue and drops what waits too long (own
+/// publishes after 5 s, forwarded messages after 1 s), and says so once a heartbeat as `SlowPeer`.
+/// That is the signal #224 had to be reconstructed without: a link that cannot carry what this
+/// node sends, where a vote waits behind transactions and may be the message that is dropped. It
+/// comes every second while it lasts, so it is summed here and spoken once a minute — the first
+/// time at once, because the first sighting is the news.
+#[derive(Default)]
+struct SlowPeerLog {
+    peers: HashMap<PeerId, (usize, Option<std::time::Instant>)>,
+}
+
+impl SlowPeerLog {
+    /// Add `dropped` for `peer`; the total to report, if it is time to report one.
+    fn note(&mut self, peer: PeerId, dropped: usize, now: std::time::Instant) -> Option<usize> {
+        if dropped == 0 {
+            return None;
+        }
+        let (pending, last) = self.peers.entry(peer).or_insert((0, None));
+        *pending += dropped;
+        let due =
+            last.is_none_or(|at| now.saturating_duration_since(at) >= SLOW_PEER_REPORT_INTERVAL);
+        if !due {
+            return None;
+        }
+        let total = *pending;
+        *pending = 0;
+        *last = Some(now);
+        Some(total)
+    }
+}
+
 /// How long a connected peer may stay without a single known topic subscription before its
 /// connection is taken for broken (#232). A healthy peer's subscriptions are its first message on
 /// a new connection and arrive within a round trip; this is twenty seconds of that.
@@ -2961,6 +3017,49 @@ mod peer_departure_tests {
     fn a_peer_we_never_announced_is_never_reported_gone() {
         assert!(!peer_departed(0, false));
         assert!(!peer_departed(2, false));
+    }
+}
+
+#[cfg(test)]
+mod slow_peer_log_tests {
+    use super::{SlowPeerLog, SLOW_PEER_REPORT_INTERVAL};
+    use libp2p::PeerId;
+    use std::time::{Duration, Instant};
+
+    /// The first sighting is the news and is reported at once; after that, once a minute with
+    /// everything dropped in between — never lost, never every second.
+    #[test]
+    fn a_slow_peer_is_reported_at_once_then_once_a_minute_with_the_sum() {
+        let peer = PeerId::random();
+        let mut log = SlowPeerLog::default();
+        let t0 = Instant::now();
+        assert_eq!(log.note(peer, 3, t0), Some(3));
+        assert_eq!(log.note(peer, 5, t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.note(peer, 7, t0 + Duration::from_secs(30)), None);
+        assert_eq!(log.note(peer, 1, t0 + SLOW_PEER_REPORT_INTERVAL), Some(13));
+    }
+
+    #[test]
+    fn peers_are_reported_separately() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let mut log = SlowPeerLog::default();
+        let t0 = Instant::now();
+        assert_eq!(log.note(a, 1, t0), Some(1));
+        assert_eq!(
+            log.note(b, 2, t0),
+            Some(2),
+            "one peer's report must not silence another's"
+        );
+    }
+
+    /// A heartbeat with nothing dropped is not a report and does not start the clock.
+    #[test]
+    fn nothing_dropped_is_nothing_to_say() {
+        let peer = PeerId::random();
+        let mut log = SlowPeerLog::default();
+        let t0 = Instant::now();
+        assert_eq!(log.note(peer, 0, t0), None);
+        assert_eq!(log.note(peer, 4, t0 + Duration::from_secs(1)), Some(4));
     }
 }
 
