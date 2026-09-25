@@ -8,6 +8,12 @@ description = "ZK-STARK Proof of Personhood for Helix validators — winterfell-
 
 [dependencies]
 winterfell.workspace = true
+# The proof-context type and its serialisation, which `winterfell` does not re-export — needed to
+# compare a proof's header against the one this crate's prover writes before anything else reads
+# the proof (see `verify_personhood`). Pinned to the exact versions `winterfell` 0.13.1 uses, both
+# already in the tree through it.
+winter-air = "=0.13.1"
+winter-utils = "=0.13.1"
 serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true
