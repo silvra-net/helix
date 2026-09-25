@@ -107,7 +107,6 @@ pub trait RoundProvider: Send + Sync + 'static {
 #[derive(Debug, Clone, Default)]
 pub struct RoundSyncCodec;
 
-#[async_trait::async_trait]
 impl request_response::Codec for RoundSyncCodec {
     type Protocol = StreamProtocol;
     type Request = RoundSyncRequest;

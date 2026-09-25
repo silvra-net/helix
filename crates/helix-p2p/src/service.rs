@@ -2691,21 +2691,18 @@ fn forwarding_of(message: Option<&Gossiped>) -> Forwarding {
     }
 }
 
-/// Tell gossipsub whether a message may be forwarded. `Ok(false)` means it is no longer cached —
-/// it aged out before a verdict came — and there is nothing left to forward or lose.
+/// Tell gossipsub whether a message may be forwarded. A `false` back means it is no longer cached
+/// — it aged out before a verdict came — and there is nothing left to forward or lose.
 fn report_forwarding(
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
     message_id: &gossipsub::MessageId,
     propagation_source: &PeerId,
     acceptance: gossipsub::MessageAcceptance,
 ) {
-    if let Err(e) = swarm
+    let _still_cached = swarm
         .behaviour_mut()
         .gossipsub
-        .report_message_validation_result(message_id, propagation_source, acceptance)
-    {
-        debug!(error = ?e, "Forwarding a checked message failed");
-    }
+        .report_message_validation_result(message_id, propagation_source, acceptance);
 }
 
 /// A height the *sender* provably holds, for `peer_tips`. A committed block is the sender's own
@@ -4680,7 +4677,7 @@ mod proposal_reoffer_tests {
     /// like a success would silently cost the cold-start round the re-offer exists for.
     #[test]
     fn a_proposal_that_reached_nobody_must_be_offered_again() {
-        assert!(!proposal_reached_the_network(&Err(PublishError::InsufficientPeers)));
+        assert!(!proposal_reached_the_network(&Err(PublishError::NoPeersSubscribedToTopic)));
         assert!(!proposal_reached_the_network(&Err(PublishError::MessageTooLarge)));
         assert!(!proposal_reached_the_network(&Err(PublishError::TransformFailed(
             std::io::Error::other("transform"),

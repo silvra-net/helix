@@ -75,7 +75,7 @@ tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"]
 rustix = { version = "1.1", features = ["fs"] }
 
 # P2P networking
-libp2p = { version = "0.54", features = [
+libp2p = { version = "0.57", features = [
     "tcp", "noise", "yamux",
     "gossipsub", "mdns",
     "tokio", "dns", "macros",
@@ -93,11 +93,6 @@ libp2p = { version = "0.54", features = [
     # every connection is what lets both sides give it up.
     "ping",
 ] }
-void = "1"
-# Required to implement libp2p's `request_response::Codec`, which is declared `#[async_trait]`
-# (#138). Already in the tree as a transitive dependency of libp2p-request-response, so this only
-# makes an existing dependency direct.
-async-trait = "0.1"
 
 # Wallet encryption
 aes-gcm = "0.10"

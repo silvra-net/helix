@@ -114,7 +114,6 @@ pub trait GenesisProvider: Send + Sync + 'static {
 #[derive(Debug, Clone, Default)]
 pub struct GenesisCodec;
 
-#[async_trait::async_trait]
 impl request_response::Codec for GenesisCodec {
     type Protocol = StreamProtocol;
     type Request = GenesisRequest;

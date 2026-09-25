@@ -109,7 +109,6 @@ pub trait BlockProvider: Send + Sync + 'static {
 #[derive(Debug, Clone, Default)]
 pub struct BlockSyncCodec;
 
-#[async_trait::async_trait]
 impl request_response::Codec for BlockSyncCodec {
     type Protocol = StreamProtocol;
     type Request = BlockSyncRequest;

@@ -98,7 +98,7 @@ impl IpConnLimiter {
 
 impl NetworkBehaviour for IpConnLimiter {
     type ConnectionHandler = dummy::ConnectionHandler;
-    type ToSwarm = void::Void;
+    type ToSwarm = std::convert::Infallible;
 
     fn handle_pending_inbound_connection(
         &mut self,
@@ -190,7 +190,7 @@ impl NetworkBehaviour for IpConnLimiter {
         _connection_id: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
-        void::unreachable(event)
+        match event {}
     }
 
     fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
