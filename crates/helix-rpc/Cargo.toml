@@ -27,6 +27,8 @@ bincode.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Already in the tree through reqwest's gzip; here to read a compressed answer back in a test.
+flate2 = "1"
 
 # Unix only: its sole use is `statvfs` for the diagnostics endpoint, and rustix configures its
 # `fs` module out on Windows — declaring the dependency there would pull a crate whose only
