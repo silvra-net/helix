@@ -179,11 +179,28 @@ const RPC_SYNC_POLL_SECS: u64 = 4;
 /// immediately when no round is in flight.
 const RPC_CATCHUP_ROUND_GRACE_BLOCKS: u64 = 3;
 
-/// True for the truthy env/config spellings `1`/`true`/`yes`/`on` (case-insensitive) — the
-/// same set already accepted for `HELIX_P2P_DISABLE_MDNS`, factored out so the new
-/// `HELIX_NEW_CHAIN` flag reads identically.
-fn flag_is_truthy(v: &str) -> bool {
-    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+/// A yes/no setting: `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`/empty, in any case. `None`
+/// for anything else — `ture`, `enabled`, `y` — which [`flag_setting`] reads as "no", out loud.
+fn flag_value(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" | "" => Some(false),
+        _ => None,
+    }
+}
+
+/// Reads the yes/no setting `name`. An unrecognised spelling counts as "no", as it always did, but
+/// is no longer silent: `HELIX_NEW_CHAIN=ture` sends a node that was meant to start its own chain
+/// onto the public network, and the operator should read why in the first lines of the log.
+fn flag_setting(name: &str, v: &str) -> bool {
+    flag_value(v).unwrap_or_else(|| {
+        warn!(
+            value = %v,
+            "{name} is not a yes/no value (1/true/yes/on or 0/false/no/off) — reading it as \
+             \"no\""
+        );
+        false
+    })
 }
 
 /// The file the validator keypair lives in: an explicit `HELIX_VALIDATOR_KEY` /
@@ -837,7 +854,7 @@ impl HelixNode {
         // (potentially themselves) the public network.
         let new_chain = config::resolve("HELIX_NEW_CHAIN", &cfg.new_chain)
             .as_deref()
-            .map(flag_is_truthy)
+            .map(|v| flag_setting("HELIX_NEW_CHAIN", v))
             .unwrap_or(false);
         let sync_peer = config::resolve("HELIX_SYNC_PEER", &cfg.sync_peer).or_else(|| {
             if new_chain {
@@ -1107,7 +1124,7 @@ impl HelixNode {
         // live production node), where mDNS would otherwise cross-wire the two and drown
         // each in the other's incompatible-height gossip. See `P2PConfig::enable_mdns`.
         if let Some(v) = config::resolve("HELIX_P2P_DISABLE_MDNS", &cfg.p2p_disable_mdns) {
-            if flag_is_truthy(&v) {
+            if flag_setting("HELIX_P2P_DISABLE_MDNS", &v) {
                 info!("mDNS LAN discovery disabled — relying on seed peers + peer exchange only");
                 p2p_config.enable_mdns = false;
             }
@@ -12992,5 +13009,31 @@ mod p2p_address_setting_tests {
         let msg =
             announced_public_addr("/ip4/203.0.113.7/tcpp/8546", 8546).unwrap_err().to_string();
         assert!(msg.contains("not an address peers can dial"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod flag_setting_tests {
+    use super::*;
+
+    #[test]
+    fn yes_and_no_are_read_in_every_spelling_the_docs_accept() {
+        for yes in ["1", "true", "TRUE", " yes ", "On"] {
+            assert_eq!(flag_value(yes), Some(true), "{yes:?}");
+        }
+        for no in ["0", "false", "No", "off", "", "  "] {
+            assert_eq!(flag_value(no), Some(false), "{no:?}");
+        }
+    }
+
+    /// Unrecognised is not "no" in disguise: it is the case that gets a warning, and still reads
+    /// as "no", which is what it always read as.
+    #[test]
+    fn an_unrecognised_spelling_is_told_apart_and_still_reads_as_no() {
+        for odd in ["ture", "enabled", "y", "2"] {
+            assert_eq!(flag_value(odd), None, "{odd:?}");
+            assert!(!flag_setting("HELIX_TEST_FLAG", odd), "{odd:?}");
+        }
+        assert!(flag_setting("HELIX_TEST_FLAG", "yes"));
     }
 }
