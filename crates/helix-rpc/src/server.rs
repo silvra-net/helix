@@ -439,9 +439,13 @@ async fn get_block_by_hash(
 async fn get_blocks_range(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, u64>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let from = params.get("from").copied().unwrap_or(0);
     let count = params.get("count").copied().unwrap_or(100).min(500);
+    let _permit = match heavy_response_permit().await {
+        Ok(permit) => permit,
+        Err(busy) => return busy,
+    };
     let store = state.store.read().await;
     let mut blocks = Vec::with_capacity(count as usize);
     for h in from..from.saturating_add(count) {
@@ -450,7 +454,79 @@ async fn get_blocks_range(
             Err(_) => break, // reached tip — stop silently
         }
     }
-    (StatusCode::OK, Json(json!(blocks)))
+    // Serialized straight from the structs, not through `json!` — see `get_sync_blocks`.
+    (StatusCode::OK, Json(blocks)).into_response()
+}
+
+/// How many large answers — a block range, a bincode block batch — this node builds at once.
+///
+/// Each one holds its blocks in memory while it is being built, and these endpoints need no
+/// account and cost the asker nothing: without a bound, memory was whatever the number of
+/// parallel requests made it. Measured 2026-09-25 on a local node with near-empty blocks: ten
+/// parallel JSON batches took it from 51 MB to 573 MB. Requests beyond this wait for a place
+/// instead of being turned away — a node that already runs a syncing client falls back to JSON on
+/// any error from the bincode path, so a refusal would push it onto the more expensive answer.
+static HEAVY_RESPONSES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// How long a request waits for one of those places before it is told to come back.
+const HEAVY_RESPONSE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn heavy_response_permit(
+) -> Result<tokio::sync::SemaphorePermit<'static>, axum::response::Response> {
+    permit_or_busy(&HEAVY_RESPONSES, HEAVY_RESPONSE_WAIT).await
+}
+
+/// A place in `places`, waiting up to `wait` for one — or the answer that says to come back.
+async fn permit_or_busy(
+    places: &tokio::sync::Semaphore,
+    wait: std::time::Duration,
+) -> Result<tokio::sync::SemaphorePermit<'_>, axum::response::Response> {
+    match tokio::time::timeout(wait, places.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            Json(json!({ "error": "busy serving block batches — retry in a few seconds" })),
+        )
+            .into_response()),
+    }
+}
+
+/// The JSON answer to `/sync/blocks`, written one block at a time.
+///
+/// Built whole, this was the most expensive thing a stranger could ask this node for:
+/// `Json(json!(blocks))` turned the batch into a `serde_json::Value` tree first, in which every
+/// byte of every signature and public key is a node of its own — measured at 35 times the blocks'
+/// size, 62 MB for 200 near-empty blocks (#237). Streamed, a request holds one block at a time,
+/// whatever the block size and however many are asked for. The bytes are the same JSON array a
+/// client has always parsed; only the order of keys inside an object may differ, which no JSON
+/// reader depends on.
+fn stream_blocks_json(store: Arc<RwLock<HelixDb>>, from: u64, count: u64) -> axum::body::Body {
+    let end = from.saturating_add(count);
+    // (next height, nothing written yet, finished)
+    let chunks = futures_util::stream::unfold((from, true, false), move |(height, first, done)| {
+        let store = store.clone();
+        async move {
+            if done {
+                return None;
+            }
+            let block = if height < end {
+                store.read().await.get_block_by_height(height).ok()
+            } else {
+                None
+            };
+            let Some(block) = block else {
+                let close: &[u8] = if first { b"[]" } else { b"]" };
+                return Some((Ok::<_, std::io::Error>(close.to_vec()), (height, false, true)));
+            };
+            let mut chunk = vec![if first { b'[' } else { b',' }];
+            if let Err(e) = serde_json::to_writer(&mut chunk, &block) {
+                return Some((Err(std::io::Error::other(e)), (height, false, true)));
+            }
+            Some((Ok(chunk), (height.saturating_add(1), false, false)))
+        }
+    });
+    axum::body::Body::from_stream(chunks)
 }
 
 /// Full block download for node sync — returns raw `Block` structs as JSON.
@@ -665,15 +741,21 @@ async fn get_sync_blocks(
     let count: u64 =
         params.get("count").and_then(|v| v.parse().ok()).unwrap_or(200).min(200);
     let binary = params.get("encoding").map(String::as_str) == Some("bincode");
-    let store = state.store.read().await;
-    let mut blocks: Vec<Block> = Vec::with_capacity(count as usize);
-    for h in from..from.saturating_add(count) {
-        match store.get_block_by_height(h) {
-            Ok(block) => blocks.push(block),
-            Err(_) => break,
-        }
-    }
     if binary {
+        // Bincode opens with the number of blocks, so this answer is built whole — at about the
+        // blocks' own size, and one of a bounded number at a time.
+        let _permit = match heavy_response_permit().await {
+            Ok(permit) => permit,
+            Err(busy) => return busy,
+        };
+        let store = state.store.read().await;
+        let mut blocks: Vec<Block> = Vec::with_capacity(count as usize);
+        for h in from..from.saturating_add(count) {
+            match store.get_block_by_height(h) {
+                Ok(block) => blocks.push(block),
+                Err(_) => break,
+            }
+        }
         // A serialization failure here is not worth failing the request over: answering JSON is
         // always correct, just larger, and the caller handles both.
         if let Ok(bytes) = bincode::serialize(&blocks) {
@@ -685,7 +767,12 @@ async fn get_sync_blocks(
                 .into_response();
         }
     }
-    (StatusCode::OK, Json(json!(blocks))).into_response()
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        stream_blocks_json(state.store.clone(), from, count),
+    )
+        .into_response()
 }
 
 /// The whole chain state, so a joining node can start from it instead of replaying every block.
@@ -781,6 +868,11 @@ async fn get_state_snapshot(
     // above it, and it can only do that for a height that stands still. The live tip moves while
     // the joiner is checking it, so it can never be named by a checkpoint.
     let asked: Option<u64> = params.get("height").and_then(|v| v.trim().parse().ok());
+    // A copy of the whole state per request, and the state grows with every account anyone opens.
+    let _permit = match heavy_response_permit().await {
+        Ok(permit) => permit,
+        Err(busy) => return busy,
+    };
     if let Some(h) = asked {
         let stored = { state.store.read().await.state_snapshot_at_or_before(h) };
         return match stored {
@@ -3543,6 +3635,85 @@ mod tests {
 
         let response = get_sync_blocks(State(state), Query(params)).await;
         assert_eq!(response.into_response().status(), StatusCode::OK);
+    }
+
+    async fn sync_blocks_json(state: &AppState, from: u64, count: u64) -> (axum::response::Response, Vec<Block>) {
+        let mut params = std::collections::HashMap::new();
+        params.insert("from".to_string(), from.to_string());
+        params.insert("count".to_string(), count.to_string());
+        let response = get_sync_blocks(State(state.clone()), Query(params)).await;
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let blocks: Vec<Block> = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("not a JSON block array ({e}): {:?}", String::from_utf8_lossy(&bytes)));
+        (axum::response::Response::from_parts(parts, axum::body::Body::empty()), blocks)
+    }
+
+    /// The streamed answer is the array a client has always parsed, for every length — empty,
+    /// one block, and a request reaching past the tip.
+    #[tokio::test]
+    async fn a_streamed_block_batch_is_a_json_array_of_every_length() {
+        let state = fresh_test_state_with_blocks(5).await;
+        let (response, none) = sync_blocks_json(&state, 1_000, 10).await;
+        assert!(none.is_empty());
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let (_, one) = sync_blocks_json(&state, 2, 1).await;
+        assert_eq!(one.iter().map(|b| b.header.height).collect::<Vec<_>>(), vec![2]);
+        let (_, past_tip) = sync_blocks_json(&state, 3, 100).await;
+        assert_eq!(past_tip.iter().map(|b| b.header.height).collect::<Vec<_>>(), vec![3, 4, 5]);
+    }
+
+    /// The JSON batch is written a block at a time, not built whole (#237): the response is ready
+    /// while a writer holds the store, because no block has been read yet. An answer built in
+    /// memory first would wait for the lock here.
+    #[tokio::test]
+    async fn the_json_block_batch_reads_its_blocks_as_it_writes_them() {
+        let state = fresh_test_state_with_blocks(5).await;
+        let writer = state.store.clone();
+        let held = writer.write().await;
+        let mut params = std::collections::HashMap::new();
+        params.insert("from".to_string(), "1".to_string());
+        params.insert("count".to_string(), "5".to_string());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            get_sync_blocks(State(state.clone()), Query(params)),
+        )
+        .await
+        .expect("the answer waited for the store — it was built before it was sent");
+        drop(held);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let blocks: Vec<Block> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(blocks.len(), 5);
+    }
+
+    /// A request beyond the places waits for one rather than being turned away — a refusal would
+    /// push an existing client onto its more expensive JSON fallback — and only a wait that runs
+    /// out is answered with "come back", and says when.
+    #[tokio::test]
+    async fn a_heavy_request_waits_for_a_place_and_is_told_to_return_only_when_none_frees() {
+        let places = tokio::sync::Semaphore::new(1);
+        let taken = places.acquire().await.unwrap();
+
+        let busy = permit_or_busy(&places, std::time::Duration::from_millis(50))
+            .await
+            .expect_err("no place was free");
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.headers().get(axum::http::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
+
+        let (got, ()) = tokio::join!(
+            permit_or_busy(&places, std::time::Duration::from_secs(5)),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                drop(taken);
+            }
+        );
+        assert!(got.is_ok(), "a place freed during the wait must be handed over");
     }
 
     /// The compact encoding must be the *same blocks*, not merely a smaller answer — a transport
