@@ -21,6 +21,13 @@ const RECOVERY_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("recove
 /// same reason as everything else here: a block's `CommitSig`s no longer carry the key, so a node
 /// that cannot look one up after a restart could not verify a single commit certificate.
 const VALIDATOR_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("validator_keys");
+/// The key each address derives from, once it has signed with it — see
+/// `ChainState::account_keys` (#243). Without the table a restarted node would know none of them,
+/// refuse every block whose transactions leave their key out, and fall off the chain. Entries are
+/// never removed (exactly one key derives an address), so it needs none of the stale-row pruning
+/// the removable tables below have — and it is written only for addresses it does not yet hold,
+/// since every entry is ~2 KB and rewriting all of them per block would dwarf everything else.
+const ACCOUNT_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("account_keys");
 const PROPOSALS: TableDefinition<u64, &[u8]> = TableDefinition::new("proposals");
 const PERSONHOOD_COMMITMENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("personhood_commitments");
 /// "{validator}:{height}:{round}" → already-slashed double-sign incidents.
@@ -256,6 +263,7 @@ impl HelixDb {
         tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(VALIDATOR_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(ACCOUNT_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -402,6 +410,7 @@ impl HelixDb {
             let mut recovery_requests = tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut recovery_keys = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut validator_keys = tx.open_table(VALIDATOR_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut account_keys = tx.open_table(ACCOUNT_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut proposals = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut personhood_commitments = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut slashed_double_sign_incidents = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -484,6 +493,19 @@ impl HelixDb {
                 let encoded = bincode::serialize(key)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 validator_keys.insert(addr.as_str(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+            for (addr, key) in &state.account_keys {
+                let known = account_keys
+                    .get(addr.as_str())
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .is_some();
+                if known {
+                    continue;
+                }
+                let encoded = bincode::serialize(key)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                account_keys.insert(addr.as_str(), encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
             for (id, proposal) in &state.proposals {
@@ -750,6 +772,7 @@ impl HelixDb {
         let recovery_requests_table = tx.open_table(RECOVERY_REQUESTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let recovery_keys_table = tx.open_table(RECOVERY_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         let validator_keys_table = tx.open_table(VALIDATOR_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
+        let account_keys_table = tx.open_table(ACCOUNT_KEYS).map_err(|e| StorageError::Db(e.to_string()))?;
         let proposals_table = tx.open_table(PROPOSALS).map_err(|e| StorageError::Db(e.to_string()))?;
         let personhood_commitments_table = tx.open_table(PERSONHOOD_COMMITMENTS).map_err(|e| StorageError::Db(e.to_string()))?;
         let slashed_double_sign_incidents_table = tx.open_table(SLASHED_DOUBLE_SIGN_INCIDENTS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -827,6 +850,14 @@ impl HelixDb {
             let key = bincode::deserialize(v.value())
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             validator_keys.insert(k.value().to_string(), key);
+        }
+
+        let mut account_keys = std::collections::HashMap::new();
+        for entry in account_keys_table.iter().map_err(|e| StorageError::Db(e.to_string()))? {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let key = bincode::deserialize(v.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            account_keys.insert(k.value().to_string(), key);
         }
 
         let mut proposals = std::collections::HashMap::new();
@@ -1030,6 +1061,7 @@ impl HelixDb {
 
         Ok(ChainState {
             validator_keys,
+            account_keys,
             chain_id,
             accounts,
             applied_height,
@@ -1692,7 +1724,7 @@ mod tests {
             crypto_version: Default::default(),
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: PublicKey::from_bytes(vec![]),
+            public_key: Some(PublicKey::from_bytes(vec![])),
         }
     }
 
@@ -2710,6 +2742,31 @@ mod tests {
             !loaded.reward_addresses.contains_key(&addr(3).to_string()),
             "a cleared reward address came back after reopening"
         );
+        assert_eq!(loaded.state_hash(), state.state_hash(), "and the reloaded state is the same state");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #243: a key on record survives a restart. Without it the restarted node would refuse
+    /// every block carrying a transaction that left its key out — the rest of the network applies
+    /// it — and fall off the chain the moment it came back.
+    #[test]
+    fn a_recorded_account_key_survives_reopening() {
+        let (db, path) = fresh_db();
+        let kp = helix_crypto::KeyPair::generate();
+        let owner = Address::from_public_key(&kp.public);
+        let mut state = ChainState::new(1_000_000);
+        state.record_account_key(&owner, &kp.public);
+        db.save_chain_state(&state).unwrap();
+        // Saved again with nothing new: the table is written only for addresses it lacks, and
+        // skipping must not lose the one it has.
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert_eq!(loaded.account_key(&owner), Some(&kp.public));
         assert_eq!(loaded.state_hash(), state.state_hash(), "and the reloaded state is the same state");
 
         let _ = std::fs::remove_file(&path);

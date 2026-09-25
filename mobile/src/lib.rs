@@ -176,7 +176,7 @@ pub fn sign_transaction(seed: Vec<u8>, tx: UnsignedTx) -> Result<SignedTx, Mobil
         crypto_version: keypair.scheme,
         chain_id,
         signature: Signature::from_bytes(vec![]),
-        public_key: keypair.public.clone(),
+        public_key: Some(keypair.public.clone()),
     };
     let hash = signed.signing_hash();
     signed.signature = keypair

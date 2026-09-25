@@ -15,7 +15,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/blocks/latest` | Latest block with full transaction list |
 | GET | `/blocks/height/:n` | Block by height |
 | GET | `/blocks/height/:n/header` | Header only (for light clients) |
-| GET | `/blocks/height/:n/proof/:tx_hash` | Merkle inclusion proof for a transaction |
+| GET | `/blocks/height/:n/proof/:tx_hash` | Merkle inclusion proof for a transaction — replay it from the returned `leaf_hash`, not from `tx_hash` (see Transaction Format) |
 | GET | `/blocks/hash/:hash` | Block by hash |
 | GET | `/blocks/range` | Range of blocks (`?from=&count=`) — display view, per-tx status included; not the sync path (see `/sync/blocks`) |
 | GET | `/accounts/:address` | Balance, staked amount, nonce — 400 on invalid address format |
@@ -215,7 +215,7 @@ when asking for help without having to read through it first.
 ### Transaction Format
 
 Transactions are signed ML-DSA (or SPHINCS+) objects. The signing hash is
-`BLAKE3(bincode::serialize(TxPayload))`, where `TxPayload` excludes `signature` and
+`BLAKE3("helix-tx-v1:" ‖ bincode(TxPayload))`, where `TxPayload` excludes `signature` and
 `public_key`.
 
 ```json
@@ -244,6 +244,20 @@ Transactions are signed ML-DSA (or SPHINCS+) objects. The signing hash is
   fundings of 2026-08-07 came out byte-identical to those of the 2026-08-05 reset
 - Minimum fee: 1,000 nano-HLX
 - The mempool validates the signature before accepting
+- `public_key` may be `null` once the chain knows the sender's key. The first transaction an
+  address signs puts the key it derives from on record; after that a node keeps the transaction
+  **without** the key, so blocks carry each ~2 KB key once instead of once per transaction (#243).
+  Wallets can keep sending it — a node strips it, and one that does not know the key yet needs
+  it. A socially recovered account signs with its recovery key, and a transaction without a key
+  is checked against that one, never against the key on record. Nodes gossip every transaction
+  **with** its key, so each peer checks it against nothing but its own bytes
+- The **transaction id** (`tx_hash`) is `BLAKE3("helix-txid-v1:" ‖ signing hash ‖ signature)` —
+  independent of `public_key`, so the id a wallet is given at submission is the id the block
+  carries. A block's `merkle_root` is over each transaction's **leaf hash**,
+  `BLAKE3("helix-txleaf-v1:" ‖ bincode(transaction))`, which does cover whether the key is
+  there: the base fee is charged per byte of what the block carries, so the header has to pin
+  that form. `GET /blocks/height/:n/proof/:tx_hash` returns both, and a proof is replayed from
+  `leaf_hash`
 
 Wallets take the chain id from a compiled-in constant when talking to the public endpoint, and
 from the endpoint itself only when you named it (your own node, a devnet). That asymmetry is

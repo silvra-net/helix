@@ -1022,6 +1022,7 @@ async fn get_tx_proof(
         StatusCode::OK,
         Json(json!(TxProofResponse {
             tx_hash: tx_hash_hex,
+            leaf_hash: block.transactions[index].leaf_hash().to_hex(),
             block_height: block.height(),
             block_hash: block.hash().to_hex(),
             merkle_root: block.header.merkle_root.to_hex(),
@@ -1900,13 +1901,16 @@ fn read_kb_field(path: &str, field: &str) -> u64 {
 
 async fn submit_transaction(
     State(state): State<AppState>,
-    Json(tx): Json<Transaction>,
+    Json(mut tx): Json<Transaction>,
 ) -> impl IntoResponse {
     let tx_hash = tx.hash().to_hex();
-    let (recovery_key, can_pay, chain_id, account_nonce) = {
+    let (recovery_key, recorded_key, can_pay, chain_id, account_nonce) = {
         let chain = state.chain_state.read().await;
         (
             chain.recovery_key(&tx.from).cloned(),
+            // The key the chain holds for the sender, if it has seen it sign (#243): what lets
+            // the pool store this transaction without its own, and lets a wallet leave it out.
+            chain.account_key(&tx.from).cloned(),
             helix_executor::can_pay_fee(&chain, &tx),
             chain.chain_id,
             // The nonce the executor will measure this transaction against. Read here, where the
@@ -1928,17 +1932,26 @@ async fn submit_transaction(
     // The signature before the pool's lock, never under it (#238): a proposer packing a block
     // waits for that lock behind every request queued before it, and a refused submission costs
     // its sender nothing.
-    let checked = match helix_mempool::CheckedSignature::check(tx.clone()) {
+    let keys = helix_mempool::SenderKeys { recovery: recovery_key.as_ref(), recorded: recorded_key.as_ref() };
+    let checked = match helix_mempool::CheckedSignature::check(tx.clone(), keys) {
         Ok(checked) => checked,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() })));
         }
     };
     let mut mempool = state.mempool.write().await;
-    let result = mempool.add_checked(checked, recovery_key.as_ref(), chain_id, Some(account_nonce));
+    let result = mempool.add_checked(checked, keys, chain_id, Some(account_nonce));
     drop(mempool);
     match result {
         Ok(()) => {
+            // Gossip travels with the key, always (#243): a peer then checks the transaction
+            // against nothing but its own bytes, and a forgery is the author's alone (#225) —
+            // which a peer could not tell apart from a key the chain changed a block ago if it
+            // had to use its own copy of the chain's. A wallet that left the key out gets it
+            // put back here, from the chain that just verified it.
+            if tx.public_key.is_none() {
+                tx.public_key = tx.signing_key(keys.recovery, keys.recorded).ok().cloned();
+            }
             // Gossip to the rest of the network — this node may never propose a block
             // itself (see AppState::p2p_command_tx's doc comment). Best-effort: a full
             // outbound command channel shouldn't fail the client's submission, since the
@@ -2081,7 +2094,7 @@ mod tests {
             chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
-            public_key: PublicKey::from_bytes(vec![]),
+            public_key: Some(PublicKey::from_bytes(vec![])),
         }
     }
 
@@ -2210,7 +2223,7 @@ mod tests {
             crypto_version: CryptoVersion::MlDsa,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
 
@@ -2283,7 +2296,7 @@ mod tests {
             crypto_version: CryptoVersion::MlDsa,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
 
@@ -2507,7 +2520,7 @@ mod tests {
         let alice = Address::from_public_key(&keypair.public);
         // Clearing the flat min_fee is not enough: a real ML-DSA-signed transfer is ~5.4 KB and
         // owes ~5410 nano at the base-fee floor alone.
-        let mut pending = Transaction { fee: 10_000, public_key: keypair.public.clone(), ..tx(&alice, &addr(2), 1, 0) };
+        let mut pending = Transaction { fee: 10_000, public_key: Some(keypair.public.clone()), ..tx(&alice, &addr(2), 1, 0) };
         pending.signature = keypair.sign(pending.signing_hash().as_bytes()).unwrap();
         let hash = pending.hash();
         state.mempool.write().await.add(pending, Hash::ZERO, None).unwrap();
@@ -2723,7 +2736,7 @@ mod tests {
         state.chain_state.write().await.update_account(&alice, |acc| acc.balance = 1_000_000);
         let mut forged = Transaction {
             fee: 10_000,
-            public_key: keypair.public.clone(),
+            public_key: Some(keypair.public.clone()),
             ..tx(&alice, &addr(2), 1, 0)
         };
         let mut signature = keypair.sign(forged.signing_hash().as_bytes()).unwrap().as_bytes().to_vec();
@@ -2775,7 +2788,7 @@ mod tests {
             // Clears the base fee for its own size, not merely Mempool's flat min_fee — that
             // distinction is what this comment used to get wrong, along with the rest of the suite.
             fee: 10_000,
-            public_key: keypair.public.clone(),
+            public_key: Some(keypair.public.clone()),
             ..tx(&alice, &bob, 1, 0)
         };
         submitted.signature = keypair.sign(submitted.signing_hash().as_bytes()).unwrap();
@@ -2790,6 +2803,90 @@ mod tests {
             }
             other => panic!("expected a BroadcastTransaction command, got {other:?}"),
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #243: the block commits to `leaf_hash`, not to the id, so the proof has to name the leaf
+    /// it starts from — a client replaying it from `tx_hash` would reject every honest proof.
+    /// Proven here for a transaction the block carries without its key, where the two differ.
+    #[tokio::test]
+    async fn a_tx_proof_starts_from_the_leaf_the_block_committed_to() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let bob = addr(2);
+        let mut stripped = tx(&alice, &bob, 10, 1);
+        stripped.public_key = None;
+        let id = stripped.hash();
+        let transactions = vec![tx(&alice, &bob, 10, 0), stripped.clone(), tx(&alice, &bob, 10, 2)];
+        let mut committed = block(7, &alice, transactions);
+        committed.header.merkle_root = helix_core::transactions_root(&committed.transactions);
+        let root = committed.header.merkle_root;
+        state.store.write().await.put_block(committed).unwrap();
+
+        let response = get_tx_proof(State(state), Path((7, id.to_hex()))).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let proof: TxProofResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(proof.tx_hash, id.to_hex());
+        assert_eq!(proof.leaf_hash, stripped.leaf_hash().to_hex());
+        assert_ne!(proof.leaf_hash, proof.tx_hash, "premise: without its key the two differ");
+
+        let steps: Vec<helix_crypto::MerkleProofStep> = proof
+            .proof
+            .iter()
+            .map(|step| helix_crypto::MerkleProofStep {
+                sibling: Hash::from_hex(&step.sibling).unwrap(),
+                sibling_is_right: step.sibling_is_right,
+            })
+            .collect();
+        let leaf = Hash::from_hex(&proof.leaf_hash).unwrap();
+        assert!(helix_crypto::verify_merkle_proof(leaf, &steps, root));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #243: a wallet may leave out a key the chain already holds. The pool stores the
+    /// transaction without it — that is what blocks carry — but the gossip carries it, put back
+    /// from the chain, so every peer checks it against the transaction's own bytes (#225). And a
+    /// sender the chain has never seen still has to send its key.
+    #[tokio::test]
+    async fn a_known_sender_may_leave_its_key_out_and_the_gossip_carries_it_anyway() {
+        let (state, path) = fresh_app_state();
+        let (p2p_command_tx, mut p2p_command_rx) = mpsc::channel(8);
+        let state = AppState { p2p_command_tx, ..state };
+
+        let keypair = KeyPair::generate();
+        let alice = Address::from_public_key(&keypair.public);
+        let bob = addr(2);
+        let sign = |nonce: u64| {
+            let mut t = Transaction { fee: 10_000, public_key: None, ..tx(&alice, &bob, 1, nonce) };
+            t.signature = keypair.sign(t.signing_hash().as_bytes()).unwrap();
+            t
+        };
+        state.chain_state.write().await.update_account(&alice, |acc| acc.balance = 1_000_000);
+
+        let refused = submit_transaction(State(state.clone()), Json(sign(0))).await.into_response();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "nothing on record yet");
+        assert!(p2p_command_rx.try_recv().is_err());
+
+        state.chain_state.write().await.record_account_key(&alice, &keypair.public);
+        let submitted = sign(0);
+        let id = submitted.hash();
+        let response = submit_transaction(State(state.clone()), Json(submitted)).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        match p2p_command_rx.try_recv() {
+            Ok(P2PCommand::BroadcastTransaction(broadcast)) => {
+                assert_eq!(broadcast.public_key.as_ref(), Some(&keypair.public), "gossip carries the key");
+                assert_eq!(broadcast.hash(), id);
+                assert!(broadcast.verify_own_signature().is_ok());
+            }
+            other => panic!("expected a BroadcastTransaction command, got {other:?}"),
+        }
+        let pooled = state.mempool.write().await.take(10, &|_| Some(0));
+        assert_eq!(pooled.len(), 1);
+        assert!(pooled[0].public_key.is_none(), "the pool keeps what the block will carry");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -3229,7 +3326,7 @@ mod tests {
             crypto_version: CryptoVersion::MlDsa,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         t.signature = kp.sign(t.signing_hash().as_bytes()).unwrap();
         let hash = t.hash();

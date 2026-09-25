@@ -228,7 +228,7 @@ async fn send(
         chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     };
 
     price_and_sign(&mut tx, fee, &kp, node).await?;
@@ -270,7 +270,7 @@ async fn simple_amount_tx(
         crypto_version: kp.scheme,
         chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     };
     price_and_sign(&mut tx, fee, &kp, node).await?;
 
@@ -304,7 +304,7 @@ async fn zero_amount_tx(
         crypto_version: kp.scheme,
         chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     };
     price_and_sign(&mut tx, fee, &kp, node).await?;
 
@@ -344,7 +344,7 @@ async fn targeted_amount_tx(
         crypto_version: kp.scheme,
         chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     };
     price_and_sign(&mut tx, fee, &kp, node).await?;
 
@@ -393,7 +393,7 @@ async fn redelegate(
         crypto_version: kp.scheme,
         chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     };
     price_and_sign(&mut tx, fee, &kp, node).await?;
 
@@ -434,7 +434,7 @@ async fn set_commission(
         crypto_version: kp.scheme,
         chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     };
     price_and_sign(&mut tx, fee, &kp, node).await?;
 
@@ -483,7 +483,7 @@ async fn set_reward_address(
         crypto_version: kp.scheme,
         chain_id: super::resolve_chain_id(node).await?,
         signature: Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     };
     price_and_sign(&mut tx, fee, &kp, node).await?;
 

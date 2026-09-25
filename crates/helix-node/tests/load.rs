@@ -39,6 +39,18 @@ impl NodeGuard {
             .map(|m| m.len())
             .unwrap_or(0)
     }
+
+    /// What the database has actually written, in 4 KB pages — not the file's length, which redb
+    /// grows in doubling steps and which therefore stands still across most writes. The length is
+    /// the right number for a promise about the file (the disk budget); for "what does one
+    /// transaction cost on disk" it is a staircase, and a flood that stays on one step reads as
+    /// costing nothing.
+    fn chain_db_allocated_bytes(&self) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(self._work_dir.path().join("helix-data.redb"))
+            .map(|m| m.blocks() * 512)
+            .unwrap_or(0)
+    }
 }
 
 impl Drop for NodeGuard {
@@ -137,7 +149,7 @@ fn signed_transfer(
         crypto_version: kp.scheme,
         chain_id,
         signature: helix_crypto::Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     };
     tx.signature = kp.sign(tx.signing_hash().as_bytes()).expect("sign at fee 0");
     let size = tx.size_bytes();
@@ -301,14 +313,27 @@ async fn a_flood_of_transactions_is_fully_accounted_for_and_never_overfills_a_bl
 
     // No block may exceed what the network can carry. A block over `MAX_BLOCK_BYTES` cannot be
     // gossiped, so it is not a lost block — it is a chain that stops (#163).
+    //
+    // Measured on the blocks themselves, not as `tx_count × tx_bytes`: since #243 a transaction
+    // from a sender the chain already knows is stored without its key, so the flood's later
+    // transactions are ~1.9 KB smaller than the first. Counting them all at full size reported
+    // 371 transactions as 2.02 MB — a block that really was under the cap.
     let mut largest = 0u64;
     let mut fullest = 0u64;
+    let mut without_key = 0u64;
     for h in start + 1..=end {
-        let block = get_json(&format!("http://127.0.0.1:{RPC_PORT}/blocks/height/{h}"))
-            .await
-            .expect("block");
-        let count = block["tx_count"].as_u64().unwrap_or(0);
-        let bytes = count * tx_bytes;
+        let fetched: Vec<helix_core::Block> = reqwest::get(format!(
+            "http://127.0.0.1:{RPC_PORT}/sync/blocks?from={h}&count=1"
+        ))
+        .await
+        .expect("block request")
+        .json()
+        .await
+        .expect("block");
+        let block = fetched.into_iter().next().expect("the block at this height");
+        let count = block.transactions.len() as u64;
+        let bytes = block.transaction_bytes();
+        without_key += block.transactions.iter().filter(|t| t.public_key.is_none()).count() as u64;
         largest = largest.max(bytes);
         fullest = fullest.max(count);
         assert!(
@@ -326,7 +351,7 @@ async fn a_flood_of_transactions_is_fully_accounted_for_and_never_overfills_a_bl
     let blocks = end - start;
     println!(
         "drained {FLOOD} transactions in {:.1}s over {blocks} blocks — {:.0} tx/s, fullest block \
-         {fullest} tx ({:.2} MB of a {:.0} MB cap)",
+         {fullest} tx ({:.2} MB of a {:.0} MB cap), {without_key} carried without their key",
         drained.as_secs_f64(),
         FLOOD as f64 / drained.as_secs_f64(),
         largest as f64 / 1e6,
@@ -482,12 +507,12 @@ async fn disk_cost_of_a_block_is_measured_empty_and_full() {
     // this window is the per-block floor — header, commit certificate, and whatever redb writes
     // to index them.
     let h0 = status().await.expect("status")["height"].as_u64().unwrap_or(0);
-    let d0 = node.chain_db_bytes();
+    let d0 = node.chain_db_allocated_bytes();
     while status().await.and_then(|s| s["height"].as_u64()).unwrap_or(0) < h0 + 30 {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let h1 = status().await.expect("status")["height"].as_u64().unwrap_or(0);
-    let d1 = node.chain_db_bytes();
+    let d1 = node.chain_db_allocated_bytes();
     let empty_per_block = (d1.saturating_sub(d0)) as f64 / (h1 - h0).max(1) as f64;
 
     // Then the same measurement with the blocks full.
@@ -507,7 +532,7 @@ async fn disk_cost_of_a_block_is_measured_empty_and_full() {
     assert!(accepted > FLOOD / 2, "only {accepted}/{FLOOD} accepted — the flood never happened");
 
     let h2 = status().await.expect("status")["height"].as_u64().unwrap_or(0);
-    let d2 = node.chain_db_bytes();
+    let d2 = node.chain_db_allocated_bytes();
     // Drain: wait until the mempool is empty, so every accepted transaction is on disk.
     for _ in 0..240 {
         if status().await.and_then(|s| s["mempool_size"].as_u64()).unwrap_or(1) == 0 {
@@ -518,10 +543,19 @@ async fn disk_cost_of_a_block_is_measured_empty_and_full() {
     // redb defers some of its writing; let it settle so the file reflects the data.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let h3 = status().await.expect("status")["height"].as_u64().unwrap_or(0);
-    let d3 = node.chain_db_bytes();
+    let d3 = node.chain_db_allocated_bytes();
 
     let loaded_blocks = (h3 - h2).max(1);
     let loaded_growth = d3.saturating_sub(d2);
+    // The premise, checked before a number is drawn from it. Measured on the file's length this
+    // read 0 B for 1500 transactions once #243 made them smaller: the flood stayed within one of
+    // redb's doubling steps, "0 B per transaction" passed the upper bound below, and the test
+    // said nothing while looking green.
+    assert!(
+        loaded_growth > 0,
+        "the database wrote nothing measurable for {accepted} transactions — the instrument saw no \
+         growth, so no cost per transaction can be read from it"
+    );
     let per_tx = loaded_growth.saturating_sub((empty_per_block * loaded_blocks as f64) as u64) as f64
         / accepted.max(1) as f64;
 
@@ -734,11 +768,17 @@ async fn a_disk_budget_stops_the_database_from_growing() {
 
     // Ten rounds, each writing a slice of the budget. Without pruning the file would run well past
     // it; with it, the window has to tighten and the file settle.
+    //
+    // 750 per round, not the 500 this started with: since #243 every transaction after the
+    // sender's first is stored without its key, ~3.5 KB instead of ~5.4 KB, and 5000 of them no
+    // longer carried the file past the budget — it stopped at 64.8 MB of 80, so there was nothing
+    // to prune, and the test blamed the prune loop.
+    const PER_ROUND: u64 = 750;
     for round in 0..10u64 {
-        let txs: Vec<Transaction> = (0..500)
+        let txs: Vec<Transaction> = (0..PER_ROUND)
             .map(|i| signed_transfer(&kp, &sender, &recipient, 1_000, nonce + i, chain_id, base_fee, FEE_HEADROOM_MULTIPLE))
             .collect();
-        nonce += 500;
+        nonce += PER_ROUND;
         for tx in &txs {
             let _ = submit(&client, tx).await;
         }
@@ -781,16 +821,19 @@ async fn a_disk_budget_stops_the_database_from_growing() {
     let height = status().await.and_then(|s| s["height"].as_u64()).unwrap_or(0);
     println!("peak file {:.1} MB · height {height} · earliest retained {earliest:?}", peak as f64 / 1048576.0);
 
+    // The premise, measured before anything is concluded from it: the budget only tightens the
+    // window once the file is past it, so a file that never got there shows nothing about pruning
+    // either way. Without this, a flood too small to matter reads as "the budget is not wired".
+    assert!(
+        peak > BUDGET_MB * 1024 * 1024,
+        "precondition: the file never passed the {BUDGET_MB} MB budget (peak {:.1} MB), so there was \
+         nothing to prune — the flood is too small to test the budget, which says nothing about it",
+        peak as f64 / 1048576.0
+    );
     assert!(
         earliest.is_some_and(|e| e > 0),
-        "the budget never pruned anything after two minutes of waiting — it is not wired to the \
-         prune loop at all (earliest={earliest:?}, height={height})"
-    );
-    // Written as tx rather than blocks: 5000 transactions at ~4.9 KB on disk is ~24 MB of payload
-    // alone, so a node that kept everything could not be under the budget by luck.
-    assert!(
-        nonce >= 5_000,
-        "precondition: the flood must exceed the budget several times over, sent {nonce}"
+        "the file passed the budget and nothing was pruned after two minutes of waiting — the \
+         budget is not wired to the prune loop (earliest={earliest:?}, height={height})"
     );
     let ceiling = BUDGET_MB * 1024 * 1024 * 2;
     assert!(

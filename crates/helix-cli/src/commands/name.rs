@@ -53,7 +53,7 @@ async fn register(name: String, signer: Signer, fee: Option<u64>, node: &str) ->
         chain_id: super::resolve_chain_id(node).await?,
 
         signature: Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     };
 
     price_and_sign(&mut tx, fee, &kp, node).await?;

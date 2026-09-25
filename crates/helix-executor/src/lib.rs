@@ -221,9 +221,9 @@ pub fn execute_transaction_metered(
     }
 
     // Signature first: an unsigned transaction is nobody's, so there is no one to charge.
-    if !verify_tx_signature(state, tx) {
+    let Some(records_key) = verify_tx_signature(state, tx) else {
         return Receipt::failure(tx_hash, "invalid signature", 0, 0);
-    }
+    };
 
     // EIP-1559: the transaction must be able to pay this block's base fee for its size, and
     // that portion of its fee is burned. A transaction that can't pay is not includable —
@@ -276,6 +276,15 @@ pub fn execute_transaction_metered(
             0,
             0,
         );
+    }
+
+    // From here the transaction applies, succeeding or charged, so the key it proved to derive
+    // its sender goes on record now and later transactions may leave it out (#243). Before the
+    // dispatch rather than after it: which executors run cannot matter to what the chain knows.
+    if records_key {
+        if let Some(key) = &tx.public_key {
+            state.record_account_key(&tx.from, key);
+        }
     }
 
     let receipt = match tx.tx_type {
@@ -377,25 +386,29 @@ pub fn can_pay_fee(state: &ChainState, tx: &Transaction) -> bool {
     state.get_or_default(&tx.from).balance >= tx.fee
 }
 
-/// Verify a transaction's signature, accounting for social recovery: if `tx.from`'s
-/// control was ever rotated by guardian quorum (see [`execute_approve_recovery`]), the
-/// active override key must have produced the signature — the address no longer needs to
-/// derive from `tx.public_key`, since that's the whole point of a recovered account.
-/// Otherwise this falls back to the normal address-derivation + ML-DSA check.
-fn verify_tx_signature(state: &ChainState, tx: &Transaction) -> bool {
-    match state.recovery_key(&tx.from) {
-        Some(active_key) => {
-            tx.public_key.as_bytes() == active_key.as_bytes()
-                && helix_crypto::verify_with_scheme(
-                    tx.crypto_version,
-                    active_key,
-                    tx.signing_hash().as_bytes(),
-                    &tx.signature,
-                )
-                .is_ok()
-        }
-        None => tx.verify_signature().is_ok(),
-    }
+/// Verify a transaction's signature against the key the chain says may sign for `tx.from` —
+/// see [`Transaction::signing_key`]: the active recovery key if the account was socially
+/// recovered (the address no longer needs to derive from it, which is the point of recovery),
+/// else the attached key if it derives the address, else the key on record (#243).
+///
+/// `None` if it does not verify. `Some(true)` if it verified under an attached key the chain has
+/// not recorded yet and that derives the sender — the one case in which applying the transaction
+/// puts a key on record.
+fn verify_tx_signature(state: &ChainState, tx: &Transaction) -> Option<bool> {
+    let recovery_key = state.recovery_key(&tx.from);
+    let recorded_key = state.account_key(&tx.from);
+    let key = tx.signing_key(recovery_key, recorded_key).ok()?;
+    tx.verify_signature_under(key).ok()?;
+    Some(recovery_key.is_none() && recorded_key.is_none() && tx.public_key.is_some())
+}
+
+/// The key `tx` was signed with, which `execute_transaction` has already verified. For the
+/// executors that keep it (`execute_stake`), since a transaction from a known sender need not
+/// carry one (#243).
+fn verified_signing_key(state: &ChainState, tx: &Transaction) -> PublicKey {
+    tx.signing_key(state.recovery_key(&tx.from), state.account_key(&tx.from))
+        .expect("execute_transaction verified the signature under this key before dispatching")
+        .clone()
 }
 
 fn execute_transfer(
@@ -470,10 +483,11 @@ fn execute_stake(
     }
 
     // Record the key this address signs with, so its future `CommitSig`s need not carry it.
-    // `verify_tx_signature` has already proved that `tx.public_key` derives `tx.from`, so this
+    // `verify_tx_signature` has already proved the signing key entitled to `tx.from`, so this
     // stores nothing that was taken on trust — and a consensus key can never differ from the one
     // the address derives, which is what makes the address a safe lookup handle.
-    state.set_validator_key(&tx.from, tx.public_key.clone());
+    let signing_key = verified_signing_key(state, tx);
+    state.set_validator_key(&tx.from, signing_key);
     state.update_account(&tx.from, |acc| {
         acc.balance -= total_cost;
         acc.staked += tx.amount;
@@ -2180,7 +2194,7 @@ mod tests {
             chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -2286,7 +2300,7 @@ mod tests {
             chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -2345,7 +2359,7 @@ mod tests {
             chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -2372,7 +2386,7 @@ mod tests {
             chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -2487,7 +2501,7 @@ mod tests {
             chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
-            public_key: new_kp.public.clone(),
+            public_key: Some(new_kp.public.clone()),
         };
         transfer_tx.signature = new_kp.sign(transfer_tx.signing_hash().as_bytes()).unwrap();
         let receipt = execute_transaction(&mut state, &transfer_tx, &validator, 3, 0);
@@ -2534,7 +2548,7 @@ mod tests {
             chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -2796,7 +2810,7 @@ mod tests {
             chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -3620,7 +3634,7 @@ mod tests {
             chain_id: helix_crypto::Hash::ZERO,
 
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -4312,7 +4326,7 @@ mod tests {
             crypto_version: kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -4424,7 +4438,7 @@ mod tests {
             crypto_version: kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -4745,7 +4759,7 @@ mod tests {
             crypto_version: kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -4999,7 +5013,7 @@ mod tests {
             crypto_version: reporter_kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: reporter_kp.public.clone(),
+            public_key: Some(reporter_kp.public.clone()),
         };
         tx.signature = reporter_kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -6106,7 +6120,7 @@ mod tests {
             crypto_version: kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -8014,6 +8028,164 @@ mod reward_address_tests {
         b.reward_addresses
             .insert(validator.to_string(), Address::from_public_key(&KeyPair::generate().public));
 
+        assert_ne!(a.state_hash(), b.state_hash());
+    }
+}
+
+#[cfg(test)]
+mod account_key_tests {
+    use super::tests::signed_tx;
+    use super::*;
+    use helix_crypto::KeyPair;
+
+    const HLX: u64 = 1_000_000_000;
+
+    fn funded_account(state: &mut ChainState, kp: &KeyPair) -> Address {
+        let addr = Address::from_public_key(&kp.public);
+        state.update_account(&addr, |acc| acc.balance = 1_000 * HLX);
+        addr
+    }
+
+    fn transfer(kp: &KeyPair, from: &Address, nonce: u64) -> Transaction {
+        let to = Address::from_public_key(&KeyPair::generate().public);
+        signed_tx(kp, from, TxType::Transfer, Some(to), HLX, vec![], nonce, 100_000)
+    }
+
+    fn without_key(mut tx: Transaction) -> Transaction {
+        tx.public_key = None;
+        tx
+    }
+
+    fn sink() -> Address {
+        Address::from_public_key(&KeyPair::generate().public)
+    }
+
+    /// #243, the premise: the first transaction an address signs puts its key on record, and from
+    /// then on a transaction from it verifies without carrying one.
+    #[test]
+    fn the_first_transaction_records_the_key_and_later_ones_may_leave_it_out() {
+        let kp = KeyPair::generate();
+        let mut state = ChainState::new(0);
+        let from = funded_account(&mut state, &kp);
+
+        // Positive control: before anything is on record, a transaction without a key is
+        // nobody's — refused, and nothing changes.
+        let early = without_key(transfer(&kp, &from, 0));
+        let before = state.state_hash();
+        let receipt = execute_transaction(&mut state, &early, &sink(), 0, 0);
+        assert!(!receipt.success);
+        assert_eq!(receipt.error.as_deref(), Some("invalid signature"));
+        assert_eq!(state.state_hash(), before, "a refused transaction changes nothing");
+
+        assert!(execute_transaction(&mut state, &transfer(&kp, &from, 0), &sink(), 0, 0).success);
+        assert_eq!(state.account_key(&from), Some(&kp.public), "its key is on record now");
+
+        let later = without_key(transfer(&kp, &from, 1));
+        let receipt = execute_transaction(&mut state, &later, &sink(), 1, 0);
+        assert!(receipt.success, "{:?}", receipt.error);
+        assert_eq!(state.get_or_default(&from).nonce, 2);
+    }
+
+    /// A transaction that applies records its key whether its operation succeeds or is charged
+    /// as a failure — both are the chain accepting that the sender signed it. One refused before
+    /// it applies (wrong nonce) records nothing: a refusal leaves the state untouched, and that
+    /// is what lets the executor refuse transactions no one pays for.
+    #[test]
+    fn a_charged_failure_records_the_key_and_a_refusal_does_not() {
+        let kp = KeyPair::generate();
+        let mut state = ChainState::new(0);
+        let from = funded_account(&mut state, &kp);
+
+        let wrong_nonce = transfer(&kp, &from, 7);
+        let before = state.state_hash();
+        assert!(!execute_transaction(&mut state, &wrong_nonce, &sink(), 0, 0).success);
+        assert_eq!(state.account_key(&from), None);
+        assert_eq!(state.state_hash(), before);
+
+        let to = Address::from_public_key(&KeyPair::generate().public);
+        let unaffordable = signed_tx(&kp, &from, TxType::Transfer, Some(to), 10_000 * HLX, vec![], 0, 100_000);
+        let receipt = execute_transaction(&mut state, &unaffordable, &sink(), 0, 0);
+        assert!(!receipt.success, "premise: the operation fails");
+        assert_eq!(state.get_or_default(&from).nonce, 1, "premise: and it is charged");
+        assert_eq!(state.account_key(&from), Some(&kp.public));
+    }
+
+    /// The base fee is charged per byte of what the block carries, so a transaction without its
+    /// key burns less — which is the point, and also what forces the block to commit to the form
+    /// (`Transaction::leaf_hash`).
+    #[test]
+    fn a_transaction_without_its_key_burns_the_base_fee_for_the_bytes_it_carries() {
+        let kp = KeyPair::generate();
+        let mut state = ChainState::new(0);
+        let from = funded_account(&mut state, &kp);
+        assert!(execute_transaction(&mut state, &transfer(&kp, &from, 0), &sink(), 0, 0).success);
+
+        let full = transfer(&kp, &from, 1);
+        let stripped = without_key(full.clone());
+        let receipt = execute_transaction(&mut state, &stripped, &sink(), 1, 3);
+        assert!(receipt.success, "{:?}", receipt.error);
+        assert_eq!(receipt.fee_burned, 3 * stripped.size_bytes());
+        assert!(receipt.fee_burned < 3 * full.size_bytes());
+    }
+
+    /// A recovered account signs with its recovery key, and a transaction without a key borrows
+    /// that one — never the original key on record, which recovery exists to retire. Nor does the
+    /// recovery key go on record: it does not derive the address, and the record is only ever
+    /// the key that does.
+    #[test]
+    fn a_recovered_account_resolves_to_its_recovery_key_and_never_records_it() {
+        let owner = KeyPair::generate();
+        let rescuer = KeyPair::generate();
+        let mut state = ChainState::new(0);
+        let from = funded_account(&mut state, &owner);
+        assert!(execute_transaction(&mut state, &transfer(&owner, &from, 0), &sink(), 0, 0).success);
+        state.set_recovery_key(&from, rescuer.public.clone());
+
+        let by_old_key = without_key(transfer(&owner, &from, 1));
+        assert!(
+            !execute_transaction(&mut state, &by_old_key, &sink(), 1, 0).success,
+            "the key on record must not outlive the recovery that retired it",
+        );
+
+        let by_rescuer = without_key(transfer(&rescuer, &from, 1));
+        let receipt = execute_transaction(&mut state, &by_rescuer, &sink(), 1, 0);
+        assert!(receipt.success, "{:?}", receipt.error);
+
+        let with_rescuer_key = transfer(&rescuer, &from, 2);
+        assert!(execute_transaction(&mut state, &with_rescuer_key, &sink(), 2, 0).success);
+        assert_eq!(state.account_key(&from), Some(&owner.public), "the record is still the address's own key");
+
+        // And an account recovered before it ever signed has nothing on record at all.
+        let fresh = KeyPair::generate();
+        let fresh_from = funded_account(&mut state, &fresh);
+        state.set_recovery_key(&fresh_from, rescuer.public.clone());
+        assert!(execute_transaction(&mut state, &transfer(&rescuer, &fresh_from, 0), &sink(), 3, 0).success);
+        assert_eq!(state.account_key(&fresh_from), None);
+    }
+
+    /// Staking records the consensus key, which later blocks' commit certificates are checked
+    /// against. From a stake without a key it has to come from the record, not from nowhere.
+    #[test]
+    fn a_stake_without_its_key_records_the_key_on_record_as_the_validator_key() {
+        let kp = KeyPair::generate();
+        let mut state = ChainState::new(0);
+        let from = funded_account(&mut state, &kp);
+        assert!(execute_transaction(&mut state, &transfer(&kp, &from, 0), &sink(), 0, 0).success);
+
+        let stake = without_key(signed_tx(&kp, &from, TxType::Stake, None, 100 * HLX, vec![], 1, 100_000));
+        let receipt = execute_transaction(&mut state, &stake, &sink(), 1, 0);
+        assert!(receipt.success, "{:?}", receipt.error);
+        assert_eq!(state.validator_key(&from), Some(&kp.public));
+    }
+
+    /// Which keys are on record decides which blocks verify, so it is consensus state: two nodes
+    /// that disagree about one must disagree about the state root too.
+    #[test]
+    fn the_state_hash_covers_the_keys_on_record() {
+        let kp = KeyPair::generate();
+        let a = ChainState::new(0);
+        let mut b = ChainState::new(0);
+        b.record_account_key(&Address::from_public_key(&kp.public), &kp.public);
         assert_ne!(a.state_hash(), b.state_hash());
     }
 }

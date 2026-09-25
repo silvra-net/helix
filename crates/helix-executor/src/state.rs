@@ -360,6 +360,20 @@ pub struct ChainState {
     /// Populated from the staking transaction, whose own signature check has already proved the
     /// key derives the sender — so nothing here is taken on trust that was not already required.
     pub validator_keys: HashMap<String, PublicKey>,
+    /// The key each address derives from, recorded the first time it signs a transaction that
+    /// carries it (#243) — what lets a transaction from a known sender travel without its
+    /// 1952-byte key (`Transaction::public_key`).
+    ///
+    /// Write-once by construction, and for a reason stronger than policy: exactly one key derives
+    /// a given address, so there is never a second value to record. Social recovery does not
+    /// change it — it changes which key is *entitled* to sign (`recovery_keys`, consulted first),
+    /// not which key the address comes from — which is why a recovered account never records its
+    /// recovery key here.
+    ///
+    /// Recorded only after `Transaction::signing_key` has checked that the key derives the
+    /// sender, so nothing here is taken on trust that was not already required; the lookup
+    /// checks it again anyway.
+    pub account_keys: HashMap<String, PublicKey>,
     /// Runtime-adjustable protocol parameters — changed only via passed governance proposals.
     pub governance_params: GovernanceParams,
     /// Governance proposals by id, both pending and resolved.
@@ -609,6 +623,7 @@ impl ChainState {
             recovery_requests: HashMap::new(),
             recovery_keys: HashMap::new(),
             validator_keys: HashMap::new(),
+            account_keys: HashMap::new(),
             governance_params: GovernanceParams::default(),
             proposals: HashMap::new(),
             next_proposal_id: 0,
@@ -1068,6 +1083,19 @@ impl ChainState {
         self.validator_keys.insert(address.to_string(), key);
     }
 
+    /// The key `address` derives from, if the chain has seen it sign with it (#243).
+    pub fn account_key(&self, address: &Address) -> Option<&PublicKey> {
+        self.account_keys.get(address.as_str())
+    }
+
+    /// Record the key `address` derives from. The caller has checked the derivation; a second
+    /// call can only ever carry the same key (see `account_keys`), so it is not written again.
+    pub fn record_account_key(&mut self, address: &Address, key: &PublicKey) {
+        if !self.account_keys.contains_key(address.as_str()) {
+            self.account_keys.insert(address.to_string(), key.clone());
+        }
+    }
+
     /// Addresses that meet the minimum stake threshold — candidates for the next validator epoch.
     ///
     /// Sorted by address: `self.accounts` is a `HashMap`, whose iteration order depends on
@@ -1436,6 +1464,9 @@ impl ChainState {
             recovery_requests: BTreeMap<&'a str, &'a RecoveryRequest>,
             recovery_keys: BTreeMap<&'a str, &'a PublicKey>,
             validator_keys: BTreeMap<&'a str, &'a PublicKey>,
+            // Decides which transactions verify without a key of their own (#243): a node that
+            // forgot one would refuse a block every other node applies.
+            account_keys: BTreeMap<&'a str, &'a PublicKey>,
             governance_params: &'a GovernanceParams,
             proposals: BTreeMap<u64, CanonicalProposal<'a>>,
             next_proposal_id: u64,
@@ -1480,6 +1511,7 @@ impl ChainState {
             recovery_requests: self.recovery_requests.iter().map(|(k, v)| (k.as_str(), v)).collect(),
             recovery_keys: self.recovery_keys.iter().map(|(k, v)| (k.as_str(), v)).collect(),
             validator_keys: self.validator_keys.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            account_keys: self.account_keys.iter().map(|(k, v)| (k.as_str(), v)).collect(),
             governance_params: &self.governance_params,
             proposals: self
                 .proposals

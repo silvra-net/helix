@@ -139,7 +139,7 @@ fn a_transaction() -> helix_core::Transaction {
         crypto_version: CryptoScheme::MlDsa,
         chain_id: Hash::digest(b"canary"),
         signature: Signature::from_bytes(vec![]),
-        public_key: PublicKey::from_bytes(vec![7; 32]),
+        public_key: Some(PublicKey::from_bytes(vec![7; 32])),
     }
 }
 

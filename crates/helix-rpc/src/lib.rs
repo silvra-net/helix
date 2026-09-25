@@ -190,6 +190,11 @@ impl From<&helix_crypto::MerkleProofStep> for ProofStepResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxProofResponse {
     pub tx_hash: String,
+    /// The leaf the proof starts from — `Transaction::leaf_hash`, over the transaction's bytes as
+    /// the block carries them, not `tx_hash`. The two differ because a node leaves out a public
+    /// key the chain already holds (#243): the id stays what the wallet was told, and the block
+    /// commits to the exact bytes it executed.
+    pub leaf_hash: String,
     pub block_height: u64,
     pub block_hash: String,
     pub merkle_root: String,

@@ -4383,7 +4383,7 @@ mod observed_height_tests {
             crypto_version: helix_crypto::CryptoScheme::MlDsa,
             chain_id: helix_crypto::Hash::digest(b"chain"),
             signature: Signature::from_bytes(vec![]),
-            public_key: PublicKey::from_bytes(vec![1; 32]),
+            public_key: Some(PublicKey::from_bytes(vec![1; 32])),
         }
     }
 

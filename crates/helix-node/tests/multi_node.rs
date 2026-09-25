@@ -1645,7 +1645,7 @@ fn sign_flood(
                 crypto_version: kp.scheme,
                 chain_id,
                 signature: helix_crypto::Signature::from_bytes(vec![]),
-                public_key: kp.public.clone(),
+                public_key: Some(kp.public.clone()),
             };
             tx.signature = kp.sign(tx.signing_hash().as_bytes()).expect("sign at fee 0");
             // 20× the base fee, for the reason `load.rs` documents: a batch signed up front is

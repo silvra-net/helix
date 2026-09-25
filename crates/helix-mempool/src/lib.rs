@@ -126,18 +126,53 @@ pub struct Mempool {
 ///
 /// Only [`CheckedSignature::check`] makes one, so a `CheckedSignature` is a transaction whose
 /// signature verified — the type is the proof, and `add_checked` cannot be handed anything else.
-pub struct CheckedSignature(Transaction);
+/// It remembers the key it verified under: the pool resolves the key again under its lock, and
+/// skips the verification only if that is the same key (#243 — a transaction without a key of
+/// its own is verified under one the chain holds, which the caller passed in).
+pub struct CheckedSignature {
+    tx: Transaction,
+    key: PublicKey,
+}
 
 impl CheckedSignature {
-    pub fn check(tx: Transaction) -> MempoolResult<Self> {
-        tx.verify_own_signature()
-            .map_err(|e| MempoolError::ForgedSignature(e.to_string()))?;
-        Ok(CheckedSignature(tx))
+    /// A transaction that carries its key is verified under it, and a failure is
+    /// `ForgedSignature` — nothing but its own bytes decided it. One without a key is verified
+    /// under the key `keys` say the chain holds for its sender, and a failure is plain `Invalid`:
+    /// the chain's key can have changed a block ago.
+    pub fn check(tx: Transaction, keys: SenderKeys<'_>) -> MempoolResult<Self> {
+        let key = match &tx.public_key {
+            Some(attached) => {
+                tx.verify_own_signature()
+                    .map_err(|e| MempoolError::ForgedSignature(e.to_string()))?;
+                attached.clone()
+            }
+            None => {
+                let key = tx
+                    .signing_key(keys.recovery, keys.recorded)
+                    .map_err(|e| MempoolError::Invalid(e.to_string()))?
+                    .clone();
+                tx.verify_signature_under(&key)
+                    .map_err(|e| MempoolError::Invalid(e.to_string()))?;
+                key
+            }
+        };
+        Ok(CheckedSignature { tx, key })
     }
 
     pub fn transaction(&self) -> &Transaction {
-        &self.0
+        &self.tx
     }
+}
+
+/// What the chain knows about who may sign for a transaction's sender, read from chain state by
+/// the caller — the pool holds none, by design. `recovery` is the active social-recovery key,
+/// `recorded` the key the address derives from once the chain has seen it sign (#243). The
+/// default, both `None`, is a sender the chain knows nothing about: the transaction must carry
+/// its key, and that key must derive `from`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SenderKeys<'a> {
+    pub recovery: Option<&'a PublicKey>,
+    pub recorded: Option<&'a PublicKey>,
 }
 
 impl Mempool {
@@ -367,51 +402,62 @@ impl Mempool {
         chain_id: Hash,
         account_nonce: Option<u64>,
     ) -> MempoolResult<()> {
-        self.add_inner(tx, None, chain_id, account_nonce, false)
+        self.add_inner(tx, SenderKeys::default(), chain_id, account_nonce, None)
     }
 
-    /// Like `add`, but for a sender whose control was ever rotated by social-recovery
-    /// guardian quorum: `recovery_key` (looked up via `ChainState::recovery_key` by the
-    /// caller, which alone has chain-state access) is the active override key that must
-    /// have produced the signature. Without this, `add`'s plain `verify_signature` would
-    /// reject every transaction from a recovered account outright — the new key never
-    /// hashes to the (unchanged) address by design — and `execute_transaction`'s equally
-    /// recovery-aware check would never be reachable for it. `recovery_key: None` behaves
-    /// exactly like `add`.
-    pub fn add_with_recovery_key(
+    /// Like `add`, with what the chain knows about the sender's keys (see [`SenderKeys`]).
+    ///
+    /// `keys.recovery` is what lets a socially recovered account transact at all: the new key
+    /// never hashes to the (unchanged) address by design, so without it `add` would reject every
+    /// transaction from such an account, and `execute_transaction`'s equally recovery-aware
+    /// check would never be reachable for it. `keys.recorded` lets a transaction arrive without
+    /// its key, and lets the pool store one without it (#243).
+    pub fn add_with_keys(
         &mut self,
         tx: Transaction,
-        recovery_key: Option<&PublicKey>,
+        keys: SenderKeys<'_>,
         chain_id: Hash,
         account_nonce: Option<u64>,
     ) -> MempoolResult<()> {
-        self.add_inner(tx, recovery_key, chain_id, account_nonce, false)
+        self.add_inner(tx, keys, chain_id, account_nonce, None)
     }
 
-    /// Like `add_with_recovery_key`, for a transaction whose signature was checked before the
-    /// caller took the pool's lock — see [`CheckedSignature`].
+    /// Like `add_with_keys`, for a transaction whose signature was checked before the caller
+    /// took the pool's lock — see [`CheckedSignature`].
     pub fn add_checked(
         &mut self,
-        tx: CheckedSignature,
-        recovery_key: Option<&PublicKey>,
+        checked: CheckedSignature,
+        keys: SenderKeys<'_>,
         chain_id: Hash,
         account_nonce: Option<u64>,
     ) -> MempoolResult<()> {
-        self.add_inner(tx.0, recovery_key, chain_id, account_nonce, true)
+        let CheckedSignature { tx, key } = checked;
+        self.add_inner(tx, keys, chain_id, account_nonce, Some(&key))
     }
 
-    /// `signature_checked`: the caller came through `add_checked`, whose `CheckedSignature` can
-    /// only exist once the signature verified. Every other caller keeps the old order — cheap
-    /// refusals first, the verification after them, where it has always been.
+    /// `checked_under`: the key the caller already verified the signature under, outside the
+    /// lock (`add_checked`). The verification is skipped only if the pool resolves the same key;
+    /// every other caller keeps the old order — cheap refusals first, the verification after
+    /// them, where it has always been.
     fn add_inner(
         &mut self,
-        tx: Transaction,
-        recovery_key: Option<&PublicKey>,
+        mut tx: Transaction,
+        keys: SenderKeys<'_>,
         chain_id: Hash,
         account_nonce: Option<u64>,
-        signature_checked: bool,
+        checked_under: Option<&PublicKey>,
     ) -> MempoolResult<()> {
         self.evict_expired();
+
+        // #243: a key the chain already holds for this sender is not kept. What the pool stores
+        // is what a proposer packs, so this is where blocks stop carrying the same 1952 bytes
+        // with every transaction of a known account. Before the fee gates, because the base fee
+        // is charged on the stored size — the size the block will execute. Nothing a verifier
+        // decides changes: the key resolved below is the one that was removed. Whether it
+        // arrived with one is kept, because only a failure under a key the transaction carried
+        // is something its author alone can have caused.
+        let arrived_with_key = tx.public_key.is_some();
+        tx.strip_key_the_chain_knows(keys.recovery, keys.recorded);
 
         // Both fee gates below have to agree with `execute_transaction`'s, or this pool starts
         // either admitting transactions that cannot execute or — far worse, and the reason both
@@ -471,15 +517,25 @@ impl Mempool {
         // down other users' pending transactions.
         //
         // In two halves, so the rejection says which: a key not entitled to `from` is state-
-        // dependent and cheap, a signature that fails under the transaction's own key is neither
-        // (see `MempoolError::ForgedSignature`). Same checks, same order as
-        // `verify_signature_with_recovery_key`.
-        tx.verify_sender_key(recovery_key)
-            .map_err(|e| MempoolError::Invalid(e.to_string()))?;
-        // Already done, outside the lock, when the transaction came through `add_checked` (#238).
-        if !signature_checked {
-            tx.verify_own_signature()
-                .map_err(|e| MempoolError::ForgedSignature(e.to_string()))?;
+        // dependent and cheap, a signature that fails under the key the transaction carried is
+        // neither (see `MempoolError::ForgedSignature`). A transaction that arrived without one
+        // was checked under the chain's key, which can have changed a block ago — plain
+        // `Invalid`, like every other state-dependent refusal.
+        {
+            let key = tx
+                .signing_key(keys.recovery, keys.recorded)
+                .map_err(|e| MempoolError::Invalid(e.to_string()))?;
+            // Already done, outside the lock, when the transaction came through `add_checked`
+            // (#238) — under this very key, or it is done again.
+            if checked_under.map(PublicKey::as_bytes) != Some(key.as_bytes()) {
+                tx.verify_signature_under(key).map_err(|e| {
+                    if arrived_with_key {
+                        MempoolError::ForgedSignature(e.to_string())
+                    } else {
+                        MempoolError::Invalid(e.to_string())
+                    }
+                })?;
+            }
         }
 
         // Another chain's transaction cannot execute here, so holding it wastes a pool slot and,
@@ -785,12 +841,12 @@ mod tests {
         let mut forged = make_tx(&kp, 10_000, 0);
         forged.signature = kp.sign(b"a different message").unwrap();
         assert!(matches!(
-            CheckedSignature::check(forged),
+            CheckedSignature::check(forged, SenderKeys::default()),
             Err(MempoolError::ForgedSignature(_))
         ));
         let honest = make_tx(&kp, 10_000, 0);
         let hash = honest.hash();
-        let checked = CheckedSignature::check(honest).unwrap();
+        let checked = CheckedSignature::check(honest, SenderKeys::default()).unwrap();
         assert_eq!(checked.transaction().hash(), hash);
     }
 
@@ -803,30 +859,30 @@ mod tests {
         let kp = KeyPair::generate();
         let mut pool = Mempool::new();
         let other_chain = Hash::digest(b"another chain");
-        let wrong_chain = CheckedSignature::check(make_tx(&kp, 10_000, 0)).unwrap();
+        let wrong_chain = CheckedSignature::check(make_tx(&kp, 10_000, 0), SenderKeys::default()).unwrap();
         assert!(matches!(
-            pool.add_checked(wrong_chain, None, other_chain, Some(0)),
+            pool.add_checked(wrong_chain, SenderKeys::default(), other_chain, Some(0)),
             Err(MempoolError::ForeignChain { .. })
         ));
-        let spent = CheckedSignature::check(make_tx(&kp, 10_000, 3)).unwrap();
+        let spent = CheckedSignature::check(make_tx(&kp, 10_000, 3), SenderKeys::default()).unwrap();
         assert!(matches!(
-            pool.add_checked(spent, None, Hash::ZERO, Some(5)),
+            pool.add_checked(spent, SenderKeys::default(), Hash::ZERO, Some(5)),
             Err(MempoolError::NonceSpent { .. })
         ));
 
         let owner = KeyPair::generate();
         let stranger = KeyPair::generate();
         let mut not_theirs = make_tx(&owner, 10_000, 0);
-        not_theirs.public_key = stranger.public.clone();
+        not_theirs.public_key = Some(stranger.public.clone());
         not_theirs.signature = stranger.sign(not_theirs.signing_hash().as_bytes()).unwrap();
-        let checked = CheckedSignature::check(not_theirs).expect("its own key did sign it");
+        let checked = CheckedSignature::check(not_theirs, SenderKeys::default()).expect("its own key did sign it");
         assert!(matches!(
-            pool.add_checked(checked, None, Hash::ZERO, Some(0)),
+            pool.add_checked(checked, SenderKeys::default(), Hash::ZERO, Some(0)),
             Err(MempoolError::Invalid(_))
         ));
 
-        let fine = CheckedSignature::check(make_tx(&kp, 10_000, 0)).unwrap();
-        pool.add_checked(fine, None, Hash::ZERO, Some(0)).unwrap();
+        let fine = CheckedSignature::check(make_tx(&kp, 10_000, 0), SenderKeys::default()).unwrap();
+        pool.add_checked(fine, SenderKeys::default(), Hash::ZERO, Some(0)).unwrap();
         assert_eq!(pool.len(), 1);
     }
 
@@ -838,7 +894,7 @@ mod tests {
         let owner = KeyPair::generate();
         let stranger = KeyPair::generate();
         let mut tx = make_tx(&owner, 10_000, 0);
-        tx.public_key = stranger.public.clone();
+        tx.public_key = Some(stranger.public.clone());
         tx.signature = stranger.sign(tx.signing_hash().as_bytes()).unwrap();
 
         let err = Mempool::new().add(tx, Hash::ZERO, Some(0)).unwrap_err();
@@ -1219,7 +1275,7 @@ mod tests {
             crypto_version: keypair.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![0u8; 32]),
-            public_key: keypair.public.clone(),
+            public_key: Some(keypair.public.clone()),
         };
         let hash = tx.signing_hash();
         tx.signature = keypair.sign(hash.as_bytes()).unwrap();
@@ -1242,7 +1298,7 @@ mod tests {
             crypto_version: keypair.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![0u8; 32]),
-            public_key: keypair.public.clone(),
+            public_key: Some(keypair.public.clone()),
         };
         let hash = tx.signing_hash();
         tx.signature = keypair.sign(hash.as_bytes()).unwrap();
@@ -1676,5 +1732,120 @@ mod tests {
         let taken = pool.take(10, &|_| None);
         assert!(taken.is_empty(), "expired tx must not be included in take()");
         assert_eq!(pool.len(), 0);
+    }
+
+    fn recorded(key: &PublicKey) -> SenderKeys<'_> {
+        SenderKeys { recovery: None, recorded: Some(key) }
+    }
+
+    /// #243: what the pool stores is what a proposer packs, so a sender the chain already knows
+    /// has to lose its key *here* — with the same id, since that is what the wallet watches for
+    /// and what `remove_committed` matches the committed copy by.
+    #[test]
+    fn a_known_senders_transaction_is_kept_without_its_key() {
+        let kp = KeyPair::generate();
+        let tx = make_tx(&kp, 10_000, 0);
+        let id = tx.hash();
+        let mut pool = Mempool::new();
+        pool.add_with_keys(tx.clone(), recorded(&kp.public), Hash::ZERO, Some(0)).unwrap();
+
+        let packed = pool.take(10, &|_| Some(0));
+        assert_eq!(packed.len(), 1);
+        assert!(packed[0].public_key.is_none(), "the chain knows this key; the block need not carry it");
+        assert_eq!(packed[0].hash(), id, "and the id the sender was given is the one it carries");
+        assert!(packed[0].size_bytes() + 1900 < tx.size_bytes());
+        pool.remove_committed(&[id], &|_| Some(1));
+        assert!(pool.is_empty(), "the committed copy removes the pooled one");
+
+        // A sender the chain has never seen keeps it — the block is where it goes on record.
+        let stranger = KeyPair::generate();
+        let mut pool = Mempool::new();
+        pool.add_with_keys(make_tx(&stranger, 10_000, 0), SenderKeys::default(), Hash::ZERO, Some(0))
+            .unwrap();
+        assert!(pool.take(10, &|_| Some(0))[0].public_key.is_some());
+    }
+
+    /// The base fee is charged on the bytes the block will carry, and for a known sender those
+    /// are the bytes without the key — so the pool must price that form, or it refuses a
+    /// transaction the chain would execute.
+    #[test]
+    fn a_known_sender_pays_the_base_fee_for_the_form_the_block_carries() {
+        let kp = KeyPair::generate();
+        let sample = make_tx(&kp, 1, 0);
+        let mut stripped_sample = sample.clone();
+        stripped_sample.public_key = None;
+        let base_fee = 2;
+        let fee = base_fee * stripped_sample.size_bytes() + 10;
+        assert!(fee < base_fee * sample.size_bytes(), "premise: enough only without the key");
+
+        let mut pool = Mempool::new();
+        pool.set_base_fee_per_byte(base_fee);
+        assert!(matches!(
+            pool.add_with_keys(make_tx(&kp, fee, 0), SenderKeys::default(), Hash::ZERO, Some(0)),
+            Err(MempoolError::BelowBaseFee { .. })
+        ));
+        pool.add_with_keys(make_tx(&kp, fee, 0), recorded(&kp.public), Hash::ZERO, Some(0))
+            .expect("the chain knows the key, so the block will not carry it");
+    }
+
+    /// A transaction may arrive without its key — but only a failure under a key it carried says
+    /// anything about its author. Checked under the chain's key, a failure can be a key that
+    /// changed a block ago, so it is `Invalid` and never `ForgedSignature`; nobody is charged.
+    #[test]
+    fn a_transaction_without_a_key_is_judged_under_the_chains_and_never_called_forged() {
+        let kp = KeyPair::generate();
+        let mut stripped = make_tx(&kp, 10_000, 0);
+        stripped.public_key = None;
+
+        assert!(matches!(
+            Mempool::new().add_with_keys(stripped.clone(), SenderKeys::default(), Hash::ZERO, Some(0)),
+            Err(MempoolError::Invalid(_))
+        ), "no key anywhere");
+        Mempool::new()
+            .add_with_keys(stripped.clone(), recorded(&kp.public), Hash::ZERO, Some(0))
+            .expect("the chain's key verifies it");
+
+        let mut forged = stripped.clone();
+        forged.signature = kp.sign(b"a different message").unwrap();
+        assert!(matches!(
+            Mempool::new().add_with_keys(forged.clone(), recorded(&kp.public), Hash::ZERO, Some(0)),
+            Err(MempoolError::Invalid(_))
+        ));
+        assert!(matches!(
+            CheckedSignature::check(forged, recorded(&kp.public)),
+            Err(MempoolError::Invalid(_))
+        ));
+
+        // The same forgery carrying its key is still a forgery, even though the pool would have
+        // dropped that key: the failure was under bytes the author sent.
+        let mut forged_with_key = make_tx(&kp, 10_000, 0);
+        forged_with_key.signature = kp.sign(b"a different message").unwrap();
+        assert!(matches!(
+            Mempool::new().add_with_keys(forged_with_key, recorded(&kp.public), Hash::ZERO, Some(0)),
+            Err(MempoolError::ForgedSignature(_))
+        ));
+    }
+
+    /// `add_checked` skips the verification only for the key it was done under. Handed keys that
+    /// resolve differently — a recovery that landed between the check and the lock — it verifies
+    /// again, and the rescuer's key does not accept the owner's signature.
+    #[test]
+    fn a_checked_signature_counts_only_for_the_key_it_was_checked_under() {
+        let owner = KeyPair::generate();
+        let rescuer = KeyPair::generate();
+        let mut stripped = make_tx(&owner, 10_000, 0);
+        stripped.public_key = None;
+
+        let checked = CheckedSignature::check(stripped.clone(), recorded(&owner.public)).unwrap();
+        let recovered = SenderKeys { recovery: Some(&rescuer.public), recorded: Some(&owner.public) };
+        assert!(matches!(
+            Mempool::new().add_checked(checked, recovered, Hash::ZERO, Some(0)),
+            Err(MempoolError::Invalid(_))
+        ));
+
+        let checked = CheckedSignature::check(stripped, recorded(&owner.public)).unwrap();
+        Mempool::new()
+            .add_checked(checked, recorded(&owner.public), Hash::ZERO, Some(0))
+            .expect("the same key it was checked under");
     }
 }

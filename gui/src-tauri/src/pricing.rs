@@ -54,7 +54,7 @@ pub fn build_tx(tx_type: TxType, from: Address, to: Option<Address>, amount: u64
         // devnet; `rpc::fetch_chain_id` is where the decision of whom to believe lives.
         chain_id,
         signature: Signature::from_bytes(vec![]),
-        public_key: kp.public.clone(),
+        public_key: Some(kp.public.clone()),
     }
 }
 
@@ -67,7 +67,7 @@ pub fn build_tx(tx_type: TxType, from: Address, to: Option<Address>, amount: u64
 /// correctly-sized signature, measure, price, then sign for real. Sound because bincode encodes
 /// the fee as a fixed 8 bytes — the size is identical for fee 0 and fee u64::MAX.
 pub fn finalize_and_sign(tx: &mut Transaction, explicit_fee: Option<u64>, base_fee_per_byte: u64, kp: &KeyPair) -> Result<(), String> {
-    tx.public_key = kp.public.clone();
+    tx.public_key = Some(kp.public.clone());
 
     if let Some(fee) = explicit_fee {
         tx.fee = fee;

@@ -250,8 +250,24 @@ pub struct Transaction {
     pub chain_id: Hash,
     /// Detached signature over the canonical hash of this tx
     pub signature: Signature,
-    /// Full public key (needed for sig verification + address derivation)
-    pub public_key: PublicKey,
+    /// The key that produced `signature` — or `None`, once the chain knows it (#243).
+    ///
+    /// An address is a one-way truncation of a hash of its key, so a verifier has to be handed the
+    /// key from somewhere, and an ML-DSA key is 1952 bytes: more than a third of a plain transfer.
+    /// It does not have to be handed over every time. The first transaction an address signs
+    /// records the key it derives from (`ChainState::account_keys`), and from then on a node that
+    /// admits a transaction from that address stores it without the key, so blocks — proposed,
+    /// committed, stored and synced — carry each key once instead of once per transaction.
+    ///
+    /// Wallets keep attaching it: they cannot know whether the chain has seen them yet, and a key
+    /// the chain already knows costs nothing but bytes on the way in. Gossip keeps it too (see
+    /// `Mempool`), so every transaction a node forwards can still be checked against nothing but
+    /// its own bytes (#225).
+    ///
+    /// Neither the signature (`signing_hash`) nor the transaction id (`hash`) covers it, so
+    /// stripping it changes neither. The block does: its merkle leaves are [`Self::leaf_hash`],
+    /// over the full bytes.
+    pub public_key: Option<PublicKey>,
 }
 
 impl Transaction {
@@ -277,10 +293,28 @@ impl Transaction {
         Hash::digest_many(&[b"helix-tx-v1:", &payload])
     }
 
-    /// Full transaction hash (includes signature — unique tx identifier)
+    /// The transaction id — what a wallet is told at submission and watches for, and what the
+    /// mempool, receipts and indices key on: the signed payload plus the signature.
+    ///
+    /// Deliberately not the public key (#243). A node strips a key the chain already knows before
+    /// the transaction goes into a block, and an id that covered the key would change on the way:
+    /// the wallet would wait for a hash no block ever carries, and the pool could not recognise the
+    /// committed copy of its own transaction to remove it. The signature stays in, so two signings
+    /// of the same intent remain two transactions, as they always were.
     pub fn hash(&self) -> Hash {
+        let signed = self.signing_hash();
+        Hash::digest_many(&[b"helix-txid-v1:", signed.as_bytes(), self.signature.as_bytes()])
+    }
+
+    /// The merkle leaf a block commits to: every byte of the transaction, key or no key.
+    ///
+    /// Not [`Self::hash`], because that is the same for both forms while executing them is not —
+    /// the base fee is charged per byte (`size_bytes`). A header that committed only to ids would
+    /// let anyone who relays a block re-attach or strip keys without changing its hash, and every
+    /// node that received that copy would burn a different fee and compute a different state.
+    pub fn leaf_hash(&self) -> Hash {
         let payload = bincode::serialize(self).expect("serialization is infallible");
-        Hash::digest(&payload)
+        Hash::digest_many(&[b"helix-txleaf-v1:", &payload])
     }
 
     /// Serialized on-wire size in bytes — the unit the EIP-1559 base fee is charged against
@@ -290,6 +324,9 @@ impl Transaction {
         bincode::serialized_size(self).expect("serialization is infallible")
     }
 
+    /// Checks the signature against the key the transaction carries, as if the chain knew nothing
+    /// about its sender — so a transaction without a key fails. What a wallet can check about its
+    /// own transaction; a node checks with [`Self::signing_key`].
     pub fn verify_signature(&self) -> CryptoResult<()> {
         self.verify_signature_with_recovery_key(None)
     }
@@ -300,42 +337,69 @@ impl Transaction {
     /// and the normal "public key derives the address" rule is intentionally skipped,
     /// since that's the whole point of a recovered account. `recovery_key: None` (the
     /// common case) falls back to the plain address-derivation + signature check.
-    ///
-    /// Mempool admission must use this — not `verify_signature` — for any tx whose sender
-    /// has a recovery key set, or `execute_transaction`'s equally recovery-aware
-    /// `verify_tx_signature` check is unreachable: every such tx would already have been
-    /// rejected before it ever reached the executor.
     pub fn verify_signature_with_recovery_key(&self, recovery_key: Option<&PublicKey>) -> CryptoResult<()> {
-        self.verify_sender_key(recovery_key)?;
-        self.verify_own_signature()
+        let key = self.signing_key(recovery_key, None)?;
+        self.verify_signature_under(key)
     }
 
-    /// The first half of [`Self::verify_signature_with_recovery_key`]: is the attached key
-    /// entitled to sign for `from`? Cheap — no cryptography — and **dependent on chain state**:
-    /// a recovery key is set and replaced by transactions, so a node one block behind can see an
-    /// honest transaction from a just-recovered account fail here. A failure says the transaction
-    /// is not admissible *here, now*; it does not say its author lied.
-    pub fn verify_sender_key(&self, recovery_key: Option<&PublicKey>) -> CryptoResult<()> {
+    /// The key this transaction's signature has to verify under, given what the chain knows about
+    /// `from`: `recovery_key`, the active override if the account was socially recovered, and
+    /// `recorded_key`, the key the address derives from if the chain has seen it sign (#243).
+    ///
+    /// An attached key is held to exactly the rule it always was: it must be the recovery key, or
+    /// else derive `from` — otherwise anyone could sign with their own key under a victim's
+    /// address, since the signature check alone only proves possession of *some* key. A
+    /// transaction without one borrows the chain's: the recovery key if there is one, else the
+    /// recorded key. The recorded key is checked against `from` as well, which costs one hash and
+    /// means the registry is never the only thing standing between a key and an address.
+    ///
+    /// Cheap — no signature is verified — and **dependent on chain state**: a recovery key is set
+    /// and replaced by transactions, and a key is recorded by one, so a node one block behind can
+    /// see an honest transaction fail here. A failure says the transaction is not admissible
+    /// *here, now*; it does not say its author lied.
+    pub fn signing_key<'a>(
+        &'a self,
+        recovery_key: Option<&'a PublicKey>,
+        recorded_key: Option<&'a PublicKey>,
+    ) -> CryptoResult<&'a PublicKey> {
+        let Some(attached) = &self.public_key else {
+            if let Some(active_key) = recovery_key {
+                return Ok(active_key);
+            }
+            return match recorded_key {
+                Some(key) if Address::from_public_key(key) == self.from => Ok(key),
+                Some(_) => Err(helix_crypto::CryptoError::InvalidAddress(
+                    "the key on record for the sender does not derive its address".to_string(),
+                )),
+                None => Err(helix_crypto::CryptoError::InvalidAddress(
+                    "no public key attached, and the chain has none on record for the sender".to_string(),
+                )),
+            };
+        };
         match recovery_key {
             Some(active_key) => {
-                if self.public_key.as_bytes() != active_key.as_bytes() {
+                if attached.as_bytes() != active_key.as_bytes() {
                     return Err(helix_crypto::CryptoError::InvalidAddress(
                         "public key does not match the active recovery key".to_string(),
                     ));
                 }
             }
             None => {
-                // The attached public key must actually derive the claimed sender address —
-                // otherwise anyone could sign with their own key while setting `from` to a
-                // victim's address, since the ML-DSA check alone only proves key possession.
-                if Address::from_public_key(&self.public_key) != self.from {
+                if Address::from_public_key(attached) != self.from {
                     return Err(helix_crypto::CryptoError::InvalidAddress(
                         "public key does not match sender address".to_string(),
                     ));
                 }
             }
         }
-        Ok(())
+        Ok(attached)
+    }
+
+    /// The first half of [`Self::verify_signature_with_recovery_key`]: is the attached key
+    /// entitled to sign for `from`? See [`Self::signing_key`], of which this is the case where the
+    /// chain has no key on record.
+    pub fn verify_sender_key(&self, recovery_key: Option<&PublicKey>) -> CryptoResult<()> {
+        self.signing_key(recovery_key, None).map(|_| ())
     }
 
     /// The second half: does the signature verify against the key **this transaction carries**?
@@ -343,14 +407,41 @@ impl Transaction {
     /// configuration — so a failure is something no honest node can have produced. It is also
     /// the expensive half (a full ML-DSA or SLH-DSA verification), which is why a peer that sends
     /// such transactions is worth holding to it (the node charges the author, #225).
+    ///
+    /// A transaction without a key fails: there is nothing of its own to check it against.
     pub fn verify_own_signature(&self) -> CryptoResult<()> {
+        let key = self.public_key.as_ref().ok_or_else(|| {
+            helix_crypto::CryptoError::InvalidPublicKey("the transaction carries no public key".to_string())
+        })?;
+        self.verify_signature_under(key)
+    }
+
+    /// Does the signature verify under `key`? The expensive step, with the key chosen by the
+    /// caller — [`Self::signing_key`] for a node, the attached one for [`Self::verify_own_signature`].
+    pub fn verify_signature_under(&self, key: &PublicKey) -> CryptoResult<()> {
         let hash = self.signing_hash();
-        helix_crypto::verify_with_scheme(
-            self.crypto_version,
-            &self.public_key,
-            hash.as_bytes(),
-            &self.signature,
-        )
+        helix_crypto::verify_with_scheme(self.crypto_version, key, hash.as_bytes(), &self.signature)
+    }
+
+    /// Drops the attached key when it is the one the chain would use anyway — the recovery key if
+    /// the sender has one, else the key on record — and reports whether it did (#243).
+    ///
+    /// Byte comparison only, so it changes nothing a verifier decides: [`Self::signing_key`] on the
+    /// stripped transaction returns exactly the key that was removed. A key the chain does not
+    /// know, or a different one, stays attached — the transaction is then judged on it as before.
+    pub fn strip_key_the_chain_knows(
+        &mut self,
+        recovery_key: Option<&PublicKey>,
+        recorded_key: Option<&PublicKey>,
+    ) -> bool {
+        let known = recovery_key.or(recorded_key);
+        match (&self.public_key, known) {
+            (Some(attached), Some(known)) if attached.as_bytes() == known.as_bytes() => {
+                self.public_key = None;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -388,7 +479,7 @@ mod tests {
             crypto_version: keypair.scheme,
             chain_id: Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: keypair.public.clone(),
+            public_key: Some(keypair.public.clone()),
         };
         tx.signature = keypair.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -488,5 +579,96 @@ mod tests {
         assert!(tx.verify_sender_key(None).is_ok());
         assert!(tx.verify_own_signature().is_err());
         assert!(tx.verify_signature_with_recovery_key(None).is_err());
+    }
+
+    /// #243, the premise everything else rests on: a node may strip the key without the sender
+    /// losing track of the transaction. The id the wallet was told must be the id the block
+    /// carries, and the pool must recognise the committed copy of what it holds.
+    #[test]
+    fn stripping_the_key_keeps_the_signature_and_the_id() {
+        let keypair = KeyPair::generate();
+        let tx = build_tx(Address::from_public_key(&keypair.public), &keypair);
+        let mut stripped = tx.clone();
+        assert!(stripped.strip_key_the_chain_knows(None, Some(&keypair.public)));
+        assert!(stripped.public_key.is_none());
+
+        assert_eq!(tx.signing_hash(), stripped.signing_hash());
+        assert_eq!(tx.hash(), stripped.hash(), "the id must not depend on the key");
+        assert_ne!(tx.leaf_hash(), stripped.leaf_hash(), "the bytes a block commits to must");
+        assert!(stripped.size_bytes() + 1900 < tx.size_bytes(), "and the point is the bytes");
+
+        let key = stripped.signing_key(None, Some(&keypair.public)).unwrap();
+        assert!(stripped.verify_signature_under(key).is_ok());
+    }
+
+    /// The signature still distinguishes two signings of the same intent, as it did when the id
+    /// was a hash of everything.
+    #[test]
+    fn the_id_still_covers_the_signature() {
+        let keypair = KeyPair::generate();
+        let tx = build_tx(Address::from_public_key(&keypair.public), &keypair);
+        let mut resigned = tx.clone();
+        resigned.signature = Signature::from_bytes(vec![7; 32]);
+        assert_ne!(tx.hash(), resigned.hash());
+    }
+
+    /// Only a key the chain would use anyway may go. Anything else stays attached and is judged
+    /// on its own — stripping must never turn a transaction the chain would refuse into one it
+    /// resolves differently.
+    #[test]
+    fn only_the_key_the_chain_would_use_is_stripped() {
+        let owner = KeyPair::generate();
+        let other = KeyPair::generate();
+        let tx = build_tx(Address::from_public_key(&owner.public), &owner);
+
+        let mut unknown = tx.clone();
+        assert!(!unknown.strip_key_the_chain_knows(None, None), "nothing on record");
+        assert!(unknown.public_key.is_some());
+
+        let mut different = tx.clone();
+        assert!(!different.strip_key_the_chain_knows(None, Some(&other.public)));
+        assert!(different.public_key.is_some());
+
+        // Recovered: the recovery key is what counts, and the original key — though on record —
+        // is no longer entitled to sign, so a transaction carrying it must keep it and fail.
+        let mut recovered = tx.clone();
+        assert!(!recovered.strip_key_the_chain_knows(Some(&other.public), Some(&owner.public)));
+        assert!(recovered.signing_key(Some(&other.public), Some(&owner.public)).is_err());
+    }
+
+    /// Without an attached key the chain's decides: the recovery key before the recorded one,
+    /// and nothing at all when the chain knows none.
+    #[test]
+    fn a_stripped_transaction_resolves_the_key_the_chain_holds() {
+        let owner = KeyPair::generate();
+        let rescuer = KeyPair::generate();
+        let mut tx = build_tx(Address::from_public_key(&owner.public), &owner);
+        tx.public_key = None;
+
+        assert!(tx.signing_key(None, None).is_err(), "no key anywhere");
+        assert!(tx.verify_signature().is_err(), "a wallet-side check has nothing to go on");
+        assert!(tx.verify_own_signature().is_err());
+        assert_eq!(tx.signing_key(None, Some(&owner.public)).unwrap(), &owner.public);
+        assert_eq!(
+            tx.signing_key(Some(&rescuer.public), Some(&owner.public)).unwrap(),
+            &rescuer.public,
+            "a recovered account signs with its recovery key, whatever is on record",
+        );
+        assert!(
+            tx.verify_signature_under(tx.signing_key(Some(&rescuer.public), Some(&owner.public)).unwrap())
+                .is_err(),
+            "and the original key's signature no longer counts",
+        );
+    }
+
+    /// The registry is not the only thing between a key and an address: a recorded key that does
+    /// not derive the sender is refused, so a corrupted or mistaken entry cannot authorise it.
+    #[test]
+    fn a_recorded_key_must_derive_the_sender() {
+        let owner = KeyPair::generate();
+        let impostor = KeyPair::generate();
+        let mut tx = build_tx(Address::from_public_key(&owner.public), &impostor);
+        tx.public_key = None;
+        assert!(tx.signing_key(None, Some(&impostor.public)).is_err());
     }
 }

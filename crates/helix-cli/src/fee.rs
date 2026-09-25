@@ -100,7 +100,7 @@ pub async fn price_and_sign(
     node: &str,
 ) -> Result<()> {
     tx.fee = explicit_fee.unwrap_or(0);
-    tx.public_key = kp.public.clone();
+    tx.public_key = Some(kp.public.clone());
     tx.signature = kp.sign(tx.signing_hash().as_bytes())?;
 
     if explicit_fee.is_some() {
@@ -176,7 +176,7 @@ mod tests {
             crypto_version: kp.scheme,
             chain_id: helix_core::default_chain_id(),
             signature: helix_crypto::Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         }
     }
 
@@ -197,10 +197,7 @@ mod tests {
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         sign_at_base_fee(&mut tx, 1, &kp).unwrap();
         assert_eq!(tx.fee, 2 * tx.size_bytes());
-        assert!(
-            helix_crypto::verify(&tx.public_key, tx.signing_hash().as_bytes(), &tx.signature)
-                .is_ok()
-        );
+        assert!(tx.verify_signature().is_ok());
     }
 
     /// The same, through a real socket: the path `price_and_sign` takes in production, so the

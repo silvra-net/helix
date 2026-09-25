@@ -304,8 +304,7 @@ impl Block {
 
     /// Recompute and verify the merkle root matches the header
     pub fn verify_merkle_root(&self) -> bool {
-        let tx_hashes: Vec<Hash> = self.transactions.iter().map(|tx| tx.hash()).collect();
-        merkle_root(&tx_hashes) == self.header.merkle_root
+        transactions_root(&self.transactions) == self.header.merkle_root
     }
 
     pub fn tx_count(&self) -> usize {
@@ -316,10 +315,21 @@ impl Block {
     /// client that trusts this block's header (and hence its `merkle_root`)
     /// can use the proof to confirm the transaction was included, without
     /// downloading the block's full transaction list.
+    ///
+    /// The proven leaf is the transaction's [`Transaction::leaf_hash`], not its id.
     pub fn merkle_proof_for(&self, index: usize) -> Option<Vec<MerkleProofStep>> {
-        let tx_hashes: Vec<Hash> = self.transactions.iter().map(|tx| tx.hash()).collect();
-        merkle_proof(&tx_hashes, index)
+        let leaves: Vec<Hash> = self.transactions.iter().map(|tx| tx.leaf_hash()).collect();
+        merkle_proof(&leaves, index)
     }
+}
+
+/// The merkle root a header commits to for `transactions`: over their
+/// [`Transaction::leaf_hash`]es, so a block pins the exact bytes it carries and not only which
+/// transactions they are. The two differ once a node strips a key the chain knows (#243), and
+/// only the bytes decide what executing the block charges.
+pub fn transactions_root(transactions: &[Transaction]) -> Hash {
+    let leaves: Vec<Hash> = transactions.iter().map(|tx| tx.leaf_hash()).collect();
+    merkle_root(&leaves)
 }
 
 /// Genesis block — the first block, height 0, no parent.
@@ -381,8 +391,38 @@ mod tests {
             crypto_version: Default::default(),
             chain_id: helix_crypto::Hash::ZERO,
             signature: Sig::from_bytes(vec![]),
-            public_key: PublicKey::from_bytes(vec![]),
+            public_key: Some(PublicKey::from_bytes(vec![1, 2, 3])),
         }
+    }
+
+    /// #243: a node strips a key the chain knows, and the transaction id deliberately does not
+    /// notice. The block has to: executing the stripped form burns a smaller base fee than the
+    /// full one, so a header that committed only to ids would let whoever relays a committed block
+    /// change what every receiver computes, without changing its hash.
+    #[test]
+    fn a_block_commits_to_whether_its_transactions_carry_their_keys() {
+        let transactions: Vec<Transaction> = (0..3).map(tx).collect();
+        let mut stripped = transactions.clone();
+        stripped[1].public_key = None;
+
+        assert_eq!(transactions[1].hash(), stripped[1].hash(), "premise: stripping keeps the id");
+        assert_ne!(
+            transactions_root(&transactions),
+            transactions_root(&stripped),
+            "the root must pin which form the block carries",
+        );
+
+        let mut block = genesis_block(
+            Address::from_public_key(&PublicKey::from_bytes(vec![9])),
+            PublicKey::from_bytes(vec![9]),
+            Sig::from_bytes(vec![]),
+            0,
+        );
+        block.transactions = transactions;
+        block.header.merkle_root = transactions_root(&block.transactions);
+        assert!(block.verify_merkle_root(), "premise: the honest block checks out");
+        block.transactions = stripped;
+        assert!(!block.verify_merkle_root(), "the same header must not vouch for the other form");
     }
 
     /// A light client holding only a block's header can verify a specific
@@ -391,7 +431,7 @@ mod tests {
     #[test]
     fn merkle_proof_for_matches_block_header_merkle_root() {
         let transactions: Vec<Transaction> = (0..5).map(tx).collect();
-        let tx_hashes: Vec<Hash> = transactions.iter().map(|t| t.hash()).collect();
+        let tx_hashes: Vec<Hash> = transactions.iter().map(|t| t.leaf_hash()).collect();
         let root = merkle_root(&tx_hashes);
 
         let block = Block {

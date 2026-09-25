@@ -15,7 +15,7 @@ use helix_executor::{
     state::ChainState,
     GovernanceParams,
 };
-use helix_mempool::{Mempool, MempoolError};
+use helix_mempool::{Mempool, MempoolError, SenderKeys};
 use helix_p2p::{
     blocksync::BlockSyncResponse,
     config::P2PConfig,
@@ -2011,7 +2011,9 @@ async fn admit_peer_transaction(
 }
 
 /// `Valid` if the transaction went into the pool, `Forged` if its signature fails under its own
-/// key, `Unjudged` for every other rejection.
+/// key, `Unjudged` for every other rejection — including a transaction that arrives without its
+/// key (#243): honest nodes gossip every transaction with it, so that this check never has to
+/// lean on this node's copy of the chain.
 ///
 /// `Forged` is the one rejection no honest node can cause: it stops the transaction from being
 /// forwarded and costs its author a strike (#225). Every other rejection — a spent nonce, a pool
@@ -2024,10 +2026,19 @@ async fn admission_verdict(
     mempool: &Arc<RwLock<Mempool>>,
     chain_state: &Arc<RwLock<ChainState>>,
 ) -> TransactionVerdict {
-    let (recovery_key, can_pay, chain_id, account_nonce) = {
+    // A gossiped transaction carries its key (#243). Without one it could only be checked
+    // against this node's copy of the chain's, where a failure is a key that may have changed a
+    // block ago and so is charged to nobody — a forgery that costs every node a verification
+    // and its author nothing. Refused before any cryptography; no honest node sends it.
+    if tx.public_key.is_none() {
+        warn!(from = %tx.from, "Rejected peer tx: gossiped without its public key");
+        return TransactionVerdict::Unjudged;
+    }
+    let (recovery_key, recorded_key, can_pay, chain_id, account_nonce) = {
         let chain = chain_state.read().await;
         (
             chain.recovery_key(&tx.from).cloned(),
+            chain.account_key(&tx.from).cloned(),
             helix_executor::can_pay_fee(&chain, &tx),
             chain.chain_id,
             // Same gate as the RPC submit path, and for the same reason it exists there:
@@ -2042,12 +2053,8 @@ async fn admission_verdict(
         warn!(from = %tx.from, fee = tx.fee, "Rejected peer tx: sender cannot pay the declared fee");
         return TransactionVerdict::Unjudged;
     }
-    let admitted = mempool.write().await.add_with_recovery_key(
-        tx,
-        recovery_key.as_ref(),
-        chain_id,
-        Some(account_nonce),
-    );
+    let keys = SenderKeys { recovery: recovery_key.as_ref(), recorded: recorded_key.as_ref() };
+    let admitted = mempool.write().await.add_with_keys(tx, keys, chain_id, Some(account_nonce));
     match admitted {
         Ok(()) => TransactionVerdict::Valid,
         Err(e) => {
@@ -3079,7 +3086,7 @@ async fn report_double_sign_evidence(
         crypto_version: keypair.scheme,
         chain_id,
         signature: Signature::from_bytes(vec![]),
-        public_key: keypair.public.clone(),
+        public_key: Some(keypair.public.clone()),
     };
     tx.signature = match keypair.sign(tx.signing_hash().as_bytes()) {
         Ok(sig) => sig,
@@ -3161,7 +3168,7 @@ async fn send_probation_heartbeat_if_due(
         crypto_version: keypair.scheme,
         chain_id,
         signature: Signature::from_bytes(vec![]),
-        public_key: keypair.public.clone(),
+        public_key: Some(keypair.public.clone()),
     };
     tx.signature = match keypair.sign(tx.signing_hash().as_bytes()) {
         Ok(sig) => sig,
@@ -10436,14 +10443,13 @@ mod handle_p2p_event_tests {
             crypto_version: kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Sig::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         fat.signature = kp.sign(fat.signing_hash().as_bytes()).unwrap();
         b1.transactions = vec![fat];
         // Merkle root and proposer signature made correct, so size is the only thing left to
         // refuse it on — otherwise this would pass for the wrong reason.
-        let tx_hashes: Vec<_> = b1.transactions.iter().map(|t| t.hash()).collect();
-        b1.header.merkle_root = helix_crypto::merkle_root(&tx_hashes);
+        b1.header.merkle_root = helix_core::transactions_root(&b1.transactions);
         b1.header.signature = kp.sign(b1.header.signing_hash().as_bytes()).unwrap();
 
         let batch = BlockSyncResponse {
@@ -10954,7 +10960,7 @@ mod handle_p2p_event_tests {
             crypto_version: reporter_kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Sig::from_bytes(vec![]),
-            public_key: reporter_kp.public.clone(),
+            public_key: Some(reporter_kp.public.clone()),
         };
         evidence_tx.signature = reporter_kp.sign(evidence_tx.signing_hash().as_bytes()).unwrap();
 
@@ -11010,7 +11016,7 @@ mod handle_p2p_event_tests {
             crypto_version: sender_kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Sig::from_bytes(vec![]),
-            public_key: sender_kp.public.clone(),
+            public_key: Some(sender_kp.public.clone()),
         };
         rejected.signature = sender_kp.sign(rejected.signing_hash().as_bytes()).unwrap();
         let tx_hash = rejected.hash();
@@ -12917,7 +12923,7 @@ mod peer_transaction_routing_tests {
             crypto_version: CryptoScheme::MlDsa,
             chain_id: Hash::digest(b"chain"),
             signature: Signature::from_bytes(vec![]),
-            public_key: PublicKey::from_bytes(vec![1; 32]),
+            public_key: Some(PublicKey::from_bytes(vec![1; 32])),
         }
     }
 
@@ -13005,7 +13011,7 @@ mod forged_transaction_tests {
             crypto_version: kp.scheme,
             chain_id,
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
@@ -13063,7 +13069,7 @@ mod forged_transaction_tests {
         let f = fixture(Mempool::new());
         let mut tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
         let stranger = KeyPair::generate();
-        tx.public_key = stranger.public.clone();
+        tx.public_key = Some(stranger.public.clone());
         tx.signature = stranger.sign(tx.signing_hash().as_bytes()).unwrap();
         assert_rejected_and_unjudged(f, tx, "key not entitled to `from`").await;
     }
@@ -13126,6 +13132,35 @@ mod forged_transaction_tests {
             vec![TransactionVerdict::Valid]
         );
         assert_eq!(f.mempool.read().await.len(), 1);
+    }
+
+    /// #243: gossip carries the key, always — so a transaction that arrives without one is
+    /// refused before any cryptography, and charged to nobody. Checked against this node's copy
+    /// of the chain's key instead, a failure could be a key that changed a block ago, so a
+    /// forgery sent that way would cost every node a verification and its author nothing.
+    #[tokio::test]
+    async fn a_gossiped_transaction_without_its_key_is_refused_and_not_held_against_the_author() {
+        let f = fixture(Mempool::new());
+        let from = Address::from_public_key(&f.kp.public);
+        f.chain_state.write().await.record_account_key(&from, &f.kp.public);
+        let mut tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
+        tx.public_key = None;
+        assert_rejected_and_unjudged(f, tx, "gossiped without its key").await;
+    }
+
+    /// The other half: a known sender's gossiped transaction carries its key on the wire and
+    /// goes into the pool without it, which is where the saving is — every block carries the
+    /// pool's form.
+    #[tokio::test]
+    async fn a_known_senders_gossiped_transaction_is_pooled_without_its_key() {
+        let f = fixture(Mempool::new());
+        let from = Address::from_public_key(&f.kp.public);
+        f.chain_state.write().await.record_account_key(&from, &f.kp.public);
+        let tx = signed(&f.kp, 0, 1_000_000, f.chain_id);
+        assert_eq!(admit(&f, tx).await, vec![TransactionVerdict::Valid]);
+        let pooled = f.mempool.write().await.take(10, &|_| Some(0));
+        assert_eq!(pooled.len(), 1);
+        assert!(pooled[0].public_key.is_none());
     }
 }
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use helix_core::{Block, BlockHeader, CommitSig, Transaction};
-use helix_crypto::{merkle_root, Address, Hash, KeyPair, Signature};
+use helix_crypto::{Address, Hash, KeyPair, Signature};
 use tracing::{debug, info};
 
 use crate::{
@@ -1946,8 +1946,7 @@ impl BftEngine {
             .expect("system clock is before epoch")
             .as_millis() as u64;
 
-        let tx_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
-        let merkle = merkle_root(&tx_hashes);
+        let merkle = helix_core::transactions_root(&transactions);
 
         let last_commit = self
             .last_commit
@@ -3811,7 +3810,7 @@ mod tests {
             crypto_version: kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: helix_crypto::Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         }
     }
 

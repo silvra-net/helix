@@ -414,7 +414,7 @@ mod node_reply_tests {
             crypto_version: kp.scheme,
             chain_id: helix_crypto::Hash::ZERO,
             signature: Signature::from_bytes(vec![]),
-            public_key: kp.public.clone(),
+            public_key: Some(kp.public.clone()),
         };
         tx.signature = kp.sign(tx.signing_hash().as_bytes()).expect("sign");
         tx
