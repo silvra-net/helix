@@ -71,6 +71,13 @@ pub enum MobileError {
          for the public Helix chain"
     )]
     InvalidChainId(String),
+    #[error("from {0:?} is not the address of this seed ({1}) — nothing was signed")]
+    NotThisSeedsAddress(String, String),
+    #[error(
+        "a fee of {0} nano-HLX is above the {1} nano-HLX a wallet pays for one transaction — \
+         nothing was signed. A fee this high usually comes from a node reporting a false base fee"
+    )]
+    FeeAboveCeiling(u64, u64),
 }
 
 /// Every `TxType` variant, spelled exactly as `UnsignedTx::tx_type` must spell it. A `match`
@@ -131,6 +138,21 @@ pub fn sign_transaction(seed: Vec<u8>, tx: UnsignedTx) -> Result<SignedTx, Mobil
     let keypair = keypair_from_seed(&seed)?;
     let from = Address::from_str(&tx.from)
         .map_err(|e| MobileError::InvalidAddress(tx.from.clone(), e.to_string()))?;
+    // Signed with this seed, the transaction can only ever be valid from this seed's address. A
+    // different `from` was a transaction the chain refuses, with an error that names neither the
+    // seed nor the caller's mistake — say it here, before anything is signed.
+    let own = Address::from_public_key(&keypair.public);
+    if from != own {
+        return Err(MobileError::NotThisSeedsAddress(tx.from.clone(), own.to_string()));
+    }
+    // The fee arrives here already priced, usually from a base fee a node reported — and a node
+    // is not to be trusted with that (#222: a lying node had the CLI sign away a balance as its
+    // fee). The same ceiling the CLI and the desktop wallet keep, enforced where every mobile
+    // caller passes through.
+    let ceiling = helix_core::fee::WALLET_AUTO_FEE_CEILING_NANO;
+    if tx.fee > ceiling {
+        return Err(MobileError::FeeAboveCeiling(tx.fee, ceiling));
+    }
     let to = tx
         .to
         .map(|s| Address::from_str(&s).map_err(|e| MobileError::InvalidAddress(s, e.to_string())))
@@ -250,6 +272,45 @@ mod tests {
             };
             assert_eq!(tx_type_from_str(name).unwrap(), variant);
         }
+    }
+
+    fn transfer(from: String, fee: u64) -> UnsignedTx {
+        UnsignedTx {
+            chain_id: String::new(),
+            version: 1,
+            tx_type: "Transfer".to_string(),
+            to: Some(from.clone()),
+            from,
+            amount: 100,
+            fee,
+            nonce: 0,
+            data: vec![],
+        }
+    }
+
+    /// A seed can only sign for its own address; any other `from` would be refused by the chain
+    /// with an error naming neither — so it is refused here, before signing, and says why.
+    #[test]
+    fn a_from_that_is_not_this_seeds_address_is_refused_before_signing() {
+        let other: Vec<u8> = (100u8..132).collect();
+        let stranger = derive_address(other).unwrap();
+        assert!(matches!(
+            sign_transaction(test_seed(), transfer(stranger, 1)),
+            Err(MobileError::NotThisSeedsAddress(_, _))
+        ));
+    }
+
+    /// The fee ceiling the CLI and the desktop wallet keep (#222), here too: up to it signs, one
+    /// nano more does not.
+    #[test]
+    fn a_fee_above_the_wallet_ceiling_is_not_signed() {
+        let ceiling = helix_core::fee::WALLET_AUTO_FEE_CEILING_NANO;
+        let own = derive_address(test_seed()).unwrap();
+        assert!(sign_transaction(test_seed(), transfer(own.clone(), ceiling)).is_ok());
+        assert!(matches!(
+            sign_transaction(test_seed(), transfer(own, ceiling + 1)),
+            Err(MobileError::FeeAboveCeiling(f, c)) if f == ceiling + 1 && c == ceiling
+        ));
     }
 
     #[test]
