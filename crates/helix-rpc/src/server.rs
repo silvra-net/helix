@@ -171,14 +171,11 @@ fn rate_limit_from_env() -> (f64, f64) {
     }
 }
 
-pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
-    let (burst, refill) = rate_limit_from_env();
-    if (burst, refill) != (DEFAULT_RPC_BURST, DEFAULT_RPC_REFILL_PER_SEC) {
-        tracing::info!(burst, refill_per_sec = refill, "RPC rate limit overridden");
-    }
-    let limiter = Arc::new(RateLimiter::new(burst, refill));
-
-    let app = Router::new()
+/// Every route and layer the node serves, in the order it serves them — one place, so a test can
+/// send a request through exactly what production runs (compression and the rate limiter
+/// included) instead of calling a handler on its own and missing what the layers do to it.
+fn router(state: AppState, limiter: Arc<RateLimiter>) -> Router {
+    Router::new()
         .route("/", get(root))
         .route("/logo.png", get(logo))
         .route("/chainquiry.png", get(chainquiry_logo))
@@ -234,7 +231,17 @@ pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
         // one that cannot decode it, still gets plain JSON.
         .layer(CompressionLayer::new())
         .layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
-        .with_state(state);
+        .with_state(state)
+}
+
+pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {
+    let (burst, refill) = rate_limit_from_env();
+    if (burst, refill) != (DEFAULT_RPC_BURST, DEFAULT_RPC_REFILL_PER_SEC) {
+        tracing::info!(burst, refill_per_sec = refill, "RPC rate limit overridden");
+    }
+    let limiter = Arc::new(RateLimiter::new(burst, refill));
+
+    let app = router(state, limiter);
 
     info!("RPC server listening on http://{}", bind);
     let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
@@ -533,7 +540,13 @@ fn stream_blocks_json(store: Arc<RwLock<HelixDb>>, from: u64, count: u64) -> axu
             Some((Ok(chunk), (height.saturating_add(1), false, false)))
         }
     });
-    axum::body::Body::from_stream(chunks)
+    // Fused: `unfold` panics if it is polled again after it ended, and the compression layer does
+    // exactly that — for every client that sends `Accept-Encoding: gzip`, the node's own sync
+    // client among them. The panic dropped the connection before the last chunk, so the client
+    // read a truncated answer (found by the load test, see
+    // `a_streamed_block_batch_survives_the_compression_layer`). A fused stream answers "ended"
+    // for as long as it is asked.
+    axum::body::Body::from_stream(futures_util::StreamExt::fuse(chunks))
 }
 
 /// Full block download for node sync — returns raw `Block` structs as JSON.
@@ -3698,6 +3711,44 @@ mod tests {
         let blocks: Vec<Block> = serde_json::from_slice(&bytes)
             .unwrap_or_else(|e| panic!("not a JSON block array ({e}): {:?}", String::from_utf8_lossy(&bytes)));
         (axum::response::Response::from_parts(parts, axum::body::Body::empty()), blocks)
+    }
+
+    /// The streamed JSON answer (#237) through every layer production puts in front of it. Found
+    /// by a load test, not by the tests above: they read the handler's body directly, and the
+    /// compression layer — which answers any client that sends `Accept-Encoding: gzip`, the node's
+    /// own sync client among them — polls the body once more after it has ended. `unfold` panics
+    /// on that poll, the connection drops before the last chunk, and the client reads a truncated
+    /// answer: "unexpected EOF during chunk size line".
+    #[tokio::test]
+    async fn a_streamed_block_batch_survives_the_compression_layer() {
+        use std::io::Read;
+        use tower::ServiceExt;
+
+        let state = fresh_test_state_with_blocks(5).await;
+        let limiter = Arc::new(RateLimiter::new(1_000.0, 1_000.0));
+        let mut request = axum::http::Request::builder()
+            .uri("/sync/blocks?from=1&count=3")
+            .header(axum::http::header::ACCEPT_ENCODING, "gzip")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+
+        let response = router(state, limiter).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "premise: the answer went through the compression layer"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the whole answer arrives");
+        let mut json = String::new();
+        flate2::read::GzDecoder::new(&body[..]).read_to_string(&mut json).unwrap();
+        let blocks: Vec<Block> = serde_json::from_str(&json).unwrap();
+        assert_eq!(blocks.len(), 3);
     }
 
     /// The streamed answer is the array a client has always parsed, for every length — empty,
