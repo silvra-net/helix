@@ -52,3 +52,9 @@ pub const TOPIC_COMMITTED_BLOCKS: &str = "helix/committed-blocks/1.0.0";
 /// every follower connected to just one hub; if that hub goes down, followers connected
 /// only to it have no path to each other).
 pub const TOPIC_PEER_EXCHANGE: &str = "helix/peer-exchange/1.0.0";
+/// The protocol prefix of the gossipsub instance transactions travel on — their own lane, apart
+/// from proposals, votes and blocks (#224). gossipsub gives each instance its own send queue per
+/// connection, so a flood of transactions no longer stands in front of a vote. Every other topic
+/// stays on gossipsub's default protocol, which keeps the 1.2+ features (IDONTWANT) for the large
+/// consensus messages; a custom prefix only offers 1.1 and 1.0.
+pub const TRANSACTION_GOSSIP_PROTOCOL: &str = "/helix/tx";

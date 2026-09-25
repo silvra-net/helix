@@ -58,6 +58,17 @@ fn spawn(cfg: P2PConfig) -> (mpsc::Sender<P2PCommand>, mpsc::Receiver<P2PEvent>)
 /// A bare gossipsub node speaking exactly the protocol the service speaks — signed messages,
 /// strict validation — and nothing else. It can publish any bytes on any topic.
 fn hostile_gossiper() -> Swarm<gossipsub::Behaviour> {
+    gossiper_on(None)
+}
+
+/// The same, on the lane transactions travel on (`TRANSACTION_GOSSIP_PROTOCOL`, #224). A client on
+/// the default protocol can publish on the transactions topic all it likes: the service does not
+/// subscribe to it there, and nothing is ever delivered.
+fn hostile_tx_gossiper() -> Swarm<gossipsub::Behaviour> {
+    gossiper_on(Some(helix_p2p::TRANSACTION_GOSSIP_PROTOCOL))
+}
+
+fn gossiper_on(protocol_prefix: Option<&'static str>) -> Swarm<gossipsub::Behaviour> {
     SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -67,11 +78,14 @@ fn hostile_gossiper() -> Swarm<gossipsub::Behaviour> {
         )
         .expect("tcp transport")
         .with_behaviour(|key| {
-            let config = gossipsub::ConfigBuilder::default()
+            let mut builder = gossipsub::ConfigBuilder::default();
+            builder
                 .heartbeat_interval(Duration::from_secs(1))
-                .validation_mode(gossipsub::ValidationMode::Strict)
-                .build()
-                .expect("gossipsub config");
+                .validation_mode(gossipsub::ValidationMode::Strict);
+            if let Some(prefix) = protocol_prefix {
+                builder.protocol_id_prefix(prefix);
+            }
+            let config = builder.build().expect("gossipsub config");
             gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Signed(key.clone()), config)
                 .expect("gossipsub behaviour")
         })
@@ -158,7 +172,7 @@ async fn garbage_relayed_by_an_honest_node_gets_the_attacker_cut_off_and_not_the
     // canary at the end checks that too.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let mut attacker = hostile_gossiper();
+    let mut attacker = hostile_tx_gossiper();
     let attacker_id = *attacker.local_peer_id();
     let topic = gossipsub::IdentTopic::new(TOPIC_TRANSACTIONS);
     attacker.behaviour_mut().subscribe(&topic).unwrap();
@@ -250,7 +264,7 @@ async fn a_forged_transaction_is_charged_to_its_author_and_forwarded_to_nobody()
     };
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let mut attacker = hostile_gossiper();
+    let mut attacker = hostile_tx_gossiper();
     let attacker_id = attacker.local_peer_id().to_string();
     let topic = gossipsub::IdentTopic::new(TOPIC_TRANSACTIONS);
     attacker.behaviour_mut().subscribe(&topic).unwrap();
@@ -356,7 +370,7 @@ async fn a_transaction_crosses_the_relay_only_after_its_node_found_it_valid() {
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let mut writer = hostile_gossiper();
+    let mut writer = hostile_tx_gossiper();
     let writer_id = writer.local_peer_id().to_string();
     let topic = gossipsub::IdentTopic::new(TOPIC_TRANSACTIONS);
     writer.behaviour_mut().subscribe(&topic).unwrap();
@@ -433,7 +447,7 @@ async fn a_transaction_crosses_the_relay_only_after_its_node_found_it_valid() {
 /// wherever a hub has not been upgraded yet.
 #[tokio::test]
 async fn garbage_through_an_old_relay_is_never_held_against_the_relay() {
-    let mut old_relay = hostile_gossiper();
+    let mut old_relay = hostile_tx_gossiper();
     let relay_id = old_relay.local_peer_id().to_string();
     let topic = gossipsub::IdentTopic::new(TOPIC_TRANSACTIONS);
     old_relay.behaviour_mut().subscribe(&topic).unwrap();
@@ -458,7 +472,7 @@ async fn garbage_through_an_old_relay_is_never_held_against_the_relay() {
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let mut attacker = hostile_gossiper();
+    let mut attacker = hostile_tx_gossiper();
     attacker.behaviour_mut().subscribe(&topic).unwrap();
     attacker
         .dial("/ip4/127.0.0.1/tcp/19769".parse::<Multiaddr>().unwrap())
@@ -610,6 +624,11 @@ fn a_vote(height: u64) -> helix_consensus::Vote {
 /// chain stops with it; this is the test that notices. And none of the attacker's garbage may
 /// cross at all: an upgraded relay stops it, so operators still running an older build never see
 /// it and never charge the relay for it.
+///
+/// Transactions have travelled on a lane of their own since #224, and this attacker and observer
+/// speak the default protocol, on which the relay does not subscribe to the transactions topic —
+/// so for that one topic "garbage never crosses" holds here without proving anything. The four
+/// tests above cover it, on the transaction lane.
 #[tokio::test]
 async fn an_upgraded_relay_forwards_every_consensus_topic_at_once_and_garbage_never() {
     let (_relay_cmd, _relay_events_nobody_reads) = spawn(config(19_765, vec![]));

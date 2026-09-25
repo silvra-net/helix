@@ -32,7 +32,7 @@ use crate::roundsync::{
 };
 use crate::{
     P2PError, P2PResult, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_PEER_EXCHANGE,
-    TOPIC_TRANSACTIONS, TOPIC_VOTES,
+    TOPIC_TRANSACTIONS, TOPIC_VOTES, TRANSACTION_GOSSIP_PROTOCOL,
 };
 
 /// Events received FROM the P2P network → node
@@ -257,7 +257,13 @@ pub enum P2PCommand {
 
 #[derive(NetworkBehaviour)]
 pub(crate) struct HelixBehaviour {
+    /// Proposals, votes, committed blocks and peer exchange — the consensus lane (see `Lane`).
     gossipsub: gossipsub::Behaviour,
+    /// Transactions, on a protocol of their own (`TRANSACTION_GOSSIP_PROTOCOL`, #224). A second
+    /// instance because gossipsub queues per instance and per connection: on one instance a vote
+    /// waited behind every transaction queued before it, which is how a transaction flood stretched
+    /// the block time from under a second to seven.
+    transactions: gossipsub::Behaviour,
     /// LAN peer auto-discovery — `Toggle`d off when `P2PConfig::enable_mdns` is false
     /// (deterministic seed-peer-only peering; see that field's doc comment). When off it
     /// emits no events, so the `Mdns` match arms below simply never fire.
@@ -433,9 +439,8 @@ impl P2PService {
             .gossipsub
             .subscribe(&block_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
-        swarm
-            .behaviour_mut()
-            .gossipsub
+        Lane::of_topic(TOPIC_TRANSACTIONS)
+            .of(&mut swarm)
             .subscribe(&tx_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
         swarm
@@ -642,6 +647,7 @@ impl P2PService {
         let mut subscription_watch = tokio::time::interval(SUBSCRIPTION_WATCH_INTERVAL);
         // Messages gossipsub had to drop per peer, reported at most once a minute each.
         let mut slow_peers = SlowPeerLog::default();
+        let mut slow_tx_peers = SlowPeerLog::default();
         let mut awaiting_subscriptions: HashMap<PeerId, std::time::Instant> = HashMap::new();
 
         loop {
@@ -649,10 +655,24 @@ impl P2PService {
                 event = swarm.next() => {
                     let Some(event) = event else { break };
                     match event {
-                        SwarmEvent::Behaviour(HelixBehaviourEvent::Gossipsub(
-                            gossipsub::Event::Message { propagation_source, message_id, message }
-                        )) => {
+                        SwarmEvent::Behaviour(
+                            HelixBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                                propagation_source,
+                                message_id,
+                                message,
+                            })
+                            | HelixBehaviourEvent::Transactions(gossipsub::Event::Message {
+                                propagation_source,
+                                message_id,
+                                message,
+                            }),
+                        ) => {
                             let topic = message.topic.as_str();
+                            // Exact, not a guess: each lane subscribes only its own topics, and
+                            // gossipsub delivers nothing for a topic its instance does not
+                            // subscribe to. The verdict must go back to the instance that holds
+                            // the message in its cache.
+                            let lane = Lane::of_topic(topic);
                             // Decoded once, and not at all for a banned peer.
                             let gossiped = (!reputation.is_banned(&propagation_source.to_string()))
                                 .then(|| decode_gossip(topic, &message.data));
@@ -663,6 +683,7 @@ impl P2PService {
                             if let Forwarding::Now(acceptance) = forwarding_of(gossiped.as_ref()) {
                                 report_forwarding(
                                     &mut swarm,
+                                    lane,
                                     &message_id,
                                     &propagation_source,
                                     acceptance,
@@ -1015,6 +1036,7 @@ impl P2PService {
                             for (peer_id, addr) in peers {
                                 info!(peer = %peer_id, "mDNS peer discovered");
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                swarm.behaviour_mut().transactions.add_explicit_peer(&peer_id);
                                 let _ = swarm.dial(addr);
                             }
                         }
@@ -1023,6 +1045,7 @@ impl P2PService {
                         )) => {
                             for (peer_id, _) in peers {
                                 swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                                swarm.behaviour_mut().transactions.remove_explicit_peer(&peer_id);
                             }
                         }
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Gossipsub(
@@ -1035,10 +1058,29 @@ impl P2PService {
                                 warn!(
                                     peer = %peer_id,
                                     dropped = total,
-                                    "Messages to this peer were dropped — its send queue was full \
-                                     or they waited too long to go out. The link to it is not \
-                                     keeping up with what this node sends, and votes and proposals \
-                                     share that queue with transactions"
+                                    "Consensus messages to this peer were dropped — its send queue \
+                                     was full or they waited too long to go out. Proposals and \
+                                     votes are what travel on this queue, so the link to it is not \
+                                     keeping up with consensus itself"
+                                );
+                            }
+                        }
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Transactions(
+                            gossipsub::Event::SlowPeer { peer_id, failed_messages },
+                        )) => {
+                            // Expected under a flood — that is what the lane is for: transactions
+                            // back up and get dropped here instead of in front of a vote. They stay
+                            // in this node's pool; said once a minute, not as a warning.
+                            let dropped = failed_messages.priority + failed_messages.non_priority;
+                            if let Some(total) =
+                                slow_tx_peers.note(peer_id, dropped, std::time::Instant::now())
+                            {
+                                info!(
+                                    peer = %peer_id,
+                                    dropped = total,
+                                    "Transactions to this peer were dropped on their way out — the \
+                                     link to it is not keeping up with the transaction flow. They \
+                                     stay in this node's pool"
                                 );
                             }
                         }
@@ -1124,6 +1166,7 @@ impl P2PService {
                             // without ever finalizing. A single production validator never
                             // exercised this; three did.
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            swarm.behaviour_mut().transactions.add_explicit_peer(&peer_id);
 
                             // Announce what we know right away too — don't make a freshly
                             // connected peer wait up to 30s for the periodic tick just to
@@ -1175,6 +1218,7 @@ impl P2PService {
                             peer_tips.remove(&peer_id);
                             publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
                             swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                            swarm.behaviour_mut().transactions.remove_explicit_peer(&peer_id);
                             reputation.on_disconnect(&peer_id.to_string());
                             let _ = event_tx
                                 .send(P2PEvent::PeerDisconnected(peer_id.to_string()))
@@ -1334,6 +1378,13 @@ impl P2PService {
                 }
 
                 _ = subscription_watch.tick() => {
+                    // The consensus lane only. #232's reconnect is a connection event, and it
+                    // costs both instances their subscriptions at once, so this lane alone
+                    // catches it — while a peer that does not speak the transaction lane at all
+                    // (an older build, a bare gossipsub client) is still a perfectly good peer
+                    // for consensus and must not be dropped for it. Requiring both was the first
+                    // version; `hostile_gossip`'s observer, which speaks only the default
+                    // protocol, was cut off by it after 20 s.
                     let subscribed: HashSet<PeerId> = swarm
                         .behaviour()
                         .gossipsub
@@ -1364,8 +1415,11 @@ impl P2PService {
                         TransactionVerdict::Forged => gossipsub::MessageAcceptance::Reject,
                         TransactionVerdict::Unjudged => gossipsub::MessageAcceptance::Ignore,
                     };
+                    // A ticket is only ever issued for a transaction, and transactions only
+                    // travel on their own lane.
                     report_forwarding(
                         &mut swarm,
+                        Lane::Transactions,
                         &checked.message_id,
                         &checked.propagation_source,
                         acceptance,
@@ -1465,7 +1519,8 @@ impl P2PService {
                         }
                         P2PCommand::BroadcastTransaction(tx) => {
                             if let Ok(data) = bincode::serialize(&tx) {
-                                if let Err(e) = swarm.behaviour_mut().gossipsub
+                                if let Err(e) = Lane::of_topic(TOPIC_TRANSACTIONS)
+                                    .of(&mut swarm)
                                     .publish(tx_topic.clone(), data)
                                 {
                                     debug!("Tx broadcast: {}", e);
@@ -2751,14 +2806,46 @@ fn forwarding_of(message: Option<&Gossiped>) -> Forwarding {
 /// — it aged out before a verdict came — and there is nothing left to forward or lose.
 fn report_forwarding(
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
+    lane: Lane,
     message_id: &gossipsub::MessageId,
     propagation_source: &PeerId,
     acceptance: gossipsub::MessageAcceptance,
 ) {
-    let _still_cached = swarm
-        .behaviour_mut()
-        .gossipsub
-        .report_message_validation_result(message_id, propagation_source, acceptance);
+    let _still_cached =
+        lane.of(swarm)
+            .report_message_validation_result(message_id, propagation_source, acceptance);
+}
+
+/// Which gossipsub instance a topic travels on (#224).
+///
+/// Transactions have a lane of their own so that a flood of them cannot stand in front of a vote:
+/// gossipsub keeps one unprioritised send queue per instance and connection, and on a shared
+/// instance a vote waited behind every transaction queued before it. Everything else — proposals,
+/// votes, committed blocks, peer exchange — stays on the default instance, which keeps gossipsub's
+/// 1.2+ features for the large consensus messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Consensus,
+    Transactions,
+}
+
+impl Lane {
+    /// The one place a topic is assigned to a lane: subscribing, publishing and answering for a
+    /// message all follow from it.
+    fn of_topic(topic: &str) -> Lane {
+        if topic == TOPIC_TRANSACTIONS {
+            Lane::Transactions
+        } else {
+            Lane::Consensus
+        }
+    }
+
+    fn of(self, swarm: &mut libp2p::Swarm<HelixBehaviour>) -> &mut gossipsub::Behaviour {
+        match self {
+            Lane::Consensus => &mut swarm.behaviour_mut().gossipsub,
+            Lane::Transactions => &mut swarm.behaviour_mut().transactions,
+        }
+    }
 }
 
 /// A height the *sender* provably holds, for `peer_tips`. A committed block is the sender's own
@@ -3017,6 +3104,30 @@ mod peer_departure_tests {
     fn a_peer_we_never_announced_is_never_reported_gone() {
         assert!(!peer_departed(0, false));
         assert!(!peer_departed(2, false));
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::Lane;
+    use crate::{
+        TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS, TOPIC_PEER_EXCHANGE, TOPIC_TRANSACTIONS, TOPIC_VOTES,
+    };
+
+    /// Every topic this network has, and the lane it travels on. Transactions alone get their own:
+    /// anything consensus needs in time — proposals, votes, committed blocks — must never share a
+    /// queue with a flood of them (#224).
+    #[test]
+    fn transactions_travel_alone_and_everything_else_on_the_consensus_lane() {
+        assert_eq!(Lane::of_topic(TOPIC_TRANSACTIONS), Lane::Transactions);
+        for topic in [
+            TOPIC_BLOCKS,
+            TOPIC_VOTES,
+            TOPIC_COMMITTED_BLOCKS,
+            TOPIC_PEER_EXCHANGE,
+        ] {
+            assert_eq!(Lane::of_topic(topic), Lane::Consensus, "{topic}");
+        }
     }
 }
 
@@ -3888,6 +3999,43 @@ mod peer_exchange_tests {
 /// same protocols to reach each other at all, and a second copy of this builder is exactly the
 /// duplicated invariant that goes stale the first time a transport is added to one of them —
 /// silently, and only on the path nobody exercises by hand.
+/// gossipsub's configuration, the same for both lanes (see `Lane`) except for the protocol the
+/// transaction lane speaks. One function, so the two instances cannot drift apart in anything that
+/// decides whether a message is accepted, forwarded or dropped.
+fn gossip_config(max_msg_size: usize, protocol_prefix: Option<&'static str>) -> gossipsub::Config {
+    // A message's id is a hash of its bytes, so identical bytes are the same message whoever sends
+    // them.
+    fn content_id(msg: &gossipsub::Message) -> gossipsub::MessageId {
+        let mut hasher = DefaultHasher::new();
+        msg.data.hash(&mut hasher);
+        gossipsub::MessageId::from(hasher.finish().to_string())
+    }
+
+    let mut builder = gossipsub::ConfigBuilder::default();
+    builder
+        // 1s (down from libp2p's 1s default that a prior 10s override had
+        // slowed right down): the heartbeat drives both mesh maintenance and
+        // the IHAVE/IWANT gossip that recovers messages a peer missed while its
+        // mesh was still forming. At 10s, a consensus vote dropped during the
+        // first seconds of a round was not re-offered until long after the round
+        // had already timed out — so in a multi-validator set some node was
+        // always short a prevote or precommit and no round ever reached quorum.
+        // At 1s the recovery lands well within a round. Cheap at Helix's small
+        // validator-set scale.
+        .heartbeat_interval(Duration::from_secs(1))
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        // Nothing is forwarded until this node has said it may be (#228) — see
+        // `forwarding_of`. Without it gossipsub relays every message before the payload
+        // is read, and an honest node passes on whatever an attacker injects.
+        .validate_messages()
+        .message_id_fn(content_id)
+        .max_transmit_size(max_msg_size);
+    if let Some(prefix) = protocol_prefix {
+        builder.protocol_id_prefix(prefix);
+    }
+    builder.build().expect("gossipsub config is valid")
+}
+
 pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<HelixBehaviour>> {
     let max_msg_size = config.max_message_size;
 
@@ -3909,38 +4057,16 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
         .await
         .map_err(|e| P2PError::Transport(e.to_string()))?
         .with_behaviour(|key| {
-            let message_id_fn = |msg: &gossipsub::Message| {
-                let mut hasher = DefaultHasher::new();
-                msg.data.hash(&mut hasher);
-                gossipsub::MessageId::from(hasher.finish().to_string())
-            };
-
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                // 1s (down from libp2p's 1s default that a prior 10s override had
-                // slowed right down): the heartbeat drives both mesh maintenance and
-                // the IHAVE/IWANT gossip that recovers messages a peer missed while its
-                // mesh was still forming. At 10s, a consensus vote dropped during the
-                // first seconds of a round was not re-offered until long after the round
-                // had already timed out — so in a multi-validator set some node was
-                // always short a prevote or precommit and no round ever reached quorum.
-                // At 1s the recovery lands well within a round. Cheap at Helix's small
-                // validator-set scale.
-                .heartbeat_interval(Duration::from_secs(1))
-                .validation_mode(gossipsub::ValidationMode::Strict)
-                // Nothing is forwarded until this node has said it may be (#228) — see
-                // `forwarding_of`. Without it gossipsub relays every message before the payload
-                // is read, and an honest node passes on whatever an attacker injects.
-                .validate_messages()
-                .message_id_fn(message_id_fn)
-                .max_transmit_size(max_msg_size)
-                .build()
-                .expect("gossipsub config is valid");
-
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
+                gossip_config(max_msg_size, None),
             )
             .expect("gossipsub behaviour is valid");
+            let transactions = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossip_config(max_msg_size, Some(TRANSACTION_GOSSIP_PROTOCOL)),
+            )
+            .expect("transaction gossip behaviour is valid");
 
             let mdns: Toggle<mdns::tokio::Behaviour> = if config.enable_mdns {
                 Some(
@@ -3994,6 +4120,7 @@ pub(crate) async fn build_swarm(config: &P2PConfig) -> P2PResult<libp2p::Swarm<H
 
             HelixBehaviour {
                 gossipsub,
+                transactions,
                 mdns,
                 connection_limits,
                 ip_limits,
