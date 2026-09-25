@@ -18,3 +18,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 helix-identity.workspace = true
+
+# Unix only: `statvfs` for the free-space reserve (#245). rustix configures its `fs` module out on
+# Windows — declaring the dependency there would pull a crate whose only needed module does not
+# exist. See `free_disk_bytes`.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true

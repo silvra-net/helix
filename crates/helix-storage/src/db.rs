@@ -215,8 +215,17 @@ fn configured_cache_bytes() -> usize {
     cache_bytes_from(std::env::var("HELIX_DB_CACHE_MB").ok().as_deref())
 }
 
+/// Free space a write must leave on the disk that holds the database (#245). A block is at most
+/// 2 MB and a state snapshot a few more, so 1 GiB is far more than any single write needs — it is
+/// a margin against everything else on the machine, which the node does not control.
+pub const MIN_FREE_DISK_BYTES: u64 = 1 << 30;
+
 pub struct HelixDb {
     db: Database,
+    /// Where the database lives, so a write can ask how much room is left on that disk.
+    path: std::path::PathBuf,
+    /// See [`MIN_FREE_DISK_BYTES`]; adjustable for tests (`set_min_free_bytes`).
+    min_free_bytes: u64,
     /// Take a state snapshot every this many heights; 0 disables it.
     ///
     /// It lives here rather than at the ten call sites of `save_chain_state` because that is what
@@ -225,7 +234,47 @@ pub struct HelixDb {
     snapshot_interval: u64,
 }
 
+/// Bytes available to this process on the disk that holds `path` — `None` where that cannot be
+/// read, which then refuses nothing: a guard that stopped a node on a failed `statvfs` would trade
+/// a rare corruption for a certain outage.
+#[cfg(unix)]
+fn free_disk_bytes(path: &Path) -> Option<u64> {
+    // The volume, not the file: before the first write the file may not exist yet.
+    let target = if path.exists() { path } else { path.parent().filter(|p| !p.as_os_str().is_empty())? };
+    let s = rustix::fs::statvfs(target).ok()?;
+    let unit = if s.f_frsize > 0 { s.f_frsize } else { s.f_bsize };
+    Some(s.f_bavail.saturating_mul(unit))
+}
+
+/// `statvfs` is POSIX, and rustix configures its `fs` module out on Windows entirely — the call
+/// does not fail there, it does not compile (the lesson of the diagnostics route, 2026-08-26).
+/// Windows nodes go without the reserve rather than without a build.
+#[cfg(not(unix))]
+fn free_disk_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 impl HelixDb {
+    /// Change the free-space reserve a write must leave (#245). For tests — a disk cannot be
+    /// filled on demand, a reserve can be raised past it.
+    pub fn set_min_free_bytes(&mut self, bytes: u64) {
+        self.min_free_bytes = bytes;
+    }
+
+    /// Refuses a write before it begins when the disk is within the reserve of full.
+    ///
+    /// Only on the writes that grow the database — blocks, receipts, state. Not on pruning, which
+    /// is what gives pages back, and must keep working on exactly the disk this refuses.
+    fn ensure_disk_reserve(&self) -> StorageResult<()> {
+        match free_disk_bytes(&self.path) {
+            Some(free) if free < self.min_free_bytes => Err(StorageError::DiskAlmostFull {
+                free_bytes: free,
+                reserve_bytes: self.min_free_bytes,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Open with an explicit snapshot interval instead of the configured one.
     ///
     /// Exists so the interval can be exercised without reaching into the process environment —
@@ -286,7 +335,12 @@ impl HelixDb {
         tx.open_table(RECEIPTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(STATE_SNAPSHOTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
-        Ok(HelixDb { db, snapshot_interval: configured_snapshot_interval() })
+        Ok(HelixDb {
+            db,
+            path: path.to_path_buf(),
+            min_free_bytes: MIN_FREE_DISK_BYTES,
+            snapshot_interval: configured_snapshot_interval(),
+        })
     }
 
     // ── State snapshots ──────────────────────────────────────────────────────
@@ -381,6 +435,7 @@ impl HelixDb {
     // ── Account state ────────────────────────────────────────────────────────
 
     pub fn save_chain_state(&self, state: &ChainState) -> StorageResult<()> {
+        self.ensure_disk_reserve()?;
         // Written inside the same transaction as the state it describes. A snapshot that survives
         // a crash the state did not — or the other way round — is a snapshot whose height lies
         // about its contents, and the joiner it lies to has no way to tell.
@@ -1377,6 +1432,7 @@ impl BlockStore for HelixDb {
         if receipts.is_empty() {
             return Ok(());
         }
+        self.ensure_disk_reserve()?;
         let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
         {
             let mut table = tx.open_table(RECEIPTS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1414,6 +1470,7 @@ impl BlockStore for HelixDb {
     }
 
     fn put_block(&mut self, block: Block) -> StorageResult<()> {
+        self.ensure_disk_reserve()?;
         let hash = block.hash();
         let height = block.height();
         let encoded = bincode::serialize(&block)
@@ -2769,6 +2826,53 @@ mod tests {
         assert_eq!(loaded.account_key(&owner), Some(&kp.public));
         assert_eq!(loaded.state_hash(), state.state_hash(), "and the reloaded state is the same state");
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #245: near a full disk, a write is refused before it begins — and the file it was not
+    /// written to is untouched. A validator's disk filled twice on 2026-09-25, and both times a
+    /// write that ran out of space half-way left a redb file with a zeroed region header that no
+    /// build can open. A disk cannot be filled on demand in a test, so the reserve is raised past
+    /// whatever this disk has free.
+    #[test]
+    fn near_a_full_disk_a_write_is_refused_before_it_begins() {
+        let (mut db, path) = fresh_db();
+        let validator = addr(1);
+        db.put_block(block_with_txs(0, &validator, vec![])).unwrap();
+        db.put_block(block_with_txs(1, &validator, vec![])).unwrap();
+        let mut state = ChainState::new(1_000_000);
+        state.applied_height = 1;
+        db.save_chain_state(&state).unwrap();
+
+        db.set_min_free_bytes(u64::MAX);
+        assert!(matches!(
+            db.put_block(block_with_txs(2, &validator, vec![])),
+            Err(StorageError::DiskAlmostFull { .. })
+        ));
+        state.applied_height = 2;
+        let refused = db.save_chain_state(&state).unwrap_err();
+        assert!(matches!(refused, StorageError::DiskAlmostFull { .. }));
+        assert!(refused.to_string().contains("HELIX_KEEP_BLOCKS"), "and says what to do: {refused}");
+        let receipt = Receipt::success(Hash::digest(b"a transaction"), 1, 1);
+        assert!(matches!(db.put_receipts(&[receipt]), Err(StorageError::DiskAlmostFull { .. })));
+        // Pruning gives pages back, so it must keep working on exactly this disk.
+        db.prune_blocks_below(2, 10).expect("pruning is never refused");
+
+        drop(db);
+        let db = HelixDb::open(&path).expect("the file the writes were refused on still opens");
+        assert_eq!(db.latest_height(), 1, "nothing of the refused block was written");
+        assert_eq!(db.load_chain_state(1_000_000).unwrap().applied_height, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The reserve is a real measurement: on a disk with room to spare, the default lets every
+    /// write through (positive control — a guard that refused everything would pass the test
+    /// above).
+    #[test]
+    fn with_room_on_the_disk_the_reserve_lets_writes_through() {
+        let (mut db, path) = fresh_db();
+        db.set_min_free_bytes(1);
+        db.put_block(block_with_txs(0, &addr(1), vec![])).expect("one byte of reserve is always there");
         let _ = std::fs::remove_file(&path);
     }
 }

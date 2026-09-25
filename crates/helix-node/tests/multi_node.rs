@@ -690,9 +690,15 @@ async fn a_node_will_not_start_on_a_setting_it_would_ignore() {
     assert_port_free(RPC, "startup-refusal RPC");
     assert_port_free(P2P, "startup-refusal P2P");
 
-    for (setting, value) in
-        [("HELIX_KEEP_BYTES", "120 gigs"), ("HELIX_P2P_SEED_PEERS", "203.0.113.7:8546")]
-    {
+    for (setting, value) in [
+        ("HELIX_KEEP_BYTES", "120 gigs"),
+        ("HELIX_P2P_SEED_PEERS", "203.0.113.7:8546"),
+        // #245: the checkpoint a validator used on 2026-09-25, its hash one character short.
+        (
+            "HELIX_TRUSTED_CHECKPOINT",
+            "450000:f3e9dbfdbc41af039c296016cc2dcc8ed4e49a8e7743ba10db8a1ec41bddd1a",
+        ),
+    ] {
         let dir = tempdir::TempDir::new().expect("temp dir");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_helix"));
         cmd.arg("start")
@@ -1511,6 +1517,82 @@ fn bind_relay_listener(port: u16, what: &str) -> std::net::TcpListener {
         .unwrap_or_else(|e| panic!("{what} cannot bind {port}: {e}"));
     listener.set_nonblocking(true).expect("non-blocking relay listener");
     listener
+}
+
+/// The lowest block height this node still holds (`earliest_block` in `/diagnostics`); 0 while it
+/// has pruned nothing.
+async fn earliest_retained(rpc_port: u16) -> Option<u64> {
+    let diag: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{rpc_port}/diagnostics")).await.ok()?.json().await.ok()?;
+    Some(diag["earliest_block"].as_u64().unwrap_or(0))
+}
+
+const PS_A_RPC: u16 = 29_771;
+const PS_A_P2P: u16 = 29_772;
+const PS_LINK: u16 = 29_773;
+const PS_B_RPC: u16 = 29_781;
+const PS_B_P2P: u16 = 29_782;
+
+/// #245: a node joining with `HELIX_KEEP_BLOCKS` prunes while it is still catching up.
+///
+/// On 2026-09-25 a validator on a 96 GB disk set `HELIX_KEEP_BLOCKS=100000` and synced from block
+/// 0: the pruner was only started once the startup sync had finished, and sat out any tick while
+/// it ran, so the node wrote the whole chain — 17 GB — filled the disk and lost its database.
+///
+/// B syncs through a slow link (100 KB/s, a small server's uplink), so its catch-up spans several
+/// prune ticks after its tip passes the window. The property is `earliest_block > 0` while
+/// `is_syncing` is still true — impossible when the pruner starts after the sync.
+#[tokio::test]
+#[ignore = "one producer to 1300 blocks, then a follower syncing through a slow link with a keep window (~8 min) — run with --ignored --nocapture"]
+async fn a_pruning_node_prunes_while_it_is_still_catching_up() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
+    const TARGET: u64 = 1_300;
+    const KEEP: u64 = 1_000;
+
+    let _a = spawn_node_with(PS_A_RPC, PS_A_P2P, None, &[("HELIX_BLOCK_TIME_MS", "20")], None);
+    wait_until_reachable(PS_A_RPC, Duration::from_secs(30)).await;
+    wait_for_height(PS_A_RPC, TARGET, Duration::from_secs(900)).await;
+
+    let _link = spawn_link(PS_LINK, PS_A_RPC, 100 * 1024);
+    let keep = KEEP.to_string();
+    let _b = spawn_node_with(PS_B_RPC, PS_B_P2P, Some(PS_LINK), &[("HELIX_KEEP_BLOCKS", keep.as_str())], None);
+    wait_until_reachable(PS_B_RPC, Duration::from_secs(60)).await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    let mut pruned_while_syncing = None;
+    let mut last = (0u64, true, 0u64);
+    while std::time::Instant::now() < deadline {
+        // `earliest` first, `is_syncing` second — the order is the measurement. `syncing` only
+        // ever goes from true to false, so a node still syncing *after* it reported a pruned block
+        // was syncing when it pruned it. Read the other way round, the first version of this test
+        // passed with the pruner started after the sync: the sync ended between the two requests,
+        // the pruner removed its first batch, and "syncing, earliest 501" was a moment that never
+        // existed.
+        let earliest = earliest_retained(PS_B_RPC).await.unwrap_or(0);
+        if let Some(status) = status(PS_B_RPC).await {
+            let height = status["height"].as_u64().unwrap_or(0);
+            let syncing = status["is_syncing"].as_bool().unwrap_or(false);
+            last = (height, syncing, earliest);
+            if syncing && earliest > 0 {
+                pruned_while_syncing = Some((height, earliest));
+                break;
+            }
+            if !syncing && height >= TARGET {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let (height, syncing, earliest) = last;
+    println!("follower: height {height}, syncing {syncing}, earliest retained {earliest}, pruned while syncing {pruned_while_syncing:?}");
+    let Some((at, from)) = pruned_while_syncing else {
+        panic!(
+            "the follower never pruned while it was catching up (last seen: height {height}, \
+             syncing {syncing}, earliest {earliest}) — a node joining from block 0 writes the \
+             whole chain before its keep window does anything"
+        );
+    };
+    assert!(at > KEEP && from > 0, "premise: pruning only starts past the window, at {at} from {from}");
 }
 
 /// The relays keep carrying bytes while a test body blocks its own thread — the property whose

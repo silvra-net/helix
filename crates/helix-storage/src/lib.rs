@@ -40,6 +40,21 @@ pub enum StorageError {
          get the validator slashed; do not run two validators from the same key."
     )]
     AlreadyLocked(std::path::PathBuf),
+    /// The disk that holds the database is within the reserve of full, and a write was refused
+    /// before it began (#245). A write that runs out of space half-way is not a failed write but a
+    /// lost database: on 2026-09-25 a validator's disk filled twice, and both times redb left a
+    /// file whose region header was zeroed, which no build can open. Refusing up front turns that
+    /// into an ordinary storage failure — the node exits, the file is intact, and the message
+    /// says what to do.
+    #[error(
+        "only {} MB are free on the disk that holds the chain database, less than the {} MB this \
+         node keeps in reserve — the write was refused before it began, because a write that runs \
+         out of space half-way leaves a database no build can open. Free space on that disk, or \
+         bound the database with HELIX_KEEP_BLOCKS or HELIX_KEEP_BYTES.",
+        .free_bytes / (1024 * 1024),
+        .reserve_bytes / (1024 * 1024)
+    )]
+    DiskAlmostFull { free_bytes: u64, reserve_bytes: u64 },
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;

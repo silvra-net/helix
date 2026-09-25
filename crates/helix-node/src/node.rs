@@ -766,6 +766,7 @@ impl HelixNode {
             std::env::var("HELIX_KEEP_BYTES").ok().as_deref(),
         )?;
         check_seed_peers(&configured_seed_peers(&cfg))?;
+        check_trusted_checkpoint_setting(config::resolve("HELIX_TRUSTED_CHECKPOINT", &None).as_deref())?;
 
         let key_path = resolve_validator_key_path(&cfg);
         // Double-sign state lives beside the key it protects: validator-key.json ->
@@ -1321,6 +1322,22 @@ impl HelixNode {
         // engine from the true tip, exactly as an ordinary restart (whose DB is already current)
         // already does. Consensus additionally waits on `syncing` in `block_production_loop`; a
         // node that proposes while still missing history would fork off a chain it hasn't seen.
+        //
+        // The pruner starts before the sync, not after it (#245). Started after, a node joining
+        // from block 0 wrote the whole chain to disk before its window did anything: a validator
+        // with `HELIX_KEEP_BLOCKS=100000` on a 96 GB disk reached 17 GB, filled the disk, and lost
+        // the database to it. Off by default: somebody has to keep the history, and a config
+        // default must not be what decides that for a network (#194).
+        let keep_blocks = configured_keep_blocks();
+        let keep_bytes = configured_keep_bytes();
+        if keep_blocks > 0 || keep_bytes > 0 {
+            tokio::spawn(prune_loop(
+                self.store.clone(),
+                keep_blocks,
+                keep_bytes,
+                std::path::PathBuf::from(CHAIN_DB_FILE),
+            ));
+        }
         if let Some(peer_url) = self.sync_peer.clone() {
             // Best-effort: the target is only for the progress display, so an old or
             // unreachable peer just leaves it at 0 (reported as `null`) rather than
@@ -1340,7 +1357,7 @@ impl HelixNode {
             if local_tip == 0 {
                 if let Some(raw) = config::resolve("HELIX_TRUSTED_CHECKPOINT", &None) {
                     match parse_trusted_checkpoint(&raw) {
-                        Some(cp) if cp.height > 0 => {
+                        Ok(cp) => {
                             let chain_id = self.chain_state.read().await.chain_id;
                             info!(
                                 height = cp.height,
@@ -1365,10 +1382,13 @@ impl HelixNode {
                                 ),
                             }
                         }
-                        _ => warn!(
+                        // Refused at startup (`check_trusted_checkpoint_setting`), so a node only gets
+                        // here if the value changed underneath it — which it cannot, it is read from
+                        // the environment. Kept as a warning rather than a panic all the same.
+                        Err(why) => warn!(
                             value = %raw,
-                            "HELIX_TRUSTED_CHECKPOINT is not `<height>:<block hash>` — ignoring it \
-                             and replaying the chain"
+                            reason = %why,
+                            "HELIX_TRUSTED_CHECKPOINT cannot be used — replaying the chain instead"
                         ),
                     }
                 }
@@ -1715,20 +1735,6 @@ impl HelixNode {
                 ));
             }
             (None, None) => {}
-        }
-
-        // Prune old blocks, if this operator asked for it. Off by default: somebody has to keep
-        // the history, and a config default must not be what decides that for a network (#194).
-        let keep_blocks = configured_keep_blocks();
-        let keep_bytes = configured_keep_bytes();
-        if keep_blocks > 0 || keep_bytes > 0 {
-            tokio::spawn(prune_loop(
-                self.store.clone(),
-                keep_blocks,
-                keep_bytes,
-                std::path::PathBuf::from(CHAIN_DB_FILE),
-                self.syncing.clone(),
-            ));
         }
 
         tokio::spawn(validator_health_loop(
@@ -4216,21 +4222,31 @@ async fn prune_loop(
     keep_blocks: u64,
     budget_bytes: u64,
     db_path: std::path::PathBuf,
-    syncing: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    use std::sync::atomic::Ordering;
     let mut ticker = tokio::time::interval(Duration::from_secs(PRUNE_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut announced = false;
     let mut announced_window = 0u64;
+    let mut behind = false;
 
     loop {
-        ticker.tick().await;
-        // Not while catching up. The horizon would be computed against a tip that is still
-        // climbing, and a node that is busy applying batches has better uses for its write lock.
-        if syncing.load(Ordering::Relaxed) {
-            continue;
+        // While catching up too (#245). This loop used to sit out every tick of the startup sync,
+        // on the argument that the tip was still climbing — but the horizon is this node's own tip
+        // minus its window, which is as valid a line mid-sync as after it, and the sync never
+        // reads below it (it builds on its tip). Sitting out meant a node joining from block 0
+        // wrote the whole chain before the window did anything.
+        //
+        // And without waiting while it is behind: one tick removes at most
+        // `PRUNE_BATCHES_PER_TICK × PRUNE_BATCH_BLOCKS`, 500 blocks a second, and a sync or a
+        // horizon that jumped (a snapshot join at height 490 000 leaves 390 000 heights to walk)
+        // outpaces that. Each batch hands the write lock back, so running on costs the sync
+        // nothing it would not pay anyway.
+        if behind {
+            tokio::task::yield_now().await;
+        } else {
+            ticker.tick().await;
         }
+        behind = false;
         let tip = { store.read().await.latest_height() };
 
         // Re-derived every tick, not once at startup: the cost of a block moves with the validator
@@ -4274,6 +4290,9 @@ async fn prune_loop(
 
         let mut removed_this_tick = 0u64;
         let mut earliest = 0u64;
+        // Assume behind until a batch says it reached the horizon; an error ends the pass *not*
+        // behind, so a failing prune waits for the next tick instead of spinning on it.
+        behind = true;
         for _ in 0..PRUNE_BATCHES_PER_TICK {
             let outcome = {
                 let db = store.write().await;
@@ -4284,11 +4303,13 @@ async fn prune_loop(
                     removed_this_tick += o.removed;
                     earliest = o.earliest;
                     if o.done {
+                        behind = false;
                         break;
                     }
                 }
                 Err(e) => {
                     warn!(err = %e, "Could not prune old blocks — will try again");
+                    behind = false;
                     break;
                 }
             }
@@ -6186,31 +6207,88 @@ struct TrustedCheckpoint {
     state_root: Option<Hash>,
 }
 
-/// Parse `HELIX_TRUSTED_CHECKPOINT`, format `<height>:<block hash hex>[:<state root hex>]`.
+/// Parse `HELIX_TRUSTED_CHECKPOINT`, format `<height>:<block hash hex>[:<state root hex>]`, or
+/// say exactly what is wrong with it.
 ///
 /// Pure, because every rejection here is a node that will *not* take the shortcut — and silently
 /// accepting a malformed anchor is the one outcome that must be impossible. A partially-parsed
-/// checkpoint is worse than none: none falls back to the full sync, which is always correct.
+/// checkpoint is worse than none.
+///
+/// The reason is the point of returning one (#245). A checkpoint copied with its last character
+/// missing used to be reported as "not `<height>:<block hash>`", which the operator reading it had
+/// every reason to believe it was — and then the node replayed the chain from block 0 onto a disk
+/// too small for it, twice. "The block hash has 63 characters, a block hash has 64" is a mistake
+/// anyone can fix in a minute. `check_trusted_checkpoint_setting` refuses the start with it.
 ///
 /// The third part is optional so an operator with an old two-part checkpoint still starts and
 /// still syncs. What they do not get is the snapshot shortcut, and the refusal says how to get
 /// the missing half (`GET /sync/checkpoint`, compared across more than one node — a value from
 /// the single node you are about to sync from is that node vouching for itself, #139).
-fn parse_trusted_checkpoint(raw: &str) -> Option<TrustedCheckpoint> {
-    let mut parts = raw.trim().split(':');
-    let height: u64 = parts.next()?.trim().parse().ok()?;
-    let block_hash = Hash::from_hex(parts.next()?.trim()).ok()?;
-    let state_root = match parts.next() {
-        // A third part that is present but unreadable is a typo, not an omission. Falling back to
-        // `None` there would quietly downgrade the operator to the weaker form they did not ask
-        // for, so the whole checkpoint is refused instead.
-        Some(raw_root) => Some(Hash::from_hex(raw_root.trim()).ok()?),
+fn parse_trusted_checkpoint(raw: &str) -> Result<TrustedCheckpoint, String> {
+    let parts: Vec<&str> = raw.trim().split(':').map(str::trim).collect();
+    if parts.len() < 2 {
+        return Err("it has no `:` between the height and the block hash".to_string());
+    }
+    if parts.len() > 3 {
+        return Err(format!("it has {} parts separated by `:`, and the format has at most three", parts.len()));
+    }
+    let height: u64 = parts[0]
+        .parse()
+        .map_err(|_| format!("the height {:?} is not a whole number", parts[0]))?;
+    if height == 0 {
+        return Err("its height is 0 — the genesis block, so there is nothing to skip to".to_string());
+    }
+    let block_hash = checkpoint_hash("block hash", parts[1])?;
+    // A third part that is present but unreadable is a typo, not an omission. Falling back to
+    // `None` there would quietly downgrade the operator to the weaker form they did not ask for,
+    // so the whole checkpoint is refused instead.
+    let state_root = match parts.get(2) {
+        Some(raw_root) => Some(checkpoint_hash("state root", raw_root)?),
         None => None,
     };
-    if parts.next().is_some() {
-        return None; // more than three parts is not this format
+    Ok(TrustedCheckpoint { height, block_hash, state_root })
+}
+
+/// One 32-byte hash of a checkpoint, or which of the ways a copied hash goes wrong this is.
+fn checkpoint_hash(what: &str, raw: &str) -> Result<Hash, String> {
+    if raw.is_empty() {
+        return Err(format!("the {what} is empty"));
     }
-    Some(TrustedCheckpoint { height, block_hash, state_root })
+    if let Some(bad) = raw.chars().find(|c| !c.is_ascii_hexdigit()) {
+        return Err(format!("the {what} contains {bad:?}, and a {what} is hexadecimal (0-9, a-f)"));
+    }
+    if raw.len() != 64 {
+        return Err(format!(
+            "the {what} has {} characters, and a {what} has 64 — characters were lost or added \
+             when it was copied",
+            raw.len()
+        ));
+    }
+    Hash::from_hex(raw).map_err(|e| format!("the {what} cannot be read: {e}"))
+}
+
+/// Refuses a trusted checkpoint this node cannot read, before anything is created or opened
+/// (#245).
+///
+/// Ignoring it was the dangerous fallback, not the safe one it looked like. An operator sets a
+/// checkpoint because they do not want the whole chain — on 2026-09-25 a validator on a 96 GB disk
+/// did, with a hash one character short. The node said the value was not a checkpoint, replayed
+/// every block from 0, filled the disk, and the full disk left a redb file no build can open. A
+/// node that will not start is noticed by the person who just set the value, while they still
+/// have it in front of them.
+fn check_trusted_checkpoint_setting(raw: Option<&str>) -> Result<()> {
+    if let Some(raw) = raw {
+        if let Err(why) = parse_trusted_checkpoint(raw) {
+            bail!(
+                "HELIX_TRUSTED_CHECKPOINT={raw:?} cannot be used: {why}. The format is \
+                 <height>:<block hash>:<state root>, exactly as `GET /sync/checkpoint` prints it \
+                 (compare it on more than one node). Without it this node would replay the whole \
+                 chain from block 0, which is what fills a small disk — so it does not start. \
+                 Unset the variable to replay the chain on purpose."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A state snapshot is the whole account set at once. 256 MB is roughly a million accounts —
@@ -7306,15 +7384,12 @@ mod sync_blocks_from_peer_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A malformed anchor must parse to nothing, never to something partial: the fallback is the
-    /// full sync, which is always correct, while a half-read checkpoint would anchor the node to
-    /// a height or hash the operator did not write.
     /// The three-part form, and the two ways the third part can be wrong.
     ///
     /// Absent means the operator has an older checkpoint: parse it, anchor the blocks, refuse the
     /// shortcut. **Present but unreadable is a typo**, and falling back to `None` there would
     /// silently hand them the weaker form they did not ask for — so the whole checkpoint is
-    /// refused and they get the full sync plus a chance to notice.
+    /// refused.
     #[test]
     fn a_state_root_is_taken_when_readable_and_refused_when_it_is_a_typo() {
         let block = Hash::from_bytes([1u8; 32]);
@@ -7323,37 +7398,36 @@ mod sync_blocks_from_peer_tests {
         let full = format!("175000:{}:{}", block.to_hex(), root.to_hex());
         assert_eq!(
             parse_trusted_checkpoint(&full),
-            Some(TrustedCheckpoint {
+            Ok(TrustedCheckpoint {
                 height: 175_000,
                 block_hash: block.clone(),
                 state_root: Some(root.clone())
             })
         );
 
-        assert_eq!(
-            parse_trusted_checkpoint(&format!("175000:{}:", block.to_hex())),
-            None,
+        assert!(
+            parse_trusted_checkpoint(&format!("175000:{}:", block.to_hex())).is_err(),
             "an empty third part is a truncated paste, not an omission"
         );
-        assert_eq!(
-            parse_trusted_checkpoint(&format!("175000:{}:nothex", block.to_hex())),
-            None,
+        assert!(
+            parse_trusted_checkpoint(&format!("175000:{}:nothex", block.to_hex())).is_err(),
             "and an unreadable one must not quietly downgrade to the two-part form"
         );
-        assert_eq!(
-            parse_trusted_checkpoint(&format!("175000:{}:{}:extra", block.to_hex(), root.to_hex())),
-            None,
+        assert!(
+            parse_trusted_checkpoint(&format!("175000:{}:{}:extra", block.to_hex(), root.to_hex())).is_err(),
             "nor may a fourth part be ignored — this is not that format"
         );
     }
 
+    /// A malformed anchor must parse to nothing, never to something partial: a half-read
+    /// checkpoint would anchor the node to a height or hash the operator did not write.
     #[test]
     fn a_checkpoint_parses_only_when_both_halves_are_whole() {
         let hash = Hash::from_bytes([1u8; 32]);
         let good = format!("175000:{}", hash.to_hex());
         assert_eq!(
             parse_trusted_checkpoint(&good),
-            Some(TrustedCheckpoint {
+            Ok(TrustedCheckpoint {
                 height: 175_000,
                 block_hash: hash.clone(),
                 state_root: None
@@ -7361,7 +7435,7 @@ mod sync_blocks_from_peer_tests {
         );
         assert_eq!(
             parse_trusted_checkpoint(&format!("  175000 : {}  ", hash.to_hex())),
-            Some(TrustedCheckpoint { height: 175_000, block_hash: hash, state_root: None }),
+            Ok(TrustedCheckpoint { height: 175_000, block_hash: hash, state_root: None }),
             "whitespace around either half is the operator's copy-paste, not a different value"
         );
 
@@ -7375,10 +7449,54 @@ mod sync_blocks_from_peer_tests {
             "175000:00ff",
         ] {
             assert!(
-                parse_trusted_checkpoint(bad).is_none(),
+                parse_trusted_checkpoint(bad).is_err(),
                 "{bad:?} must not parse — a partial checkpoint is worse than none"
             );
         }
+    }
+
+    /// #245, the case from the field: a validator on a 96 GB disk set a checkpoint whose hash had
+    /// lost its last character. It was reported as "not `<height>:<block hash>`" and ignored, the
+    /// node replayed the chain from 0, and the disk filled. The reason has to name the length,
+    /// because that is the one thing the operator could not see by looking at it.
+    #[test]
+    fn a_hash_one_character_short_is_named_as_exactly_that() {
+        let from_the_field = "450000:f3e9dbfdbc41af039c296016cc2dcc8ed4e49a8e7743ba10db8a1ec41bddd1a";
+        let why = parse_trusted_checkpoint(from_the_field).unwrap_err();
+        assert!(why.contains("block hash has 63 characters"), "{why}");
+        assert!(why.contains("64"), "{why}");
+        assert!(
+            parse_trusted_checkpoint(&format!("{from_the_field}0")).is_ok(),
+            "premise: with the lost character back it is a checkpoint"
+        );
+
+        let root_short = format!("450000:{}:{}", "ab".repeat(32), "cd".repeat(31));
+        assert!(parse_trusted_checkpoint(&root_short).unwrap_err().contains("state root has 62"));
+        assert!(
+            parse_trusted_checkpoint(&format!("450000:{}x", "ab".repeat(31)))
+                .unwrap_err()
+                .contains("'x'"),
+            "a stray character is named, not counted"
+        );
+        assert!(
+            parse_trusted_checkpoint(&format!("0:{}", "ab".repeat(32))).unwrap_err().contains("genesis"),
+            "height 0 skips nothing — it used to be dropped without a word"
+        );
+    }
+
+    /// The start refuses an unreadable checkpoint and names the variable, the value and the
+    /// reason; an unset one and a readable one are no business of this check.
+    #[test]
+    fn an_unreadable_checkpoint_stops_the_start_and_says_why() {
+        assert!(check_trusted_checkpoint_setting(None).is_ok());
+        assert!(check_trusted_checkpoint_setting(Some(&format!("450000:{}", "ab".repeat(32)))).is_ok());
+
+        let short = format!("450000:{}", "ab".repeat(31));
+        let err = check_trusted_checkpoint_setting(Some(&short)).unwrap_err().to_string();
+        assert!(err.contains("HELIX_TRUSTED_CHECKPOINT"), "{err}");
+        assert!(err.contains(&format!("{short:?}")), "{err}");
+        assert!(err.contains("block hash has 62 characters"), "{err}");
+        assert!(err.contains("/sync/checkpoint"), "and where a good one comes from: {err}");
     }
 
     async fn serve_blocks(blocks: Vec<Block>) -> String {
@@ -9472,6 +9590,58 @@ mod body_cap_tests {
             sync_body_cap(count) > largest_honest_batch,
             "a batch of {count} blocks at the block size limit must fit under the cap"
         );
+    }
+
+    /// #245: a pruner that is behind runs on instead of waiting for its next tick. One tick removes
+    /// at most `PRUNE_BATCHES_PER_TICK × PRUNE_BATCH_BLOCKS`; a sync can outpace that, and a
+    /// snapshot join leaves a horizon far above the earliest block — here genesis and one block at
+    /// 12 000, so the pruner walks 11 000 empty heights in 22 batches. Waiting between passes that
+    /// is two ticks; running on, none. On a paused clock the difference is exact.
+    #[tokio::test(start_paused = true)]
+    async fn a_pruner_that_is_behind_does_not_wait_for_its_next_tick() {
+        let path = std::env::temp_dir().join(format!(
+            "helix-test-prune-pace-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut db = HelixDb::open(&path).unwrap();
+        let kp = helix_crypto::KeyPair::generate();
+        let block_at = |height: u64| {
+            let mut block = helix_core::genesis_block(
+                Address::from_public_key(&kp.public),
+                kp.public.clone(),
+                helix_crypto::Signature::from_bytes(vec![]),
+                height,
+            );
+            block.header.height = height;
+            block
+        };
+        db.put_block(block_at(0)).unwrap();
+        db.put_block(block_at(12_000)).unwrap();
+        let store = Arc::new(RwLock::new(db));
+        let horizon = prune_horizon(12_000, MIN_KEEP_BLOCKS).expect("premise: something to prune");
+        assert!(
+            horizon > PRUNE_BATCHES_PER_TICK as u64 * PRUNE_BATCH_BLOCKS * 2,
+            "premise: more than two ticks of work at the old pace"
+        );
+
+        tokio::spawn(prune_loop(store.clone(), MIN_KEEP_BLOCKS, 0, path.clone()));
+        let started = tokio::time::Instant::now();
+        while store.read().await.earliest_block_height().unwrap() < horizon {
+            assert!(
+                started.elapsed() < Duration::from_secs(10 * PRUNE_INTERVAL_SECS),
+                "the pruner never reached its horizon"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(PRUNE_INTERVAL_SECS),
+            "reached the horizon after {:?} — it waited for ticks while it had work",
+            started.elapsed()
+        );
+        assert!(store.read().await.get_block_by_height(12_000).is_ok(), "the tip is kept");
+        let _ = std::fs::remove_file(&path);
     }
 }
 

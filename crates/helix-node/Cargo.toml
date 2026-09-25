@@ -35,3 +35,6 @@ libp2p.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+# A paused clock for timer-driven loops (`start_paused`): a test of "does not wait for its next
+# tick" is exact on virtual time and a coin flip on the wall clock. Same tokio, one more feature.
+tokio = { workspace = true, features = ["test-util"] }
