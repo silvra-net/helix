@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, DEFAULT_NODE, LOCAL_NODE, isLocalNode } from "../api";
+import { refusedLocalChain } from "../nodeRefusal";
 import { StakeActionPanel, type StakeAction } from "../components/StakeActionPanel";
 import type { LogLine, NetworkStatus, NodeProcessStatus, Overview, SubmitResult, ValidatorPool, ValidatorStatus } from "../types";
 import { hlx, shortAddr, shortHash } from "../format";
@@ -30,6 +31,9 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
   const [procNotice, setProcNotice] = useState<string | null>(null);
   const [nodePass, setNodePass] = useState("");
   const [lines, setLines] = useState<LogLine[]>([]);
+  // Set once the chain has been moved aside, so the refusal hint does not keep asking for a reset
+  // that has already happened; cleared by the next start.
+  const [chainMovedAside, setChainMovedAside] = useState(false);
   const consoleRef = useRef<HTMLDivElement | null>(null);
   const autoScroll = useRef(true);
 
@@ -57,10 +61,13 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
     }
   }, [lines]);
 
+  const chainRefused = !procStatus?.running && !chainMovedAside && refusedLocalChain(lines);
+
   const startLocalNode = async () => {
     setProcError(null);
     setProcBusy(true);
     setLines([]);
+    setChainMovedAside(false);
     try {
       // The node runs as this wallet's key (see node_process.rs). An encrypted wallet file
       // cannot be read without its passphrase, and the node has no terminal to ask on — so it
@@ -90,6 +97,7 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
     setProcBusy(true);
     try {
       const backup = await api.nodeResetChain();
+      setChainMovedAside(true);
       setProcNotice(`Local chain moved aside. Start the node to re-sync. Old copy: ${backup}`);
     } catch (e) {
       setProcError(String(e));
@@ -417,13 +425,24 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
         {procError && <div className="error" style={{ marginTop: 8 }}>{procError}</div>}
         {procNotice && <div className="notice" style={{ marginTop: 8 }}>{procNotice}</div>}
 
+        {/* The node refused this machine's copy of the chain and exited. Its own message is in the
+            console below, but a line in a console is easy to miss and the repair is one button
+            away — so say it here and open the reset. */}
+        {chainRefused && (
+          <div className="error" style={{ marginTop: 8 }}>
+            The node refused the chain stored on this machine: it is from before the network was
+            reset, or from an older version it cannot read. Nothing was changed. Reset the local
+            chain below — the old copy is renamed, not deleted — and start the node again.
+          </div>
+        )}
+
         {/* Recovery for a local chain that can no longer follow the network — a database from
             an incompatible build, or one left behind after the network reset its own chain.
             Without this the only way out is finding the file by hand. Deliberately not offered
             while the node runs (it holds the database open), and deliberately a rename rather
             than a delete. */}
         {!procStatus?.running && (
-          <details style={{ marginTop: 12 }}>
+          <details open={chainRefused || undefined} style={{ marginTop: 12 }}>
             <summary className="muted small" style={{ cursor: "pointer" }}>
               Node won't sync? Reset the local chain
             </summary>

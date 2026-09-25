@@ -820,18 +820,7 @@ impl HelixNode {
         let genesis_probe = store.get_block_by_height(0);
         if let Err(e) = &genesis_probe {
             if !empty_data_directory(e) {
-                anyhow::bail!(
-                    "{} holds a block 0 this build cannot read: {e}\n\
-                     That is NOT an empty data directory, so this node refuses to start rather \
-                     than write a new genesis over the chain that is already there.\n\
-                     The usual cause is a release that changed the block format — the data is \
-                     intact, this binary simply speaks a different one.\n\
-                     To join the new chain: rename the data directory (do NOT delete it, e.g. \
-                     `mv {0} {0}.pre-upgrade.bak`, and the peer file beside it) and start again \
-                     — this node will then fetch the genesis from the network.\n\
-                     To keep reading the old chain: run the version that wrote it.",
-                    db_path.display()
-                );
+                return Err(unreadable_genesis_refusal(&db_path, e));
             }
         }
 
@@ -5584,6 +5573,26 @@ fn verify_genesis_checkpoint(
             version = env!("CARGO_PKG_VERSION"),
         ),
     }
+}
+
+/// Why this node will not start on a data directory whose block 0 it cannot read — see
+/// [`empty_data_directory`] for why that is never taken as "empty".
+///
+/// A function rather than a `bail!` in the startup path so its wording can be tested: the desktop
+/// wallet recognises it by text (`gui/src/nodeRefusal.ts`) and offers its reset button.
+fn unreadable_genesis_refusal(db_path: &Path, e: &helix_storage::StorageError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} holds a block 0 this build cannot read: {e}\n\
+         That is NOT an empty data directory, so this node refuses to start rather \
+         than write a new genesis over the chain that is already there.\n\
+         The usual cause is a release that changed the block format — the data is \
+         intact, this binary simply speaks a different one.\n\
+         To join the new chain: rename the data directory (do NOT delete it, e.g. \
+         `mv {0} {0}.pre-upgrade.bak`, and the peer file beside it) and start again \
+         — this node will then fetch the genesis from the network.\n\
+         To keep reading the old chain: run the version that wrote it.",
+        db_path.display()
+    )
 }
 
 /// Whether this node may carry on with the chain already in its data directory.
@@ -11949,6 +11958,52 @@ mod genesis_verification_tests {
             "a configured hash must not be blamed on the build, and the other way round: \
              {configured}"
         );
+    }
+
+    /// The desktop wallet recognises both startup refusals by their text and offers its reset
+    /// button (`gui/src/nodeRefusal.ts`). The node and the wallet are separate programs, so a
+    /// reworded message would switch that off without failing anything on either side. This
+    /// reads the wallet's list and requires every entry to be in one of the two messages, and
+    /// each message to carry one of them.
+    #[test]
+    fn the_desktop_wallet_still_recognises_the_refusals_it_can_repair() {
+        const WALLET: &str = include_str!("../../../gui/src/nodeRefusal.ts");
+        let list = WALLET
+            .split_once("LOCAL_CHAIN_REFUSALS = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("nodeRefusal.ts declares LOCAL_CHAIN_REFUSALS = [ … ]");
+        let markers: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        assert_eq!(markers.len(), 2, "one marker per refusal, parsed from: {list}");
+
+        let db = Path::new("helix-data.redb");
+        let other_chain = verify_stored_genesis(
+            Some(&GenesisCheckpoint::CompiledIn(some_genesis(2).hash().to_hex())),
+            &some_genesis(1),
+            db,
+        )
+        .expect_err("premise: the two genesis blocks differ")
+        .to_string();
+        let unreadable = unreadable_genesis_refusal(
+            db,
+            &helix_storage::StorageError::Serialization("invalid value: integer `1952`".into()),
+        )
+        .to_string();
+
+        for marker in &markers {
+            assert!(
+                other_chain.contains(marker) || unreadable.contains(marker),
+                "the wallet looks for {marker:?}, which neither refusal says any more"
+            );
+        }
+        for message in [&other_chain, &unreadable] {
+            let first_line = message.lines().next().unwrap_or_default();
+            assert!(
+                markers.iter().any(|m| first_line.contains(m)),
+                "the wallet would not recognise this refusal (it reads the output line by line, \
+                 so the marker has to be on the first): {first_line}"
+            );
+        }
     }
 
     #[test]
