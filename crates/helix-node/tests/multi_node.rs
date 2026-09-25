@@ -1393,6 +1393,17 @@ const TL_C_LINK: u16 = 29_597;
 /// `node.silvra.net`: 600–1090 KB/s, median 890).
 const LINK_BYTES_PER_SEC: u64 = 890 * 1024;
 
+/// The link rate the flood test runs at: `LINK_BYTES_PER_SEC`, or `HELIX_TEST_LINK_BYTES_PER_SEC`
+/// for an experiment. Whether a slow block time belongs to the link or to something else is
+/// answered by taking the link away and seeing whether it stays — the unthrottled run of #224 did
+/// that by editing this constant.
+fn link_rate() -> u64 {
+    std::env::var("HELIX_TEST_LINK_BYTES_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LINK_BYTES_PER_SEC)
+}
+
 /// Forward TCP between two loopback ports at a fixed byte rate, in both directions.
 ///
 /// One relay stands for one node's link, so its rate is that node's bandwidth — **shared by every
@@ -1666,6 +1677,7 @@ fn sign_flood(
 #[ignore = "three validator processes behind throttled links, two activation epochs, then a 2000-tx flood (~8-12 min) — run with --ignored --nocapture"]
 async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_production() {
     let _serialized = NODE_TEST_LOCK.lock().await;
+    let rate = link_rate();
     for (port, label) in [
         (TL_A_RPC, "A rpc"), (TL_A_P2P, "A p2p"), (TL_A_LINK, "A link"),
         (TL_B_RPC, "B rpc"), (TL_B_P2P, "B p2p"), (TL_B_LINK, "B link"),
@@ -1678,9 +1690,9 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
     // that dial and waits for the next redial tick, which costs 30 s of the test's budget for no
     // reason.
     let links = [
-        spawn_link(TL_A_LINK, TL_A_P2P, LINK_BYTES_PER_SEC),
-        spawn_link(TL_B_LINK, TL_B_P2P, LINK_BYTES_PER_SEC),
-        spawn_link(TL_C_LINK, TL_C_P2P, LINK_BYTES_PER_SEC),
+        spawn_link(TL_A_LINK, TL_A_P2P, rate),
+        spawn_link(TL_B_LINK, TL_B_P2P, rate),
+        spawn_link(TL_C_LINK, TL_C_P2P, rate),
     ];
 
     let kp_a = KeyPair::generate();
@@ -1770,7 +1782,7 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
     eprintln!(
         "link use over the {:.0} s of the flood: {}",
         flood_started.elapsed().as_secs_f64(),
-        link_use(&carried_before, &carried_after, flood_started.elapsed(), LINK_BYTES_PER_SEC)
+        link_use(&carried_before, &carried_after, flood_started.elapsed(), rate)
     );
 
     // What the blocks carried of the flood against what the chain applied (#231). Every flood
@@ -1799,7 +1811,7 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
     let applied = nonce_after - nonce_before;
     eprintln!(
         "link {} KB/s per node · idle: median {:.2}s p90 {:.2}s · under {accepted} tx: median {:.2}s p90 {:.2}s, fullest block {} tx · flood carried {carried}, applied {applied}",
-        LINK_BYTES_PER_SEC / 1024, idle.median, idle.p90, loaded.median, loaded.p90, loaded.fullest
+        rate / 1024, idle.median, idle.p90, loaded.median, loaded.p90, loaded.fullest
     );
     assert!(carried > 0, "no block carried any of the flood — the comparison below would be empty");
     assert_eq!(

@@ -3170,15 +3170,6 @@ async fn send_probation_heartbeat_if_due(
     let _ = p2p_tx.try_send(P2PCommand::BroadcastTransaction(tx));
 }
 
-/// Execute, rotate, broadcast, and persist a block that just reached BFT finality —
-/// whether that happened locally (this node cast the deciding vote itself in
-/// `block_production_loop`) or via a peer's vote arriving through P2P
-/// (`handle_p2p_event`). Both paths must apply identical side effects exactly once.
-///
-/// `should_broadcast`: set to `true` when this node was part of the consensus round
-/// (it knows the correct committed round). Set to `false` when applying a block
-/// received via `NewCommittedBlock` — the block has already been broadcast by the
-/// proposer, and re-broadcasting with a wrong round tag would confuse other nodes.
 /// Deterministically compute the EIP-1559 base fee (nano-HLX per tx byte) the block *after*
 /// `block` must carry, from that block's own base fee and total serialized transaction bytes.
 /// The floor is `fee::INITIAL_BASE_FEE_PER_BYTE` — empty blocks decay the base fee back down to
@@ -3533,6 +3524,15 @@ async fn fetch_tip_certificate(
     commit_sigs_to_votes(cert.signatures, expected_height, expected_hash, key_for)
 }
 
+/// Execute, rotate, broadcast, and persist a block that just reached BFT finality —
+/// whether that happened locally (this node cast the deciding vote itself in
+/// `block_production_loop`) or via a peer's vote arriving through P2P
+/// (`handle_p2p_event`). Both paths must apply identical side effects exactly once.
+///
+/// `should_broadcast`: set to `true` when this node was part of the consensus round
+/// (it knows the correct committed round). Set to `false` when applying a block
+/// received via `NewCommittedBlock` — the nodes that finalized it have broadcast it
+/// already, and re-broadcasting with a wrong round tag would confuse other nodes.
 #[allow(clippy::too_many_arguments)]
 async fn apply_finalized_block(
     block: Block,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use helix_crypto::{Address, Hash};
 
@@ -10,8 +10,15 @@ pub struct VoteSet {
     pub height: u64,
     pub round: u32,
     pub vote_type: VoteType,
-    /// One vote per validator address
-    votes: HashMap<String, Vote>,
+    /// One vote per validator address — ordered, so every node holding the same votes hands out
+    /// the same certificate, byte for byte.
+    ///
+    /// It was a `HashMap`, and its order differs per process. Every validator then broadcast the
+    /// same committed block with the same precommits in its own order: different bytes, so
+    /// gossipsub treated each copy as a new message, forwarded all of them and could not suppress
+    /// any with IDONTWANT. Measured under the flood test (#235): each node received about 84
+    /// distinct full-block messages for 31 blocks, and the links moved ~210 MB in 124 s.
+    votes: BTreeMap<String, Vote>,
     /// Accumulated voting power per block hash
     power_by_hash: HashMap<[u8; 32], u64>,
     validator_set: ValidatorSet,
@@ -23,7 +30,7 @@ impl VoteSet {
             height,
             round,
             vote_type,
-            votes: HashMap::new(),
+            votes: BTreeMap::new(),
             power_by_hash: HashMap::new(),
             validator_set,
         }
@@ -173,6 +180,38 @@ mod tests {
         };
         vote.signature = keypair.sign(&vote.signing_bytes()).unwrap();
         vote
+    }
+
+    /// Two nodes holding the same votes must hand out the same certificate. The committed block
+    /// every validator broadcasts carries it, and gossipsub recognises a copy only by its bytes:
+    /// three orders were three messages, each forwarded in full (#235).
+    #[test]
+    fn the_same_votes_make_the_same_certificate_in_whatever_order_they_arrived() {
+        let keys: Vec<KeyPair> = (0..7).map(|_| KeyPair::generate()).collect();
+        let set = ValidatorSet::new(
+            keys.iter()
+                .map(|k| crate::Validator::new(Address::from_public_key(&k.public), 1_000, true))
+                .collect(),
+            0,
+        );
+        let block_hash = Hash::digest(b"block");
+        let votes: Vec<Vote> = keys.iter().map(|k| signed_vote(k, 1, 0, block_hash)).collect();
+
+        let mut here = VoteSet::new(1, 0, VoteType::Prevote, set.clone());
+        let mut there = VoteSet::new(1, 0, VoteType::Prevote, set);
+        for vote in &votes {
+            here.add(vote.clone()).unwrap();
+        }
+        for vote in votes.iter().rev() {
+            there.add(vote.clone()).unwrap();
+        }
+
+        let order = |certificate: Vec<Vote>| -> Vec<String> {
+            certificate.iter().map(|v| v.validator.to_string()).collect()
+        };
+        let (a, b) = (order(here.quorum_votes()), order(there.quorum_votes()));
+        assert_eq!(a.len(), 7, "premise: all seven votes are the quorum");
+        assert_eq!(a, b, "the same votes came out in two orders");
     }
 
     #[test]
