@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libp2p::{
-    futures::StreamExt,
+    futures::{FutureExt, StreamExt},
     gossipsub, mdns, ping, request_response,
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, SwarmBuilder,
@@ -543,6 +543,10 @@ impl P2PService {
         // a flood. Cleared on a response and on any failure, so a peer that never answers costs one
         // request and one timeout, not a wedged sync.
         let mut blocksync_in_flight = false;
+        // The block-sync answers this node is building or sending — see `BlockSyncServing`.
+        let mut blocksync_serving = BlockSyncServing::default();
+        let (blocksync_answer_tx, mut blocksync_answers) =
+            mpsc::channel::<BlockSyncAnswer>(MAX_BLOCKSYNC_SERVES);
         // Peers that have *demonstrated* a different history, whatever they advertise. See
         // `P2PCommand::BlocksyncPeerOnAnotherChain`.
         let mut foreign_by_evidence: HashSet<PeerId> = HashSet::new();
@@ -839,27 +843,50 @@ impl P2PService {
                             request_response::Event::Message { peer, message, .. }
                         )) => {
                             match message {
-                                request_response::Message::Request { request, channel, .. } => {
-                                    // Answered right here, inside the swarm loop, via the injected
-                                    // provider — no request-id bookkeeping and no round trip out to
-                                    // the node and back to the correct response slot. Serving is
-                                    // read-only and cannot be turned into anything else: the
-                                    // requester picks a height range, nothing more.
-                                    let count = clamp_batch(request.count);
-                                    let response = block_provider
-                                        .blocks(request.from_height, count)
-                                        .await;
-                                    debug!(
-                                        peer = %peer,
-                                        from = request.from_height,
-                                        asked = request.count,
-                                        served = response.blocks.len(),
-                                        "Answering a block-sync request"
-                                    );
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .blocksync
-                                        .send_response(channel, response);
+                                request_response::Message::Request {
+                                    request_id,
+                                    request,
+                                    channel,
+                                } => {
+                                    // Built off this loop (see `BlockSyncServing`): reading a
+                                    // hundred blocks used to happen right here, and every vote
+                                    // this node casts waited for it — for any peer that asked.
+                                    if blocksync_serving.admit(peer, request_id) {
+                                        let provider = block_provider.clone();
+                                        let answers = blocksync_answer_tx.clone();
+                                        let count = clamp_batch(request.count);
+                                        tokio::spawn(async move {
+                                            // A provider that panics must still free its place.
+                                            let response = std::panic::AssertUnwindSafe(
+                                                provider.blocks(request.from_height, count),
+                                            )
+                                            .catch_unwind()
+                                            .await
+                                            .unwrap_or_else(|_| BlockSyncResponse::empty());
+                                            let _ = answers
+                                                .send(BlockSyncAnswer {
+                                                    peer,
+                                                    request_id,
+                                                    channel,
+                                                    response,
+                                                })
+                                                .await;
+                                        });
+                                    } else {
+                                        // Honest nodes ask one at a time, so a second request
+                                        // from the same peer is not one; and with every place
+                                        // taken, an empty answer sends the asker elsewhere for a
+                                        // while (its cooldown) rather than queueing it here.
+                                        debug!(
+                                            peer = %peer,
+                                            serving = blocksync_serving.len(),
+                                            "Not answering a block-sync request now — no place free"
+                                        );
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .blocksync
+                                            .send_response(channel, BlockSyncResponse::empty());
+                                    }
                                 }
                                 request_response::Message::Response { response, .. } => {
                                     blocksync_in_flight = false;
@@ -902,9 +929,15 @@ impl P2PService {
                             debug!(peer = %peer, err = %error, "Block-sync request failed — trying another peer");
                         }
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
-                            request_response::Event::InboundFailure { peer, error, .. }
+                            request_response::Event::InboundFailure { peer, request_id, error, .. }
                         )) => {
+                            blocksync_serving.finished(peer, request_id);
                             debug!(peer = %peer, err = %error, "Failed to answer a block-sync request");
+                        }
+                        SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
+                            request_response::Event::ResponseSent { peer, request_id, .. }
+                        )) => {
+                            blocksync_serving.finished(peer, request_id);
                         }
 
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Roundsync(
@@ -1268,6 +1301,18 @@ impl P2PService {
                         );
                         let _ = swarm.disconnect_peer_id(peer);
                     }
+                }
+
+                Some(answer) = blocksync_answers.recv() => {
+                    let BlockSyncAnswer { peer, request_id, channel, response } = answer;
+                    debug!(
+                        peer = %peer,
+                        served = response.blocks.len(),
+                        "Answering a block-sync request"
+                    );
+                    let handed =
+                        swarm.behaviour_mut().blocksync.send_response(channel, response).is_ok();
+                    blocksync_serving.answered(peer, request_id, handed);
                 }
 
                 Some(checked) = transaction_verdicts.recv() => {
@@ -2420,6 +2465,85 @@ fn broadcast_known_addrs(
 }
 
 // ─── Gossip: decode, decide forwarding, hand over ────────────────────────────
+
+/// How many block-sync answers this node builds or sends at once, across all peers.
+///
+/// An answer is up to `RESPONSE_SIZE_MAXIMUM` (8 MiB) in memory until libp2p has written it, it
+/// costs a core while it is being built (~15 ms for a hundred production blocks, measured on V1),
+/// and any connected peer may ask — no stake, no account, and it need not even read the answer. So
+/// under attack every place is a busy core on the machine that also carries the node's tunnel. Two
+/// peers can catch up from this node at the same moment; a third is answered empty and asks
+/// someone else, or here again after its cooldown.
+pub(crate) const MAX_BLOCKSYNC_SERVES: usize = 2;
+
+/// A block-sync answer, built off the swarm loop and handed back to it to send.
+struct BlockSyncAnswer {
+    peer: PeerId,
+    request_id: request_response::InboundRequestId,
+    channel: request_response::ResponseChannel<BlockSyncResponse>,
+    response: BlockSyncResponse,
+}
+
+/// The block-sync answers this node is building or sending: at most one per peer, and
+/// [`MAX_BLOCKSYNC_SERVES`] in all.
+///
+/// A place is held from the request until libp2p has written the answer or given up on it — not
+/// merely until it is built, because an answer handed to a peer that reads slowly stays in memory
+/// until then. Honest nodes ask one at a time (`blocksync_in_flight`), so one per peer costs them
+/// nothing and bounds what a single connection can make this node hold.
+///
+/// Generic over the request id only so that it can be tested: libp2p's `InboundRequestId` has no
+/// public constructor.
+struct BlockSyncServing<Id = request_response::InboundRequestId> {
+    /// The request each peer is being served for, and whether its answer has been handed over.
+    serving: HashMap<PeerId, (Id, bool)>,
+}
+
+impl<Id> Default for BlockSyncServing<Id> {
+    fn default() -> Self {
+        BlockSyncServing {
+            serving: HashMap::new(),
+        }
+    }
+}
+
+impl<Id: Copy + PartialEq> BlockSyncServing<Id> {
+    /// Take a place for this request, or refuse it.
+    fn admit(&mut self, peer: PeerId, request_id: Id) -> bool {
+        if self.serving.contains_key(&peer) || self.serving.len() >= MAX_BLOCKSYNC_SERVES {
+            return false;
+        }
+        self.serving.insert(peer, (request_id, false));
+        true
+    }
+
+    /// The answer is built: handed to libp2p (`handed`), or not — its connection is gone, and
+    /// nothing more will be heard of it.
+    fn answered(&mut self, peer: PeerId, request_id: Id, handed: bool) {
+        if let Some(entry) = self.serving.get_mut(&peer) {
+            if entry.0 == request_id {
+                if handed {
+                    entry.1 = true;
+                } else {
+                    self.serving.remove(&peer);
+                }
+            }
+        }
+    }
+
+    /// libp2p is done with it: written, or failed. A failure *before* the answer was built leaves
+    /// the place taken, because the builder is still running — it frees the place when it
+    /// finishes, finding the connection gone.
+    fn finished(&mut self, peer: PeerId, request_id: Id) {
+        if matches!(self.serving.get(&peer), Some((id, true)) if *id == request_id) {
+            self.serving.remove(&peer);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.serving.len()
+    }
+}
 
 /// A gossiped message, decoded and nothing else — no side effect has happened yet. Deciding
 /// whether to forward it (`forwarding_of`) and acting on it are separate steps, in that order.
@@ -4234,5 +4358,80 @@ mod accountability_tests {
     #[test]
     fn a_message_with_no_known_author_is_charged_to_no_one() {
         assert_eq!(accountable_author(None, |_| true), None);
+    }
+}
+
+#[cfg(test)]
+mod blocksync_serving_tests {
+    use super::{BlockSyncServing, MAX_BLOCKSYNC_SERVES};
+    use libp2p::PeerId;
+
+    /// One place per peer: honest nodes ask one at a time, so a second request while the first is
+    /// being served is not an honest one — and without this one connection could fill every place.
+    #[test]
+    fn a_peer_holds_one_place_at_most() {
+        let mut places = BlockSyncServing::<u64>::default();
+        let peer = PeerId::random();
+        assert!(places.admit(peer, 1));
+        assert!(
+            !places.admit(peer, 2),
+            "a second request from the same peer waits for no place"
+        );
+        assert!(
+            places.admit(PeerId::random(), 3),
+            "another peer is not held up by it"
+        );
+    }
+
+    #[test]
+    fn no_more_places_than_the_limit() {
+        let mut places = BlockSyncServing::<u64>::default();
+        for id in 0..MAX_BLOCKSYNC_SERVES as u64 {
+            assert!(places.admit(PeerId::random(), id));
+        }
+        assert!(!places.admit(PeerId::random(), 99));
+        assert_eq!(places.len(), MAX_BLOCKSYNC_SERVES);
+    }
+
+    /// A place is held until libp2p is done with the answer — built is not enough, because an
+    /// answer handed to a slow reader stays in memory until it is written.
+    #[test]
+    fn a_place_is_freed_when_the_answer_is_written_not_when_it_is_built() {
+        let mut places = BlockSyncServing::<u64>::default();
+        let peer = PeerId::random();
+        places.admit(peer, 7);
+        places.answered(peer, 7, true);
+        assert_eq!(places.len(), 1, "built and handed over, not yet written");
+        places.finished(peer, 7);
+        assert_eq!(places.len(), 0);
+    }
+
+    /// The connection went away while the answer was still being built: libp2p reports the
+    /// failure first, and the builder, still running, must still be counted until it finishes.
+    #[test]
+    fn a_failure_before_the_answer_is_built_keeps_the_place_until_the_builder_finishes() {
+        let mut places = BlockSyncServing::<u64>::default();
+        let peer = PeerId::random();
+        places.admit(peer, 7);
+        places.finished(peer, 7);
+        assert_eq!(places.len(), 1, "the builder is still reading blocks");
+        places.answered(peer, 7, false);
+        assert_eq!(
+            places.len(),
+            0,
+            "and frees the place when it finds the connection gone"
+        );
+    }
+
+    /// Events about some other request of the same peer — an empty refusal, say — free nothing.
+    #[test]
+    fn events_about_another_request_free_nothing() {
+        let mut places = BlockSyncServing::<u64>::default();
+        let peer = PeerId::random();
+        places.admit(peer, 7);
+        places.answered(peer, 8, false);
+        places.answered(peer, 7, true);
+        places.finished(peer, 8);
+        assert_eq!(places.len(), 1);
     }
 }

@@ -48,10 +48,24 @@ pub const MAX_BLOCKSYNC_BATCH: u32 = helix_consensus::EPOCH_LENGTH as u32;
 /// broken or hostile, and reading it to the end would be the amplification.
 const REQUEST_SIZE_MAXIMUM: u64 = 1024;
 
-/// Hard ceiling on a decoded response: `MAX_BLOCKSYNC_BATCH` blocks plus one commit certificate,
-/// with generous headroom over the ~26 KB a production block currently occupies. A peer cannot make
-/// us allocate more than this no matter what it claims to be sending.
-const RESPONSE_SIZE_MAXIMUM: u64 = 8 * 1024 * 1024;
+/// Hard ceiling on a decoded response. A peer cannot make us allocate more than this no matter
+/// what it claims to be sending.
+///
+/// This comment used to call it "generous headroom" for `MAX_BLOCKSYNC_BATCH` blocks, reckoned at
+/// the ~26 KB a production block then occupied. A hundred blocks of a busy hour are more than
+/// that — thirty transfers a block make ~10 MB — and the server served the whole range anyway, so
+/// every request over such a stretch failed here, at the requester. The server now stops at
+/// [`MAX_RESPONSE_BLOCK_BYTES`].
+pub const RESPONSE_SIZE_MAXIMUM: u64 = 8 * 1024 * 1024;
+
+/// How many bytes of blocks one answer may carry: what a requester reads, less a mebibyte for the
+/// tip certificate — a vote with its key is ~5.4 KB, so that is room for ~190 of them.
+pub const MAX_RESPONSE_BLOCK_BYTES: u64 = RESPONSE_SIZE_MAXIMUM - 1024 * 1024;
+
+// A server always serves at least one block, however large, or a requester could never get past a
+// full one. So the largest block — its transactions plus a header whose certificate grows with the
+// validator set — has to fit an answer with room to spare.
+const _: () = assert!(helix_core::fee::MAX_BLOCK_BYTES * 2 <= MAX_RESPONSE_BLOCK_BYTES);
 
 /// Ask a peer for up to `count` consecutive blocks starting at `from_height`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

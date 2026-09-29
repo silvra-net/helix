@@ -2647,10 +2647,24 @@ impl helix_p2p::BlockProvider for StoreBlockProvider {
             }
             let last = our_tip.min(from_height + u64::from(count) - 1);
 
+            // No more than a requester reads (`MAX_RESPONSE_BLOCK_BYTES`): a busy stretch served
+            // whole was larger than that, and every request over it failed at the requester. The
+            // last block served is certified below like any other, so a shorter answer loses
+            // nothing — the requester asks again from there. Always at least one block, however
+            // large: a budget must never stand between a requester and a block it needs.
+            let budget = helix_p2p::blocksync::MAX_RESPONSE_BLOCK_BYTES;
+            let mut used = 0u64;
             let mut blocks = Vec::new();
             for height in from_height..=last {
                 match self.store.read().await.get_block_by_height(height) {
-                    Ok(block) => blocks.push(block),
+                    Ok(block) => {
+                        let size = bincode::serialized_size(&block).unwrap_or(u64::MAX);
+                        if !blocks.is_empty() && used.saturating_add(size) > budget {
+                            break;
+                        }
+                        used = used.saturating_add(size);
+                        blocks.push(block);
+                    }
                     // A hole in our own store — serve the contiguous prefix, nothing past it.
                     Err(_) => break,
                 }
@@ -9195,6 +9209,79 @@ mod handle_p2p_event_tests {
         let served = provider.blocks(9, 10).await;
 
         assert!(served.blocks.is_empty() && served.tip_certificate.is_empty());
+    }
+
+    /// `n` blocks from height 1, each carrying `per_block` transfers (~5.4 KB each, key included)
+    /// and certified by its successor — the shape of a busy stretch of chain.
+    fn busy_blocks(kp: &KeyPair, n: u64, per_block: usize) -> Vec<Block> {
+        let sender = Address::from_public_key(&KeyPair::generate().public);
+        let mut prev_hash = Hash::ZERO;
+        let mut out = Vec::new();
+        for h in 1..=n {
+            let mut block = signed_block(kp, h, prev_hash);
+            if h > 1 {
+                block.header.last_commit = tip_commit_sigs(h - 1, prev_hash, &[kp]);
+            }
+            block.transactions = (0..per_block)
+                .map(|i| Transaction {
+                    version: 1,
+                    tx_type: TxType::Transfer,
+                    from: sender.clone(),
+                    to: Some(sender.clone()),
+                    amount: 1,
+                    fee: 1,
+                    nonce: h * 1_000 + i as u64,
+                    data: vec![],
+                    crypto_version: helix_core::CryptoVersion::MlDsa,
+                    chain_id: Hash::digest(b"busy"),
+                    signature: Sig::from_bytes(vec![i as u8; 3_309]),
+                    // 0.15.x: every transaction carries its key (#243 is 0.16.0).
+                    public_key: kp.public.clone(),
+                })
+                .collect();
+            // The provider serves what the store holds and checks no root; the requester does.
+            block.header.signature = kp.sign(block.header.signing_hash().as_bytes()).unwrap();
+            prev_hash = block.hash();
+            out.push(block);
+        }
+        out
+    }
+
+    /// A busy stretch served whole is more than a requester reads. A hundred blocks of ~100 KB —
+    /// thirty transfers each, a load the chain carries at ~15 transactions a second — are ~10 MB,
+    /// and a block-sync answer is read to at most `RESPONSE_SIZE_MAXIMUM` (8 MiB). The provider
+    /// used to serve the whole range regardless, so every request over such a stretch failed at
+    /// the requester, and a node that fell behind during a busy hour could not catch up over P2P
+    /// at all. It now stops where a requester can still read, and certifies the last block it
+    /// serves, so the rest follows in the next request.
+    #[tokio::test]
+    async fn the_block_provider_serves_no_more_than_a_requester_reads() {
+        use helix_p2p::BlockProvider;
+        let kp = KeyPair::generate();
+        let blocks = busy_blocks(&kp, 100, 30);
+        let whole: u64 = blocks.iter().map(|b| bincode::serialized_size(b).unwrap()).sum();
+        let limit = helix_p2p::blocksync::RESPONSE_SIZE_MAXIMUM;
+        assert!(whole > limit, "premise: the stretch is larger than an answer ({whole} B)");
+        let (store, cell) = store_with_chain(&kp, &blocks).await;
+        let provider = StoreBlockProvider {
+            store,
+            tip_certificate: cell,
+            chain_state: {
+                let mut cs = ChainState::new(0);
+                cs.set_validator_key(&Address::from_public_key(&kp.public), kp.public.clone());
+                Arc::new(RwLock::new(cs))
+            },
+        };
+
+        let served = provider.blocks(1, 100).await;
+
+        let bytes = bincode::serialized_size(&served).unwrap();
+        assert!(bytes <= limit, "served {bytes} B, and a requester reads {limit} B at most");
+        let heights: Vec<u64> = served.blocks.iter().map(|b| b.height()).collect();
+        assert!(heights.len() > 1, "a budget is not a reason to serve one block at a time");
+        let from_the_start: Vec<u64> = (1..=heights.len() as u64).collect();
+        assert_eq!(heights, from_the_start, "from the start, in order");
+        assert!(!served.tip_certificate.is_empty(), "and the last one it serves is certified");
     }
 
     /// A block whose successor carries no `last_commit` cannot be certified by us, so the provider
