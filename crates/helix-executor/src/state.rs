@@ -1009,6 +1009,22 @@ impl ChainState {
         });
     }
 
+    /// Drop governance proposals whose voting period is over. Called once per block (see
+    /// `execute_block`).
+    ///
+    /// A proposal costs one transaction fee and any stake at all, and until this it stayed in
+    /// consensus state for good — executed, expired, or spam that never had a chance. Every block
+    /// hashes the whole state and every save wrote every proposal again, so the cost of each one
+    /// was paid by every node on every block, forever. A closed proposal has nothing left to
+    /// decide: no vote can reach it (`is_expired`), and a passed one has already changed the
+    /// parameter it named. What it did stays on the chain in its transactions and receipts.
+    ///
+    /// Ids are not reused — `next_proposal_id` only counts up — so a wallet holding an old id
+    /// gets "proposal not found", never someone else's proposal.
+    pub fn prune_closed_proposals(&mut self, height: u64) {
+        self.proposals.retain(|_, p| !p.is_expired(height));
+    }
+
     /// Resolve a registered name (without `.hlx`) to its owning address string.
     pub fn resolve_name(&self, name: &str) -> Option<&str> {
         self.names.get(name).map(|s| s.as_str())

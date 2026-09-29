@@ -290,14 +290,19 @@ validator minimum) can propose and vote on two runtime-adjustable parameters:
 ```bash
 helix governance params                          # current values
 helix governance propose fuel-per-fee-unit 3 --key alice.json
-helix governance list                            # all proposals
+helix governance list                            # the proposals still open to a vote
 helix governance show 0                          # one proposal's vote tally
 helix governance vote 0 --key alice.json          # cast a stake-weighted yes-vote
 ```
 
-A proposal passes once yes-votes reach a 2/3-plus-one supermajority of the total stake that
-existed *when the proposal was created* (frozen at creation so a voter can't game the
-denominator by unstaking after voting), or expires unexecuted after 1000 blocks. Every
-address can vote once per proposal.
+A proposal passes once yes-votes reach a 2/3-plus-one supermajority of the largest total stake
+the network held while it was open — never less than at creation, so a voter cannot shrink the
+denominator by unstaking after voting, and raised by any stake that arrives later, so a latecomer
+cannot carry a vote the rest of the stake never saw. A proposal that does not pass expires after
+1000 blocks. Every address can vote once per proposal.
+
+Once its 1000 blocks are over, a proposal — passed or not — leaves the chain state, so
+`governance list` and `show` only know the ones still open. What a passed proposal changed stays in
+force (`governance params`), and every proposal and vote stays on the chain as its transaction.
 
 ---

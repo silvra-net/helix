@@ -29,7 +29,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/validators/:address/pool` | A validator's delegation pool — delegated stake, commission, effective stake, and `reward_address` (where the validator's own share is paid; `null` = to the validator itself) |
 | GET | `/names/:name` | Resolve name to address |
 | GET | `/governance/params` | Current runtime-adjustable protocol parameters |
-| GET | `/governance/proposals` | All proposals (`?limit=&offset=`) |
+| GET | `/governance/proposals` | Proposals whose voting period is still running (`?limit=&offset=`); a closed one leaves the state |
 | GET | `/governance/proposals/:id` | One proposal's status |
 | GET | `/mempool` | Pending transaction count |
 | GET | `/sync/blocks` | Raw block range for peer sync (`?from=&count=`). `&encoding=bincode` returns the same blocks as `application/octet-stream` instead of JSON — ~3.5× fewer bytes and a fraction of the serving node's CPU, because JSON renders every byte of an ML-DSA key or signature as a decimal number. Clients try it once and fall back to JSON if the peer does not know it. The JSON answer is streamed a block at a time; the bincode answer, `/blocks/range` and `/sync/snapshot` are built whole, so a node builds at most four of them at once — further requests wait for a place, and after 30 s get **503** with `Retry-After` |

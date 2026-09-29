@@ -132,6 +132,9 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
     // Redelegations whose source-slashing window has closed stop being consensus state. Done
     // after the transactions so an entry created in this block is never pruned by it.
     state.prune_expired_redelegations(height);
+    // Proposals whose vote is over, likewise — see `prune_closed_proposals`. A vote in this block
+    // was checked against the same `is_expired`, so nothing pruned here could still have counted.
+    state.prune_closed_proposals(height);
 
     // Epoch boundary: rebuild the active validator set from current stake. After this block's
     // transactions, so a `Stake` in this very block is considered, and after
@@ -4334,6 +4337,47 @@ mod tests {
             signed_governance_tx(&voter_kp, &voter, TxType::VoteProposal, governance::encode_vote(0), 0, 10_000);
         let receipt = execute_transaction(&mut state, &vote_tx, &validator, expired_height, 0);
         assert!(!receipt.success);
+    }
+
+    /// A proposal leaves the state once its vote is over (#249) — open or passed. It costs one fee
+    /// and any stake at all, and every node hashes the whole state on every block, so one that
+    /// stayed would be paid for by every node, forever. Driven through `execute_block`, where the
+    /// pruning is wired, not through the pruning function alone.
+    #[test]
+    fn a_proposal_leaves_the_state_once_its_vote_is_over() {
+        let mut state = ChainState::new(0);
+        let proposer_kp = KeyPair::generate();
+        let proposer = Address::from_public_key(&proposer_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        state.update_account(&proposer, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 1;
+        });
+        let fuel = governance::GovernanceParam::FuelPerFeeUnit;
+        for (nonce, value) in [(0u64, 2u64), (1, 3)] {
+            let data = governance::encode_proposal(fuel, value);
+            let (kp, from) = (&proposer_kp, &proposer);
+            let tx = signed_governance_tx(kp, from, TxType::CreateProposal, data, nonce, 10_000);
+            let created = execute_transaction(&mut state, &tx, &validator, 0, 0).success;
+            assert!(created, "premise: created");
+        }
+        // The proposer holds all the stake there is, so its vote carries proposal 0.
+        let ballot = governance::encode_vote(0);
+        let (kp, from) = (&proposer_kp, &proposer);
+        let vote = signed_governance_tx(kp, from, TxType::VoteProposal, ballot, 2, 10_000);
+        assert!(execute_transaction(&mut state, &vote, &validator, 0, 0).success, "premise: voted");
+        assert!(state.proposal(0).is_some_and(|p| p.executed), "premise: proposal 0 passed");
+        assert_eq!(state.governance_params.fuel_per_fee_unit, 2);
+
+        let last_vote = governance::VOTING_PERIOD_BLOCKS;
+        execute_block(&mut state, &empty_block(&validator, last_vote));
+        let kept = state.proposals.len();
+        assert_eq!(kept, 2, "both are kept through the last block a vote can reach");
+
+        execute_block(&mut state, &empty_block(&validator, last_vote + 1));
+        assert!(state.proposals.is_empty(), "and neither after it — passed or not");
+        assert_eq!(state.next_proposal_id, 2, "ids are never handed out again");
+        assert_eq!(state.governance_params.fuel_per_fee_unit, 2, "what passed stays in force");
     }
 
     // ── Unbonding / ClaimUnbonded tests ──────────────────────────────────────

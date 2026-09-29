@@ -563,6 +563,23 @@ impl HelixDb {
                 account_keys.insert(addr.as_str(), encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // Proposals leave the state once their vote is over (`prune_closed_proposals`), so the
+            // table loses them too — insert-only persistence would bring every closed proposal back
+            // on this node's next start, and only on this node (see JAILED_UNTIL's doc comment).
+            {
+                let stale: Vec<u64> = proposals
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let id = k.value();
+                        (!state.proposals.contains_key(&id)).then_some(id)
+                    })
+                    .collect();
+                for id in stale {
+                    proposals.remove(id).map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
             for (id, proposal) in &state.proposals {
                 let encoded = bincode::serialize(proposal)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -2800,6 +2817,42 @@ mod tests {
             "a cleared reward address came back after reopening"
         );
         assert_eq!(loaded.state_hash(), state.state_hash(), "and the reloaded state is the same state");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #249: a proposal pruned from the state stays pruned across a restart. Insert-only
+    /// persistence would bring every closed proposal back on this node alone, and the reloaded
+    /// state would hash differently from everyone else's.
+    #[test]
+    fn a_pruned_proposal_does_not_come_back_after_reopening() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        for id in 0..2u64 {
+            state.set_proposal(helix_executor::governance::GovernanceProposal {
+                id,
+                proposer: addr(1).to_string(),
+                param: helix_executor::governance::GovernanceParam::FuelPerFeeUnit,
+                new_value: 2,
+                created_at_height: id,
+                voters: Default::default(),
+                yes_stake: 0,
+                quorum_denominator: 1,
+                executed: false,
+            });
+        }
+        db.save_chain_state(&state).unwrap();
+
+        state.proposals.remove(&0);
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert!(loaded.proposal(0).is_none(), "a pruned proposal came back after reopening");
+        assert!(loaded.proposal(1).is_some(), "and the open one must still be there");
+        assert_eq!(loaded.state_hash(), state.state_hash(), "the reloaded state is the same state");
 
         let _ = std::fs::remove_file(&path);
     }
