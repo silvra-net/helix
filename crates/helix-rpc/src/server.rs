@@ -797,22 +797,6 @@ async fn get_sync_blocks(
         .into_response()
 }
 
-/// The whole chain state, so a joining node can start from it instead of replaying every block.
-///
-/// `GET /sync/snapshot` — bincode only, and deliberately: this is not a document anybody reads.
-/// The same state as JSON costs 4.5x for nothing, and the one consumer is a node that is about to
-/// hash it and compare (see [`helix_executor::state::StateSnapshot`]).
-///
-/// Height and state are read under **one** lock, because the pair is the claim: `applied_height`
-/// and the state are stamped together at the end of every block, and a reader that straddled that
-/// moment would serve a state labelled with the wrong height — which the receiver then checks
-/// against the wrong block's `prev_state_root` and refuses, having been told something true about
-/// a state that never existed at that height.
-///
-/// Serving this costs a clone of the state under a read lock. At the 508 accounts this chain holds
-/// that is nothing; it grows with the account count, and the answer then is to stream rather than
-/// clone — noted rather than pre-built, because the shape of that depends on how big "too big"
-/// turns out to be.
 /// `GET /sync/checkpoint` — a height and block hash a joining node can anchor to, in the exact
 /// form `HELIX_TRUSTED_CHECKPOINT` takes.
 ///
@@ -834,7 +818,13 @@ async fn get_sync_blocks(
 /// validator set read out of the snapshot under test. So the state root has to arrive the way the
 /// genesis hash does: from outside, through the operator. This endpoint is how an operator
 /// collects it — from several nodes, and only when they agree.
-async fn get_sync_checkpoint(State(state): State<AppState>) -> impl IntoResponse {
+async fn get_sync_checkpoint(State(state): State<AppState>) -> axum::response::Response {
+    // Reads a whole stored state per request — cheap at today's size, but it grows with every
+    // account, and every other answer that copies a state or a batch takes one of the same places.
+    let _permit = match heavy_response_permit().await {
+        Ok(permit) => permit,
+        Err(busy) => return busy,
+    };
     let store = state.store.read().await;
     let tip = store.latest_height();
     let heights = store.state_snapshot_heights().unwrap_or_default();
@@ -867,7 +857,8 @@ async fn get_sync_checkpoint(State(state): State<AppState>) -> impl IntoResponse
                            nothing on its own — and the state_root is the half that decides \
                            whether a snapshot can be believed at all.",
             })),
-        );
+        )
+            .into_response();
     }
 
     (
@@ -878,8 +869,25 @@ async fn get_sync_checkpoint(State(state): State<AppState>) -> impl IntoResponse
             "tip": tip,
         })),
     )
+        .into_response()
 }
 
+/// The whole chain state, so a joining node can start from it instead of replaying every block.
+///
+/// `GET /sync/snapshot` — bincode only, and deliberately: this is not a document anybody reads.
+/// The same state as JSON costs 4.5x for nothing, and the one consumer is a node that is about to
+/// hash it and compare (see [`helix_executor::state::StateSnapshot`]).
+///
+/// Height and state are read under **one** lock, because the pair is the claim: `applied_height`
+/// and the state are stamped together at the end of every block, and a reader that straddled that
+/// moment would serve a state labelled with the wrong height — which the receiver then checks
+/// against the wrong block's `prev_state_root` and refuses, having been told something true about
+/// a state that never existed at that height.
+///
+/// Serving this costs a clone of the state under a read lock. At the 508 accounts this chain holds
+/// that is nothing; it grows with the account count, and the answer then is to stream rather than
+/// clone — noted rather than pre-built, because the shape of that depends on how big "too big"
+/// turns out to be.
 async fn get_state_snapshot(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -3963,6 +3971,28 @@ mod tests {
             }
         );
         assert!(got.is_ok(), "a place freed during the wait must be handed over");
+    }
+
+    /// `/sync/checkpoint` reads a whole stored state per request, so it takes one of the heavy
+    /// places like every other answer that copies a state or a batch. Held only briefly here:
+    /// the places are shared by every test in this binary, and one that needs a place waits.
+    #[tokio::test]
+    async fn the_checkpoint_waits_for_a_heavy_place() {
+        let state = fresh_test_state_with_blocks(1).await;
+        let every_place = HEAVY_RESPONSES.acquire_many(4).await.unwrap();
+        let while_taken = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            get_sync_checkpoint(State(state.clone())),
+        )
+        .await;
+        assert!(while_taken.is_err(), "answered while every heavy place was taken");
+        drop(every_place);
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get_sync_checkpoint(State(state)),
+        )
+        .await;
+        assert!(answered.is_ok(), "and answers once a place is free");
     }
 
     /// The compact encoding must be the *same blocks*, not merely a smaller answer — a transport
