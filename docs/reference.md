@@ -119,6 +119,8 @@ deliberately **not** the node's log — see the note below on why.
   "validators_not_heard_from": 1,
   "peer_tip_height": 36378,
   "rounds_lost_with_quorum_power": 0,
+  "compact_blocks_rebuilt": 1532,
+  "compact_blocks_not_rebuilt": 4,
   "chain_db_bytes_per_block": 81426,
   "earliest_block": null,
   "disk_days_remaining": 82,
@@ -163,6 +165,14 @@ What each field is for:
   network-timing problem, not an availability one, and no amount of restarting the absent validator
   fixes it. Measured on the live chain on 2026-09-04: one such round with 2e12 of power heard
   against a quorum of 1.667e12.
+- **`compact_blocks_rebuilt` / `compact_blocks_not_rebuilt`** — proposals and committed blocks
+  travel compact (the header and the transaction ids), and each node rebuilds them from the
+  transactions it already holds. These count the blocks that mattered here — a proposal for the
+  height this validator is deciding, a committed block right above its tip — that it could rebuild,
+  and the ones it could not, for each of which it fetched or waited for the whole block. A few
+  misses are normal: a transaction can reach a node a moment after the block that carries it. A
+  share that stays high means transactions are arriving late, and the bandwidth compact blocks save
+  is being spent after all. Both count from this process's start.
 - **`earliest_block`** — the lowest height this node still holds, or `null` when it keeps
   everything. A node run with `HELIX_KEEP_BLOCKS` drops older blocks to bound disk growth, and
   below this height it can answer neither a block query nor a wallet's history lookup — not because

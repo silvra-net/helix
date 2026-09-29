@@ -1519,6 +1519,22 @@ fn bind_relay_listener(port: u16, what: &str) -> std::net::TcpListener {
     listener
 }
 
+/// `(rebuilt, not rebuilt)` compact blocks this node has seen (#235), from `/diagnostics`.
+async fn compact_block_counts(rpc_port: u16) -> (u64, u64) {
+    let d: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{rpc_port}/diagnostics"))
+        .await
+        .expect("diagnostics")
+        .json()
+        .await
+        .expect("diagnostics json");
+    // Absent on a build from before #235, which is what an A/B run against one sees: zeros, and
+    // the assertion after the measurement says so.
+    (
+        d["compact_blocks_rebuilt"].as_u64().unwrap_or(0),
+        d["compact_blocks_not_rebuilt"].as_u64().unwrap_or(0),
+    )
+}
+
 /// The lowest block height this node still holds (`earliest_block` in `/diagnostics`); 0 while it
 /// has pruned nothing.
 async fn earliest_retained(rpc_port: u16) -> Option<u64> {
@@ -1867,6 +1883,20 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
         link_use(&carried_before, &carried_after, flood_started.elapsed(), rate)
     );
 
+    // Until the whole flood is in the chain: the measure that does not depend on how many blocks
+    // the cadence window happened to cover — twelve blocks are a third of the flood on a fast
+    // build and all of it on a slow one, and bytes over such a window compare nothing (#235).
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let (_, nonce) = height_and_nonce(TL_A_RPC, &flood_sender).await;
+        if nonce - nonce_before >= accepted || std::time::Instant::now() > drain_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let drained_after = flood_started.elapsed();
+    let carried_drained: Vec<(u64, u64)> = links.iter().map(ThrottledLink::carried).collect();
+
     // What the blocks carried of the flood against what the chain applied (#231). Every flood
     // transaction a block carries must apply: a block that packs one it cannot apply wastes its
     // space, and the transaction is then dropped from every pool as committed — lost, with every
@@ -1894,6 +1924,28 @@ async fn blocks_stay_on_cadence_under_a_flood_when_every_link_is_as_slow_as_prod
     eprintln!(
         "link {} KB/s per node · idle: median {:.2}s p90 {:.2}s · under {accepted} tx: median {:.2}s p90 {:.2}s, fullest block {} tx · flood carried {carried}, applied {applied}",
         rate / 1024, idle.median, idle.p90, loaded.median, loaded.p90, loaded.fullest
+    );
+    // Bytes every link sent until the flood was in the chain, per flood transaction — the number
+    // compact blocks (#235) exist to bring down, comparable across runs and builds.
+    let sent: u64 = carried_before.iter().zip(&carried_drained).map(|(b, a)| a.1 - b.1).sum();
+    let compact: Vec<(u64, u64)> = {
+        let mut counts = Vec::new();
+        for port in [TL_A_RPC, TL_B_RPC, TL_C_RPC] {
+            counts.push(compact_block_counts(port).await);
+        }
+        counts
+    };
+    eprintln!(
+        "whole flood applied {:.1} s after it began · {:.1} KB sent over the links per flood \
+         transaction · compact blocks rebuilt/not: A {}/{} B {}/{} C {}/{}",
+        drained_after.as_secs_f64(),
+        sent as f64 / 1e3 / applied.max(1) as f64,
+        compact[0].0, compact[0].1, compact[1].0, compact[1].1, compact[2].0, compact[2].1,
+    );
+    assert!(
+        compact.iter().map(|c| c.0).sum::<u64>() > 0,
+        "no node rebuilt a single compact block from its pool — every block reached every node \
+         whole, or not at all: the counters say {compact:?}"
     );
     assert!(carried > 0, "no block carried any of the flood — the comparison below would be empty");
     assert_eq!(

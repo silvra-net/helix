@@ -22,6 +22,7 @@ use crate::blocksync::{
     clamp_batch, BlockProvider, BlockSyncCodec, BlockSyncRequest, BlockSyncResponse,
     BLOCKSYNC_PROTOCOL, MAX_BLOCKSYNC_BATCH,
 };
+use crate::compact::{CompactBlock, CompactProposal};
 use crate::config::P2PConfig;
 use crate::conn_limits::IpConnLimiter;
 use crate::genesis_sync::{GenesisCodec, GenesisProvider, GenesisResponse, GENESIS_PROTOCOL};
@@ -38,7 +39,10 @@ use crate::{
 /// Events received FROM the P2P network → node
 #[derive(Debug)]
 pub enum P2PEvent {
-    NewProposal(Proposal),
+    /// A proposal from a peer, compact (#235): the node rebuilds its block from its own pool. The
+    /// second field names the peer to ask for the whole proposal if it cannot — the proposer when
+    /// it is connected here, otherwise whoever relayed it.
+    NewProposal(CompactProposal, String),
     /// A gossiped transaction, and — when it came through gossip — the ticket the node answers
     /// with its verdict (`GossipTicket::answer`): the transaction is not forwarded to anyone until
     /// then (#228). `None` for a transaction that reached the node another way.
@@ -48,8 +52,9 @@ pub enum P2PEvent {
     /// certificate — the precommit votes that finalized it. The receiving node applies the block
     /// after verifying the proposer signature, and adopts the certificate as its own `last_commit`
     /// when it never collected those votes itself (the committed-blocks fast path), so the block's
-    /// participation and finality are not lost (#114).
-    NewCommittedBlock(Block, Vec<Vote>),
+    /// participation and finality are not lost (#114). Compact (#235): the node rebuilds the
+    /// block from what it holds, and a node that cannot catches up over block sync instead.
+    NewCommittedBlock(CompactBlock, Vec<Vote>),
     PeerConnected(String),
     PeerDisconnected(String),
     /// This node started announcing `addr` as its own, after a peer confirmed it could reach it.
@@ -204,9 +209,13 @@ pub enum P2PCommand {
     /// itself: gossipsub publishes each message once and refuses to re-publish the same bytes for
     /// a minute, so the proposer's per-tick re-offer never reaches a node that was not listening
     /// during the one broadcast that counted. See the `roundsync` module.
+    ///
+    /// `ask` names the peer to ask. A node that could not rebuild a compact proposal (#235) knows
+    /// who has the whole one — the peer it came from; `None` rotates over the connected peers.
     RequestRoundSync {
         height: u64,
         round: u32,
+        ask: Option<String>,
     },
     /// The node could not verify the block-sync batch this peer served (backlog #140). The service
     /// cannot tell that by itself: from here a batch that fails verification and one that applies
@@ -779,11 +788,21 @@ impl P2PService {
                                 }
                                 Gossiped::Proposal(proposal) => {
                                     debug!(
-                                        height = proposal.block.height(),
+                                        height = proposal.height(),
                                         round = proposal.round,
+                                        transactions = proposal.block.transactions.len(),
                                         "Proposal from peer"
                                     );
-                                    let _ = event_tx.send(P2PEvent::NewProposal(proposal)).await;
+                                    // Who holds the whole proposal if this node cannot rebuild it:
+                                    // its author, if we can reach it, otherwise the relay that just
+                                    // handed it to us.
+                                    let ask = message
+                                        .source
+                                        .filter(|author| swarm.is_connected(author))
+                                        .unwrap_or(propagation_source);
+                                    let _ = event_tx
+                                        .send(P2PEvent::NewProposal(proposal, ask.to_string()))
+                                        .await;
                                 }
                                 Gossiped::Vote(vote) => {
                                     let _ = event_tx.send(P2PEvent::NewVote(vote)).await;
@@ -791,6 +810,7 @@ impl P2PService {
                                 Gossiped::CommittedBlock(block, commit) => {
                                     debug!(
                                         height = block.height(),
+                                        transactions = block.transactions.len(),
                                         commit_sigs = commit.len(),
                                         "Committed block from peer"
                                     );
@@ -1450,7 +1470,9 @@ impl P2PService {
                 Some(cmd) = command_rx.recv() => {
                     match cmd {
                         P2PCommand::BroadcastProposal(proposal) => {
-                            if let Ok(data) = bincode::serialize(&proposal) {
+                            // Compact (#235): the header and the ids of the transactions, which
+                            // every receiver already holds from the transaction lane.
+                            if let Ok(data) = bincode::serialize(&CompactProposal::of(&proposal)) {
                                 // The proposer re-offers its pending proposal every tick, and
                                 // gossipsub refuses identical bytes for a minute — so on a healthy
                                 // chain every repeat after the first is rejected, and libp2p logs
@@ -1505,22 +1527,30 @@ impl P2PService {
                                 }
                             }
                         }
-                        P2PCommand::RequestRoundSync { height, round } => {
+                        P2PCommand::RequestRoundSync { height, round, ask } => {
                             if roundsync_in_flight {
                                 // One at a time. The answer is only useful inside the round that
                                 // asked for it, so queueing more would just deliver stale rounds.
                                 debug!(height, round, "Round-sync request already in flight");
                             } else {
                                 let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+                                // A named peer that is still connected is asked first: it is the
+                                // one that just handed us this proposal in compact form (#235).
+                                let named = ask
+                                    .and_then(|peer| peer.parse::<PeerId>().ok())
+                                    .filter(|peer| peers.contains(peer));
                                 if peers.is_empty() {
                                     debug!(height, round, "No peer to ask for the round");
                                 } else {
-                                    // Rotate rather than always asking the same peer: the one that
-                                    // cannot answer is often exactly the one whose silence put us
-                                    // here, and a deterministic pick would ask it forever (the
-                                    // mistake #140 fixed for block sync).
-                                    let peer = peers[roundsync_next_peer % peers.len()];
-                                    roundsync_next_peer = roundsync_next_peer.wrapping_add(1);
+                                    // Otherwise rotate rather than always asking the same peer: the
+                                    // one that cannot answer is often exactly the one whose silence
+                                    // put us here, and a deterministic pick would ask it forever
+                                    // (the mistake #140 fixed for block sync).
+                                    let peer = named.unwrap_or_else(|| {
+                                        let peer = peers[roundsync_next_peer % peers.len()];
+                                        roundsync_next_peer = roundsync_next_peer.wrapping_add(1);
+                                        peer
+                                    });
                                     debug!(peer = %peer, height, round, "Asking a peer for the round we are missing");
                                     swarm.behaviour_mut().roundsync.send_request(
                                         &peer,
@@ -1554,7 +1584,10 @@ impl P2PService {
                             // tuple on the committed-blocks topic — a wire-format change from the
                             // bare `Block` this used to carry, so it needs a coordinated upgrade
                             // (#114/#109); the receive side below parses the same shape.
-                            if let Ok(data) = bincode::serialize(&(&block, &commit)) {
+                            // Compact since #235, like proposals: whoever needs this block
+                            // holds its transactions already, or catches up over block sync.
+                            let compact = CompactBlock::of(&block);
+                            if let Ok(data) = bincode::serialize(&(&compact, &commit)) {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
                                     .publish(committed_topic.clone(), data)
                                 {
@@ -2768,9 +2801,9 @@ fn broadcast_known_addrs(
 /// A gossiped message, decoded and nothing else — no side effect has happened yet. Deciding
 /// whether to forward it (`forwarding_of`) and acting on it are separate steps, in that order.
 enum Gossiped {
-    Proposal(Proposal),
+    Proposal(CompactProposal),
     Vote(Vote),
-    CommittedBlock(Block, Vec<Vote>),
+    CommittedBlock(CompactBlock, Vec<Vote>),
     Transaction(Transaction),
     PeerExchange(PeerExchangeMsg),
     /// The topic is ours and the bytes are not a message of it.
@@ -2785,7 +2818,7 @@ fn decode_gossip(topic: &str, data: &[u8]) -> Gossiped {
     } else if topic == TOPIC_VOTES {
         bincode::deserialize(data).ok().map(Gossiped::Vote)
     } else if topic == TOPIC_COMMITTED_BLOCKS {
-        bincode::deserialize::<(Block, Vec<Vote>)>(data)
+        bincode::deserialize::<(CompactBlock, Vec<Vote>)>(data)
             .ok()
             .map(|(block, commit)| Gossiped::CommittedBlock(block, commit))
     } else if topic == TOPIC_TRANSACTIONS {
@@ -2889,7 +2922,7 @@ impl Lane {
 fn observed_height(message: &Gossiped) -> Option<u64> {
     match message {
         Gossiped::CommittedBlock(block, _) => Some(block.height()),
-        Gossiped::Proposal(proposal) => proposal.block.height().checked_sub(1),
+        Gossiped::Proposal(proposal) => proposal.height().checked_sub(1),
         _ => None,
     }
 }
@@ -4352,6 +4385,7 @@ mod observed_height_tests {
         GossipTicket, Gossiped, P2PEvent, TransactionVerdict, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS,
         TOPIC_PEER_EXCHANGE, TOPIC_TRANSACTIONS, TOPIC_VOTES,
     };
+    use crate::compact::{CompactBlock, CompactProposal};
     use helix_consensus::proposal::Proposal;
     use helix_core::block::{genesis_block, Block};
     use helix_crypto::{Address, PublicKey, Signature};
@@ -4390,9 +4424,11 @@ mod observed_height_tests {
     /// A committed block is the sender's own finalized history: it holds at least that height.
     #[test]
     fn a_committed_block_claims_its_own_height() {
-        let data =
-            bincode::serialize(&(block_at(4_200), Vec::<helix_consensus::vote::Vote>::new()))
-                .unwrap();
+        let data = bincode::serialize(&(
+            CompactBlock::of(&block_at(4_200)),
+            Vec::<helix_consensus::vote::Vote>::new(),
+        ))
+        .unwrap();
 
         let message = decode_gossip(TOPIC_COMMITTED_BLOCKS, &data);
 
@@ -4405,7 +4441,8 @@ mod observed_height_tests {
     /// request a block nobody has committed, take a short answer, and cool down an honest peer.
     #[test]
     fn a_proposal_claims_only_the_height_below_it() {
-        let data = bincode::serialize(&Proposal::fresh(0, block_at(4_200))).unwrap();
+        let data =
+            bincode::serialize(&CompactProposal::of(&Proposal::fresh(0, block_at(4_200)))).unwrap();
 
         let message = decode_gossip(TOPIC_BLOCKS, &data);
 
@@ -4416,7 +4453,8 @@ mod observed_height_tests {
     /// And a proposal for height 0 claims nothing rather than underflowing.
     #[test]
     fn a_proposal_at_the_genesis_height_claims_nothing() {
-        let data = bincode::serialize(&Proposal::fresh(0, block_at(0))).unwrap();
+        let data =
+            bincode::serialize(&CompactProposal::of(&Proposal::fresh(0, block_at(0)))).unwrap();
 
         assert_eq!(observed_height(&decode_gossip(TOPIC_BLOCKS, &data)), None);
     }
@@ -4438,7 +4476,8 @@ mod observed_height_tests {
     #[test]
     fn forwarding_is_decided_for_every_kind_of_message() {
         use MessageAcceptance::{Accept, Ignore, Reject};
-        let proposal = bincode::serialize(&Proposal::fresh(0, block_at(7))).unwrap();
+        let proposal =
+            bincode::serialize(&CompactProposal::of(&Proposal::fresh(0, block_at(7)))).unwrap();
         let pk = PublicKey::from_bytes(vec![7; 32]);
         let vote = bincode::serialize(&helix_consensus::vote::Vote {
             vote_type: helix_consensus::vote::VoteType::Prevote,
@@ -4451,8 +4490,11 @@ mod observed_height_tests {
             signature: Signature::from_bytes(vec![1; 32]),
         })
         .unwrap();
-        let committed =
-            bincode::serialize(&(block_at(7), Vec::<helix_consensus::vote::Vote>::new())).unwrap();
+        let committed = bincode::serialize(&(
+            CompactBlock::of(&block_at(7)),
+            Vec::<helix_consensus::vote::Vote>::new(),
+        ))
+        .unwrap();
         let transaction = bincode::serialize(&a_transaction()).unwrap();
         let peer_exchange = bincode::serialize(&super::PeerExchangeMsg {
             peers: vec![],

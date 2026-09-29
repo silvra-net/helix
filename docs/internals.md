@@ -29,6 +29,14 @@ it, and an answer arriving after nil has been cast can no longer be used. It is 
 slowest link in the set rather than the fastest — a proposal that is sent promptly and is
 perfectly valid still loses its round if it does not fan out in time.
 
+**How a block travels.** Every transaction is gossiped once, on its own lane, when it is
+submitted. Proposals and committed blocks then travel *compact*: the signed header, and for each
+transaction only its id and whether the block's copy carries the sender's public key. Each node
+rebuilds the block from its own pool and checks the result against the header's Merkle root, so
+what it rebuilt is the block byte for byte. A node that lacks a transaction does not guess — it
+asks a peer for the whole proposal (round sync), or fetches the committed block over block sync.
+A full block of ~1.4 MB crosses a link as ~15 KB.
+
 Nil is only ever a prevote. Helix never *precommits* nil, so "precommit quorum" keeps meaning
 exactly one thing: a real block is final.
 
@@ -47,9 +55,12 @@ the two, halting is the safe failure.
 
 What still recovers on its own is the case where the set is large enough that quorum survives the
 loss. Every block header carries `last_commit` — the precommit signatures that finalized its
-*parent* (see `helix_core::CommitSig`) — and `ChainState` counts, per validator, how many
-consecutive blocks its signature was absent from. After ~150 blocks (~5 minutes) of confirmed
-absence, the validator is **downtime-jailed**: removed from `stakers()` outright, independent of
+*parent* (see `helix_core::CommitSig`) — and `ChainState` keeps, per validator, a debt that every
+missing signature raises by 2 and every present one pays down by 1. It grows while a validator
+signs fewer than two thirds of the blocks — the share quorum asks of the set — and shrinks above
+that, so a validator that signs *now and then* is caught as surely as one that never does. A
+validator that is silent outright reaches the threshold after exactly 1800 blocks (~1 hour at 2 s),
+and is then **downtime-jailed**: removed from `stakers()` outright, independent of
 stake, until it submits an explicit `Unjail` transaction (see [Staking](staking.md#staking)). It survives
 node restarts and carries no slash — downtime isn't proof of malice, only lost quorum weight and
 rewards while jailed. The catch is the same arithmetic as above: jailing is *counted from blocks*,

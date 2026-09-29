@@ -1,4 +1,5 @@
 pub mod blocksync;
+pub mod compact;
 pub mod config;
 mod conn_limits;
 pub mod genesis_bootstrap;
@@ -12,6 +13,7 @@ pub mod service;
 pub use blocksync::{
     BlockProvider, BlockSyncRequest, BlockSyncResponse, BLOCKSYNC_PROTOCOL, MAX_BLOCKSYNC_BATCH,
 };
+pub use compact::{CompactBlock, CompactProposal, RebuildError, TxRef};
 pub use config::P2PConfig;
 pub use genesis_bootstrap::{fetch_genesis_over_p2p, GENESIS_FETCH_TIMEOUT};
 pub use genesis_sync::{
@@ -41,12 +43,17 @@ pub enum P2PError {
 pub type P2PResult<T> = Result<T, P2PError>;
 
 /// Gossipsub topic names — versioned so future protocol upgrades can coexist
-pub const TOPIC_BLOCKS: &str = "helix/blocks/1.0.0";
+/// Proposals, compact (`compact::CompactProposal`): the header and the ids of the transactions,
+/// which every receiver rebuilds from its own pool (#235). 2.0.0 because the bytes are not the
+/// 1.0.0 message — a node that still speaks 1.0.0 is simply not subscribed, rather than reading
+/// the new shape as garbage and charging whoever wrote it.
+pub const TOPIC_BLOCKS: &str = "helix/blocks/2.0.0";
 pub const TOPIC_TRANSACTIONS: &str = "helix/transactions/1.0.0";
 pub const TOPIC_VOTES: &str = "helix/votes/1.0.0";
 /// Finalized, committed blocks — broadcast after BFT quorum so lagging peers
-/// can apply them directly without replaying the vote round.
-pub const TOPIC_COMMITTED_BLOCKS: &str = "helix/committed-blocks/1.0.0";
+/// can apply them directly without replaying the vote round. Compact since 2.0.0, like
+/// proposals (`compact::CompactBlock` plus the commit certificate).
+pub const TOPIC_COMMITTED_BLOCKS: &str = "helix/committed-blocks/2.0.0";
 /// Known-peer-address announcements — see `service::PeerExchangeMsg`'s doc comment for
 /// why this exists (mDNS-only discovery and a single explicit seed-peer dial both leave
 /// every follower connected to just one hub; if that hub goes down, followers connected

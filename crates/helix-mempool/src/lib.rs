@@ -790,6 +790,12 @@ impl Mempool {
     pub fn contains(&self, hash: &Hash) -> bool {
         self.by_hash.contains_key(&hash.to_hex())
     }
+
+    /// The pending transaction with this id, in the form this pool holds it — which may differ
+    /// from a block's copy by the sender's key (#243). What a compact block is rebuilt from (#235).
+    pub fn get(&self, hash: &Hash) -> Option<&Transaction> {
+        self.by_hash.get(&hash.to_hex())
+    }
 }
 
 impl Default for Mempool {

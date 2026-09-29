@@ -22,6 +22,7 @@ use helix_core::block::{genesis_block, Block, CommitSig};
 use helix_core::{CryptoVersion, Transaction, TxType};
 use helix_crypto::{Address, Hash, PublicKey, Signature};
 use helix_p2p::blocksync::BlockSyncResponse;
+use helix_p2p::compact::{CompactBlock, CompactProposal};
 use helix_p2p::genesis_sync::{GenesisPayload, GenesisResponse};
 use helix_p2p::roundsync::RoundSyncResponse;
 use serde::de::DeserializeOwned;
@@ -155,10 +156,17 @@ fn a_length_anywhere_in_a_peer_message_is_never_reserved_for() {
     assert!(seen >= 64 << 20, "the counting allocator missed a 64 MiB reservation ({seen})");
 
     let mut report = Vec::new();
-    // Gossip, one per topic, in the types `decode_gossip` reads them as.
-    report.push(("proposal", sweep("proposal", &Proposal::fresh(0, a_block()))));
+    // Gossip, one per topic, in the types `decode_gossip` reads them as — proposals and committed
+    // blocks compact since #235.
+    report.push((
+        "proposal",
+        sweep("proposal", &CompactProposal::of(&Proposal::fresh(0, a_block()))),
+    ));
     report.push(("vote", sweep("vote", &a_vote())));
-    report.push(("committed block", sweep("committed block", &(a_block(), vec![a_vote(), a_vote()]))));
+    report.push((
+        "committed block",
+        sweep("committed block", &(CompactBlock::of(&a_block()), vec![a_vote(), a_vote()])),
+    ));
     report.push(("transaction", sweep("transaction", &a_transaction())));
     // Peer exchange is private to the service; its shape is strings and numbers, mirrored here.
     let peer_exchange: (Vec<String>, String, u64, String, u64) = (

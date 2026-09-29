@@ -84,6 +84,8 @@ pub struct AppState {
     /// Rounds lost despite enough voting power being heard (#192), published by the production
     /// loop so this route never has to ask consensus.
     pub rounds_lost_with_quorum_power: Arc<std::sync::atomic::AtomicU64>,
+    /// `(rebuilt, not rebuilt)` compact blocks so far (#235) — read from the node on each request.
+    pub compact_block_counts: fn() -> (u64, u64),
     /// Target milliseconds between blocks, from the node. Only used to turn "bytes per block" into
     /// "days of disk left"; nothing here depends on it being exact.
     pub block_time_ms: u64,
@@ -1786,6 +1788,8 @@ async fn get_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
         peer_count: state.peer_count.load(Ordering::Relaxed),
         validators_not_heard_from: state.silent_peer_validators.load(Ordering::Relaxed),
         rounds_lost_with_quorum_power: state.rounds_lost_with_quorum_power.load(Ordering::Relaxed),
+        compact_blocks_rebuilt: (state.compact_block_counts)().0,
+        compact_blocks_not_rebuilt: (state.compact_block_counts)().1,
         peer_tip_height: match state.highest_peer_tip.load(Ordering::Relaxed) {
             0 => None,
             h => Some(h),
@@ -2190,6 +2194,7 @@ mod tests {
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rounds_lost_with_quorum_power: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            compact_block_counts: || (0, 0),
             block_time_ms: 2_000,
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3291,6 +3296,7 @@ mod tests {
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rounds_lost_with_quorum_power: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            compact_block_counts: || (0, 0),
             block_time_ms: 2_000,
             last_cosigned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cosigned_at_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),

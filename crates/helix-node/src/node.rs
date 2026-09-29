@@ -18,6 +18,7 @@ use helix_executor::{
 use helix_mempool::{Mempool, MempoolError, SenderKeys};
 use helix_p2p::{
     blocksync::BlockSyncResponse,
+    compact::{CompactBlock, RebuildError},
     config::P2PConfig,
     service::{
         GossipTicket, P2PCommand, P2PEvent, P2PService, TransactionVerdict,
@@ -1265,6 +1266,7 @@ impl HelixNode {
             started_at_unix: crate::run_record::now_unix(),
             silent_peer_validators: silent_peer_validators.clone(),
             rounds_lost_with_quorum_power: rounds_lost_with_quorum_power.clone(),
+            compact_block_counts,
             highest_peer_tip: self.highest_peer_tip.clone(),
             block_time_ms: config::resolve_u64("HELIX_BLOCK_TIME_MS", None).unwrap_or(BLOCK_TIME_MS),
             keep_blocks: configured_keep_blocks(),
@@ -1850,8 +1852,45 @@ async fn request_round_sync_if_waiting(
 ) {
     let missing = { engine.read().await.missing_proposal() };
     if let Some((height, round)) = missing {
-        let _ = p2p_tx.try_send(P2PCommand::RequestRoundSync { height, round });
+        let _ = p2p_tx.try_send(P2PCommand::RequestRoundSync { height, round, ask: None });
     }
+}
+
+/// Compact blocks from peers (#235) this node rebuilt from its own pool, and the ones it could
+/// not — each of those cost a whole block after all, fetched over round sync. Counted only where
+/// the block mattered: a proposal for the height this validator is deciding, a committed block
+/// for the height right above its tip. Served in `/diagnostics`; a miss rate that stays high means
+/// transactions are not reaching this node ahead of the blocks that carry them.
+static COMPACT_BLOCKS_REBUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COMPACT_BLOCKS_NOT_REBUILT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn note_compact_block(rebuilt: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if rebuilt {
+        COMPACT_BLOCKS_REBUILT.fetch_add(1, Relaxed);
+    } else {
+        COMPACT_BLOCKS_NOT_REBUILT.fetch_add(1, Relaxed);
+    }
+}
+
+/// `(rebuilt, not rebuilt)` so far in this process — see `COMPACT_BLOCKS_REBUILT`.
+fn compact_block_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (COMPACT_BLOCKS_REBUILT.load(Relaxed), COMPACT_BLOCKS_NOT_REBUILT.load(Relaxed))
+}
+
+/// A committed block from a peer, rebuilt from this node's pool (#235) and counted.
+async fn rebuild_compact_block(
+    compact: &CompactBlock,
+    mempool: &Arc<RwLock<Mempool>>,
+) -> Result<Block, RebuildError> {
+    let rebuilt = {
+        let pool = mempool.read().await;
+        compact.rebuild(|id| pool.get(id).cloned())
+    };
+    note_compact_block(rebuilt.is_ok());
+    rebuilt
 }
 
 /// Fold a proposal from a peer into the engine and act on the outcome.
@@ -2099,8 +2138,70 @@ async fn handle_p2p_event(
         P2PEvent::NewTransaction(tx, ticket) => {
             admit_peer_transaction(tx, ticket, mempool, chain_state).await
         }
-        P2PEvent::NewProposal(proposal) => {
-            apply_peer_proposal(proposal, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
+        P2PEvent::NewProposal(compact, ask) => {
+            let height = compact.height();
+            // A proposal for a height this node has already committed changes nothing — the engine
+            // would drop it — and its transactions have left the pool, so rebuilding it would only
+            // count a miss that is not one.
+            if height <= store.read().await.latest_height() {
+                return;
+            }
+            let rebuilt = {
+                let pool = mempool.read().await;
+                compact.rebuild(|id| pool.get(id).cloned())
+            };
+            let deciding = {
+                let eng = engine.read().await;
+                height == eng.current_height() + 1
+                    && eng.validator_set().get(&Address::from_public_key(&keypair.public)).is_some()
+            };
+            match rebuilt {
+                Ok(proposal) => {
+                    if deciding {
+                        note_compact_block(true);
+                    }
+                    apply_peer_proposal(proposal, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
+                }
+                // Only a validator deciding this height needs the proposal, so only it fetches.
+                // A follower never used proposals: it takes blocks as they are committed.
+                Err(why) if deciding => {
+                    // Fetching costs the peer asked a whole block. Without these two checks any
+                    // peer could make every validator ask the hub for one, per forged header, over
+                    // the one link the whole network shares (#177): the header must be signed by
+                    // a validator of this set, and the engine must still be able to use a proposal.
+                    let worth_a_block = {
+                        let eng = engine.read().await;
+                        let header = &compact.block.header;
+                        eng.wants_proposal()
+                            && eng.validator_set().get(&header.validator).is_some()
+                            && header.verify_signature().is_ok()
+                    };
+                    if !worth_a_block {
+                        debug!(
+                            height,
+                            round = compact.round,
+                            reason = %why,
+                            "Compact proposal not rebuilt and not worth fetching"
+                        );
+                        return;
+                    }
+                    note_compact_block(false);
+                    debug!(
+                        height,
+                        round = compact.round,
+                        reason = %why,
+                        peer = %ask,
+                        "Could not rebuild a compact proposal from this node's pool — asking for \
+                         the whole one"
+                    );
+                    let _ = p2p_tx.try_send(P2PCommand::RequestRoundSync {
+                        height,
+                        round: compact.round,
+                        ask: Some(ask),
+                    });
+                }
+                Err(_) => {}
+            }
         }
         P2PEvent::NewVote(vote) => {
             apply_peer_vote(vote, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
@@ -2123,9 +2224,9 @@ async fn handle_p2p_event(
                 apply_peer_vote(vote, mempool, store, chain_state, engine, keypair, p2p_tx, last_applied_height, signing_guard, tip_certificate).await;
             }
         }
-        P2PEvent::NewCommittedBlock(block, commit_certificate) => {
+        P2PEvent::NewCommittedBlock(compact, commit_certificate) => {
             let our_height = store.read().await.latest_height();
-            let block_height = block.height();
+            let block_height = compact.height();
 
             if block_height <= our_height {
                 // Already have it — duplicate from gossip, ignore.
@@ -2212,7 +2313,23 @@ async fn handle_p2p_event(
                 return;
             }
 
-            // block_height == our_height + 1: verify proposer sig, then that the
+            // block_height == our_height + 1. Rebuild the block from what this node holds (#235).
+            // One that cannot is not stuck: the gossip that brought this has already told the
+            // block-sync driver that the sender holds this height, and it fetches whole blocks.
+            let block = match rebuild_compact_block(&compact, mempool).await {
+                Ok(block) => block,
+                Err(why) => {
+                    debug!(
+                        height = block_height,
+                        reason = %why,
+                        "Could not rebuild a committed block from this node's pool — block sync \
+                         will fetch it"
+                    );
+                    return;
+                }
+            };
+
+            // Verify proposer sig, then that the
             // signer is actually a member of the current validator set — a
             // self-consistent signature alone only proves the embedded public key
             // matches the declared `validator` address, not that this address holds
@@ -10021,7 +10138,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
 
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(block, vec![]),
+            P2PEvent::NewCommittedBlock(CompactBlock::of(&block), vec![]),
             &mempool,
             &peer_count,
             &store,
@@ -10074,7 +10191,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
 
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(block, cert),
+            P2PEvent::NewCommittedBlock(CompactBlock::of(&block), cert),
             &mempool,
             &peer_count,
             &store,
@@ -10092,6 +10209,82 @@ mod handle_p2p_event_tests {
         let state = chain_state.read().await;
         assert!(state.get(&validator_addr).unwrap().balance > 0, "block reward must land on the actual block validator");
         assert!(state.get(&Address::from_public_key(&own_kp.public)).is_none(), "our own address never participated and must not receive anything");
+    }
+
+    /// Committed blocks travel compact too (#235). With its transaction in the pool the block is
+    /// applied — the very block, by hash; without it nothing is applied here and nothing breaks:
+    /// the gossip has already told block sync that the sender holds this height.
+    #[tokio::test]
+    async fn a_compact_committed_block_is_applied_only_where_its_transactions_are_held() {
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        let chain_id = Hash::digest(b"compact committed block");
+        let sender = KeyPair::generate();
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: Address::from_public_key(&sender.public),
+            to: Some(validator_addr.clone()),
+            amount: 1,
+            fee: 10_000_000,
+            nonce: 0,
+            data: vec![],
+            crypto_version: sender.scheme,
+            chain_id,
+            signature: Sig::from_bytes(vec![]),
+            public_key: Some(sender.public.clone()),
+        };
+        tx.signature = sender.sign(tx.signing_hash().as_bytes()).unwrap();
+
+        let mut block = signed_block(&validator_kp, 1, Hash::ZERO);
+        block.transactions = vec![tx.clone()];
+        block.header.merkle_root = helix_core::transactions_root(&block.transactions);
+        block.header.signature = validator_kp.sign(block.header.signing_hash().as_bytes()).unwrap();
+        let block_hash = block.hash();
+        let cert = commit_sigs_to_votes(
+            tip_commit_sigs(1, block_hash, &[&validator_kp]),
+            1,
+            block_hash,
+            &key_from_pairs(&[&validator_kp]),
+        );
+
+        for held in [false, true] {
+            let mut pool = Mempool::new();
+            if held {
+                pool.add(tx.clone(), chain_id, Some(0)).expect("premise: the pool takes it");
+            }
+            let store = Arc::new(RwLock::new(fresh_store()));
+            let validator_set =
+                ValidatorSet::new(vec![Validator::new(validator_addr.clone(), 1_000_000, true)], 0);
+            let engine =
+                Arc::new(RwLock::new(BftEngine::new(validator_set, validator_addr.clone(), 0)));
+            let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+
+            handle_p2p_event(
+                P2PEvent::NewCommittedBlock(CompactBlock::of(&block), cert.clone()),
+                &Arc::new(RwLock::new(pool)),
+                &Arc::new(AtomicUsize::new(0)),
+                &store,
+                &Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX))),
+                &engine,
+                &KeyPair::generate(),
+                &p2p_tx,
+                &None,
+                &Arc::new(Mutex::new(0)),
+                &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+                &Arc::new(RwLock::new(TipCertificate::default())),
+            )
+            .await;
+
+            let store = store.read().await;
+            if held {
+                assert_eq!(store.latest_height(), 1, "held: the block is applied");
+                assert_eq!(store.get_block_by_height(1).unwrap().hash(), block_hash);
+                assert_eq!(store.get_block_by_height(1).unwrap().transactions, vec![tx.clone()]);
+            } else {
+                assert_eq!(store.latest_height(), 0, "not held: nothing is applied here");
+            }
+        }
     }
 
     /// Audit A1: a committed block from a real in-set validator, correctly signed, building on our
@@ -10136,7 +10329,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
 
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(block, lone_cert),
+            P2PEvent::NewCommittedBlock(CompactBlock::of(&block), lone_cert),
             &mempool,
             &peer_count,
             &store,
@@ -10895,7 +11088,7 @@ mod handle_p2p_event_tests {
         let (p2p_tx, mut p2p_rx) = mpsc::channel(8);
 
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(block, vec![]),
+            P2PEvent::NewCommittedBlock(CompactBlock::of(&block), vec![]),
             &mempool,
             &peer_count,
             &store,
@@ -11464,7 +11657,7 @@ mod handle_p2p_event_tests {
         // content is irrelevant; it's never applied directly, only used to detect the gap.
         let far_ahead = signed_block(&kp, 5, prev_hash);
         handle_p2p_event(
-            P2PEvent::NewCommittedBlock(far_ahead, vec![]),
+            P2PEvent::NewCommittedBlock(CompactBlock::of(&far_ahead), vec![]),
             &mempool,
             &peer_count,
             &store,
@@ -12837,6 +13030,236 @@ mod round_sync_tests {
         );
     }
 
+    /// A transfer honestly signed by a fresh key, of the kind a pool holds and a block carries.
+    fn pooled_transfer(chain_id: Hash) -> Transaction {
+        let kp = KeyPair::generate();
+        let mut tx = Transaction {
+            version: 1,
+            tx_type: TxType::Transfer,
+            from: Address::from_public_key(&kp.public),
+            to: Some(Address::from_public_key(&KeyPair::generate().public)),
+            amount: 1,
+            fee: 10_000_000,
+            nonce: 0,
+            data: vec![],
+            crypto_version: kp.scheme,
+            chain_id,
+            signature: Signature::from_bytes(vec![]),
+            public_key: Some(kp.public.clone()),
+        };
+        tx.signature = kp.sign(tx.signing_hash().as_bytes()).unwrap();
+        tx
+    }
+
+    /// The round-0 proposal for height 1 that `proposer_kp` makes over `transactions`, and the
+    /// state it builds on.
+    fn proposal_over(
+        proposer_kp: &KeyPair,
+        set: &ValidatorSet,
+        transactions: Vec<Transaction>,
+    ) -> (helix_consensus::Proposal, ChainState) {
+        let chain_state = ChainState::new(0);
+        let mut proposer =
+            BftEngine::new(set.clone(), Address::from_public_key(&proposer_kp.public), 0);
+        let (h, root) = (proposer.current_height(), chain_state.state_hash());
+        let _ = proposer.produce_block(proposer_kp, Hash::ZERO, h, root, transactions);
+        let proposal = proposer.round_evidence(1).0.expect("the proposer holds its own proposal");
+        (proposal, chain_state)
+    }
+
+    /// Hand `event` to a node with `pool` and return every command it sent.
+    async fn deliver(
+        event: P2PEvent,
+        pool: Mempool,
+        chain_state: ChainState,
+        engine: &Arc<RwLock<BftEngine>>,
+        kp: &KeyPair,
+    ) -> Vec<P2PCommand> {
+        let (p2p_tx, mut p2p_rx) = mpsc::channel(64);
+        handle_p2p_event(
+            event,
+            &Arc::new(RwLock::new(pool)),
+            &Arc::new(AtomicUsize::new(1)),
+            &Arc::new(RwLock::new(fresh_store())),
+            &Arc::new(RwLock::new(chain_state)),
+            engine,
+            kp,
+            &p2p_tx,
+            &None,
+            &Arc::new(Mutex::new(0)),
+            &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            &Arc::new(RwLock::new(TipCertificate::default())),
+        )
+        .await;
+        std::iter::from_fn(|| p2p_rx.try_recv().ok()).collect()
+    }
+
+    fn asked_for_a_round(commands: &[P2PCommand]) -> Option<(u64, u32, Option<String>)> {
+        commands.iter().find_map(|cmd| match cmd {
+            P2PCommand::RequestRoundSync { height, round, ask } => {
+                Some((*height, *round, ask.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    /// A validator of `set` (or anyone) running the engine, at height 0.
+    fn engine_of(set: ValidatorSet, kp: &KeyPair) -> Arc<RwLock<BftEngine>> {
+        Arc::new(RwLock::new(BftEngine::new(set, Address::from_public_key(&kp.public), 0)))
+    }
+
+    /// `proposal` as it arrives over gossip, from a peer called "sender".
+    fn gossiped(proposal: &helix_consensus::Proposal) -> P2PEvent {
+        P2PEvent::NewProposal(helix_p2p::CompactProposal::of(proposal), SENDER.into())
+    }
+
+    const SENDER: &str = "12D3KooWsender";
+
+    /// Proposals travel compact (#235): header and transaction ids. A validator that holds the
+    /// transactions rebuilds the block and joins the round exactly as if the whole block had come
+    /// — same block, a vote on it, and nobody asked for anything.
+    #[tokio::test]
+    async fn a_compact_proposal_is_rebuilt_from_the_pool_and_joins_the_round() {
+        let (proposer_kp, waiting_kp, set) = two_validators();
+        let chain_id = Hash::digest(b"compact proposal");
+        let tx = pooled_transfer(chain_id);
+        let (proposal, chain_state) = proposal_over(&proposer_kp, &set, vec![tx.clone()]);
+        let mut pool = Mempool::new();
+        pool.add(tx, chain_id, Some(0)).expect("premise: the pool takes the transaction");
+
+        let engine = engine_of(set, &waiting_kp);
+        let commands = deliver(
+            gossiped(&proposal),
+            pool,
+            chain_state,
+            &engine,
+            &waiting_kp,
+        )
+        .await;
+
+        assert_eq!(
+            engine.read().await.pending_proposal().map(|b| b.hash()),
+            Some(proposal.block.hash()),
+            "the rebuilt block must be the proposed one, byte for byte — its hash is the header's"
+        );
+        let voted = commands.iter().any(|c| matches!(c, P2PCommand::BroadcastVote(_)));
+        assert!(voted, "and it is voted on");
+        let asked = asked_for_a_round(&commands);
+        assert_eq!(asked, None, "nothing was missing, so nothing is fetched");
+    }
+
+    /// One transaction short, and the proposal is not guessed at: the node asks for the whole one,
+    /// from the peer that handed it the compact form — which holds it, having just sent it.
+    #[tokio::test]
+    async fn a_compact_proposal_this_node_cannot_rebuild_is_fetched_whole_from_its_sender() {
+        let (proposer_kp, waiting_kp, set) = two_validators();
+        let chain_id = Hash::digest(b"compact proposal");
+        let txs = vec![pooled_transfer(chain_id)];
+        let (proposal, chain_state) = proposal_over(&proposer_kp, &set, txs);
+
+        let engine = engine_of(set, &waiting_kp);
+        let commands = deliver(
+            gossiped(&proposal),
+            Mempool::new(),
+            chain_state,
+            &engine,
+            &waiting_kp,
+        )
+        .await;
+
+        let adopted = engine.read().await.pending_proposal().is_some();
+        assert!(!adopted, "a block it cannot rebuild is not adopted");
+        assert_eq!(
+            asked_for_a_round(&commands),
+            Some((1, 0, Some(SENDER.to_string()))),
+            "without the whole proposal this validator can only prevote nil"
+        );
+    }
+
+    /// A compact proposal whose header no validator signed is not worth a block. Without this a
+    /// stranger could send headers with made-up transaction ids, and every validator would ask the
+    /// hub for a whole block per header — the hub paying for the attack over the one link everyone
+    /// shares.
+    #[tokio::test]
+    async fn a_compact_proposal_no_validator_signed_is_not_fetched() {
+        let (proposer_kp, waiting_kp, set) = two_validators();
+        let chain_id = Hash::digest(b"compact proposal");
+        let txs = vec![pooled_transfer(chain_id)];
+        let (mut proposal, chain_state) = proposal_over(&proposer_kp, &set, txs);
+        let stranger = KeyPair::generate();
+        proposal.block.header.validator = Address::from_public_key(&stranger.public);
+        proposal.block.header.public_key = stranger.public.clone();
+        let signing_hash = proposal.block.header.signing_hash();
+        proposal.block.header.signature = stranger.sign(signing_hash.as_bytes()).unwrap();
+        let signed = proposal.block.header.verify_signature().is_ok();
+        assert!(signed, "premise: signed, just not by a validator");
+
+        let engine = engine_of(set, &waiting_kp);
+        let commands = deliver(
+            gossiped(&proposal),
+            Mempool::new(),
+            chain_state,
+            &engine,
+            &waiting_kp,
+        )
+        .await;
+
+        assert_eq!(asked_for_a_round(&commands), None);
+    }
+
+    /// Once this node holds the round's proposal, another compact form of it that does not rebuild
+    /// — a replayed header with altered ids — must not cost anyone a block.
+    #[tokio::test]
+    async fn a_node_that_holds_the_proposal_fetches_no_other() {
+        let (proposer_kp, waiting_kp, set) = two_validators();
+        let chain_id = Hash::digest(b"compact proposal");
+        let tx = pooled_transfer(chain_id);
+        let (proposal, chain_state) = proposal_over(&proposer_kp, &set, vec![tx.clone()]);
+        let engine = engine_of(set, &waiting_kp);
+        let mut pool = Mempool::new();
+        pool.add(tx, chain_id, Some(0)).expect("premise: the pool takes the transaction");
+        let _ = deliver(
+            gossiped(&proposal),
+            pool,
+            chain_state.clone(),
+            &engine,
+            &waiting_kp,
+        )
+        .await;
+        let taken = engine.read().await.pending_proposal().is_some();
+        assert!(taken, "premise: the real one was taken");
+
+        let mut replayed = helix_p2p::CompactProposal::of(&proposal);
+        replayed.block.transactions[0].id = Hash::digest(b"a transaction nobody sent");
+        let replayed = P2PEvent::NewProposal(replayed, SENDER.into());
+        let commands = deliver(replayed, Mempool::new(), chain_state, &engine, &waiting_kp).await;
+
+        assert_eq!(asked_for_a_round(&commands), None);
+    }
+
+    /// A node outside the validator set never used proposals — it takes blocks as they are
+    /// committed. A proposal it cannot rebuild must not make it start fetching them.
+    #[tokio::test]
+    async fn a_follower_does_not_fetch_a_proposal_it_cannot_rebuild() {
+        let (proposer_kp, _waiting_kp, set) = two_validators();
+        let follower_kp = KeyPair::generate();
+        let chain_id = Hash::digest(b"compact proposal");
+        let txs = vec![pooled_transfer(chain_id)];
+        let (proposal, chain_state) = proposal_over(&proposer_kp, &set, txs);
+
+        let engine = engine_of(set, &follower_kp);
+        let commands = deliver(
+            gossiped(&proposal),
+            Mempool::new(),
+            chain_state,
+            &engine,
+            &follower_kp,
+        )
+        .await;
+
+        assert_eq!(asked_for_a_round(&commands), None);
+    }
+
     /// The ask fires exactly when it can help: the proposal is not ours to make, and it has been
     /// missing longer than this round's window.
     #[tokio::test]
@@ -12860,7 +13283,7 @@ mod round_sync_tests {
         request_round_sync_if_waiting(&engine, &p2p_tx).await;
 
         let asked = std::iter::from_fn(|| p2p_rx.try_recv().ok()).find_map(|cmd| match cmd {
-            P2PCommand::RequestRoundSync { height, round } => Some((height, round)),
+            P2PCommand::RequestRoundSync { height, round, .. } => Some((height, round)),
             _ => None,
         });
         assert_eq!(

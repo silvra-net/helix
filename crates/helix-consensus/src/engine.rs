@@ -1356,25 +1356,32 @@ impl BftEngine {
     /// may simply still be in flight (`PROPOSAL_PULL_TICKS`), or we have already prevoted nil and
     /// so could no longer use an answer.
     pub fn missing_proposal(&self) -> Option<(u64, u32)> {
+        if !self.wants_proposal() || self.round_ticks < PROPOSAL_PULL_TICKS {
+            return None;
+        }
+        Some((self.current_height + 1, self.active_round_number()))
+    }
+
+    /// Whether a proposal for the round this node is in would still be of use to it: it holds
+    /// none, it is not the one who makes it, and it has not prevoted yet.
+    ///
+    /// [`Self::missing_proposal`] less the wait. A node that could not rebuild a compact proposal
+    /// from its pool (#235) knows the proposal exists, so there is nothing to wait for; but
+    /// fetching it costs a peer a whole block, so it must not fetch one it could not use.
+    pub fn wants_proposal(&self) -> bool {
         let height = self.current_height + 1;
         let round = self.active_round_number();
         if self.round.as_ref().is_some_and(|r| r.proposal.is_some()) {
-            return None;
+            return false;
         }
         if self.validator_set.is_proposer(&self.address, height, round) {
-            return None;
+            return false;
         }
         // Already prevoted in this round — which here means nil, since holding a proposal was
         // ruled out above. The round is closed to proposals from that moment on
         // (`open_for_nil_prevote`), so an answer could not be applied and asking for one is a
-        // request per tick that can only ever be discarded.
-        if self.round.as_ref().is_some_and(|r| r.prevotes.has_voted(&self.address)) {
-            return None;
-        }
-        if self.round_ticks < PROPOSAL_PULL_TICKS {
-            return None;
-        }
-        Some((height, round))
+        // request that can only ever be discarded.
+        !self.round.as_ref().is_some_and(|r| r.prevotes.has_voted(&self.address))
     }
 
     /// Everything this node holds for the height it is currently deciding: the proposal envelope

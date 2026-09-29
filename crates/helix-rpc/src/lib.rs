@@ -382,6 +382,13 @@ pub struct NodeDiagnostics {
     /// "four of five voted" as "the round should have closed" put a wrong diagnosis into this
     /// project's notes twice in one day (#192).
     pub rounds_lost_with_quorum_power: u64,
+    /// Compact blocks from peers (#235) this node rebuilt from its own pool, and the ones it could
+    /// not — for each of those it fetched or waited for the whole block instead. Counted where the
+    /// block mattered: a proposal for the height this validator is deciding, a committed block
+    /// right above its tip. A share of misses that stays high means transactions reach this node
+    /// after the blocks that carry them, and the bandwidth compact blocks save is spent anyway.
+    pub compact_blocks_rebuilt: u64,
+    pub compact_blocks_not_rebuilt: u64,
     /// Height at which this node last co-signed, and how long ago. `None` on a node that has not
     /// co-signed during this run — including every non-validator.
     pub last_cosigned_height: Option<u64>,
