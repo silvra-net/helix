@@ -61,7 +61,8 @@ fn on_chain_value(param: &GovParamArg, typed: f64) -> Result<(u64, String)> {
 
 #[derive(Subcommand)]
 pub enum GovernanceCmd {
-    /// Propose changing a protocol parameter (requires an active stake)
+    /// Propose changing a protocol parameter (requires a stake of at least the chain's current
+    /// minimum validator stake)
     Propose {
         /// Which parameter to change
         #[arg(value_enum)]

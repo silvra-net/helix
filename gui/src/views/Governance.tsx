@@ -178,7 +178,9 @@ function CreateProposal({ node, onRun }: { node: string; onRun: (fn: () => Promi
         <p className="error small">Above {hlx(MAX_EXACT_HLX)} HLX this value cannot be represented exactly.</p>
       )}
       <p className="muted small">
-        Creating a proposal requires an active self-stake. The chain rejects values outside safe bounds.
+        Creating a proposal requires a self-stake of at least the current minimum validator stake (shown
+        above) — if governance changes that minimum, this bar moves with it. Voting takes any self-stake.
+        The chain rejects values outside safe bounds.
         Creating a proposal does <strong>not</strong> cast your vote — use “Vote yes” on it afterwards.
       </p>
       <div className="row-actions end">

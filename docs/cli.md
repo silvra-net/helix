@@ -301,6 +301,10 @@ denominator by unstaking after voting, and raised by any stake that arrives late
 cannot carry a vote the rest of the stake never saw. A proposal that does not pass expires after
 1000 blocks. Every address can vote once per proposal.
 
+Opening a proposal takes a stake of at least the chain's minimum validator stake — the current
+value, as `governance params` shows it, so a vote that moves the minimum moves this bar with it.
+Voting takes any stake at all, weighted by how much.
+
 Once its 1000 blocks are over, a proposal — passed or not — leaves the chain state, so
 `governance list` and `show` only know the ones still open. What a passed proposal changed stays in
 force (`governance params`), and every proposal and vote stays on the chain as its transaction.

@@ -1889,8 +1889,25 @@ fn execute_create_proposal(
 ) -> Receipt {
     let sender = state.get_or_default(&tx.from);
 
-    if sender.staked == 0 {
-        return Receipt::failure(tx_hash, "only stakers may create governance proposals", 0, 0);
+    // Opening a vote takes what validating takes (#250): the chain's minimum validator stake, read
+    // at the moment of proposing — so a passed proposal that moves the minimum moves this with it.
+    // Any stake at all used to do; one nano bought the right to put an entry into every node's
+    // state. Voting stays open to every staker, weighted by stake: a vote adds a name to a proposal
+    // that already exists, and leaves with it when the proposal closes (`prune_closed_proposals`).
+    let needed = state.governance_params.min_validator_stake;
+    if sender.staked < needed {
+        let hlx = |nano: u64| nano as f64 / genesis::NANO_PER_HLX as f64;
+        return Receipt::failure(
+            tx_hash,
+            &format!(
+                "creating a governance proposal takes a stake of at least {} HLX, the chain's \
+                 minimum validator stake; this account has {} HLX staked",
+                hlx(needed),
+                hlx(sender.staked)
+            ),
+            0,
+            0,
+        );
     }
 
     let (param, new_value) = match governance::decode_proposal(&tx.data) {
@@ -3692,6 +3709,9 @@ mod tests {
         let validator = Address::from_public_key(&KeyPair::generate().public);
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = 500_000;
         state.update_account(&addr, |acc| {
             acc.balance = 1_000_000;
             acc.staked = 500_000;
@@ -3716,6 +3736,9 @@ mod tests {
         let validator = Address::from_public_key(&KeyPair::generate().public);
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = 500_000;
         state.update_account(&addr, |acc| {
             acc.balance = 1_000_000;
             acc.staked = 500_000;
@@ -3728,6 +3751,8 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
+        let why = receipt.error.as_deref().unwrap_or("");
+        assert!(why.contains("below the minimum safe floor"), "refused for the wrong reason: {why}");
         assert!(state.proposals.is_empty(), "the chain-stalling proposal must not exist");
         // The proposal is refused; the fee is charged, as for any payable transaction that took a
         // block slot and failed.
@@ -3742,6 +3767,9 @@ mod tests {
         let validator = Address::from_public_key(&KeyPair::generate().public);
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = 500_000;
         state.update_account(&addr, |acc| {
             acc.balance = 1_000_000;
             acc.staked = 500_000;
@@ -3754,6 +3782,8 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
+        let why = receipt.error.as_deref().unwrap_or("");
+        assert!(why.contains("below the minimum safe floor"), "refused for the wrong reason: {why}");
         assert!(state.proposals.is_empty());
     }
 
@@ -3767,6 +3797,9 @@ mod tests {
         let validator = Address::from_public_key(&KeyPair::generate().public);
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = 500_000;
         state.update_account(&addr, |acc| {
             acc.balance = 1_000_000;
             acc.staked = 500_000;
@@ -3777,6 +3810,8 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success);
+        let why = receipt.error.as_deref().unwrap_or("");
+        assert!(why.contains("below the minimum safe floor"), "refused for the wrong reason: {why}");
         assert!(state.proposals.is_empty());
     }
 
@@ -3788,6 +3823,9 @@ mod tests {
 
         let floor = crate::genesis::MIN_VALIDATOR_STAKE / 100;
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = floor;
         state.update_account(&addr, |acc| {
             acc.balance = 1_000_000;
             // Must be >= floor: the new dynamic ceiling on MinValidatorStake proposals caps
@@ -3824,6 +3862,9 @@ mod tests {
         let largest_stake = floor + 1_000_000_000;
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = largest_stake;
         state.update_account(&addr, |acc| {
             acc.balance = 1_000_000;
             acc.staked = largest_stake;
@@ -3837,6 +3878,8 @@ mod tests {
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
 
         assert!(!receipt.success, "proposal exceeding every current stake must be rejected");
+        let why = receipt.error.as_deref().unwrap_or("");
+        assert!(why.contains("exceeds the current largest single stake"), "refused for the wrong reason: {why}");
         assert!(state.proposals.is_empty());
     }
 
@@ -3850,6 +3893,9 @@ mod tests {
         let largest_stake = floor + 1_000_000_000;
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = largest_stake;
         state.update_account(&addr, |acc| {
             acc.balance = 1_000_000;
             acc.staked = largest_stake;
@@ -4157,6 +4203,9 @@ mod tests {
         let voter = Address::from_public_key(&voter_kp.public);
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = 500_000;
         // Two stakers, 50/50 split. Neither alone reaches 2/3, but together they do.
         state.update_account(&proposer, |acc| {
             acc.balance = 1_000_000;
@@ -4208,6 +4257,9 @@ mod tests {
         let addr = Address::from_public_key(&kp.public);
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = 500_000;
         state.update_account(&addr, |acc| {
             acc.balance = 1_000_000;
             acc.staked = 500_000;
@@ -4245,6 +4297,10 @@ mod tests {
         let tiny = Address::from_public_key(&tiny_kp.public);
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so the minimum is the smaller of the two stakes: both may propose, and the honest
+        // staker keeps the set non-empty when the attacker unstakes (the last validator may not).
+        state.governance_params.min_validator_stake = 150;
         state.update_account(&attacker, |acc| {
             acc.balance = 1_000_000;
             acc.staked = 200;
@@ -4319,6 +4375,9 @@ mod tests {
         let voter = Address::from_public_key(&voter_kp.public);
 
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = 500_000;
         state.update_account(&proposer, |acc| {
             acc.balance = 1_000_000;
             acc.staked = 500_000;
@@ -4346,6 +4405,9 @@ mod tests {
     #[test]
     fn a_proposal_leaves_the_state_once_its_vote_is_over() {
         let mut state = ChainState::new(0);
+        // Proposing takes the chain's minimum validator stake (#250). This test is about something
+        // else, so its proposer sits exactly at that minimum.
+        state.governance_params.min_validator_stake = 1;
         let proposer_kp = KeyPair::generate();
         let proposer = Address::from_public_key(&proposer_kp.public);
         let validator = Address::from_public_key(&KeyPair::generate().public);
@@ -4378,6 +4440,74 @@ mod tests {
         assert!(state.proposals.is_empty(), "and neither after it — passed or not");
         assert_eq!(state.next_proposal_id, 2, "ids are never handed out again");
         assert_eq!(state.governance_params.fuel_per_fee_unit, 2, "what passed stays in force");
+    }
+
+    /// Opening a vote takes the chain's minimum validator stake (#250). One nano of stake used to
+    /// be enough, and each proposal is an entry every node carries while it is open.
+    #[test]
+    fn a_proposal_needs_the_chains_minimum_validator_stake() {
+        let mut state = ChainState::new(0);
+        let min = state.governance_params.min_validator_stake;
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let (short_kp, full_kp) = (KeyPair::generate(), KeyPair::generate());
+        let (short, full) =
+            (Address::from_public_key(&short_kp.public), Address::from_public_key(&full_kp.public));
+        state.update_account(&short, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = min - 1;
+        });
+        state.update_account(&full, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = min;
+        });
+        let data = || governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 2);
+
+        let tx = signed_governance_tx(&short_kp, &short, TxType::CreateProposal, data(), 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+        assert!(!receipt.success, "one nano short of the minimum must not open a vote");
+        let why = receipt.error.as_deref().unwrap_or("");
+        assert!(why.contains("minimum validator stake"), "refused for the wrong reason: {why}");
+        assert!(state.proposals.is_empty());
+
+        let tx = signed_governance_tx(&full_kp, &full, TxType::CreateProposal, data(), 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx, &validator, 0, 0).success, "at the minimum it may");
+    }
+
+    /// The bar is read when the proposal is made, so a vote that moves the minimum moves it too —
+    /// through the chain's own governance, not by setting a field.
+    #[test]
+    fn the_bar_to_propose_follows_the_minimum_when_governance_moves_it() {
+        let mut state = ChainState::new(0);
+        let min = state.governance_params.min_validator_stake;
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let (big_kp, half_kp) = (KeyPair::generate(), KeyPair::generate());
+        let (big, half) =
+            (Address::from_public_key(&big_kp.public), Address::from_public_key(&half_kp.public));
+        state.update_account(&big, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = min;
+        });
+        state.update_account(&half, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = min / 2;
+        });
+        let fuel = || governance::encode_proposal(governance::GovernanceParam::FuelPerFeeUnit, 2);
+
+        let tx = signed_governance_tx(&half_kp, &half, TxType::CreateProposal, fuel(), 0, 10_000);
+        assert!(!execute_transaction(&mut state, &tx, &validator, 0, 0).success, "premise: below the bar");
+
+        // Lower the minimum to what `half` holds; both vote it through.
+        let lower = governance::encode_proposal(governance::GovernanceParam::MinValidatorStake, min / 2);
+        let tx = signed_governance_tx(&big_kp, &big, TxType::CreateProposal, lower, 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx, &validator, 0, 0).success, "premise: proposed");
+        for (kp, from, nonce) in [(&big_kp, &big, 1), (&half_kp, &half, 1)] {
+            let vote = signed_governance_tx(kp, from, TxType::VoteProposal, governance::encode_vote(0), nonce, 10_000);
+            assert!(execute_transaction(&mut state, &vote, &validator, 0, 0).success, "premise: voted");
+        }
+        assert_eq!(state.governance_params.min_validator_stake, min / 2, "premise: the minimum moved");
+
+        let tx = signed_governance_tx(&half_kp, &half, TxType::CreateProposal, fuel(), 2, 10_000);
+        assert!(execute_transaction(&mut state, &tx, &validator, 0, 0).success, "and the bar moved with it");
     }
 
     // ── Unbonding / ClaimUnbonded tests ──────────────────────────────────────
