@@ -280,9 +280,19 @@ pub struct RecoveryStatusResponse {
     pub address: String,
     /// Currently controlling public key fingerprint, if control was ever socially recovered.
     pub recovered_key_fingerprint: Option<String>,
-    /// Guardian approvals collected so far for a pending recovery vote, if any.
+    /// Votes held by the key closest to the threshold in a pending recovery vote, if any.
     pub pending_approvals: Option<usize>,
     pub threshold: Option<usize>,
+    /// Every key the guardians currently name, with its votes (#251: each guardian holds one
+    /// vote, so a pending vote can name several keys). Empty without a pending vote.
+    #[serde(default)]
+    pub pending_keys: Vec<PendingRecoveryKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingRecoveryKey {
+    pub fingerprint: String,
+    pub approvals: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

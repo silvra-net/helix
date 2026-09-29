@@ -25,7 +25,7 @@ use crate::rate_limit::{rate_limit_middleware, RateLimiter};
 use crate::{
     AccountResponse, BlockResponse, GovernanceParamsResponse, GovernanceProposalResponse,
     GuardianResponse, HeaderResponse, NameResponse, NodeStatus, PersonhoodResponse,
-    ProofStepResponse, RecoveryStatusResponse, TxHistoryEntry, TxProofResponse,
+    PendingRecoveryKey, ProofStepResponse, RecoveryStatusResponse, TxHistoryEntry, TxProofResponse,
 };
 
 #[derive(Clone)]
@@ -1240,9 +1240,21 @@ async fn get_account_recovery(
     };
     let chain = state.chain_state.read().await;
     let recovered_key_fingerprint = chain.recovery_key(&address).map(|k| k.fingerprint());
+    let pending_keys: Vec<PendingRecoveryKey> = chain
+        .recovery_request(&address)
+        .map(|req| {
+            req.tally()
+                .into_iter()
+                .map(|(key, approvals)| PendingRecoveryKey {
+                    fingerprint: key.fingerprint(),
+                    approvals,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let (pending_approvals, threshold) = match chain.recovery_request(&address) {
-        Some(req) => (
-            Some(req.approvals.len()),
+        Some(_) => (
+            pending_keys.iter().map(|k| k.approvals).max(),
             chain.guardians(&address).map(|g| g.threshold()),
         ),
         None => (None, None),
@@ -1254,6 +1266,7 @@ async fn get_account_recovery(
             recovered_key_fingerprint,
             pending_approvals,
             threshold,
+            pending_keys,
         })),
     )
 }
@@ -3096,6 +3109,47 @@ mod tests {
         assert_eq!(disk_runway_days(None, free_kb, 2_000, None, 0), None);
         assert_eq!(disk_runway_days(per_block, 0, 2_000, None, 0), None, "an unreadable volume is unknown");
         assert_eq!(disk_runway_days(per_block, free_kb, 0, None, 0), None);
+    }
+
+    /// A pending recovery vote can name more than one key (#251: each guardian holds one vote), and
+    /// an owner deciding whether to cancel needs to see every one of them — a count alone hides a
+    /// guardian pushing a key nobody else named.
+    #[tokio::test]
+    async fn a_pending_recovery_shows_every_key_the_guardians_name() {
+        let state = fresh_test_state();
+        let owner = Address::from_public_key(&helix_crypto::KeyPair::generate().public);
+        let guardians: Vec<Address> = (0..5)
+            .map(|_| Address::from_public_key(&helix_crypto::KeyPair::generate().public))
+            .collect();
+        let (chosen, other) = (
+            helix_crypto::KeyPair::generate().public,
+            helix_crypto::KeyPair::generate().public,
+        );
+        {
+            let mut chain = state.chain_state.write().await;
+            let set = helix_identity::GuardianSet::new(&owner, guardians.clone()).unwrap();
+            chain.set_guardians(&owner, set);
+            let mut request = helix_identity::RecoveryRequest::new();
+            request.approve(guardians[0].clone(), chosen.clone(), 3).unwrap();
+            request.approve(guardians[1].clone(), chosen.clone(), 3).unwrap();
+            request.approve(guardians[4].clone(), other.clone(), 3).unwrap();
+            chain.set_recovery_request(&owner, request);
+        }
+
+        let response = get_account_recovery(State(state), Path(owner.to_string()))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(v["pending_approvals"], 2, "the key closest to the threshold: {v}");
+        assert_eq!(v["threshold"], 3);
+        let keys = v["pending_keys"].as_array().expect("pending_keys is a list");
+        assert_eq!(keys.len(), 2, "both named keys are listed: {v}");
+        assert_eq!(keys[0]["fingerprint"], chosen.fingerprint());
+        assert_eq!(keys[0]["approvals"], 2);
+        assert_eq!(keys[1]["fingerprint"], other.fingerprint());
+        assert_eq!(keys[1]["approvals"], 1);
     }
 
     /// "You have no older transactions" and "this node no longer keeps them" are opposite

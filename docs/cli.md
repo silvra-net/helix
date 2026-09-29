@@ -252,9 +252,8 @@ helix recovery register-guardians hlx... hlx... hlx... --key owner.json
 # 2. Check the guardian set and quorum threshold at any time
 helix recovery status hlx...
 #   Guardians (2 of 3): [...]
-#   Quorum is proportional to however many guardians you register (roughly 2/3, rounded
-#   up) — not a fixed "3-of-5" regardless of set size, despite what the set size range
-#   (3-10) might suggest.
+#   Quorum is proportional to however many guardians you register (3/5, rounded up:
+#   2 of 3, 3 of 5, 6 of 10) — not a fixed "3-of-5" regardless of set size.
 
 # 3. If the owner loses their key: each guardian independently approves rotating
 #    the account to a replacement public key (hex-encoded)
@@ -265,6 +264,11 @@ helix recovery approve hlx... <new_pubkey_hex> --key guardian2.json
 #    key can now sign for that address. Re-recovery to yet another key later works the same
 #    way, any number of times.
 ```
+
+Each guardian holds **one** vote. Approving another key moves that guardian's vote there; it
+does not touch anybody else's, and `recovery status` lists every key currently named with its
+votes. (Before 0.16.0 a vote for a different key restarted the whole request — one guardian
+could undo the others' approvals while the owner, whose key was lost, could do nothing.)
 
 **Replacing your guardians works even with a recovery vote in progress**, and doing so
 cancels that vote. An owner who can still sign outranks a guardian's part-way approval —
@@ -283,9 +287,9 @@ proposer decides the order inside a block — so a hostile guardian could never 
 
 ### Governance
 
-Any account with a nonzero stake (see [Staking](staking.md#staking) — this does *not* require the full
-validator minimum) can propose and vote on two runtime-adjustable parameters:
-`min-validator-stake` and `fuel-per-fee-unit`.
+Stakers vote on two runtime-adjustable parameters, `min-validator-stake` and `fuel-per-fee-unit`
+(see [Staking](staking.md#staking)). Voting takes any stake; proposing takes the chain's minimum
+validator stake, as described below.
 
 ```bash
 helix governance params                          # current values

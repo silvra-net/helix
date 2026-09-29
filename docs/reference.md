@@ -22,7 +22,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/accounts/:address/name` | Registered `.hlx` name for this address |
 | GET | `/accounts/:address/personhood` | Proof of Personhood status |
 | GET | `/accounts/:address/guardians` | Social-recovery guardian set |
-| GET | `/accounts/:address/recovery` | Pending/active recovery status |
+| GET | `/accounts/:address/recovery` | Pending/active recovery status; `pending_keys` lists every key the guardians name, with its votes |
 | GET | `/accounts/:address/transactions` | Transaction history (`?limit=&offset=`) |
 | GET | `/accounts/:address/delegations` | This account's delegations across validators, with current value |
 | GET | `/accounts/:address/storage/:key_hex` | One hex-encoded key/value from a deployed contract's own storage |

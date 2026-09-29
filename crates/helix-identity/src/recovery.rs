@@ -20,7 +20,7 @@ pub enum RecoveryError {
     SelfGuardian,
     #[error("sender is not a registered guardian for this address")]
     NotAGuardian,
-    #[error("this guardian has already approved this recovery request")]
+    #[error("this guardian already votes for this key")]
     DuplicateApproval,
 }
 
@@ -63,27 +63,69 @@ impl GuardianSet {
 }
 
 /// An in-progress guardian vote to rotate an address's controlling public key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Every guardian holds **one** vote, for one key, and may move it; a key wins when `threshold`
+/// guardians name it (#251). The request used to hold a single key and a list of approvals, and a
+/// vote for any other key replaced the whole request — so while the owner's key was lost, one
+/// guardian could erase the others' progress with a single transaction, as often as it liked.
+/// Votes are kept in the order they were cast, which every node executes identically, so the
+/// request serialises the same everywhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryRequest {
+    pub votes: Vec<RecoveryVote>,
+}
+
+/// One guardian's current choice of replacement key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryVote {
+    pub guardian: Address,
     pub new_public_key: PublicKey,
-    pub approvals: Vec<Address>,
 }
 
 impl RecoveryRequest {
-    pub fn new(new_public_key: PublicKey) -> Self {
-        RecoveryRequest {
-            new_public_key,
-            approvals: vec![],
-        }
+    pub fn new() -> Self {
+        RecoveryRequest::default()
     }
 
-    /// Record `guardian`'s approval, returning `true` once `threshold` approvals are reached.
-    pub fn approve(&mut self, guardian: Address, threshold: usize) -> Result<bool, RecoveryError> {
-        if self.approvals.contains(&guardian) {
+    /// Records `guardian`'s vote for `key`, replacing any earlier vote of theirs, and returns
+    /// `true` once `threshold` guardians name `key`. Naming the key it already names is refused.
+    pub fn approve(
+        &mut self,
+        guardian: Address,
+        key: PublicKey,
+        threshold: usize,
+    ) -> Result<bool, RecoveryError> {
+        if self
+            .votes
+            .iter()
+            .any(|v| v.guardian == guardian && v.new_public_key == key)
+        {
             return Err(RecoveryError::DuplicateApproval);
         }
-        self.approvals.push(guardian);
-        Ok(self.approvals.len() >= threshold)
+        self.votes.retain(|v| v.guardian != guardian);
+        self.votes.push(RecoveryVote {
+            guardian,
+            new_public_key: key.clone(),
+        });
+        Ok(self.approvals_for(&key) >= threshold)
+    }
+
+    /// How many guardians currently name `key`.
+    pub fn approvals_for(&self, key: &PublicKey) -> usize {
+        self.votes.iter().filter(|v| &v.new_public_key == key).count()
+    }
+
+    /// Each key some guardian names, with its number of votes, in the order each key was first
+    /// named among the current votes.
+    pub fn tally(&self) -> Vec<(&PublicKey, usize)> {
+        let mut tally: Vec<(&PublicKey, usize)> = Vec::new();
+        for vote in &self.votes {
+            match tally.iter_mut().find(|(k, _)| *k == &vote.new_public_key) {
+                Some((_, n)) => *n += 1,
+                None => tally.push((&vote.new_public_key, 1)),
+            }
+        }
+        tally
     }
 }
 
@@ -146,13 +188,34 @@ mod tests {
         let threshold = set.threshold();
 
         let new_key = KeyPair::generate().public;
-        let mut request = RecoveryRequest::new(new_key);
+        let mut request = RecoveryRequest::new();
 
-        assert_eq!(request.approve(set.guardians[0].clone(), threshold), Ok(false));
-        assert_eq!(request.approve(set.guardians[1].clone(), threshold), Ok(false));
-        assert_eq!(request.approve(set.guardians[2].clone(), threshold), Ok(true));
+        let vote = request.approve(set.guardians[0].clone(), new_key.clone(), threshold);
+        assert_eq!(vote, Ok(false));
+        let vote = request.approve(set.guardians[1].clone(), new_key.clone(), threshold);
+        assert_eq!(vote, Ok(false));
+        assert_eq!(request.approve(set.guardians[2].clone(), new_key.clone(), threshold), Ok(true));
 
-        let err = request.approve(set.guardians[0].clone(), threshold).unwrap_err();
+        let err = request.approve(set.guardians[0].clone(), new_key, threshold).unwrap_err();
         assert_eq!(err, RecoveryError::DuplicateApproval);
+    }
+
+    #[test]
+    fn a_vote_for_another_key_moves_one_vote_and_leaves_the_rest() {
+        let owner = rand_address();
+        let set = GuardianSet::new(&owner, guardians(5)).unwrap();
+        let (chosen, other) = (KeyPair::generate().public, KeyPair::generate().public);
+        let mut request = RecoveryRequest::new();
+
+        request.approve(set.guardians[0].clone(), chosen.clone(), 3).unwrap();
+        request.approve(set.guardians[1].clone(), chosen.clone(), 3).unwrap();
+        request.approve(set.guardians[4].clone(), other.clone(), 3).unwrap();
+        assert_eq!(request.tally(), vec![(&chosen, 2), (&other, 1)]);
+
+        // Guardian 1 moves to `other`: its vote for `chosen` goes, nobody else's does.
+        request.approve(set.guardians[1].clone(), other.clone(), 3).unwrap();
+        assert_eq!(request.approvals_for(&chosen), 1);
+        assert_eq!(request.approvals_for(&other), 2);
+        assert_eq!(request.votes.len(), 3, "one vote per guardian, never two");
     }
 }

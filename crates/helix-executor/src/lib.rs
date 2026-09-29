@@ -17,7 +17,7 @@ use helix_core::{
     Block, Transaction,
 };
 use helix_crypto::{Address, Hash, PublicKey};
-use helix_identity::{GuardianSet, HelixName, RecoveryRequest};
+use helix_identity::{GuardianSet, HelixName};
 use thiserror::Error;
 
 pub use helix_identity::{PersonhoodError, PersonhoodStatus};
@@ -1300,11 +1300,14 @@ fn execute_register_guardians(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
-/// A registered guardian (`tx.from`) approves rotating `tx.to`'s controlling public key to
-/// the one carried in `tx.data`. Once `threshold` (3-of-5) distinct guardians approve the
-/// *same* key, it becomes the address's active recovery override (see
-/// [`verify_tx_signature`]) — from that point on, only that key can sign for the address.
-/// Approving a different key than the one currently pending restarts the vote.
+/// A registered guardian (`tx.from`) votes to rotate `tx.to`'s controlling public key to the one
+/// carried in `tx.data`. Once `threshold` (3-of-5) distinct guardians name the *same* key, it
+/// becomes the address's active recovery override (see [`verify_tx_signature`]) — from that
+/// point on, only that key can sign for the address.
+///
+/// Each guardian holds one vote and may move it (#251). A vote for another key used to restart
+/// the whole request, so one guardian could erase the others' votes while the owner — whose key
+/// is lost — could do nothing about it.
 fn execute_approve_recovery(
     state: &mut ChainState,
     tx: &Transaction,
@@ -1340,13 +1343,9 @@ fn execute_approve_recovery(
         return Receipt::failure(tx_hash, "proposed public key is not a valid PQC public key", 0, 0);
     }
 
-    let mut request = state
-        .recovery_request(&target)
-        .filter(|r| r.new_public_key == new_key)
-        .cloned()
-        .unwrap_or_else(|| RecoveryRequest::new(new_key.clone()));
+    let mut request = state.recovery_request(&target).cloned().unwrap_or_default();
 
-    let finalized = match request.approve(tx.from.clone(), threshold) {
+    let finalized = match request.approve(tx.from.clone(), new_key.clone(), threshold) {
         Ok(reached) => reached,
         Err(e) => return Receipt::failure(tx_hash, &e.to_string(), 0, 0),
     };
@@ -1368,11 +1367,9 @@ fn execute_approve_recovery(
         .unwrap_or_else(|e| Receipt::failure(tx_hash, &e.to_string(), 0, 0))
 }
 
-/// `tx.from` clears their own pending (sub-threshold) `RecoveryRequest`. Without this, a
-/// single guardian who approves a bogus key — and never reaches the threshold, whether by
-/// mistake, going offline, or acting maliciously — permanently locks the owner out of
-/// `RegisterGuardians` (which refuses to run while any recovery request is pending), since
-/// there was previously no way to clear a sub-threshold request short of reaching quorum.
+/// `tx.from` clears their own pending (sub-threshold) `RecoveryRequest` — every guardian's vote
+/// at once — without replacing anybody. `RegisterGuardians` clears it too (#210); this is for an
+/// owner who wants the votes gone but the guardians kept.
 fn execute_cancel_recovery_request(
     state: &mut ChainState,
     tx: &Transaction,
@@ -2553,6 +2550,90 @@ mod tests {
         assert!(receipt.success, "new key should control the account: {:?}", receipt.error);
     }
 
+    /// Five guardians and an owner who has lost their key: returns the state with the set
+    /// registered, the guardians' key pairs and addresses, and the owner's address.
+    fn a_guarded_account() -> (ChainState, Vec<KeyPair>, Vec<Address>, Address) {
+        let owner_kp = KeyPair::generate();
+        let owner = Address::from_public_key(&owner_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.update_account(&owner, |acc| acc.balance = 1_000_000);
+        let kps: Vec<KeyPair> = (0..5).map(|_| KeyPair::generate()).collect();
+        let addrs: Vec<Address> =
+            kps.iter().map(|kp| Address::from_public_key(&kp.public)).collect();
+        for addr in &addrs {
+            state.update_account(addr, |acc| acc.balance = 1_000_000);
+        }
+        let reg = signed_register_guardians_tx(&owner_kp, &owner, &addrs, 0, 10_000);
+        let registered = execute_transaction(&mut state, &reg, &validator, 0, 0);
+        assert!(registered.success, "premise: registered");
+        assert_eq!(state.guardians(&owner).unwrap().threshold(), 3, "premise: 3 of 5");
+        (state, kps, addrs, owner)
+    }
+
+    /// One guardian's vote for another key does not erase the votes the others cast (#251).
+    ///
+    /// The request held one key and a list of approvals, and a vote for any other key replaced
+    /// the whole request. So during a real recovery — the owner's key is lost, the owner cannot
+    /// sign anything — a single guardian could wipe the others' progress with one transaction,
+    /// as often as it liked: the same one-guardian veto #210 removed for the owner, in the one
+    /// situation where the owner cannot step in. Now every guardian holds one vote, and a key
+    /// wins when enough of them name it.
+    #[test]
+    fn one_guardian_voting_for_another_key_does_not_erase_the_others_votes() {
+        let (mut state, kps, addrs, owner) = a_guarded_account();
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let chosen = KeyPair::generate().public;
+        let other = KeyPair::generate().public;
+
+        for (i, key) in [(0, &chosen), (1, &chosen), (4, &other), (2, &chosen)] {
+            let tx = signed_approve_recovery_tx(&kps[i], &addrs[i], &owner, key, 0, 10_000);
+            let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
+            assert!(receipt.success, "guardian {i}'s vote failed: {:?}", receipt.error);
+        }
+
+        assert_eq!(
+            state.recovery_key(&owner),
+            Some(&chosen),
+            "three of five guardians named the same key, one named another in between — the \
+             three decide"
+        );
+        assert!(state.recovery_request(&owner).is_none(), "a finished vote leaves the state");
+    }
+
+    /// A guardian may change its mind: its new vote replaces its old one, never adds to it.
+    #[test]
+    fn a_guardian_that_changes_its_vote_is_counted_once() {
+        let (mut state, kps, addrs, owner) = a_guarded_account();
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let first = KeyPair::generate().public;
+        let second = KeyPair::generate().public;
+
+        // Guardian 0 names `first`, then moves to `second`; guardians 1 and 2 name `first`.
+        for (i, key) in [(0, &first), (1, &first), (0, &second), (2, &first)] {
+            let nonce = state.get_or_default(&addrs[i]).nonce;
+            let tx = signed_approve_recovery_tx(&kps[i], &addrs[i], &owner, key, nonce, 10_000);
+            let receipt = execute_transaction(&mut state, &tx, &validator, 1, 0);
+            assert!(receipt.success, "guardian {i}'s vote failed: {:?}", receipt.error);
+        }
+        assert!(
+            state.recovery_key(&owner).is_none(),
+            "`first` holds two votes, not three: guardian 0 moved its vote away"
+        );
+
+        // The same key twice from one guardian is still refused.
+        let again = signed_approve_recovery_tx(&kps[1], &addrs[1], &owner, &first, 1, 10_000);
+        let refused = execute_transaction(&mut state, &again, &validator, 1, 0);
+        assert!(!refused.success);
+        let why = refused.error.as_deref().unwrap_or("");
+        assert!(why.contains("already votes for this key"), "refused for the wrong reason: {why}");
+
+        // A third guardian for `first` decides it.
+        let tx = signed_approve_recovery_tx(&kps[3], &addrs[3], &owner, &first, 0, 10_000);
+        assert!(execute_transaction(&mut state, &tx, &validator, 1, 0).success);
+        assert_eq!(state.recovery_key(&owner), Some(&first));
+    }
+
     #[test]
     fn approve_recovery_rejects_non_guardian() {
         let validator = Address::from_public_key(&KeyPair::generate().public);
@@ -2807,7 +2888,7 @@ mod tests {
              behind — the electorate that finishes a vote has to be the one that started it"
         );
         assert_eq!(
-            state.recovery_request(&owner).map(|r| r.approvals.len()),
+            state.recovery_request(&owner).map(|r| r.votes.len()),
             Some(1),
             "the new request starts from this guardian alone"
         );

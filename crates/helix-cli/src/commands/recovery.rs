@@ -178,11 +178,17 @@ async fn status(address: String, node: &str) -> Result<()> {
             println!("  Active recovery key fingerprint: {}", fp);
         }
         if let Some(approvals) = recovery.get("pending_approvals").and_then(|v| v.as_u64()) {
-            println!(
-                "  Pending recovery vote: {}/{} approvals",
-                approvals,
-                recovery["threshold"].as_u64().unwrap_or(0)
-            );
+            let threshold = recovery["threshold"].as_u64().unwrap_or(0);
+            println!("  Pending recovery vote: {}/{} approvals", approvals, threshold);
+            // Each guardian holds one vote, so a vote can name more than one key — show which.
+            for key in recovery["pending_keys"].as_array().into_iter().flatten() {
+                println!(
+                    "    key {}: {}/{}",
+                    key["fingerprint"].as_str().unwrap_or("?"),
+                    key["approvals"].as_u64().unwrap_or(0),
+                    threshold
+                );
+            }
         }
     }
     Ok(())

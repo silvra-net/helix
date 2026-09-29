@@ -2440,7 +2440,9 @@ mod tests {
 
         // Save state with an active recovery request for `owner`.
         let mut state = ChainState::new(1_000_000);
-        state.set_recovery_request(&owner, RecoveryRequest::new(new_key));
+        let mut request = RecoveryRequest::new();
+        request.approve(addr(2), new_key, 3).unwrap();
+        state.set_recovery_request(&owner, request);
         db.save_chain_state(&state).unwrap();
 
         // The request is cancelled/completed → removed from state → persisted again.
