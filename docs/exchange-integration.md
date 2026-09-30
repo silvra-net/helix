@@ -7,10 +7,9 @@
 This page describes the interface an integration builds on, so that one can be written and
 tested now; it is not an invitation to list a testnet coin.
 
-**This page describes the current code.** `--memo`, `--offline`, `helix tx submit`, the chain id in
-`helix chain status`, and the fix that lets a syncing node keep transaction outcomes are newer
-than the 0.20.0 release: build from source (see [Installation](installation.md)) until the next
-one. The `…_nano` fields and `memo` in API answers are already served by `node.silvra.net`.
+**Use 0.20.1 or later.** `--memo`, `--offline`, `helix tx submit`, the chain id in `helix chain
+status`, the exact amount fields and a syncing node that keeps transaction outcomes all arrived
+in 0.20.1.
 
 ## At a glance
 
@@ -41,8 +40,9 @@ have to trust someone else for, and it lifts the public rate limit. Setup is in
   `is_syncing` is false.
 - **Raise the rate limit on your own node** if you scan quickly: `HELIX_RPC_RATE_LIMIT=burst,refill`
   (default `500,100` per client IP).
-- **Use a build newer than 0.20.0.** 0.20.0 and earlier did not keep transaction outcomes for
-  blocks they took over sync, and answered `unknown` for them (#259).
+- **Start it with 0.20.1 or later.** 0.20.0 and earlier did not keep transaction outcomes for
+  blocks they took over sync, and answered `unknown` for them (#259); a node that synced under
+  0.20.0 keeps that gap for the blocks it synced then.
 
 ## Addresses
 
