@@ -207,6 +207,9 @@ fn router(state: AppState, limiter: Arc<RateLimiter>) -> Router {
         .route("/governance/proposals/:id", get(get_governance_proposal))
         .route("/mempool", get(get_mempool_info))
         .route("/mempool/transactions", get(get_mempool_transactions))
+        .route("/supply/circulating", get(get_supply_circulating))
+        .route("/supply/total", get(get_supply_total))
+        .route("/supply/max", get(get_supply_max))
         .route("/genesis", get(get_genesis))
         .route("/sync/blocks", get(get_sync_blocks))
         .route("/sync/tip-certificate", get(get_tip_certificate))
@@ -360,6 +363,9 @@ fn api_index() -> Json<Value> {
             "GET  /governance/proposals/{id}",
             "GET  /mempool",
             "GET  /mempool/transactions",
+            "GET  /supply/circulating",
+            "GET  /supply/total",
+            "GET  /supply/max",
             "GET  /genesis",
             "POST /transactions",
             "GET  /transactions/{hash}"
@@ -1738,6 +1744,32 @@ async fn get_mempool_transactions(State(state): State<AppState>) -> Json<Value> 
     Json(json!({ "transactions": hashes }))
 }
 
+/// One amount as plain text in HLX (`510021.5`), which is what listing sites fetch: a supply URL
+/// answers a bare number, nothing else.
+fn plain_hlx(nano: u64) -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        helix_core::fee::nano_as_hlx(nano),
+    )
+}
+
+/// `GET /supply/circulating` — every HLX in existence: issued less burned, staked included
+/// (staked HLX can be unstaked; nothing is locked by the protocol beyond the unbonding delay).
+async fn get_supply_circulating(State(state): State<AppState>) -> impl IntoResponse {
+    plain_hlx(state.chain_state.read().await.circulating_supply())
+}
+
+/// `GET /supply/total` — the same number as `/supply/circulating`: Helix has no locked or
+/// unissued-but-allocated supply that would set the two apart. Listing forms ask for both.
+async fn get_supply_total(State(state): State<AppState>) -> impl IntoResponse {
+    plain_hlx(state.chain_state.read().await.circulating_supply())
+}
+
+/// `GET /supply/max` — the hard cap: no block reward is minted beyond it.
+async fn get_supply_max(State(state): State<AppState>) -> impl IntoResponse {
+    plain_hlx(state.chain_state.read().await.total_supply)
+}
+
 async fn get_mempool_info(State(state): State<AppState>) -> Json<Value> {
     let mempool = state.mempool.read().await;
     Json(json!({
@@ -2805,6 +2837,28 @@ mod tests {
         let listing = get_mempool_transactions(State(state)).await.0;
         assert_eq!(listing["transactions"], json!([hash.to_hex()]));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Listing sites fetch a supply as a bare number: plain text, in HLX, exact.
+    #[tokio::test]
+    async fn the_supply_answers_a_bare_number_in_hlx() {
+        let (state, path) = fresh_app_state();
+        {
+            let mut chain = state.chain_state.write().await;
+            chain.total_issued = 510_021_500_000_001;
+            chain.total_burned = 1;
+            chain.total_supply = 33_000_000_000_000_000;
+        }
+        async fn text(response: axum::response::Response) -> (String, String) {
+            let kind = response.headers()[axum::http::header::CONTENT_TYPE].to_str().unwrap().to_string();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (kind, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+        let (kind, body) = text(get_supply_circulating(State(state.clone())).await.into_response()).await;
+        assert_eq!((kind.as_str(), body.as_str()), ("text/plain; charset=utf-8", "510021.5"));
+        assert_eq!(text(get_supply_total(State(state.clone())).await.into_response()).await.1, "510021.5");
+        assert_eq!(text(get_supply_max(State(state)).await.into_response()).await.1, "33000000");
         let _ = std::fs::remove_file(&path);
     }
 
