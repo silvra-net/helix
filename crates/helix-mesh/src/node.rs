@@ -105,6 +105,9 @@ pub enum NodeError {
     NotFound,
     /// The node refused the request (HTTP 400) — for an address, one that is not valid.
     Invalid(String),
+    /// The node's rate limit refused this service (HTTP 429). It counts per client address, and
+    /// this service is one client asking for every block.
+    RateLimited,
 }
 
 pub struct Node {
@@ -147,6 +150,7 @@ impl Node {
                     Err(NodeError::NotFound)
                 }
             }
+            StatusCode::TOO_MANY_REQUESTS => Err(NodeError::RateLimited),
             StatusCode::BAD_REQUEST => Err(NodeError::Invalid(
                 body["error"].as_str().unwrap_or("refused").to_string(),
             )),

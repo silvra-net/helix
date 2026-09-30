@@ -1,5 +1,6 @@
 //! The Mesh Data API endpoints: network, block, account, mempool.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +58,15 @@ fn malformed() -> MeshError {
 fn not_in_mempool() -> MeshError {
     error(9, "Transaction not in the mempool", false)
 }
+fn rate_limited() -> MeshError {
+    let mut e = error(10, "The Helix node is rate-limiting this service", true);
+    e.description = Some(
+        "the node limits requests per client address, and this service asks for every block — \
+         start the node with a higher HELIX_RPC_RATE_LIMIT (burst,refill per second)"
+            .into(),
+    );
+    e
+}
 
 /// Every error this service can return — `/network/options` lists them, as the specification asks.
 pub fn all_errors() -> Vec<MeshError> {
@@ -70,6 +80,7 @@ pub fn all_errors() -> Vec<MeshError> {
         no_history(),
         malformed(),
         not_in_mempool(),
+        rate_limited(),
     ]
 }
 
@@ -86,6 +97,17 @@ fn node_failure(e: NodeError, not_found: MeshError) -> (StatusCode, Json<MeshErr
         }
         NodeError::NotFound => not_found,
         NodeError::Invalid(_) => invalid_address(),
+        NodeError::RateLimited => {
+            // Once: while it lasts, every request would say it again.
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "The node is rate-limiting this service — raise HELIX_RPC_RATE_LIMIT on the node \
+                     (e.g. 5000,1000); requests are answered as retriable until then"
+                );
+            }
+            rate_limited()
+        }
     })
 }
 

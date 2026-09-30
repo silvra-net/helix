@@ -22,6 +22,7 @@ async fn stand_in_node() -> String {
         match a.as_str() {
             "hlxKnown" => (StatusCode::OK, Json(json!({ "balance_nano": "12345678901234567", "state_height": 7 }))).into_response(),
             "hlxFresh" => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found", "state_height": 7 }))).into_response(),
+            "hlxBusy" => (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "rate limit exceeded, slow down" }))).into_response(),
             _ => (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid address format" }))).into_response(),
         }
     };
@@ -74,6 +75,9 @@ async fn options_announce_every_type_and_no_history() {
     let types = body["allow"]["operation_types"].as_array().unwrap();
     assert_eq!(types.len(), helix_mesh::map::operation_types().len());
     assert_eq!(body["version"]["node_version"], "0.20.1");
+    // The specification lets a client refuse an error code it was not told about.
+    let codes: Vec<u64> = body["allow"]["errors"].as_array().unwrap().iter().map(|e| e["code"].as_u64().unwrap()).collect();
+    assert_eq!(codes, (1..=10).collect::<Vec<u64>>());
 }
 
 #[tokio::test]
@@ -127,4 +131,15 @@ async fn the_mempool_lists_and_shows_a_pending_transfer() {
     assert!(body["transaction"]["operations"][0].get("status").is_none(), "nothing has happened yet");
     let (status, body) = post(&base, "/mempool/transaction", format!(r#"{{"network_identifier":{NET},"transaction_identifier":{{"hash":"gone"}}}}"#)).await;
     assert_eq!((status, &body["code"]), (500, &json!(9)), "{body}");
+}
+
+/// A node that rate-limits this service is not "unavailable" — the operator has a setting to
+/// change, and the answer says which (found against a real node: the service asks from one
+/// address for every block).
+#[tokio::test]
+async fn a_rate_limited_request_says_so_and_is_retriable() {
+    let base = mesh().await;
+    let (status, body) = post(&base, "/account/balance", format!(r#"{{"network_identifier":{NET},"account_identifier":{{"address":"hlxBusy"}}}}"#)).await;
+    assert_eq!((status, &body["code"], &body["retriable"]), (500, &json!(10), &json!(true)), "{body}");
+    assert!(body["description"].as_str().unwrap().contains("HELIX_RPC_RATE_LIMIT"), "{body}");
 }

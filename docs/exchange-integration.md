@@ -159,6 +159,11 @@ helix-mesh --node http://127.0.0.1:8545 --listen 127.0.0.1:8080 --network testne
 The Linux and macOS `helix-cli-…` archives carry `helix-mesh` next to `helix` from the first
 release after 0.20.1; from source it is `cargo build --release -p helix-mesh`.
 
+**Raise the node's rate limit for it.** The node limits requests per client address (500 at once,
+100 a second by default), and `helix-mesh` is one client asking for every block. Start the node
+with, for example, `HELIX_RPC_RATE_LIMIT=5000,1000`; until then a throttled request comes back
+as error 10, retriable, and a sync crawls.
+
 (`HELIX_MESH_NODE`, `HELIX_MESH_LISTEN` and `HELIX_MESH_NETWORK` set the same.) The network
 identifier is `{"blockchain": "Helix", "network": "<--network>"}`; the currency is
 `{"symbol": "HLX", "decimals": 9}`, and every amount is in nano-HLX.
