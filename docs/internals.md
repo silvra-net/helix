@@ -1,6 +1,6 @@
 # How Helix works — internals
 
-> Part of the [Helix documentation](../README.md) — deep reference, split out of the README to keep it short.
+> Part of the [Helix documentation](../README.md).
 
 ## Consensus
 
@@ -66,8 +66,8 @@ node restarts and carries no slash — downtime isn't proof of malice, only lost
 rewards while jailed. The catch is the same arithmetic as above: jailing is *counted from blocks*,
 so it only ever fires while the chain is still producing them. In a set so small that quorum needs
 every validator, a single silence stops the very blocks that would have counted the absence —
-which is just another way of saying **a small validator set tolerates zero faults** (see
-[Security](../README.md#security)).
+which is another way of saying that **three or fewer validators tolerate no fault at all** — four
+survive one, seven survive two (see [Security](../README.md#security)).
 
 Only validators in the **active set** are scored this way. A validator that has staked but is
 still waiting out its one-epoch activation delay (see [Staking](staking.md#staking)) is not in the quorum
@@ -81,14 +81,16 @@ against it. The wait the protocol imposes never counts as downtime.
 
 So personhood helps only a validator below the cap; one already at it gains nothing.
 
-> **Maturity note (please read before relying on it).** The public Helix network currently
-> runs a small validator set. The vote-counting, equivocation detection, double-sign slashing, and
-> Tendermint-style **cross-round vote locking** (`locked_value` / proof-of-lock — the safety
-> mechanism that stops two different blocks from finalizing at the same height across rounds
-> under a network partition or a ⅓-Byzantine validator set) are all in place and unit-tested.
-> What is *not* yet proven is behaviour under a large, genuinely adversarial, untrusted
-> **≥4-validator** network — that needs real-world partition and Byzantine testing before the
-> BFT-safety guarantee should be relied on in production. See [Security](../README.md#security).
+> **How far this is tested.** Vote counting, equivocation detection, double-sign slashing and
+> Tendermint-style **cross-round vote locking** (`locked_value` / proof-of-lock — what stops two
+> different blocks from finalizing at the same height across rounds) are covered by unit tests
+> and by harnesses that run several real consensus engines against each other: a fault-injection
+> harness (silent, deaf and partitioned validators), a chaos harness (a third of all messages lost
+> for 400 ticks across fifty randomized networks — no fork in any run), and Byzantine tests with a
+> validator that equivocates, including a split-brain one that sends each half of the network a
+> different block. Multi-node tests run the same with real node processes. The live network has
+> run with four to six validators; behaviour at a much larger scale is shown in tests, not yet in
+> production. See [Security](../README.md#security).
 
 ---
 
@@ -98,10 +100,13 @@ So personhood helps only a validator below the cap; one already at it gains noth
 ┌─────────────────────────────────────────────────────────────┐
 │                        helix-node                           │
 │              (orchestrator, event loop, P2P)                │
-├──────────────┬──────────────┬──────────────┬────────────────┤
-│ helix-rpc    │ helix-p2p    │helix-consensus│helix-executor  │
-│ REST API     │ libp2p       │ PoS + BFT    │ State machine  │
-├──────────────┴──────────────┴──────────────┴────────────────┤
+├──────────────┬─────────────┬────────────────┬───────────────┤
+│ helix-rpc    │ helix-p2p   │ helix-consensus│ helix-executor│
+│ REST API     │ libp2p      │ PoS + BFT      │ state machine │
+├──────────────┼─────────────┼────────────────┼───────────────┤
+│ helix-mempool│             │                │ helix-vm      │
+│ tx pool      │             │                │ helix-zkp     │
+├──────────────┴─────────────┴────────────────┴───────────────┤
 │                       helix-storage                         │
 │              Persistent (redb-backed HelixDb)               │
 ├─────────────────────────────────────────────────────────────┤
@@ -110,7 +115,8 @@ So personhood helps only a validator below the cap; one already at it gains noth
 │  TxType, etc.  │  Addresses      │  Social Recovery         │
 └─────────────────────────────────────────────────────────────┘
 
-CLI: helix <subcommand>   ←→   REST API :8545   ←→   P2P :8546
+helix-cli: the client subcommands, compiled into the same `helix` binary as the node.
+CLI ←→ REST API :8545 ←→ node ←→ P2P :8546 ←→ other nodes
 ```
 
 ---
@@ -180,9 +186,7 @@ advances, since real compute was spent either way.
   The reserve does two jobs: a slash that drops the stake below the minimum is recoverable, and
   the network's operators are funded out of it (15k apiece). That is ~0.3% of the supply the
   chain eventually reaches; everything else is earned block by block. There is no founder
-  pre-mine beyond this. (510,000 — a 500k reserve — from 2026-08-26 until the 0.20.0 reset.)
-  (Read "200,000 — 100k stake plus 100k liquid" until 2026-09-22: the minimum dropped from 100k to
-  10k on 2026-08-26 and the reserve was raised to 500k, and this paragraph followed neither.)
+  pre-mine beyond this.
 - **Denomination:** 1 HLX = 1,000,000,000 nano-HLX
 - **Fee split:** the base fee (`base_fee_per_byte × transaction size`) is burned in full; the
   rest of what the sender paid is the validator's tip. Not a fixed ratio — a sender who pays
@@ -204,10 +208,7 @@ advances, since real compute was spent either way.
   confirmed double-sign. Reaches the validator's own stake, its delegation pool, any stake
   still unbonding out of either, and any stake that redelegated away inside the window — so no
   exit taken ahead of the evidence escapes it.
-- **Circulating supply** = total issued − total burned. Total issued starts small (just the
-  genesis validator stake) and grows block by block via the emission schedule above.
-- No liquid HLX is pre-mined to any wallet at genesis — the genesis validator receives only
-  its bootstrap stake, and earns everything beyond that the same way any future validator
-  would: by producing blocks.
+- **Circulating supply** = total issued − total burned. Total issued starts at the genesis
+  allocation (100,000 HLX) and grows block by block via the emission schedule above.
 
 ---
