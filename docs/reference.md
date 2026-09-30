@@ -1,6 +1,6 @@
 # Reference — API, formats, crates
 
-> Part of the [Helix documentation](../README.md) — deep reference, split out of the README to keep it short.
+> Part of the [Helix documentation](../README.md).
 
 ## REST API
 
@@ -11,7 +11,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 |---|---|---|
 | GET | `/` | Node info & endpoint list |
 | GET | `/status` | Height, hash, mempool size, supply stats |
-| GET | `/genesis` | Everything needed to rebuild this chain's exact genesis state: the genesis block, governance params, the bootstrap validator's stake, any extra genesis validators, and any liquid genesis allocations (used by fresh nodes joining via `sync_peer`) |
+| GET | `/genesis` | Everything needed to rebuild this chain's exact genesis state: the genesis block, governance params, the bootstrap validator's stake, the liquid genesis allocations, the personhood authorities and the genesis state hash a joining node recomputes and compares |
 | GET | `/blocks/latest` | Latest block with full transaction list |
 | GET | `/blocks/height/:n` | Block by height |
 | GET | `/blocks/height/:n/header` | Header only (for light clients) |
@@ -23,7 +23,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/accounts/:address/personhood` | Proof of Personhood status |
 | GET | `/accounts/:address/guardians` | Social-recovery guardian set |
 | GET | `/accounts/:address/recovery` | Pending/active recovery status; `pending_keys` lists every key the guardians name, with its votes |
-| GET | `/accounts/:address/transactions` | Transaction history (`?limit=&offset=`) |
+| GET | `/accounts/:address/transactions` | Transaction history (`?limit=&offset=`). A pruning node cannot show transactions from blocks it dropped; `history_starts_at_block` and `omitted_below_horizon` say so rather than returning a short list as if complete |
 | GET | `/accounts/:address/delegations` | This account's delegations across validators, with current value |
 | GET | `/accounts/:address/storage/:key_hex` | One hex-encoded key/value from a deployed contract's own storage |
 | GET | `/validators/:address/pool` | A validator's delegation pool — delegated stake, commission, effective stake, and `reward_address` (where the validator's own share is paid; `null` = to the validator itself) |
@@ -45,19 +45,19 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 
 ```json
 {
-  "version": "0.10.2",
-  "height": 142,
-  "best_hash": "a3f8c2...",
-  "peer_count": 2,
+  "version": "0.20.0",
+  "height": 1248,
+  "best_hash": "e430e388…",
+  "peer_count": 3,
   "is_syncing": false,
   "mempool_size": 0,
-  "total_accounts": 2,
-  "circulating_supply_hlx": 1000141.9995,
-  "total_burned_hlx": 0.0005,
-  "state_hash": "b3f1a9...",
-  "state_height": 142,
+  "total_accounts": 4,
+  "circulating_supply_hlx": 101247.999987591,
+  "total_burned_hlx": 1.2409e-05,
+  "state_hash": "eb24dea7…",
+  "state_height": 1248,
   "p2p_port": 8546,
-  "p2p_public_addr": "/dns4/p2p.example.net/tcp/443/tls/ws",
+  "p2p_public_addr": "/dns4/p2p.silvra.net/tcp/443/tls/ws",
   "base_fee_per_byte": 1
 }
 ```
@@ -68,10 +68,10 @@ and `best_hash` come from the block store while `state_hash` comes from the in-m
 and a response sampled mid-commit carries height N−1 next to the state of N. `state_height` is read
 under the same lock as `state_hash`, so those two always belong together — comparing `state_hash`
 across nodes that merely share a `height` reports divergences that aren't there. `p2p_port` is this node's own
-libp2p listen port — used by a joining peer to dial it directly, see "Joining an Existing
-Network" above. `base_fee_per_byte` is what the next block will charge per transaction byte;
-price against it rather than hardcoding a fee, since a flat number is only right until the
-network gets busy (see "Fees" above).
+libp2p listen port — used by a joining peer to dial it directly, see
+[Joining the network](running-a-node.md#joining-the-network). `base_fee_per_byte` is what the next
+block will charge per transaction byte; price against it rather than hardcoding a fee, since a
+flat number is only right until the network gets busy (see [Fees](cli.md#fees)).
 
 ### `GET /whoami`
 
@@ -106,11 +106,12 @@ firewalled one). Nodes call this on their sync peer at startup and every ten min
 ### Diagnostics response
 
 `GET /diagnostics` answers the questions that come up when a node is misbehaving. It is
-deliberately **not** the node's log — see the note below on why.
+deliberately **not** the node's log — see the note below on why. Abbreviated example (the node
+also reports disk and memory totals, load, threads and open file descriptors):
 
 ```json
 {
-  "version": "0.10.2",
+  "version": "0.20.0",
   "uptime_secs": 8412,
   "height": 36377,
   "state_height": 36377,
@@ -130,7 +131,7 @@ deliberately **not** the node's log — see the note below on why.
   "rss_kb": 344328,
   "machine_total_kb": 32758376,
   "previous_run": {
-    "version": "0.10.2",
+    "version": "0.20.0",
     "clean_exit": false,
     "ran_for_secs": 553,
     "last_height": 36119,
@@ -152,10 +153,8 @@ What each field is for:
 - **`peer_tip_height`** — the highest tip any connected peer claims. Compare it with `height`.
   Anything above it means **this** node is the one behind, and that matters more than it sounds:
   a validator below the tip cannot vote on the next height, so it is missing from the quorum, and
-  a chain that looks like it is waiting for somebody else is in fact waiting for you. On
-  2026-09-04 that difference was a single block, lasted 6 h 20 min, and could not be read anywhere
-  — the node's own health line reported the chain as stalled and advised checking the *other*
-  validators. `null` while no peer has claimed a tip yet, which is not the same as being level.
+  a chain that looks like it is waiting for somebody else is in fact waiting for you. `null`
+  while no peer has claimed a tip yet, which is not the same as being level.
 - **`rounds_lost_with_quorum_power`** — rounds this node lost *while it had heard enough voting
   power to close them*. Zero on a healthy chain, and worth watching because it separates two
   failures that look identical from outside. If votes are missing, the named validators in the
@@ -163,8 +162,7 @@ What each field is for:
   the round is failing anyway — which means the prevotes went to different values, some for the
   block and some for nil, because the proposal did not reach everyone inside its window. That is a
   network-timing problem, not an availability one, and no amount of restarting the absent validator
-  fixes it. Measured on the live chain on 2026-09-04: one such round with 2e12 of power heard
-  against a quorum of 1.667e12.
+  fixes it.
 - **`compact_blocks_rebuilt` / `compact_blocks_not_rebuilt`** — proposals and committed blocks
   travel compact (the header and the transaction ids), and each node rebuilds them from the
   transactions it already holds. These count the blocks that mattered here — a proposal for the
@@ -184,17 +182,11 @@ What each field is for:
   and fits the volume, **`disk_days_remaining` is `null`** — a pruning node's growth is not a line,
   and extrapolating one names a day that never arrives. A plateau *larger* than the disk still
   fills it, just later, so that case keeps its countdown.
-- **`/accounts/:address/transactions` gained `history_starts_at_block` and
-  `omitted_below_horizon`** — a pruning node cannot show a transaction whose block it dropped, and
-  "you have none" is the wrong thing to tell somebody looking for a payment they did receive. The
-  count says how many rows on this page are missing; the floor says where to look instead. Balances
-  are unaffected either way: they live in the state, not in the blocks.
 - **`chain_db_bytes_per_block` / `disk_days_remaining`** — what this chain actually costs to store,
   and how long the volume lasts at that rate. Measured from the node's own database rather than
   estimated, because the figure that matters is what *this* validator set writes: roughly half of
-  every block is its commit certificate, one ML-DSA public key and signature per validator, and
-  that half does not shrink when traffic does. On the live chain on 2026-09-08: 79.5 KB per block,
-  3.3 GB a day, about 80 days of headroom. The days figure is an extrapolation at the configured
+  every block is its commit certificate, one ML-DSA signature per validator, and that half does
+  not shrink when traffic does. The days figure is an extrapolation at the configured
   block time, and `null` whenever anything it needs is missing — a runway that reports a number it
   cannot support would be believed.
 - **`rss_kb` / `machine_total_kb`** — an out-of-memory kill leaves nothing in the node's own log,
@@ -225,25 +217,39 @@ when asking for help without having to read through it first.
 ### Transaction Format
 
 Transactions are signed ML-DSA (or SPHINCS+) objects. The signing hash is
-`BLAKE3("helix-tx-v1:" ‖ bincode(TxPayload))`, where `TxPayload` excludes `signature` and
-`public_key`.
+`BLAKE3("helix-tx-v1:" ‖ bincode(TxPayload))`, where `TxPayload` is every field below except
+`signature` and `public_key`, in this order.
 
-```json
+This is the body `POST /transactions` takes — a transfer of 15,000 HLX (arrays shortened):
+
+```text
 {
   "version": 1,
   "tx_type": "Transfer",
-  "from": "hlx...",
-  "to": "hlx...",
-  "amount": 100000000000,
-  "fee": 1000000,
+  "from": "hlxbx7oYT7n1nidYCxLrk1LUQ93CTXFrGWNt",
+  "to": "hlxk6QWXDZjCtvBunTwdVscNnYpYb6bg1pvQ",
+  "amount": 15000000000000,
+  "fee": 10886,
   "nonce": 0,
   "data": [],
-  "chain_id": "<hex>",
-  "signature": "<hex>",
-  "public_key": "<hex>"
+  "crypto_version": "MlDsa",
+  "chain_id": [15, 12, 58, 131, …],     32 numbers: the genesis hash as bytes
+  "signature": [ … ],                   the signature's bytes (3,309 for ML-DSA-65)
+  "public_key": [ … ]                   the key's bytes (1,952), or null — see below
 }
 ```
 
+- **Hashes, signatures and keys are JSON arrays of byte values, not hex strings**; a hex string is
+  refused. Addresses are strings. `to` is `null` for transaction types without a recipient.
+- `amount`, `fee` and `nonce` are unsigned 64-bit integers. Clients in languages whose numbers are
+  doubles (JavaScript) must write them without passing through a float — above 2^53 nano-HLX
+  (~9 million HLX) a double loses precision.
+- `tx_type` is one of: `Transfer`, `Stake`, `Unstake`, `RegisterIdentity`, `RegisterName`,
+  `RegisterGuardians`, `ApproveRecovery`, `DeployContract`, `CallContract`, `CreateProposal`,
+  `VoteProposal`, `ProvePersonhood`, `ClaimUnbonded`, `CancelRecoveryRequest`,
+  `SubmitDoubleSignEvidence`, `Delegate`, `Undelegate`, `Redelegate`, `SetCommission`, `Unjail`,
+  `ProbationHeartbeat`, `SetRewardAddress` (bincode encodes them by this position).
+- `crypto_version` is `MlDsa` or `SphincsPlus`.
 - `amount` and `fee` are in **nano-HLX** (1 HLX = 1,000,000,000 nano-HLX)
 - `nonce` is per-sender, strictly monotonic, starts at 0 — multiple sequential-nonce
   transactions from one sender can be submitted and included in the same block
@@ -252,7 +258,9 @@ Transactions are signed ML-DSA (or SPHINCS+) objects. The signing hash is
   values. Without it the same signed bytes would spend on every Helix chain that shares the
   sender's key and nonce — Ethereum's EIP-155 problem, and not a hypothetical one: the validator
   fundings of 2026-08-07 came out byte-identical to those of the 2026-08-05 reset
-- Minimum fee: 1,000 nano-HLX
+- The fee must cover `base_fee_per_byte × size` (the size of the transaction as its block carries
+  it), and at least 1,000 nano-HLX; the base-fee part is burned, the rest goes to the block's
+  proposer. `GET /status` reports `base_fee_per_byte`
 - The mempool validates the signature before accepting
 - `public_key` may be `null` once the chain knows the sender's key. The first transaction an
   address signs puts the key it derives from on record; after that a node keeps the transaction
@@ -293,9 +301,9 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 | `helix-core` | Block, BlockHeader, Transaction, TxType primitives |
 | `helix-executor` | Transaction execution, account state, genesis, fee distribution |
 | `helix-consensus` | PoS + BFT engine, validator set rotation, slashing |
-| `helix-mempool` | Fee-prioritized pool — sorts by (sender, nonce) within fee tier |
+| `helix-mempool` | Transaction pool: admits only what the sender can pay, packs each sender's next executable nonce first, highest tip across senders |
 | `helix-storage` | Persistent redb-backed block + chain-state store (`HelixDb`) |
-| `helix-p2p` | libp2p networking: gossipsub + mDNS discovery |
+| `helix-p2p` | libp2p networking: gossip (a separate lane for transactions), compact blocks, block and round sync, peer exchange, mDNS |
 | `helix-identity` | Proof of Personhood, human-readable names, social recovery |
 | `helix-vm` | WASM contract execution (`wasmi`, fuel-metered, deterministic) |
 | `helix-zkp` | ZK-STARK proof generation/verification for Proof of Personhood |
