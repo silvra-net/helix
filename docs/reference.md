@@ -27,7 +27,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/accounts/:address/delegations` | This account's delegations across validators, with current value |
 | GET | `/accounts/:address/storage/:key_hex` | One hex-encoded key/value from a deployed contract's own storage |
 | GET | `/validators/:address/pool` | A validator's delegation pool — delegated stake, commission, effective stake, and `reward_address` (where the validator's own share is paid; `null` = to the validator itself) |
-| GET | `/names/:name` | Resolve name to address |
+| GET | `/names/:name` | Resolve name to address; a free name answers 404 with its `registration_price_nano` |
 | GET | `/governance/params` | Current runtime-adjustable protocol parameters |
 | GET | `/governance/proposals` | Proposals whose voting period is still running (`?limit=&offset=`); a closed one leaves the state |
 | GET | `/governance/proposals/:id` | One proposal's status |

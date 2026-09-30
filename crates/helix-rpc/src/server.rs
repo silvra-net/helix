@@ -1090,9 +1090,16 @@ async fn resolve_name(
                 address: address.to_string(),
             })),
         ),
+        // A free name says what it would cost (#252), so a client written in anything can show the
+        // price before signing — the same rule the executor charges, not a copy of it.
         None => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("name {} not registered", name) })),
+            Json(json!({
+                "error": format!("name {} not registered", name),
+                "registration_price_nano": helix_identity::HelixName::new(name)
+                    .ok()
+                    .map(|n| helix_core::fee::name_registration_price(n.as_str().len())),
+            })),
         ),
     }
 }
@@ -3109,6 +3116,37 @@ mod tests {
         assert_eq!(disk_runway_days(None, free_kb, 2_000, None, 0), None);
         assert_eq!(disk_runway_days(per_block, 0, 2_000, None, 0), None, "an unreadable volume is unknown");
         assert_eq!(disk_runway_days(per_block, free_kb, 0, None, 0), None);
+    }
+
+    /// A free name says what it would cost (#252), and a taken one resolves as before; a name the
+    /// chain would refuse gets no price.
+    #[tokio::test]
+    async fn a_free_name_tells_its_price() {
+        let state = fresh_test_state();
+        let owner = Address::from_public_key(&helix_crypto::KeyPair::generate().public);
+        state.chain_state.write().await.names.insert("alice".into(), owner.to_string());
+
+        let read = |name: &'static str| {
+            let state = state.clone();
+            async move {
+                let response =
+                    resolve_name(State(state), Path(name.to_string())).await.into_response();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+
+        let (status, v) = read("bob").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(v["registration_price_nano"], 500_000_000_000u64, "{v}");
+        let (_, v) = read("bobby.hlx").await;
+        assert_eq!(v["registration_price_nano"], 5_000_000_000u64, "{v}");
+        let (_, v) = read("AB").await;
+        assert!(v["registration_price_nano"].is_null(), "an invalid name has no price: {v}");
+        let (status, v) = read("alice").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["address"], owner.to_string());
     }
 
     /// A pending recovery vote can name more than one key (#251: each guardian holds one vote), and

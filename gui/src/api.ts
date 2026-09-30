@@ -95,6 +95,9 @@ export const api = {
   registerName: (node: string, name: string) =>
     invoke<SubmitResult>("register_name", { node, name }),
 
+  // What registering a name costs, in HLX — burned (#252). Shorter names cost more.
+  namePrice: (name: string) => invoke<number>("name_price", { name }),
+
   resolveName: (node: string, name: string) =>
     invoke<string | null>("resolve_name", { node, name }),
 

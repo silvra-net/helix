@@ -274,7 +274,18 @@ pub async fn register_name(state: State<'_, WalletState>, node: String, name: St
     if name.is_empty() {
         return Err("enter a name".into());
     }
-    build_sign_submit(&state, &node, TxType::RegisterName, None, 0, name.into_bytes(), None).await
+    // The name's price (#252) is the transaction's amount — exactly, as the chain demands — and
+    // the wallet shows it before this runs (`name_price`), from the same rule.
+    let price = helix_core::fee::name_registration_price(name.len());
+    build_sign_submit(&state, &node, TxType::RegisterName, None, price, name.into_bytes(), None).await
+}
+
+/// What registering `name` costs in HLX, burned (#252). The wallet shows it on the button, so the
+/// person sees the price before signing — computed by the same rule the chain applies.
+#[tauri::command]
+pub fn name_price(name: String) -> f64 {
+    let name = name.trim().trim_end_matches(".hlx");
+    helix_core::fee::name_registration_price(name.len()) as f64 / 1_000_000_000.0
 }
 
 #[tauri::command]

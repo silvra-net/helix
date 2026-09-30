@@ -85,6 +85,7 @@ pub fn run() {
             commands::get_validator_pool,
             commands::list_validators,
             commands::register_name,
+            commands::name_price,
             commands::resolve_name,
             commands::my_name,
             commands::reveal_mnemonic,

@@ -25,6 +25,9 @@ export default function Identity({ node, address }: { node: string; address: str
   const [nameLoaded, setNameLoaded] = useState(false);
   const [newName, setNewName] = useState("");
   const [nameBusy, setNameBusy] = useState(false);
+  // The price of the name being typed, in HLX (#252) — from the chain's own rule, so the button
+  // shows exactly what the registration burns.
+  const [namePrice, setNamePrice] = useState<number | null>(null);
 
   const [guardians, setGuardians] = useState<GuardianInfo | null>(null);
   const [mine, setMine] = useState<RecoveryStatus | null>(null);
@@ -99,6 +102,18 @@ export default function Identity({ node, address }: { node: string; address: str
 
   const cleanedName = newName.trim().replace(/\.hlx$/, "");
   const nameErr = cleanedName ? hlxNameError(cleanedName) : null;
+
+  useEffect(() => {
+    if (!cleanedName || nameErr) {
+      setNamePrice(null);
+      return;
+    }
+    let live = true;
+    api.namePrice(cleanedName).then((p) => live && setNamePrice(p)).catch(() => live && setNamePrice(null));
+    return () => {
+      live = false;
+    };
+  }, [cleanedName, nameErr]);
   const pendingOnMe = mine && mine.pending_approvals != null;
 
   return (
@@ -128,7 +143,8 @@ export default function Identity({ node, address }: { node: string; address: str
           <>
             <div className="your-name mono">{myName}.hlx</div>
             <p className="muted small">
-              This name resolves to your address across Helix. Registering another name replaces it.
+              This name resolves to your address across Helix. Registering another name replaces it —
+              this one is then released, and anyone can register it.
             </p>
           </>
         ) : (
@@ -146,14 +162,23 @@ export default function Identity({ node, address }: { node: string; address: str
               spellCheck={false}
               placeholder="alice"
               onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && cleanedName && !nameErr && !nameBusy && registerName()}
+              onKeyDown={(e) => e.key === "Enter" && cleanedName && !nameErr && !nameBusy && namePrice != null && registerName()}
             />
             <span className="suffix">.hlx</span>
           </div>
         </label>
         {nameErr && <p className="muted small text-warn" style={{ marginTop: -4 }}>{nameErr}</p>}
-        <button className="primary" disabled={nameBusy || !cleanedName || !!nameErr} onClick={registerName}>
-          {nameBusy ? "Signing…" : cleanedName && !nameErr ? `Register ${cleanedName}.hlx` : "Register"}
+        {namePrice != null && (
+          <p className="muted small" style={{ marginTop: -4 }}>
+            A name costs {namePrice} HLX, burned — names with five characters or more cost the least.
+          </p>
+        )}
+        <button className="primary" disabled={nameBusy || !cleanedName || !!nameErr || namePrice == null} onClick={registerName}>
+          {nameBusy
+            ? "Signing…"
+            : cleanedName && !nameErr && namePrice != null
+              ? `Register ${cleanedName}.hlx for ${namePrice} HLX`
+              : "Register"}
         </button>
       </div>
 

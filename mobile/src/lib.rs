@@ -128,6 +128,13 @@ pub fn derive_address(seed: Vec<u8>) -> Result<String, MobileError> {
     Ok(Address::from_public_key(&keypair.public).to_string())
 }
 
+/// What registering `name` costs in nano-HLX, burned (#252) — the exact `amount` a `RegisterName`
+/// transaction must carry. The chain's own rule (`helix_core::fee`), so an app never keeps a copy.
+#[uniffi::export]
+pub fn name_registration_price_nano(name: String) -> u64 {
+    helix_core::fee::name_registration_price(name.trim().trim_end_matches(".hlx").len())
+}
+
 /// Build and sign a Helix transaction, returning the exact JSON body to `POST /transactions`.
 /// This is the whole point of the crate: everything below this line is real `helix-core`/
 /// `helix-crypto` code, not a reimplementation — `TxType` parsing aside (see
@@ -193,6 +200,14 @@ uniffi::setup_scaffolding!();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app builds `RegisterName` with this as the amount; the chain refuses anything else.
+    #[test]
+    fn the_name_price_an_app_signs_is_the_chains() {
+        assert_eq!(name_registration_price_nano("bob".into()), 500_000_000_000);
+        assert_eq!(name_registration_price_nano("anna.hlx".into()), 50_000_000_000);
+        assert_eq!(name_registration_price_nano(" alice ".into()), 5_000_000_000);
+    }
 
     /// Same seed as the address-derivation vector already pinned in `helix-cli`
     /// (`phrase_and_key_derivation_match_sparks_javascript_implementation`) — one recognizable

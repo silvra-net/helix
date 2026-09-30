@@ -1200,11 +1200,43 @@ fn execute_register_name(
         return Receipt::failure(tx_hash, "name already registered", 0, 0);
     }
 
-    state.names.insert(name.as_str().to_string(), tx.from.to_string());
+    // A name is permanent, so it has a price (#252): `amount` pays it, exactly, and it is burned.
+    // Exactly, not "at least": whatever a wallet signs is what leaves the account, and a price the
+    // chain charges should never be a number the signer did not see.
+    let price = helix_core::fee::name_registration_price(name.as_str().len());
+    if tx.amount != price {
+        return Receipt::failure(
+            tx_hash,
+            &format!(
+                "registering {} costs {} HLX, which is burned; this transaction pays {} HLX",
+                name.full(),
+                helix_core::fee::nano_as_hlx(price),
+                helix_core::fee::nano_as_hlx(tx.amount),
+            ),
+            0,
+            0,
+        );
+    }
+    let sender = state.get_or_default(&tx.from);
+    if sender.balance < tx.fee.saturating_add(price) {
+        return Receipt::failure(tx_hash, "insufficient balance", 0, 0);
+    }
+
+    // One name per address (#252): a new registration releases the one this address held, which
+    // anyone may then register. The reverse lookup (`name_of`) picks *a* name owned by the address
+    // out of a hash map, so with two it answered differently on different nodes and after a
+    // restart; and the wallet has always told people that registering another name replaces the
+    // first. `retain` rather than a lookup, so a state that ever held two cannot fork on which one
+    // is removed.
+    let owner = tx.from.to_string();
+    state.names.retain(|_, held_by| *held_by != owner);
+    state.names.insert(name.as_str().to_string(), owner);
     state.update_account(&tx.from, |acc| {
-        acc.balance -= tx.fee;
+        acc.balance -= tx.fee + price;
         acc.nonce += 1;
     });
+    // Burned outside the fee split, like a slash: the receipt's `fee_burned` is the fee's share.
+    state.total_burned = state.total_burned.saturating_add(price);
 
     distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
@@ -2222,13 +2254,26 @@ mod tests {
     use helix_core::{BlockHeader, CryptoVersion, TxType};
     use helix_crypto::{KeyPair, Signature};
 
+    /// A registration that pays the name's price (#252), as a wallet builds it.
     fn signed_register_name_tx(kp: &KeyPair, from: &Address, name: &str, nonce: u64, fee: u64) -> Transaction {
+        let price = helix_core::fee::name_registration_price(name.trim_end_matches(".hlx").len());
+        signed_register_name_tx_paying(kp, from, name, price, nonce, fee)
+    }
+
+    fn signed_register_name_tx_paying(
+        kp: &KeyPair,
+        from: &Address,
+        name: &str,
+        amount: u64,
+        nonce: u64,
+        fee: u64,
+    ) -> Transaction {
         let mut tx = Transaction {
             version: 1,
             tx_type: TxType::RegisterName,
             from: from.clone(),
             to: None,
-            amount: 0,
+            amount,
             fee,
             nonce,
             data: name.as_bytes().to_vec(),
@@ -2249,7 +2294,9 @@ mod tests {
         let validator = Address::from_public_key(&KeyPair::generate().public);
 
         let mut state = ChainState::new(0);
-        state.update_account(&addr, |acc| acc.balance = 1_000_000);
+        let start = 100 * genesis::NANO_PER_HLX;
+        state.update_account(&addr, |acc| acc.balance = start);
+        let burned_before = state.total_burned;
 
         let tx = signed_register_name_tx(&kp, &addr, "alice", 0, 10_000);
         let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
@@ -2257,8 +2304,90 @@ mod tests {
         assert!(receipt.success, "expected success, got: {:?}", receipt.error);
         assert_eq!(state.resolve_name("alice"), Some(addr.to_string().as_str()));
         assert_eq!(state.name_of(&addr), Some("alice"));
-        assert_eq!(state.get(&addr).unwrap().balance, 1_000_000 - 10_000);
+        let price = 5 * genesis::NANO_PER_HLX;
+        assert_eq!(state.get(&addr).unwrap().balance, start - 10_000 - price);
         assert_eq!(state.get(&addr).unwrap().nonce, 1);
+        assert_eq!(state.total_burned, burned_before + price, "the price is burned, not paid out");
+    }
+
+    /// A name's price is exactly what the transaction pays (#252): less leaves the name free,
+    /// more is refused too — a wallet must never burn more than the price the person saw.
+    #[test]
+    fn a_name_is_registered_only_for_exactly_its_price() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        let start = 1_000 * genesis::NANO_PER_HLX;
+        state.update_account(&addr, |acc| acc.balance = start);
+        let price = 500 * genesis::NANO_PER_HLX;
+
+        let wrong = [(0u64, 0), (1, price - 1), (2, price + 1), (3, 5 * genesis::NANO_PER_HLX)];
+        for (nonce, amount) in wrong {
+            let tx = signed_register_name_tx_paying(&kp, &addr, "bob", amount, nonce, 10_000);
+            let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+            assert!(!receipt.success, "paying {amount} for a three-letter name must be refused");
+            let why = receipt.error.as_deref().unwrap_or("");
+            assert!(why.contains("costs 500 HLX"), "refused for the wrong reason: {why}");
+        }
+        assert!(state.resolve_name("bob").is_none());
+        assert_eq!(
+            state.get(&addr).unwrap().balance,
+            start - 4 * 10_000,
+            "a refused registration costs its fee and nothing of the price"
+        );
+
+        let tx = signed_register_name_tx_paying(&kp, &addr, "bob", price, 4, 10_000);
+        assert!(execute_transaction(&mut state, &tx, &validator, 0, 0).success);
+        assert_eq!(state.resolve_name("bob"), Some(addr.to_string().as_str()));
+    }
+
+    /// A second name replaces the first, which is free again for anyone (#252).
+    #[test]
+    fn registering_another_name_releases_the_first() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let other_kp = KeyPair::generate();
+        let other = Address::from_public_key(&other_kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        state.update_account(&addr, |acc| acc.balance = 100 * genesis::NANO_PER_HLX);
+        state.update_account(&other, |acc| acc.balance = 100 * genesis::NANO_PER_HLX);
+
+        for (nonce, name) in [(0, "alice"), (1, "alicia")] {
+            let tx = signed_register_name_tx(&kp, &addr, name, nonce, 10_000);
+            let registered = execute_transaction(&mut state, &tx, &validator, 0, 0);
+            assert!(registered.success, "premise: {name}");
+        }
+        assert_eq!(state.name_of(&addr), Some("alicia"));
+        assert!(state.resolve_name("alice").is_none(), "the first name was released");
+        assert_eq!(state.names.len(), 1, "one name per address");
+
+        let tx = signed_register_name_tx(&other_kp, &other, "alice", 0, 10_000);
+        let taken = execute_transaction(&mut state, &tx, &validator, 0, 0);
+        assert!(taken.success, "released means free");
+        assert_eq!(state.resolve_name("alice"), Some(other.to_string().as_str()));
+        assert_eq!(state.resolve_name("alicia"), Some(addr.to_string().as_str()));
+    }
+
+    /// The price has to be there on top of the fee; a sender who can pay the fee but not the price
+    /// gets no name and loses only the fee.
+    #[test]
+    fn a_name_the_sender_cannot_pay_for_is_not_registered() {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(0);
+        let start = 5 * genesis::NANO_PER_HLX; // exactly the price, nothing for the fee
+        state.update_account(&addr, |acc| acc.balance = start);
+
+        let tx = signed_register_name_tx(&kp, &addr, "carol", 0, 10_000);
+        let receipt = execute_transaction(&mut state, &tx, &validator, 0, 0);
+        assert!(!receipt.success);
+        assert_eq!(receipt.error.as_deref(), Some("insufficient balance"));
+        assert!(state.resolve_name("carol").is_none());
+        assert_eq!(state.get(&addr).unwrap().balance, start - 10_000);
+        assert_eq!(state.total_burned, 0, "no price was burned for a name nobody got");
     }
 
     #[test]
@@ -2301,8 +2430,8 @@ mod tests {
         let validator = Address::from_public_key(&KeyPair::generate().public);
 
         let mut state = ChainState::new(0);
-        state.update_account(&addr_a, |acc| acc.balance = 1_000_000);
-        state.update_account(&addr_b, |acc| acc.balance = 1_000_000);
+        state.update_account(&addr_a, |acc| acc.balance = 100 * genesis::NANO_PER_HLX);
+        state.update_account(&addr_b, |acc| acc.balance = 100 * genesis::NANO_PER_HLX);
 
         let tx_a = signed_register_name_tx(&kp_a, &addr_a, "alice", 0, 10_000);
         assert!(execute_transaction(&mut state, &tx_a, &validator, 0, 0).success);

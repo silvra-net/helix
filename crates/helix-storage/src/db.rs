@@ -490,6 +490,23 @@ impl HelixDb {
                 accounts.insert(addr.as_str(), encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // A name leaves the state when its owner registers another (#252: one name per
+            // address), so this table needs the same stale-key pruning as recovery requests —
+            // without it the released name would come back on the next start, on this node alone.
+            {
+                let stale: Vec<String> = names
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!state.names.contains_key(&key)).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    names.remove(key.as_str()).map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
             for (name, owner) in &state.names {
                 names.insert(name.as_str(), owner.as_str())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -512,8 +529,8 @@ impl HelixDb {
             // cleared row in the table, so on the next node restart the request would
             // resurrect and re-lock the account (re-introducing exactly the lockout that
             // `CancelRecoveryRequest` was added to fix). Prune any DB key no longer present in
-            // state before re-inserting the current set. All other tables here are add/update-
-            // only, so they don't need this.
+            // state before re-inserting the current set. Names, proposals, jails and reward
+            // addresses have the same pruning, each at its own table.
             {
                 let current: std::collections::HashSet<String> =
                     state.recovery_requests.keys().cloned().collect();
@@ -2429,6 +2446,28 @@ mod tests {
         assert_eq!(refs, vec![(0, 0)]);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_released_name_does_not_come_back_after_reopening() {
+        let (db, path) = fresh_db();
+        let owner = addr(1);
+
+        let mut state = ChainState::new(1_000_000);
+        state.names.insert("first".to_string(), owner.to_string());
+        db.save_chain_state(&state).unwrap();
+
+        // The owner registers another name, which releases the first (#252).
+        state.names.remove("first");
+        state.names.insert("second".to_string(), owner.to_string());
+        db.save_chain_state(&state).unwrap();
+
+        drop(db);
+        let reopened = HelixDb::open(&path).unwrap();
+        let loaded = reopened.load_chain_state(1_000_000).unwrap();
+        assert!(loaded.resolve_name("first").is_none(), "a released name must stay released");
+        assert_eq!(loaded.name_of(&owner), Some("second"));
+        assert_eq!(loaded.state_hash(), state.state_hash(), "the reloaded state is the saved one");
     }
 
     #[test]

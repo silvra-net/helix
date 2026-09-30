@@ -190,6 +190,12 @@ helix name register alice --key alice.json     # registers alice.hlx to alice.js
 helix name resolve alice.hlx                   # -> hlx...
 ```
 
+A name costs a price on top of the fee, and the price is **burned**: 5 HLX for five characters or
+more, 50 HLX for four, 500 HLX for three. A short name needs the price confirmed —
+`helix name register bob --accept-price 500 --key bob.json` — and without it the command stops
+before anything is signed. An address holds **one** name: registering another releases the first,
+and anyone can then register it (the command says so when it happens).
+
 ### Smart Contracts
 
 Contracts are WASM modules; the exported `call` function is the entry point. A small set of

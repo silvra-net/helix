@@ -113,9 +113,35 @@ impl std::fmt::Display for AutoFeeRefused {
     }
 }
 
+/// What registering a `.hlx` name costs, in nano-HLX, on top of the transaction fee (#252). The
+/// price is **burned**, not paid to anyone.
+///
+/// A name is permanent, and it used to cost only the fee of the transaction that registered it —
+/// the same as a transfer — so every short name could be taken for a handful of fees and held for
+/// good. Short names are the scarce ones, so the price rises tenfold for each character below five:
+///
+/// | length      | price   |
+/// |-------------|---------|
+/// | 5 and more  | 5 HLX   |
+/// | 4           | 50 HLX  |
+/// | 3           | 500 HLX |
+///
+/// **Consensus rule**: the executor refuses a registration whose `amount` is not exactly this.
+/// Wallets read it from here, so the number a person confirms is the number the chain charges.
+/// `name_len` is the length without the `.hlx` suffix; names shorter than three characters are
+/// refused before any price applies.
+pub fn name_registration_price(name_len: usize) -> u64 {
+    const HLX: u64 = 1_000_000_000;
+    match name_len {
+        0..=3 => 500 * HLX,
+        4 => 50 * HLX,
+        _ => 5 * HLX,
+    }
+}
+
 /// Exact decimal HLX for a nano amount, without trailing zeros (integer arithmetic — a fee
 /// shown to a person deciding whether to pay it should not pass through a float).
-fn nano_as_hlx(nano: u64) -> String {
+pub fn nano_as_hlx(nano: u64) -> String {
     let whole = nano / 1_000_000_000;
     let frac = nano % 1_000_000_000;
     if frac == 0 {
@@ -167,6 +193,16 @@ pub fn wallet_priced_size(tx: &crate::Transaction) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_costs_more_the_shorter_it_is() {
+        let hlx = 1_000_000_000;
+        assert_eq!(name_registration_price(3), 500 * hlx);
+        assert_eq!(name_registration_price(4), 50 * hlx);
+        assert_eq!(name_registration_price(5), 5 * hlx);
+        assert_eq!(name_registration_price(32), 5 * hlx, "the longest name costs the base price");
+        assert_eq!(nano_as_hlx(name_registration_price(3)), "500");
+    }
 
     #[test]
     fn empty_blocks_hold_at_the_floor() {
