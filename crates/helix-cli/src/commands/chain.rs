@@ -37,6 +37,17 @@ async fn show_status(node: &str) -> Result<()> {
     println!("  Peers        : {}", res["peer_count"]);
     println!("  Mempool      : {} pending txs", res["mempool_size"]);
     println!("  Syncing      : {}", res["is_syncing"]);
+    // What a fee is priced against, and which chain a signature is for — the two things someone
+    // signing offline has to carry over from here (`tx send --offline`, `HELIX_CHAIN_ID`).
+    if let Some(base_fee) = res["base_fee_per_byte"].as_u64() {
+        println!("  Base fee     : {base_fee} nano-HLX per byte");
+    }
+    // Best effort: a node that cannot show its genesis is still worth a status line.
+    if let Ok(Some(genesis)) = super::get_optional(node, "/blocks/height/0", "the genesis").await {
+        if let Some(hash) = genesis["hash"].as_str() {
+            println!("  Chain id     : {hash}");
+        }
+    }
     Ok(())
 }
 

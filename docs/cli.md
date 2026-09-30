@@ -131,6 +131,33 @@ Amounts are in HLX and are signed exactly as written: up to nine decimals (one n
 0.000000001, is the smallest unit), with `.` or `,` as the separator. Anything else — `1e3`, a
 tenth decimal, a minus sign — is refused before anything is signed.
 
+**A memo** travels with a transfer — how an exchange that receives on one address tells deposits
+apart. UTF-8, at most 256 bytes; `tx status` and the recipient's history show it:
+
+```bash
+helix tx send hlx... 25 --memo "customer-4711" --key alice.json
+```
+
+**Signing on a machine that is never online.** `--offline` signs without asking any node and
+prints the signed transaction as JSON instead of sending it. Nothing can be looked up, so the
+nonce and the fee are yours to give; the chain is `HELIX_CHAIN_ID` (`helix chain status` shows
+it as "Chain id"), or the one this release is for. The transaction id is printed right away, before anything is broadcast:
+
+```bash
+# on the offline machine
+helix tx send hlx... 25 --memo "customer-4711" --key cold.json \
+    --offline --nonce 12 --fee 12000 --output signed.json
+# on an online machine
+helix tx submit signed.json          # or: … | helix tx submit -
+```
+
+The nonce is the sender's current one (`helix account <address>` on the online side). The fee
+must be at least the chain's `base_fee_per_byte` (`helix chain status`) times the size `--offline`
+prints; the base fee moves with load, so leave headroom — a wallet's own pricing doubles it.
+`tx submit` checks the signature before sending, so a file changed on the way is refused there;
+a transaction already applied is refused by the node ("Nonce already spent"), so submitting twice
+is harmless.
+
 ### Fees
 
 Helix charges **per transaction byte**, not per transaction: a block carries a base fee
@@ -177,7 +204,7 @@ Two rules follow from the fee being real money rather than a number you write do
 ### Querying the Chain
 
 ```bash
-helix chain status               # height, best hash, peer count, mempool size, sync state
+helix chain status               # height, peers, mempool, sync state, base fee, chain id
 helix chain latest               # latest block, full transaction list
 helix chain block 142            # block by height
 helix account hlx...             # balance, staked amount, nonce

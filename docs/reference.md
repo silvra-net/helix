@@ -39,7 +39,25 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/validators` | The active validator set: each validator's tier, stake, `voting_power`, commission and `reward_address`, plus the set's `total_voting_power` and `quorum_threshold` |
 | GET | `/diagnostics` | Operational state of this node — see below |
 | POST | `/transactions` | Submit a signed transaction — 400 if the signature, nonce slot, fee, or the sender's ability to pay it fails the check |
-| GET | `/transactions/:hash` | Transaction outcome — `applied` / `failed` (with `error`) / `pending` / `unknown`; 404 if no such transaction |
+| GET | `/transactions/:hash` | Transaction outcome — `applied` / `failed` (with `error`) / `pending` / `unknown`; 404 if no such transaction. Once in a block it also carries the transaction itself, `fee_burned_nano` / `fee_to_validator_nano` and the raw `data_hex` |
+
+**Exact amounts.** Every amount is reported twice: `…_hlx` as a JSON number, for display, and
+`…_nano` as a **decimal string** of nano-HLX, which is exact. A JSON number is a double in most
+languages and stops counting single nano-HLX above ~9 million HLX; anything that books, reconciles
+or compares amounts must read the `…_nano` fields. They are: `balance_nano`, `staked_nano`,
+`unbonding_stake_nano` on an account; `circulating_supply_nano` and `total_burned_nano` in
+`/status`; `amount_nano` and `fee_nano` on every transaction a block, the history or the lookup
+returns.
+
+**Memo.** A `Transfer` whose `data` is UTF-8 of at most 256 bytes carries that text as its memo,
+and every transaction view shows it as `memo` (absent otherwise) — how an exchange that receives on
+one address tells deposits apart. `helix tx send --memo` sets it. Other bytes stay in `data`,
+visible as `data_hex` in the lookup, but are no memo.
+
+**Finality.** A transaction in a block is final: consensus is BFT, a block is committed only with
+two thirds of the voting power behind it, and a committed block is never reverted. There is no
+confirmation count to wait for: `applied` in `/transactions/:hash` is final. (While Helix is a
+testnet, a reset replaces the whole chain — see the README.)
 
 ### Status response
 
@@ -54,6 +72,8 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
   "total_accounts": 4,
   "circulating_supply_hlx": 101247.999987591,
   "total_burned_hlx": 1.2409e-05,
+  "circulating_supply_nano": "101247999987591",
+  "total_burned_nano": "12409",
   "state_hash": "eb24dea7…",
   "state_height": 1248,
   "p2p_port": 8546,
@@ -250,6 +270,7 @@ This is the body `POST /transactions` takes — a transfer of 15,000 HLX (arrays
   `SubmitDoubleSignEvidence`, `Delegate`, `Undelegate`, `Redelegate`, `SetCommission`, `Unjail`,
   `ProbationHeartbeat`, `SetRewardAddress` (bincode encodes them by this position).
 - `crypto_version` is `MlDsa` or `SphincsPlus`.
+- `data` is type-specific; for a `Transfer` it is empty or the memo's UTF-8 bytes (at most 256).
 - `amount` and `fee` are in **nano-HLX** (1 HLX = 1,000,000,000 nano-HLX)
 - `nonce` is per-sender, strictly monotonic, starts at 0 — multiple sequential-nonce
   transactions from one sender can be submitted and included in the same block
@@ -281,6 +302,10 @@ Wallets take the chain id from a compiled-in constant when talking to the public
 from the endpoint itself only when you named it (your own node, a devnet). That asymmetry is
 deliberate: an endpoint that gets to answer "which chain are you on?" gets to decide what your
 signature authorises. `HELIX_CHAIN_ID` overrides both, for offline signing and fresh devnets.
+
+**Signing elsewhere.** `helix tx send … --offline --nonce <n> --fee <nano>` signs on a machine
+that talks to no node and prints this JSON body; `helix tx submit <file>` (or `-` for stdin) sends
+it from one that does. The transaction id is printed at signing, before anything is broadcast.
 
 ### Address Format
 

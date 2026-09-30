@@ -183,17 +183,8 @@ pub(crate) async fn resolve_chain_id(node: &str) -> Result<Hash> {
     static CACHED: tokio::sync::OnceCell<Hash> = tokio::sync::OnceCell::const_new();
     CACHED
         .get_or_try_init(|| async {
-            if let Some(explicit) = std::env::var("HELIX_CHAIN_ID")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            {
-                return Hash::from_hex(&explicit).map_err(|_| {
-                    anyhow!(
-                        "HELIX_CHAIN_ID is not a 32-byte hex hash: {explicit:?}. It is a chain's \
-                         genesis hash — read one with: curl -s <node>/blocks/height/0"
-                    )
-                });
+            if let Some(explicit) = explicit_chain_id()? {
+                return Ok(explicit);
             }
 
             match helix_core::chain_id_source(node) {
@@ -212,6 +203,30 @@ pub(crate) async fn resolve_chain_id(node: &str) -> Result<Hash> {
         })
         .await
         .copied()
+}
+
+/// `HELIX_CHAIN_ID`, if set — the operator's own statement of which chain to sign for.
+fn explicit_chain_id() -> Result<Option<Hash>> {
+    let Some(explicit) = std::env::var("HELIX_CHAIN_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    Hash::from_hex(&explicit).map(Some).map_err(|_| {
+        anyhow!(
+            "HELIX_CHAIN_ID is not a 32-byte hex hash: {explicit:?}. It is a chain's genesis hash \
+             — read one with: curl -s <node>/blocks/height/0"
+        )
+    })
+}
+
+/// Which chain to sign for on a machine that talks to no node: `HELIX_CHAIN_ID`, else the chain
+/// this build was released for. Never an endpoint's answer — there is none to ask, and if there
+/// were, [`resolve_chain_id`] explains why its word must not decide what a signature authorises.
+pub(crate) fn offline_chain_id() -> Result<Hash> {
+    Ok(explicit_chain_id()?.unwrap_or_else(helix_core::default_chain_id))
 }
 
 /// Submit a signed transaction. The one implementation for the whole CLI — import it, do not
