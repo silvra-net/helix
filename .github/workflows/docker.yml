@@ -1,0 +1,89 @@
+name: Docker image
+
+# The node image — with helix-mesh and helix-walletd beside it — for everyone who runs Helix in a
+# container, exchanges above all. Its own workflow on purpose: a failing image build must never
+# hold back the release itself.
+#
+# On a version tag: build and push ghcr.io/<owner>/helix:<version> and :latest.
+# By hand (workflow_dispatch): build only, push nothing — how the Dockerfile is tested, since the
+# machines this project is developed on have no Docker.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Build${{ startsWith(github.ref, 'refs/tags/') && ' and push' || '' }} (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the GitHub container registry
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Name the image
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/helix
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=sha,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Build (manual run — nothing is pushed)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: helix:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Every binary in the image starts
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          set -euo pipefail
+          for bin in helix helix-mesh helix-walletd; do
+            docker run --rm --entrypoint "$bin" helix:test --version
+          done
+
+      - name: Build and push
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The published image, pulled back: it must be the release it is named after.
+      - name: The pushed image reports its tag's version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${{ github.repository_owner }}/helix:${{ steps.meta.outputs.version }}"
+          want="${GITHUB_REF_NAME#v}"
+          for bin in helix helix-mesh helix-walletd; do
+            got="$(docker run --rm --entrypoint "$bin" "$image" --version)"
+            echo "$bin: $got"
+            case "$got" in *" $want") ;; *) echo "::error::$bin in $image reports '$got', expected $want"; exit 1;; esac
+          done
