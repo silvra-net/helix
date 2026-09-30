@@ -2488,6 +2488,28 @@ async fn settle_applied_height(last: &mut u64, store: &Arc<RwLock<HelixDb>>) {
 /// with one difference that matters: nothing is written until [`verify_block_batch`] has passed on
 /// the batch as a whole, so a peer that lies costs a round trip rather than a corrupted store.
 #[allow(clippy::too_many_arguments)]
+/// Keep what a synced block's transactions did, exactly as `apply_finalized_block` keeps it for a
+/// block this node saw finalize.
+///
+/// Both catch-up paths executed each block and threw its receipts away. On the live chain that is
+/// not a corner: every block a node took over sync — all of them on joining, after every restart,
+/// and in live following whenever block sync beat the committed-block gossip (2 of 20 in a
+/// measured run) — answered `unknown` at `/transactions/:hash` and in the address history, failed
+/// transfers included. A node an exchange runs to see its deposits could not tell a deposit that
+/// arrived from one that failed.
+///
+/// A failure to write them does not stop the sync, for the reason the consensus path gives: the
+/// block is valid without them, and their absence reads as `unknown`, never as success.
+fn store_synced_receipts(
+    store: &mut HelixDb,
+    height: u64,
+    receipts: &[helix_executor::receipt::Receipt],
+) {
+    if let Err(e) = store.put_receipts(receipts) {
+        error!(height, err = %e, "Failed to store receipts for a synced block");
+    }
+}
+
 async fn apply_synced_batch(
     batch: BlockSyncResponse,
     peer: String,
@@ -2586,7 +2608,7 @@ async fn apply_synced_batch(
         let mut s = store.write().await;
         let mut cs = chain_state.write().await;
         for block in &batch.blocks[..proven] {
-            execute_block(&mut cs, block);
+            let receipt = execute_block(&mut cs, block);
             cs.applied_height = block.height();
             if let Err(e) = s.put_block(block.clone()) {
                 // The batch verified, so this is a local storage failure, not a bad peer. Stop here
@@ -2594,6 +2616,7 @@ async fn apply_synced_batch(
                 error!(height = block.height(), err = %e, "Failed to store a synced block");
                 break;
             }
+            store_synced_receipts(&mut s, block.height(), &receipt.tx_receipts);
         }
         if let Err(e) = s.save_chain_state(&cs) {
             fatal_storage_failure("chain state", cs.applied_height, &e);
@@ -6903,13 +6926,14 @@ async fn sync_blocks_from_peer(
                     total_applied
                 );
             }
-            execute_block(chain_state, block);
+            let receipt = execute_block(chain_state, block);
             // Same stamp as the consensus path in `apply_finalized_block` — a node catching up
             // over RPC serves `/status` throughout, and a state height frozen at whatever it was
             // before the sync started would be worse than none at all. This function owns
             // `chain_state` exclusively (`&mut`), so the pair is consistent here too.
             chain_state.applied_height = h;
             store.put_block(block.clone())?;
+            store_synced_receipts(store, h, &receipt.tx_receipts);
             expected_prev_hash = block.hash();
             total_applied += 1;
             applied_this_batch += 1;
@@ -7240,6 +7264,19 @@ mod sync_blocks_from_peer_tests {
         state: &mut ChainState,
         tip: &mut (Hash, Option<u64>),
     ) -> Vec<Block> {
+        extend_chain_carrying(proposer, certifiers, heights, short_for, state, tip, &|_| Vec::new())
+    }
+
+    /// `extend_chain`, with the transactions `txs_at` names for each height in the blocks.
+    fn extend_chain_carrying(
+        proposer: &KeyPair,
+        certifiers: &[&KeyPair],
+        heights: &[u64],
+        short_for: &[u64],
+        state: &mut ChainState,
+        tip: &mut (Hash, Option<u64>),
+        txs_at: &dyn Fn(u64) -> Vec<Transaction>,
+    ) -> Vec<Block> {
         let (mut prev_hash, mut prev_height) = *tip;
         let mut blocks = Vec::with_capacity(heights.len());
         for &h in heights {
@@ -7252,6 +7289,8 @@ mod sync_blocks_from_peer_tests {
             block.header.height = h;
             block.header.prev_hash = prev_hash;
             block.header.prev_state_root = state.state_hash();
+            block.transactions = txs_at(h);
+            block.header.merkle_root = helix_core::transactions_root(&block.transactions);
             if let Some(ph) = prev_height {
                 let signers: &[&KeyPair] =
                     if short_for.contains(&ph) { &certifiers[..1] } else { certifiers };
@@ -7854,6 +7893,122 @@ mod sync_blocks_from_peer_tests {
 
         assert_eq!(applied, 3);
         assert_eq!(store.read().await.latest_height(), 3);
+    }
+
+    /// Two transfers from one funded sender, for block 1: the first refused by the executor (a
+    /// zero amount — committed, charged, and failed), the second applied.
+    fn a_failed_and_an_applied_transfer(sender: &KeyPair, to: &Address) -> Vec<Transaction> {
+        [0u64, 100].iter().enumerate().map(|(nonce, &amount)| {
+            let mut tx = Transaction {
+                version: 1,
+                tx_type: TxType::Transfer,
+                from: Address::from_public_key(&sender.public),
+                to: Some(to.clone()),
+                amount,
+                fee: 20_000,
+                nonce: nonce as u64,
+                data: b"deposit-7".to_vec(),
+                crypto_version: sender.scheme,
+                chain_id: Hash::ZERO,
+                signature: Sig::from_bytes(vec![]),
+                public_key: Some(sender.public.clone()),
+            };
+            tx.signature = sender.sign(tx.signing_hash().as_bytes()).unwrap();
+            tx
+        }).collect()
+    }
+
+    /// A chain whose block 1 carries `a_failed_and_an_applied_transfer`, the state it starts
+    /// from (the sender funded, `kp` staked), and the two transaction hashes, failed first.
+    fn chain_with_a_failed_and_an_applied_transfer(
+        kp: &KeyPair,
+    ) -> (Vec<Block>, ChainState, [Hash; 2]) {
+        let sender = KeyPair::generate();
+        let mut base = staked_state(0, &[kp]);
+        let funded = Address::from_public_key(&sender.public);
+        base.update_account(&funded, |acc| acc.balance = 1_000_000);
+        let txs = a_failed_and_an_applied_transfer(&sender, &Address::from_public_key(&kp.public));
+        let hashes = [txs[0].hash(), txs[1].hash()];
+        let mut state = base.clone();
+        let carried = txs.clone();
+        let at_one = |h: u64| if h == 1 { carried.clone() } else { Vec::new() };
+        let mut tip = (Hash::ZERO, None);
+        let blocks =
+            extend_chain_carrying(kp, &[kp], &[1, 2, 3], &[], &mut state, &mut tip, &at_one);
+        (blocks, base, hashes)
+    }
+
+    /// What a node that caught up knows about the transactions it applied. Checked on the
+    /// receipts the RPC answers from: `unknown` is what their absence reads as.
+    async fn assert_both_outcomes_kept(
+        store: &Arc<RwLock<HelixDb>>,
+        hashes: &[Hash; 2],
+        path: &str,
+    ) {
+        let s = store.read().await;
+        let failed = s.get_receipt(&hashes[0]).unwrap().unwrap_or_else(|| {
+            panic!("{path}: an applied transaction has no receipt — it would answer `unknown`")
+        });
+        assert!(!failed.success, "{path}: the refused transfer must be recorded as failed");
+        assert!(
+            failed.error.as_deref().is_some_and(|e| e.contains("greater than zero")),
+            "{path}: and with the executor's reason: {:?}",
+            failed.error
+        );
+        let applied = s.get_receipt(&hashes[1]).unwrap().unwrap_or_else(|| {
+            panic!("{path}: the applied transfer has no receipt")
+        });
+        assert!(applied.success, "{path}: the applied transfer must be recorded as applied");
+    }
+
+    /// The RPC sync — every node's path on joining, and a follower's while it catches up — keeps
+    /// the receipts of the blocks it applies (#259).
+    #[tokio::test]
+    async fn the_rpc_sync_keeps_what_each_transaction_did() {
+        let kp = KeyPair::generate();
+        let (blocks, base, hashes) = chain_with_a_failed_and_an_applied_transfer(&kp);
+        let peer_url = serve_blocks(blocks).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(base));
+        let applied = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state).await.unwrap();
+
+        assert_eq!(applied, 3, "the premise: the block carrying both transfers was applied");
+        assert_both_outcomes_kept(&store, &hashes, "RPC sync").await;
+    }
+
+    /// The P2P block sync keeps them too. It is the path a node in live following takes whenever
+    /// a batch beats the committed-block gossip, and the one after any gap.
+    #[tokio::test]
+    async fn the_p2p_block_sync_keeps_what_each_transaction_did() {
+        let kp = KeyPair::generate();
+        let (blocks, base, hashes) = chain_with_a_failed_and_an_applied_transfer(&kp);
+
+        let addr = Address::from_public_key(&kp.public);
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(base));
+        let validator_set = ValidatorSet::new(validators_from_state(&*chain_state.read().await), 0);
+        let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr, 0)));
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let (p2p_tx, _p2p_rx) = mpsc::channel(8);
+        // No tip certificate: blocks 1 and 2 are proven by the `last_commit` of the block above
+        // them, block 3 waits for the next batch — the ordinary shape of a batch.
+        let batch = BlockSyncResponse { blocks, tip_certificate: Vec::new() };
+        apply_synced_batch(
+            batch,
+            "peer".into(),
+            &store,
+            &chain_state,
+            &engine,
+            &mempool,
+            &Arc::new(Mutex::new(0)),
+            &Arc::new(RwLock::new(TipCertificate::default())),
+            &p2p_tx,
+        )
+        .await;
+
+        assert!(store.read().await.latest_height() >= 1, "the premise: block 1 was applied");
+        assert_both_outcomes_kept(&store, &hashes, "P2P block sync").await;
     }
 
     /// End-to-end reproduction of the join-stall, and the fix for it. A second operator stakes to
@@ -11472,17 +11627,6 @@ mod handle_p2p_event_tests {
         );
     }
 
-    /// Regression test for a real race: this node's own BFT engine reaching quorum
-    /// (NewProposal/NewVote) and a `NewCommittedBlock` gossip arrival for the *same* height
-    /// run as independent tokio tasks, each deciding whether to proceed from different state
-    /// (the engine's `current_height` vs. `store.latest_height()`) read *before* either ever
-    /// calls `apply_finalized_block` — with no lock held across that gap, both could observe
-    /// "not yet applied" and both call it. Without the shared `last_applied_height` guard,
-    /// this double-executes the block: harmless for most of its own transactions (rejected
-    /// the second time on stale nonces), but the block reward mint isn't nonce-gated at all,
-    /// so it mints twice regardless — silently inflating supply. Found in practice as a
-    /// small, fixed `circulating_supply` divergence between two otherwise-identical nodes.
-    /// Simulates the race by calling `apply_finalized_block` twice for the identical block
     /// Applying a block must leave behind a record of what its transactions actually did.
     /// The chain executed them, warned about the failures in its own log, and threw the
     /// receipts away — so a transaction the executor rejected was indistinguishable, from
@@ -11544,6 +11688,17 @@ mod handle_p2p_event_tests {
         );
     }
 
+    /// Regression test for a real race: this node's own BFT engine reaching quorum
+    /// (NewProposal/NewVote) and a `NewCommittedBlock` gossip arrival for the *same* height
+    /// run as independent tokio tasks, each deciding whether to proceed from different state
+    /// (the engine's `current_height` vs. `store.latest_height()`) read *before* either ever
+    /// calls `apply_finalized_block` — with no lock held across that gap, both could observe
+    /// "not yet applied" and both call it. Without the shared `last_applied_height` guard,
+    /// this double-executes the block: harmless for most of its own transactions (rejected
+    /// the second time on stale nonces), but the block reward mint isn't nonce-gated at all,
+    /// so it mints twice regardless — silently inflating supply. Found in practice as a
+    /// small, fixed `circulating_supply` divergence between two otherwise-identical nodes.
+    /// Simulates the race by calling `apply_finalized_block` twice for the identical block
     /// against the same `last_applied_height` — the second call must be a complete no-op.
     #[tokio::test]
     async fn apply_finalized_block_does_not_double_mint_a_racing_duplicate_for_the_same_height() {
