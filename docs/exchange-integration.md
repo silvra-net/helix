@@ -7,9 +7,9 @@
 This page describes the interface an integration builds on, so that one can be written and
 tested now; it is not an invitation to list a testnet coin.
 
-**Use 0.20.1 or later.** `--memo`, `--offline`, `helix tx submit`, the chain id in `helix chain
-status`, the exact amount fields and a syncing node that keeps transaction outcomes all arrived
-in 0.20.1.
+**Use 0.20.2 or later.** `--memo`, `--offline`, `helix tx submit`, the chain id in `helix chain
+status`, the exact amount fields and a syncing node that keeps transaction outcomes arrived in
+0.20.1; every balance change of a block, recorded and served, and the Mesh service in 0.20.2.
 
 ## At a glance
 
@@ -98,8 +98,8 @@ balance the block moved, with the transaction (`tx_index`, `tx_hash`; `null` for
 reward), the `account`, the `kind` (`transaction`, `reward`, `contract`) and a signed
 `delta_nano`. Summed per account they are exactly how much each balance moved, so a balance can be
 reconciled block by block. Every history row has `balance_change_nano` too: what that transaction
-did to the address, fee included. Both come from a node newer than 0.20.1, and only for blocks it
-executed itself — absent means "this node has no record", never "nothing moved".
+did to the address, fee included. Both come from a node running 0.20.2 or later, and only for blocks
+it executed itself — absent means "this node has no record", never "nothing moved".
 
 ## Sending withdrawals
 
@@ -156,8 +156,8 @@ can be restarted or upgraded without touching the node.
 helix-mesh --node http://127.0.0.1:8545 --listen 127.0.0.1:8080 --network testnet
 ```
 
-The Linux and macOS `helix-cli-…` archives carry `helix-mesh` next to `helix` from the first
-release after 0.20.1; from source it is `cargo build --release -p helix-mesh`.
+The Linux and macOS `helix-cli-…` archives carry `helix-mesh` next to `helix` from 0.20.2 on;
+from source it is `cargo build --release -p helix-mesh`.
 
 **Raise the node's rate limit for it.** The node limits requests per client address (500 at once,
 100 a second by default), and `helix-mesh` is one client asking for every block. Start the node
@@ -169,7 +169,7 @@ identifier is `{"blockchain": "Helix", "network": "<--network>"}`; the currency 
 `{"symbol": "HLX", "decimals": 9}`, and every amount is in nano-HLX.
 
 **The node behind it must have executed every block itself** with a build that records balance
-changes (the one after 0.20.1): synced from genesis, not joined from a checkpoint, not pruning.
+changes (0.20.2 or later): synced from genesis, not joined from a checkpoint, not pruning.
 Blocks come from those records, so a block the node has no record of is refused (error 5), never
 shown with operations missing.
 
