@@ -1,223 +1,143 @@
 # Staking & delegation
 
-> Part of the [Helix documentation](../README.md) — deep reference, split out of the README to keep it short.
+> Part of the [Helix documentation](../README.md).
 
 ## Staking
 
-Staking in Helix serves three distinct purposes — pick the one you actually want, they're not
-mutually exclusive:
+Three ways to put HLX to work — they combine freely:
 
-- **Run a validator** (self-stake + a node) — actively produce blocks, earn from it, and get
-  governance voting power.
-- **Delegate to a validator** — earn a share of *its* block rewards, proportional to your
-  delegation, without running anything yourself. No governance voting power.
-- **Self-stake without running a node** — governance voting power only, no yield (you're not
-  producing blocks, so there's nothing to earn a share of).
+- **Run a validator** — stake and run a node. Produces blocks, earns block rewards and fee tips,
+  and votes in governance.
+- **Delegate to a validator** — earn a share of its rewards without running anything. No
+  governance vote.
+- **Stake without a node** — a governance vote, no yield.
 
-### Staking as a Node Operator (Validator)
+### Running a validator
 
-> **Stake the address your node signs with — not some other wallet.** Your node has its own
-> validator identity in `validator-key.json` (auto-generated on first start if you didn't supply
-> one). Staking a *different* address — say a wallet you already had funded — makes that address
-> a validator the network then waits on, while **no node is signing for it**. In a small set that
-> single "phantom" validator halts the chain, and it can't be removed until the chain moves again
-> (which it can't, because it's waiting on the phantom). This is the single most common validator
-> mis-setup. Guard against it in step 1 by *verifying the two addresses are the same*.
+> **Stake the address your node signs with — no other.** The node's identity is its
+> `validator-key.json`. Stake a different wallet and that wallet's address becomes a validator
+> nothing signs for; it will never be promoted and earns nothing. Step 1 checks this.
 
-1. **Get a node running** (see [Running a Node](running-a-node.md#running-a-node)) and read off
-   the address it validates as — **this is the only address you may stake**:
+1. **Run a node and let it sync** — see [Running a Node](running-a-node.md#running-a-node). Wait
+   until `helix chain status` shows peers and a moving height. Then read the address your node
+   signs as:
    ```bash
-   helix wallet address --key validator-key.json     # e.g. hlxbx7oYT7n1...  ← your node's identity
+   helix wallet address --key validator-key.json
    ```
-   If you want your validator to *be* an existing wallet of yours, don't stake that wallet
-   against a freshly-generated node key — instead make that wallet the node's key: point
-   `HELIX_VALIDATOR_KEY` at its key file, or restore it into place with
-   `helix wallet restore --mnemonic "…" --output validator-key.json`, then re-check the address
-   above. The node signs with whatever `validator-key.json` holds, nothing else.
-2. **Stake at least the minimum** (10,000 HLX — ~0.03% of the total supply) **from that exact
-   address**, using that same key file:
+   To validate as an existing wallet of yours, make that wallet the node's key instead: point
+   `HELIX_VALIDATOR_KEY` at its file, or restore it with
+   `helix wallet restore --output validator-key.json` (it asks for the 24 words).
+2. **Fund that address and stake from it.** The minimum is 10,000 HLX (a governance parameter —
+   `GET /governance/params` shows the current value); keep a margin above it, because a slash
+   takes 5% and a validator below the minimum drops out of the set:
    ```bash
    helix tx stake 10000 --key validator-key.json
    ```
-   The `--key` here must be the same file whose address you read in step 1. If `helix tx stake`
-   uses any other key, you have just created a phantom validator — see the warning above.
-3. **Wait for two epoch rotations** (an epoch is 100 blocks — a few minutes at the 2s block time).
-   The validator set is rebuilt at each boundary from every account meeting the minimum stake,
-   counting both self-stake and anything delegated to it (see below). A new staker waits out the
-   first epoch, spends the second on *probation* — in the signing set, but with zero voting power
-   and no proposer turn — and is a full voting validator from the boundary after that, when its
-   round-robin proposer turns begin.
-
-   Probation is a test, not just a delay. During that epoch your node automatically sends a
-   small, fee-free **heartbeat transaction** signed with the staking key, and promotion happens
-   only if one of them (or a co-signed block) actually reached the chain. A staked address with
-   no node behind it sends nothing, is never promoted, and so never becomes quorum-critical — it
-   simply stays powerless and tries again. Nothing is slashed and nothing is lost.
-
-   You do not have to do anything for this, and it costs nothing: the heartbeat is exempt from
-   the base fee precisely because an operator who staked their whole balance has nothing liquid
-   left to pay with. If your validator never leaves probation, the near-certain cause is that
-   your node is signing as a *different* key than the one you staked from — check step 1 again.
-   `GET /validators` shows `tier` and `probation_liveness_seen` for exactly this diagnosis.
-4. **Earn**: every block you produce mints you a share of that block's transaction fees (50%
-   of each fee; the other 50% is burned) plus a fixed block reward (starts at 1 HLX, halves
-   yearly — see [Token Economics](internals.md#token-economics)), paid even on empty blocks. If you have
-   delegators, your share is proportional to your self-stake versus their delegated total,
-   plus a commission cut of theirs (see below) — with none, you keep 100% exactly as before.
-5. **Unstaking**: `helix tx unstake <amount> --key validator-key.json` moves stake into a
-   7-day unbonding period (still slashable during this window) before it's claimable:
+   Stake delegated to you counts toward the minimum too.
+3. **Wait two epochs** (an epoch is 100 blocks, a few minutes). The first boundary after your
+   stake puts you on **probation** — in the signing set, without voting power or proposer turns.
+   Your node proves it is running by sending a small, fee-free heartbeat signed with your key (or
+   by co-signing a block); the next boundary then makes you a full validator. A staked address
+   with no node behind it is never promoted, loses nothing, and simply waits. If you stay on
+   probation, your node signs as a different key than the one you staked — check step 1.
+   `GET /validators` shows `tier` and `probation_liveness_seen`.
+4. **Earn.** The proposer of each block receives its block reward (1 HLX at launch, halving about
+   once a year — see [Token Economics](internals.md#token-economics)) and the tips of its
+   transactions — what senders paid above the base fee, which is burned. With delegators, the
+   reward splits by your self-stake against the delegated total, and you keep a commission on
+   their part.
+5. **Set your commission** (optional; default 10%, at most 50%):
    ```bash
-   helix tx unstake 50000 --key validator-key.json
-   # ... 7 days later ...
-   helix tx claim-unbonded --key validator-key.json
+   helix tx set-commission 1000 --key validator-key.json   # basis points: 1000 = 10%
    ```
-   You can't unstake below the minimum if you're currently the *only* account meeting it —
-   that would empty the validator set and halt the chain, so it's rejected outright rather
-   than allowed and left to fail later.
-6. **Set your commission** (optional, before or after you have delegators):
+   The cap bounds what raising the rate after delegators arrive can take from them.
+6. **Pay your rewards to a wallet off the server** (optional, recommended):
    ```bash
-   helix tx set-commission 1000 --key validator-key.json   # 1000 bps = 10% (the default)
-   ```
-   Capped at 5000 bps (50%) — not to stop you from legitimately charging more, but to bound
-   the "advertise a low rate, raise it once delegators are locked in" rug-pull: even a
-   maximally hostile change can never claim more than half of what delegators earn.
-7. **Pay your rewards to a wallet that is not on the server** (optional, recommended):
-   ```bash
-   helix tx set-reward-address hlx...yourColdWallet --key validator-key.json
+   helix tx set-reward-address <address> --key validator-key.json
    helix tx set-reward-address --clear --key validator-key.json   # back to the validator key
    ```
-   Your validator key has to live on the machine that runs the node, and rewards credited to it
-   are liquid funds on the one machine an attacker most wants. With a reward address set, your
-   block rewards, your share of fees and your commission go to a wallet whose key never touches
-   that server; the validator key keeps only its stake. **Your delegators' share is not
-   affected** — it goes into your pool exactly as before, and `GET /validators` shows every
-   validator's `reward_address` so they can see that for themselves. Double-check the address:
-   rewards paid to one you cannot open are gone. This replaces the old `HELIX_REWARD_ADDRESS`
-   node setting, which only ever worked on a chain with a single validator.
+   The validator key has to live on the server; with a reward address set, your rewards,
+   tips and commission go to a wallet whose key never does. Your delegators' share is unaffected,
+   and `GET /validators` shows every validator's `reward_address`. Double-check it: rewards sent to
+   an address you cannot open are gone.
+7. **Unstake** when you want out — the stake unbonds for 7 days, and stays slashable meanwhile:
+   ```bash
+   helix tx unstake <amount> --key validator-key.json
+   helix tx claim-unbonded --key validator-key.json     # after the 7 days
+   ```
+   The last validator cannot unstake below the minimum: that would leave the chain without one.
 
-**Slashing risk:** double-signing (proposing or voting for two different blocks at the same
-height/round) burns 5% of your stake *and* 5% of your delegators' pooled stake, and jails you
-from BFT rounds immediately — not just at the next epoch. Run one node per key. Ever.
+### Slashing and jailing
 
-What the node protects for you, and what it does not: a persisted signing high-water mark stops a
-*restart* from re-signing a height it already signed (an honest reboot is safe), and the data
-directory is file-locked so a second node started against the **same** directory refuses to start
-with a clear "already in use" error rather than double-signing. Neither of those helps if you run
-a second node **elsewhere with a copy of the key** — separate machine, separate data directory.
-That setup has its own high-water mark that knows nothing of the first, so the two can sign
-conflicting blocks and slash you. There is no remote-signer coordination yet; "one node per key"
-is a discipline you keep, not something the software can currently enforce across machines.
+**Double-signing** — two different votes for the same height and round — costs 5% of your stake
+and 5% of your delegators' pool, and removes you from the active set at once. Each offence is
+punished once. **Run one node per key, ever.** The node protects you against itself: it remembers
+what it last signed (`validator-key.signing-state.json`) so a restart never signs again, and it
+locks its data directory so a second node on the same directory refuses to start. Neither helps
+against a copy of the key running on another machine — that one keeps its own memory and can sign
+against the first.
 
-**Downtime risk (no slash, but real friction):** a validator that misses too many of the
-`last_commit`s it should appear in is downtime-jailed — excluded from `stakers()`, earning
-nothing, until it explicitly rejoins:
-```bash
-helix tx unjail --key validator-key.json   # only once your node is actually back and connected
-```
-**"Too many" is a rate, not a streak, and that changed on 2026-09-18.** A missed block adds 2, a
-signed one subtracts 1, so the count grows while you are below **two thirds** participation and
-shrinks above it. Two consequences worth knowing before you run a node:
+**Downtime** costs no HLX, but removes you from the set until you come back deliberately. Each
+missed block you should have signed adds 2 to a counter, each signed one takes 1 off, so the
+counter grows while you sign less than two thirds of your blocks. At the threshold you are jailed:
 
-* Go fully dark and you are jailed after **1800 blocks** (~30–60 minutes) — the same figure as
-  before, deliberately unchanged.
-* Deliver, say, half the blocks indefinitely and you are *also* jailed eventually, where the old
-  rule never would have touched you: any signature at all reset it, so a validator that delivered
-  7.5 % looked perfectly healthy to every counter. One did, on this chain, and it cost the network
-  a sixth of its rounds.
+- after **1,800 blocks** of complete silence (about an hour);
+- and also, over a longer stretch, if you keep signing less than two thirds — what the quorum needs
+  from each validator.
 
-Two thirds is not a tuning choice — it is what the quorum needs from the set, so a validator below
-it is consuming quorum power it does not supply. Routine interruptions (a reboot, an upgrade, an
-I/O stall) stay far above the line and are never jailed however long the chain runs.
-
-Requires the minimum jail window (~300 blocks, ~10 minutes) to have passed and your stake to
-still meet the minimum. Unlike double-sign slashing this costs no HLX — going offline isn't
-proof of malice, only sustained silence is treated as a liveness problem — but it isn't
-automatic either: the same reasoning that makes an ordinary restart safe (jailing survives it,
-so the same flaky connection can't refreeze the chain every time you reboot) is exactly why
-rejoining needs a deliberate transaction, not a timer. Check whether you're currently jailed
-with `helix account <your-address>`.
-
-### Delegating to a Validator
-
-Earn a share of a validator's block rewards without running any infrastructure:
+Reboots, upgrades and short outages stay far below that. To return, once your node is back and
+synced — at least 300 blocks after the jailing, with your stake still at the minimum:
 
 ```bash
-helix tx delegate hlxValidatorAddress... 100 --key alice.json  # delegate 100 HLX
-helix validator show hlxValidatorAddress...                     # see the pool: delegated
-                                                                  # total, commission, effective stake
-helix account alice_address                                     # see your own position's
-                                                                  # current value, under "Delegations"
+helix tx unjail --key validator-key.json
 ```
 
-Delegation uses a share-pool model (the same one Cosmos SDK and liquid-staking protocols like
-Lido use): you receive pool shares priced at the pool's current value per share, and every
-reward the validator earns adds directly to the pool's total value — instantly making every
-existing share worth more, with no separate "claim rewards" step. Your position **auto-
-compounds** for free; check its current value any time with `helix account`.
+`helix account <address>` shows whether you are jailed and from which height you can unjail.
+
+### Delegating to a validator
 
 ```bash
-helix tx undelegate hlxValidatorAddress... 50 --key alice.json  # redeem 50 HLX of current value
-# ... 7 days later (same unbonding queue as self-staking) ...
-helix tx claim-unbonded --key alice.json
+helix tx delegate <validator-address> 100 --key alice.json   # delegate 100 HLX
+helix validator show <validator-address>                     # its pool: delegated total, commission
+helix account <your-address>                                 # your positions, under "Delegations"
 ```
 
-`undelegate`'s amount is the HLX value you want back (principal plus whatever compounded, or
-minus anything lost to a slash since you delegated), not raw shares — the CLI/executor
-convert internally.
-
-### Switching Validators
-
-Undelegating and re-delegating means 7 days out of the market. To move a delegation directly,
-with no unbonding wait and no missed rewards:
+Delegation uses a share pool, like the Cosmos SDK's: you receive shares at the pool's current
+value, and every reward the validator earns raises the value of every share. Your position
+compounds by itself — there is nothing to claim.
 
 ```bash
-helix tx redelegate hlxOldValidator... hlxNewValidator... 50 --key alice.json
+helix tx undelegate <validator-address> 50 --key alice.json  # take out 50 HLX of current value
+helix tx claim-unbonded --key alice.json                      # after the 7-day unbonding
 ```
 
-The stake earns at the old validator up to this transaction and at the new one immediately
-after. What it does *not* do is shed the old validator's slashing risk: the moved stake stays
-slashable for the validator you left for a full 7 days, so redelegating away from one that has
-already double-signed does not dodge the hit — the loss comes out of your shares at the new
-validator, leaving that validator's other delegators untouched.
+- **You share the validator's slashing risk.** A double-sign costs its delegators 5% of their
+  position too — which is the reason to choose a reliable validator, not just a cheap one.
+- **Undelegating does not escape a slash.** Evidence arrives some blocks after the offence; stake
+  you undelegate stays slashable for that validator for the whole 7 days of unbonding.
+  `helix account` names the validator your unbonding stake is still exposed to.
+- **One unbonding at a time** — claim it before starting another, whether from undelegating or
+  unstaking.
+- **No governance vote.** Voting weight is your own staked balance only.
 
-**While that window is open the stake cannot leave the new validator either** — neither by
-redelegating on (A→B→C) nor by undelegating out of B. Both are refused until the 7 days are up.
-That is not an extra restriction so much as the one that makes the sentence above true: the old
-validator's claim is anchored in the shares you now hold at the new one, so a withdrawal before
-the window closes would erase it. Until 2026-09-22 undelegating was allowed there, and doing it
-dropped the old validator's slashing risk entirely — two transactions, no wait, no loss.
-
-A few things worth knowing about delegation generally:
-
-- **No governance power.** Delegating moves your economic exposure to the validator's
-  performance, not your vote — governance weight stays tied to your own `helix tx stake`
-  balance only (see [Governance](cli.md#governance)). Want both? Self-stake for the vote, delegate
-  separately (to any validator, including a different one) for the yield.
-- **You share slashing risk.** If the validator you delegated to double-signs, your pool
-  value drops by the same 5% its own self-stake does — this is deliberate, not a bug: it's
-  what gives delegators a real reason to pick a reliable validator instead of just the lowest
-  commission rate.
-- **Undelegating does not outrun a slash.** Double-sign evidence travels as a transaction, so
-  it always lands some blocks after the misbehavior it proves. Undelegating in that window
-  does not save you: redeemed stake stays slashable for the validator you left, for the whole
-  7-day unbonding period, exactly as if it were still in the pool. `helix account` names the
-  validator your unbonding stake is still exposed to. Only `tx claim-unbonded`, after the
-  period ends, puts the funds beyond reach.
-- **Only one unbonding slot at a time**, same as self-staking — claim a pending unbonding
-  before starting another (whether from undelegating or unstaking).
-
-### Self-Staking Without a Node (Governance Only)
-
-If you just want a say in governance without operating infrastructure or picking a validator
-to trust:
+### Switching validators
 
 ```bash
-helix tx stake 100 --key alice.json     # any amount above 0 grants voting power
+helix tx redelegate <old-validator> <new-validator> 50 --key alice.json
 ```
 
-Your voting weight in `helix governance vote` is exactly your staked balance. Unstaking and
-claiming work identically to the validator flow above (same 7-day unbonding window, same
-commands). This path earns nothing — for yield without running a node, delegate instead (see
-above).
+The stake moves at once and keeps earning. It stays slashable for the validator you left for 7
+days — switching away from one that already double-signed does not avoid the loss — and during
+those 7 days it can neither move on to a third validator nor be undelegated.
 
----
+### Staking without a node
+
+```bash
+helix tx stake 100 --key alice.json
+```
+
+Your governance voting weight is your staked balance; unstaking works as above. Opening a proposal
+takes a stake of at least the minimum validator stake — see [Governance](cli.md#governance). This
+earns nothing; to earn without a node, delegate. (Staking the minimum or more makes the address a
+validator candidate; without a node behind it, it stays on probation and never votes in
+consensus.)
