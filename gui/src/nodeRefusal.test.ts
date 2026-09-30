@@ -9,7 +9,7 @@ describe("recognising a node that refused this machine's chain", () => {
     expect(
       refusedLocalChain([
         line("INFO helix::node: Validator address : hlx…"),
-        line("Error: helix-data.redb holds the chain whose genesis is 1a2b…, but Helix 0.16.0 joins the public network"),
+        line("Error: helix-data.redb holds the chain whose genesis is 1a2b…, but Helix 0.20.0 joins the public network"),
       ]),
     ).toBe(true);
   });

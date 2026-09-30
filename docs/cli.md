@@ -273,7 +273,7 @@ helix recovery approve hlx... <new_pubkey_hex> --key guardian2.json
 
 Each guardian holds **one** vote. Approving another key moves that guardian's vote there; it
 does not touch anybody else's, and `recovery status` lists every key currently named with its
-votes. (Before 0.16.0 a vote for a different key restarted the whole request — one guardian
+votes. (Before 0.20.0 a vote for a different key restarted the whole request — one guardian
 could undo the others' approvals while the owner, whose key was lost, could do nothing.)
 
 **Replacing your guardians works even with a recovery vote in progress**, and doing so
