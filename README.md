@@ -179,7 +179,7 @@ as the state it computes parts from the chain's it stops with an error that says
 running it drops out of the set. To **join the public network**, build the release it runs:
 
 ```bash
-git checkout v0.15.2   # the latest release tag
+git checkout v0.20.0   # the latest release tag
 cargo build --release
 ```
 
