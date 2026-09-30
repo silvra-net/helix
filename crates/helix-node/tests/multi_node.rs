@@ -525,7 +525,7 @@ async fn a_validator_funded_and_staked_at_runtime_activates_and_co_signs() {
     let ma = |port: u16| format!("/ip4/127.0.0.1/tcp/{port}");
     let fast = ("HELIX_BLOCK_TIME_MS", JOIN_BLOCK_TIME_MS);
 
-    // A: fresh single-validator genesis (its 500k liquid reserve is what funds B), known key so the
+    // A: fresh single-validator genesis (its liquid reserve is what funds B), known key so the
     // test can sign transfers from it. Seeds toward B so the two form a mesh once B is up.
     let seeds_a = ma(JOIN_B_P2P);
     let _node_a = spawn_node_with(
@@ -543,25 +543,25 @@ async fn a_validator_funded_and_staked_at_runtime_activates_and_co_signs() {
     let _node_b = spawn_node_with(JOIN_B_RPC, JOIN_B_P2P, Some(JOIN_A_RPC), &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_b)], Some(&kp_b));
     wait_until_reachable(JOIN_B_RPC, Duration::from_secs(15)).await;
 
-    // Fund B from A's liquid reserve — `helix tx send`, signed by A's key. 110k HLX: 100k to stake
-    // plus a margin for fees, mirroring how the live validators were funded.
+    // Fund B from A's liquid reserve — `helix tx send`, signed by A's key. 15k HLX: 10k to stake
+    // plus a margin, mirroring how the live validators are funded.
     let (_kd_a, key_a) = temp_keyfile(&kp_a);
     let a_url = format!("http://127.0.0.1:{JOIN_A_RPC}");
     assert!(
-        run_cli(&a_url, &["tx", "send", &addr_b, "110000", "--key", key_a.to_str().unwrap()]),
+        run_cli(&a_url, &["tx", "send", &addr_b, "15000", "--key", key_a.to_str().unwrap()]),
         "helix tx send (fund B) exited non-zero"
     );
-    let funded = wait_for_account(JOIN_A_RPC, &addr_b, |a| a["balance_hlx"].as_f64().unwrap_or(0.0) >= 110_000.0, Duration::from_secs(30)).await;
-    assert!(funded, "B was never credited the 110k funding transfer");
+    let funded = wait_for_account(JOIN_A_RPC, &addr_b, |a| a["balance_hlx"].as_f64().unwrap_or(0.0) >= 15_000.0, Duration::from_secs(30)).await;
+    assert!(funded, "B was never credited the 15k funding transfer");
 
-    // B stakes 100k — `helix tx stake`, signed by B's key. This is the transaction that makes B a
+    // B stakes 10k — `helix tx stake`, signed by B's key. This is the transaction that makes B a
     // validator; it takes effect at the next epoch boundary and B activates one epoch after that.
     let (_kd_b, key_b) = temp_keyfile(&kp_b);
     assert!(
-        run_cli(&a_url, &["tx", "stake", "100000", "--key", key_b.to_str().unwrap()]),
+        run_cli(&a_url, &["tx", "stake", "10000", "--key", key_b.to_str().unwrap()]),
         "helix tx stake exited non-zero"
     );
-    let staked = wait_for_account(JOIN_A_RPC, &addr_b, |a| a["staked_hlx"].as_f64().unwrap_or(0.0) >= 100_000.0, Duration::from_secs(30)).await;
+    let staked = wait_for_account(JOIN_A_RPC, &addr_b, |a| a["staked_hlx"].as_f64().unwrap_or(0.0) >= 10_000.0, Duration::from_secs(30)).await;
     assert!(staked, "B's stake never took effect on chain");
 
     // B must cross **three** rotations before it is active: a new staker waits one epoch in
@@ -647,7 +647,7 @@ async fn wait_for_validator_active(rpc_port: u16, address: &str, timeout: Durati
 /// no genesis shortcut for pre-staking extra validators; a network grows from one validator by
 /// funding and staking more at runtime). Does NOT wait for activation: callers that stake several
 /// joiners want them to cross their activation epochs *together*, so staking is separated from the
-/// wait. `funder_key` signs the transfer (from the genesis validator's 500k reserve); `joiner_key`
+/// wait. `funder_key` signs the transfer (from the genesis validator's reserve); `joiner_key`
 /// signs the stake. Both submit through `funder_rpc`, and each step waits for its on-chain effect
 /// before returning, so A's nonce has advanced before the next funding transfer is signed (back to
 /// back transfers sharing a committed nonce would collide).
@@ -659,19 +659,20 @@ async fn fund_and_stake(
 ) {
     let addr = Address::from_public_key(&joiner_kp.public).to_string();
     let url = format!("http://127.0.0.1:{funder_rpc}");
-    // 110k HLX: 100k to stake plus a fee margin, mirroring how the live validators were funded.
+    // 15k HLX: 10k to stake plus a margin, mirroring how the live validators are funded. Three
+    // joiners take 45k of the 90k reserve.
     assert!(
-        run_cli(&url, &["tx", "send", &addr, "110000", "--key", funder_key.to_str().unwrap()]),
+        run_cli(&url, &["tx", "send", &addr, "15000", "--key", funder_key.to_str().unwrap()]),
         "helix tx send (fund {addr}) exited non-zero"
     );
-    let funded = wait_for_account(funder_rpc, &addr, |a| a["balance_hlx"].as_f64().unwrap_or(0.0) >= 110_000.0, Duration::from_secs(30)).await;
-    assert!(funded, "{addr} was never credited its 110k funding transfer");
+    let funded = wait_for_account(funder_rpc, &addr, |a| a["balance_hlx"].as_f64().unwrap_or(0.0) >= 15_000.0, Duration::from_secs(30)).await;
+    assert!(funded, "{addr} was never credited its 15k funding transfer");
 
     assert!(
-        run_cli(&url, &["tx", "stake", "100000", "--key", joiner_key.to_str().unwrap()]),
+        run_cli(&url, &["tx", "stake", "10000", "--key", joiner_key.to_str().unwrap()]),
         "helix tx stake ({addr}) exited non-zero"
     );
-    let staked = wait_for_account(funder_rpc, &addr, |a| a["staked_hlx"].as_f64().unwrap_or(0.0) >= 100_000.0, Duration::from_secs(30)).await;
+    let staked = wait_for_account(funder_rpc, &addr, |a| a["staked_hlx"].as_f64().unwrap_or(0.0) >= 10_000.0, Duration::from_secs(30)).await;
     assert!(staked, "{addr}'s stake never took effect on chain");
 }
 
@@ -909,7 +910,7 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
     // Accelerated block time so the two 100-block activation epochs the joiners cross pass in ~1
     // minute rather than ~7 (see JOIN_BLOCK_TIME_MS); it enters no hash and not the proposer
     // schedule. A is spawned with a known key so the test can sign the funding transfers from its
-    // 500k liquid reserve.
+    // liquid reserve.
     let fast = ("HELIX_BLOCK_TIME_MS", JOIN_BLOCK_TIME_MS);
     let _node_a = spawn_node_with(VAL_A_RPC, VAL_A_P2P, None, &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_a)], Some(&kp_a));
     wait_until_reachable(VAL_A_RPC, Duration::from_secs(15)).await;
@@ -1006,7 +1007,7 @@ async fn four_validators_survive_one_going_offline() {
     let seeds_d = format!("{},{},{}", ma(FT_A_P2P), ma(FT_B_P2P), ma(FT_C_P2P));
 
     // Accelerated block time (see JOIN_BLOCK_TIME_MS) so the joiners' activation epochs pass in
-    // ~1 minute; A carries a known key so the test can fund the other three from its 500k reserve.
+    // ~1 minute; A carries a known key so the test can fund the other three from its reserve.
     let fast = ("HELIX_BLOCK_TIME_MS", JOIN_BLOCK_TIME_MS);
     let _node_a = spawn_node_with(FT_A_RPC, FT_A_P2P, None, &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_a)], Some(&kp_a));
     wait_until_reachable(FT_A_RPC, Duration::from_secs(15)).await;

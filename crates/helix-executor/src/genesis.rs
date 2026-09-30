@@ -71,7 +71,7 @@ pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 10_000; // = MIN_VALIDATOR_STAKE
 /// Credited to whoever `GenesisConfig::validator` is, never a hardcoded address: this constant
 /// ships in a public repo, and naming one deployment's wallet here would prefund it on every
 /// chain anyone launches from this source. See `GENESIS_PREFUND` on why a founder allocation
-/// stays small; 500k is ~1.5% of the supply this chain eventually reaches.
+/// stays small; 90k is ~0.3% of the supply this chain eventually reaches.
 ///
 /// Raised from 100k on 2026-07-22, and the reason is arithmetic rather than appetite. A
 /// validator set needs **four** members before it survives one going offline (`3f + 1`), each
@@ -90,7 +90,12 @@ pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 10_000; // = MIN_VALIDATOR_STAKE
 /// It is a launch reserve to be handed out, not a holding. If a deployment ever wants a
 /// genuinely small founder balance, lower this *and* accept that its validator set grows only
 /// as fast as people arrive with their own stake.
-pub const VALIDATOR_GENESIS_LIQUID_HLX: u64 = 500_000;
+///
+/// Lowered to 90k on 2026-09-30 (Vistos' decision, with the 0.20.0 reset): the bootstrap
+/// validator starts with 100k in all — this plus its 10k stake. It still seeds the validators the
+/// network has (three at 15k apiece leave 45k), and the bootstrap validator's own block rewards
+/// refill it: ~0.5 HLX a block as one proposer of four is some ten thousand HLX a day.
+pub const VALIDATOR_GENESIS_LIQUID_HLX: u64 = 90_000;
 
 /// Pre-funded genesis wallets beyond the validator's bootstrap stake: (address, balance_HLX).
 /// Empty by design (decision 2026-07-15, superseding the 2026-07-05 decision to liquid-dump
@@ -252,12 +257,12 @@ impl GenesisConfig {
 
     /// Build the initial ChainState.
     /// - `total_supply` (the hard cap) = 33 M HLX, set once and never changed afterward.
-    /// - `total_issued` (what's actually in circulation) starts at just the validator's 100 k
-    ///   HLX bootstrap stake, its 100 k liquid reserve, and any `GENESIS_PREFUND` allocations —
-    ///   the remaining ~32.8 M HLX of headroom is minted gradually via `scheduled_block_reward`,
-    ///   not handed out here.
-    /// - circulating_supply = total_issued − total_burned (starts at ~200 k, grows with block
-    ///   rewards, shrinks with burns)
+    /// - `total_issued` (what's actually in circulation) starts at just the validator's bootstrap
+    ///   stake (`VALIDATOR_GENESIS_STAKE_HLX`), its liquid reserve (`VALIDATOR_GENESIS_LIQUID_HLX`)
+    ///   and any `GENESIS_PREFUND` allocations — the rest of the cap is minted gradually via
+    ///   `scheduled_block_reward`, not handed out here.
+    /// - circulating_supply = total_issued − total_burned (starts at the genesis allocation, grows
+    ///   with block rewards, shrinks with burns)
     pub fn build_state(&self) -> ChainState {
         let total_supply = TOTAL_SUPPLY_HLX * NANO_PER_HLX;
         let mut state = ChainState::new(total_supply);
@@ -621,7 +626,8 @@ mod tests {
         // meaningful share of supply here would make the halving schedule decoration.
         //
         // This bound was "rounds to 0%" until 2026-07-22, when `VALIDATOR_GENESIS_LIQUID_HLX`
-        // went from 100k to 500k and genesis reached ~1.8%. That was a deliberate devnet
+        // went from 100k to 500k and genesis reached ~1.8% (back to 90k, ~0.3%, on 2026-09-30).
+        // That was a deliberate devnet
         // decision by the CEO, not drift: a validator set needs four members to survive one
         // outage, each needs `MIN_VALIDATOR_STAKE`, and the bootstrap validator is the only
         // possible source of that capital on a chain nobody can mine their way into. The

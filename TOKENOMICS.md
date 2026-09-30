@@ -10,9 +10,10 @@ chain by a 2/3-of-stake governance proposal; everything else is fixed at genesis
 
 ## The one-paragraph version
 
-No pre-mine. Genesis hands the bootstrap validator 200,000 HLX and nothing else: 100,000
+No pre-mine. Genesis hands the bootstrap validator 100,000 HLX and nothing else: 10,000
 staked — exactly the minimum the rules demand of any validator — so the chain can produce
-blocks at all, plus 100,000 liquid so a slash that drops it under that minimum is recoverable.
+blocks at all, plus 90,000 liquid, so a slash that drops it under that minimum is recoverable
+and the first operators can be funded to stake.
 Every other coin is *earned* by producing blocks, via a Bitcoin-shaped halving emission. Each
 transaction burns a base fee proportional to its size and tips the validator whatever was paid
 above it. Security comes from staked HLX (Proof-of-Stake), not from the emission schedule — the
@@ -23,9 +24,9 @@ two are deliberately decoupled.
 | Quantity | Value |
 |---|---|
 | Hard supply cap (`TOTAL_SUPPLY_HLX`) | 33,000,000 HLX |
-| Genesis stake (bootstrap validator, non-liquid) | 100,000 HLX (= `MIN_VALIDATOR_STAKE`) |
-| Genesis liquid reserve (bootstrap validator) | 100,000 HLX (slash recovery — see below) |
-| Genesis total | 200,000 HLX (~0.6 % of what the chain ever reaches) |
+| Genesis stake (bootstrap validator, non-liquid) | 10,000 HLX (= `MIN_VALIDATOR_STAKE`) |
+| Genesis liquid reserve (bootstrap validator) | 90,000 HLX (slash recovery, funding the first operators) |
+| Genesis total | 100,000 HLX (~0.3 % of what the chain ever reaches) |
 | Initial block reward | 1 HLX/block |
 | Halving interval | 15,768,000 blocks (~1 year at 2 s blocks) |
 | Founder pre-mine beyond the above | none |
@@ -44,8 +45,12 @@ Summed, total emission converges to:
 Σ (1 HLX >> era) × 15,768,000 blocks  ≈  2 × 15,768,000  ≈  31,536,000 HLX
 ```
 
-So the **real asymptotic max supply is ≈ 31.7M HLX** (200k genesis + ~31.5M emitted), *minus*
+So the **real asymptotic max supply is ≈ 31.6M HLX** (100k genesis + ~31.5M emitted), *minus*
 cumulative burns.
+
+> **Genesis allocation 100k (2026-09-30, with the 0.20.0 reset).** 10k staked plus 90k liquid.
+> The history below explains the earlier figures; the minimum stake itself dropped from 100k to
+> 10k on 2026-08-26, and the reserve stood at 500k between 2026-07-22 and this reset.
 
 > **Genesis allocation cut 1M → 200k (2026-07-16).** The bootstrap validator now starts with
 > 100k staked — exactly `MIN_VALIDATOR_STAKE`, the same bar every other validator must clear —

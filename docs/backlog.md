@@ -106,8 +106,8 @@ no governance tx can shrink it. The structural answer is ≥4 validators (`3f+1`
 - [ ] **P2-9 (NEW-13) — Docker-compose multi-node testnet** that exercises validator
       joins across epoch boundaries, CI-runnable. Would have caught the current bug.
 - [ ] **P2-10 — Run ≥4 validators** (ops, not code): quorum 4/5 tolerates one fault and
-      restores self-healing. The 500k genesis reserve (`VALIDATOR_GENESIS_LIQUID_HLX`)
-      already exists to fund three more — use it.
+      restores self-healing. The genesis reserve (`VALIDATOR_GENESIS_LIQUID_HLX`, 90k since
+      2026-09-30) funds three more at 15k apiece — use it.
 
 ## DONE (this branch: `hardening/validator-liveness-tooling`)
 
