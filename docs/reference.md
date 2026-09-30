@@ -18,7 +18,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/blocks/height/:n/proof/:tx_hash` | Merkle inclusion proof for a transaction — replay it from the returned `leaf_hash`, not from `tx_hash` (see Transaction Format) |
 | GET | `/blocks/hash/:hash` | Block by hash |
 | GET | `/blocks/range` | Range of blocks (`?from=&count=`) — display view, per-tx status included; not the sync path (see `/sync/blocks`) |
-| GET | `/accounts/:address` | Balance, staked amount, nonce — 400 on invalid address format |
+| GET | `/accounts/:address` | Balance, staked amount, nonce, and `state_height` — the block the balance is as of, read together with it. A valid address the chain has never seen answers **404** with `state_height` too: its balance is zero as of that block. 400 on invalid address format |
 | GET | `/accounts/:address/name` | Registered `.hlx` name for this address |
 | GET | `/accounts/:address/personhood` | Proof of Personhood status |
 | GET | `/accounts/:address/guardians` | Social-recovery guardian set |
@@ -32,6 +32,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/governance/proposals` | Proposals whose voting period is still running (`?limit=&offset=`); a closed one leaves the state |
 | GET | `/governance/proposals/:id` | One proposal's status |
 | GET | `/mempool` | Pending transaction count |
+| GET | `/mempool/transactions` | The hash of every transaction waiting in this node's pool, sorted: `{"transactions": ["…"]}`. Each one's body is at `/transactions/:hash` |
 | GET | `/sync/blocks` | Raw block range for peer sync (`?from=&count=`). `&encoding=bincode` returns the same blocks as `application/octet-stream` instead of JSON — ~3.5× fewer bytes and a fraction of the serving node's CPU, because JSON renders every byte of an ML-DSA key or signature as a decimal number. Clients try it once and fall back to JSON if the peer does not know it. The JSON answer is streamed a block at a time; the bincode answer, `/blocks/range` and `/sync/snapshot` are built whole, so a node builds at most four of them at once — further requests wait for a place, and after 30 s get **503** with `Retry-After` |
 | GET | `/sync/checkpoint` | A height, block hash and **state root** to anchor a fast join to, in the exact shape `HELIX_TRUSTED_CHECKPOINT` takes (`{"height":10000,"block_hash":"…","state_root":"…","checkpoint":"10000:…:…"}`). **An answer, not a proof:** a checkpoint taken from the node you are about to sync from is the same party vouching for itself. It is worth something when it is *compared* — every node answers this, so ask two or three and see whether they agree. The `state_root` is the half that decides whether a snapshot can be believed at all; without it a joining node has nothing to check a state against that the serving peer does not also control. Names only a height where a join would actually succeed: the stored snapshot and the block at that height must both still be here. 404 while none is, which is normal on a young or freshly pruned node. |
 | GET | `/sync/snapshot` | The chain state plus the height it belongs to, as `application/octet-stream` (bincode only — nobody reads a snapshot, and JSON would cost 4.5x for nothing). Without a parameter: whatever state this node holds right now. With **`?height=N`**: the newest *stored* snapshot at or below N, or **404** — never a substitute. That distinction is the point. A receiver verifies a snapshot by hashing it and comparing against `prev_state_root` in the header of the next block, which is signed; it can only do that for a height that stands still, and the live tip moves while it is checking. Stored snapshots are taken every `HELIX_SNAPSHOT_INTERVAL` heights (default 10000). Verifying still needs the block it compares against to be genuine, which is an out-of-band checkpoint the operator supplies — what Ethereum calls weak subjectivity. |
@@ -39,7 +40,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/validators` | The active validator set: each validator's tier, stake, `voting_power`, commission and `reward_address`, plus the set's `total_voting_power` and `quorum_threshold` |
 | GET | `/diagnostics` | Operational state of this node — see below |
 | POST | `/transactions` | Submit a signed transaction — 400 if the signature, nonce slot, fee, or the sender's ability to pay it fails the check |
-| GET | `/transactions/:hash` | Transaction outcome — `applied` / `failed` (with `error`) / `pending` / `unknown`; 404 if no such transaction. Once in a block it also carries the transaction itself, `fee_burned_nano` / `fee_to_validator_nano` and the raw `data_hex` |
+| GET | `/transactions/:hash` | Transaction outcome — `applied` / `failed` (with `error`) / `pending` / `unknown`; 404 if no such transaction. A `pending` one carries `from`, `to`, `amount_nano`, `fee_nano`, `tx_type`, `nonce` and `memo`; once in a block it carries the whole transaction, `fee_burned_nano` / `fee_to_validator_nano` and the raw `data_hex` |
 
 **Exact amounts.** Every amount is reported twice: `…_hlx` as a JSON number, for display, and
 `…_nano` as a **decimal string** of nano-HLX, which is exact. A JSON number is a double in most
@@ -346,6 +347,7 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 | `helix-vm` | WASM contract execution (`wasmi`, fuel-metered, deterministic) |
 | `helix-zkp` | ZK-STARK proof generation/verification for Proof of Personhood |
 | `helix-rpc` | Axum REST API server (`:8545`) |
+| `helix-mesh` | The `helix-mesh` binary — a Mesh (Rosetta) Data API in front of a node's REST API, see [Integrating Helix](exchange-integration.md#mesh-rosetta-data-api) |
 | `helix-node` | The `helix` binary — `helix start` orchestrates all subsystems; other subcommands are the CLI client |
 | `helix-cli` | Client subcommand library (wallet, tx, chain, …) linked into the `helix` binary |
 

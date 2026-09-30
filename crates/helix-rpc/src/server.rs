@@ -206,6 +206,7 @@ fn router(state: AppState, limiter: Arc<RateLimiter>) -> Router {
         .route("/governance/proposals", get(get_governance_proposals))
         .route("/governance/proposals/:id", get(get_governance_proposal))
         .route("/mempool", get(get_mempool_info))
+        .route("/mempool/transactions", get(get_mempool_transactions))
         .route("/genesis", get(get_genesis))
         .route("/sync/blocks", get(get_sync_blocks))
         .route("/sync/tip-certificate", get(get_tip_certificate))
@@ -358,6 +359,7 @@ fn api_index() -> Json<Value> {
             "GET  /governance/proposals",
             "GET  /governance/proposals/{id}",
             "GET  /mempool",
+            "GET  /mempool/transactions",
             "GET  /genesis",
             "POST /transactions",
             "GET  /transactions/{hash}"
@@ -1072,11 +1074,16 @@ async fn get_account(
                 has_code: acc.code.is_some(),
                 jailed_until: chain.jailed_until.get(&address).copied(),
                 missed_blocks: chain.missed_blocks.get(&address).copied(),
+                state_height: chain.applied_height,
             })),
         ),
+        // A valid address with no history: its balance is zero as of this height (#261).
         None => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("account {} not found", address) })),
+            Json(json!({
+                "error": format!("account {} not found", address),
+                "state_height": chain.applied_height,
+            })),
         ),
     }
 }
@@ -1724,6 +1731,13 @@ async fn get_account_transactions(
     )
 }
 
+/// `GET /mempool/transactions` — the id of every transaction waiting in this node's pool, sorted
+/// (#261). Each one's body is at `GET /transactions/:hash`.
+async fn get_mempool_transactions(State(state): State<AppState>) -> Json<Value> {
+    let hashes = state.mempool.read().await.hashes();
+    Json(json!({ "transactions": hashes }))
+}
+
 async fn get_mempool_info(State(state): State<AppState>) -> Json<Value> {
     let mempool = state.mempool.read().await;
     Json(json!({
@@ -2096,10 +2110,22 @@ async fn get_transaction_status(
         Ok(None) => {
             drop(store);
             let pool = state.mempool.read().await;
-            if pool.contains(&tx_hash) {
+            if let Some(tx) = pool.get(&tx_hash) {
+                // The transaction itself, not only that it waits (#261): what a client following
+                // the pool needs to show it before it lands.
                 (
                     StatusCode::OK,
-                    Json(json!({ "hash": hash_hex, "status": "pending" })),
+                    Json(json!({
+                        "hash": hash_hex,
+                        "status": "pending",
+                        "from": tx.from.to_string(),
+                        "to": tx.to.as_ref().map(|a| a.to_string()),
+                        "amount_nano": tx.amount.to_string(),
+                        "fee_nano": tx.fee.to_string(),
+                        "tx_type": format!("{:?}", tx.tx_type),
+                        "nonce": tx.nonce,
+                        "memo": tx.memo(),
+                    })),
                 )
             } else if pool.expired_recently(&tx_hash) {
                 // Distinguishable from "never seen" (backlog #156). Answering both with the same
@@ -2764,13 +2790,44 @@ mod tests {
         let hash = pending.hash();
         state.mempool.write().await.add(pending, Hash::ZERO, None).unwrap();
 
-        let response = get_transaction_status(State(state), Path(hash.to_hex()))
+        let response = get_transaction_status(State(state.clone()), Path(hash.to_hex()))
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["status"], "pending");
+        // And the transaction itself, and its id in the pool's listing (#261).
+        assert_eq!(parsed["from"], alice.to_string());
+        assert_eq!(parsed["amount_nano"], "1");
+        assert_eq!(parsed["fee_nano"], "10000");
+        assert_eq!(parsed["tx_type"], "Transfer");
+        let listing = get_mempool_transactions(State(state)).await.0;
+        assert_eq!(listing["transactions"], json!([hash.to_hex()]));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A balance comes with the height it is from, read under the same lock (#261) — also for an
+    /// address with no history, whose balance is zero as of that height.
+    #[tokio::test]
+    async fn an_account_says_which_height_its_balance_is_from() {
+        let (state, path) = fresh_app_state();
+        let (known, unknown) = (addr(1), addr(2));
+        {
+            let mut chain = state.chain_state.write().await;
+            chain.update_account(&known, |acc| acc.balance = 5);
+            chain.applied_height = 41;
+        }
+        async fn body(response: axum::response::Response) -> (StatusCode, Value) {
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        let (status, account) = body(get_account(State(state.clone()), Path(known.to_string())).await.into_response()).await;
+        assert_eq!((status, &account["balance_nano"], &account["state_height"]), (StatusCode::OK, &json!("5"), &json!(41)));
+        let (status, missing) = body(get_account(State(state), Path(unknown.to_string())).await.into_response()).await;
+        assert_eq!((status, &missing["state_height"]), (StatusCode::NOT_FOUND, &json!(41)));
 
         let _ = std::fs::remove_file(&path);
     }

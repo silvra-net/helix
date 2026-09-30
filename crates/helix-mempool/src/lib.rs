@@ -796,6 +796,14 @@ impl Mempool {
     pub fn get(&self, hash: &Hash) -> Option<&Transaction> {
         self.by_hash.get(&hash.to_hex())
     }
+
+    /// The ids of every pending transaction, in hex, sorted — the listing a client that follows
+    /// the pool starts from (the Mesh `/mempool` endpoint, #261).
+    pub fn hashes(&self) -> Vec<String> {
+        let mut hashes: Vec<String> = self.by_hash.keys().cloned().collect();
+        hashes.sort();
+        hashes
+    }
 }
 
 impl Default for Mempool {

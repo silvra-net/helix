@@ -338,6 +338,11 @@ pub struct AccountResponse {
     /// Read it as a debt against the jail, not as "blocks missed": a validator signing one block
     /// in thirteen used to show `4` here forever while missing 92 % of them.
     pub missed_blocks: Option<u32>,
+    /// The height whose state these numbers are (#261): read under the same lock as the balance,
+    /// so a client that needs "this balance, as of this block" gets one consistent pair instead
+    /// of a second request racing the next block.
+    #[serde(default)]
+    pub state_height: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -13,6 +13,7 @@ members = [
     "crates/helix-cli",
     "crates/helix-vm",
     "crates/helix-zkp",
+    "crates/helix-mesh",
 ]
 # gui/ is a Tauri desktop app (own webview/system deps) — kept out of the workspace so
 # `cargo build/test --workspace` stays exactly as before. It path-depends on helix-crypto /

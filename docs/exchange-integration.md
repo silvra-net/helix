@@ -144,8 +144,45 @@ Submitting the same signed transaction twice is harmless: while it is pending th
 "already in mempool", once it is applied "Nonce already spent". Two *different* transactions with
 the same nonce can never both apply — that is how you replace a stuck withdrawal.
 
-## Not available yet
+## Mesh (Rosetta) Data API
 
-- **A Mesh (Rosetta) API.** Planned: the read side first (blocks, transactions, balances), built on
-  `balance_changes`. The Mesh specification has supported ML-DSA-65 since July 2026; Coinbase's Go
-  SDK and its `mesh-cli` validator do not yet.
+`helix-mesh` serves the read side of the [Mesh API](https://docs.cdp.coinbase.com/mesh/docs/welcome)
+(formerly Rosetta) in front of your node: `/network/list`, `/network/options`, `/network/status`,
+`/block`, `/block/transaction`, `/account/balance`, `/mempool`, `/mempool/transaction`. It is a
+separate process that reads the node's REST API — the same endpoints this page describes — so it
+can be restarted or upgraded without touching the node.
+
+```bash
+cargo build --release -p helix-mesh
+./target/release/helix-mesh --node http://127.0.0.1:8545 --listen 127.0.0.1:8080 --network testnet
+```
+
+(`HELIX_MESH_NODE`, `HELIX_MESH_LISTEN` and `HELIX_MESH_NETWORK` set the same.) The network
+identifier is `{"blockchain": "Helix", "network": "<--network>"}`; the currency is
+`{"symbol": "HLX", "decimals": 9}`, and every amount is in nano-HLX.
+
+**The node behind it must have executed every block itself** with a build that records balance
+changes (the one after 0.20.1): synced from genesis, not joined from a checkpoint, not pruning.
+Blocks come from those records, so a block the node has no record of is refused (error 5), never
+shown with operations missing.
+
+What a block holds:
+
+| Operation | What it is |
+|---|---|
+| `FEE` | the fee a transaction paid, on its sender. A **failed** transaction carries only this: what it charged is its fee |
+| `TRANSFER`, `STAKE`, `CALL_CONTRACT`, … | the rest of what an applied transaction moved, one type per transaction type |
+| `CONTRACT_TRANSFER` | a payment a contract made during the transaction that called it |
+| `REWARD` | a validator's tips, block reward and commission. The block reward is its own transaction, `reward-<block hash>` |
+| `GENESIS` | the genesis allocations, in transaction `genesis-<genesis hash>` of block 0 (whose parent is itself, as the specification asks) |
+
+Every operation is `SUCCESS`, and together they account for every liquid balance a block moved —
+`mesh-cli check:data` reconciles every account against `/account/balance` without exemptions.
+Staked and unbonding amounts are not liquid balance and are not shown as one.
+
+Balances are available at the current block only (`historical_balance_lookup: false`); asked for
+another block, `/account/balance` answers error 7 rather than a balance from the wrong one.
+
+**Not served yet:** the Construction API (building and signing transactions). The Mesh
+specification has supported ML-DSA-65 since July 2026, but Coinbase's Go SDK and `mesh-cli` do not;
+sign with the CLI (`--offline`, [Sending withdrawals](#sending-withdrawals)) until they do.

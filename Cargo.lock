@@ -1449,6 +1449,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "helix-mesh"
+version = "0.20.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bincode",
+ "clap",
+ "helix-core",
+ "helix-crypto",
+ "helix-executor",
+ "helix-rpc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "helix-node"
 version = "0.20.1"
 dependencies = [
