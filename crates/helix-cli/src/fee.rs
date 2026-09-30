@@ -13,38 +13,47 @@ use anyhow::{bail, Context, Result};
 use helix_core::Transaction;
 use helix_crypto::KeyPair;
 
-const NANO_PER_HLX_F: f64 = 1_000_000_000.0;
+/// An amount the user typed in HLX, held exactly in nano-HLX.
+///
+/// Parsed from the digits as written (`helix_core::fee::parse_hlx`), never through an `f64`.
+/// It used to be `f64 × 1e9` cast with `as u64`, and that cast truncates: 2.01 × 1e9 is
+/// 2_009_999_999.999…, so `helix tx send <addr> 2.01` signed a transfer of **2.009999999** HLX.
+/// About one cent in five came out one nano short — invisible in a wallet, and exactly what an
+/// exchange reconciling withdrawals to the nano cannot live with.
+///
+/// Before that, the same cast answered *something* for every input: `nan` signed a zero-value
+/// transfer and charged its fee, `inf` became 18 billion HLX. Parsing text refuses both, and
+/// anything else that is not an amount, before anything is signed. It also caps at the supply:
+/// no larger amount can exist, so a larger number is a typo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Hlx(u64);
 
-/// Convert a user-typed HLX amount into nano-HLX, rejecting what cannot be an amount.
-///
-/// `as u64` on an `f64` is a saturating cast that answers *something* for every input, which is
-/// how `helix tx send <addr> nan` used to work: NaN becomes 0, so the CLI printed "Sending NaN
-/// HLX", signed a zero-value transfer, and the sender paid a fee for a transaction the executor
-/// was always going to reject. `inf` became `u64::MAX` — 18 billion HLX — and failed on balance
-/// instead. Neither is a typo worth charging someone for.
-///
-/// Also caps at the supply: no amount above it can exist, and past ~9M HLX an `f64` can no longer
-/// represent single nano anyway (53-bit mantissa vs. the 55 bits the cap needs), so a number
-/// beyond that is not a precise instruction to begin with.
-pub fn hlx_to_nano(amount_hlx: f64) -> Result<u64> {
-    if amount_hlx.is_nan() {
-        bail!("'{amount_hlx}' is not an amount");
+impl Hlx {
+    pub fn nano(self) -> u64 {
+        self.0
     }
-    if amount_hlx.is_infinite() {
-        bail!("an amount must be finite, not {amount_hlx}");
+}
+
+impl std::str::FromStr for Hlx {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        let nano = helix_core::fee::parse_hlx(text)?;
+        let supply = helix_executor::genesis::TOTAL_SUPPLY_HLX;
+        if nano > supply * 1_000_000_000 {
+            return Err(format!(
+                "{} HLX is more than the entire supply ({supply} HLX)",
+                text.trim()
+            ));
+        }
+        Ok(Hlx(nano))
     }
-    if amount_hlx < 0.0 {
-        bail!("an amount cannot be negative ({amount_hlx})");
+}
+
+impl std::fmt::Display for Hlx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&helix_core::fee::nano_as_hlx(self.0))
     }
-    let nano = amount_hlx * NANO_PER_HLX_F;
-    let max = helix_executor::genesis::TOTAL_SUPPLY_HLX as f64 * NANO_PER_HLX_F;
-    if nano > max {
-        bail!(
-            "{amount_hlx} HLX is more than the entire supply ({} HLX)",
-            helix_executor::genesis::TOTAL_SUPPLY_HLX
-        );
-    }
-    Ok(nano as u64)
 }
 
 /// What the chain charges per transaction byte right now, straight from the node that will be
@@ -135,31 +144,48 @@ mod tests {
     /// not amounts. Each of these used to produce a signed transaction: NaN a zero-value transfer
     /// the executor always rejects, infinity a claim on 18 billion HLX. The sender paid the fee
     /// either way.
+    fn hlx(text: &str) -> Result<u64, String> {
+        text.parse::<Hlx>().map(Hlx::nano)
+    }
+
     #[test]
     fn nonsense_is_refused_rather_than_silently_cast_to_a_number() {
-        assert!(hlx_to_nano(f64::NAN).is_err(), "NaN as u64 is 0 — a zero-value transfer");
-        assert!(hlx_to_nano(f64::INFINITY).is_err(), "inf as u64 is u64::MAX");
-        assert!(hlx_to_nano(f64::NEG_INFINITY).is_err());
-        assert!(hlx_to_nano(-1.0).is_err(), "negative as u64 is 0");
-        assert!(hlx_to_nano(-0.000_000_001).is_err());
+        for text in ["nan", "NaN", "inf", "-inf", "-1", "-0.000000001", "", "1e3", "ten"] {
+            assert!(hlx(text).is_err(), "{text:?} must not become an amount");
+        }
     }
 
     #[test]
     fn an_amount_beyond_the_entire_supply_is_refused() {
-        let cap = helix_executor::genesis::TOTAL_SUPPLY_HLX as f64;
-        assert!(hlx_to_nano(cap).is_ok(), "the cap itself is representable");
-        assert!(hlx_to_nano(cap + 1.0).is_err());
-        assert!(hlx_to_nano(f64::MAX).is_err());
+        let cap = helix_executor::genesis::TOTAL_SUPPLY_HLX;
+        let whole_supply = hlx(&cap.to_string()).unwrap();
+        assert_eq!(whole_supply, cap * 1_000_000_000, "the cap itself is an amount");
+        assert!(hlx(&format!("{cap}.000000001")).is_err());
+        assert!(hlx(&(cap + 1).to_string()).is_err());
+        assert!(hlx("18446744073709551616").is_err(), "past u64 is refused, not wrapped");
     }
 
     #[test]
     fn ordinary_amounts_convert_exactly() {
-        assert_eq!(hlx_to_nano(0.0).unwrap(), 0, "zero is a valid input here — the executor is what rejects a zero transfer, with a message about transfers rather than about parsing");
-        assert_eq!(hlx_to_nano(1.0).unwrap(), 1_000_000_000);
-        assert_eq!(hlx_to_nano(0.1).unwrap(), 100_000_000);
-        assert_eq!(hlx_to_nano(1.5).unwrap(), 1_500_000_000);
-        assert_eq!(hlx_to_nano(0.000_000_001).unwrap(), 1, "one nano, the smallest unit");
-        assert_eq!(hlx_to_nano(100_000.0).unwrap(), 100_000 * 1_000_000_000);
+        assert_eq!(hlx("0").unwrap(), 0, "zero is a valid input here — the executor is what rejects a zero transfer, with a message about transfers rather than about parsing");
+        assert_eq!(hlx("1").unwrap(), 1_000_000_000);
+        assert_eq!(hlx("0.1").unwrap(), 100_000_000);
+        assert_eq!(hlx("1.5").unwrap(), 1_500_000_000);
+        assert_eq!(hlx("0.000000001").unwrap(), 1, "one nano, the smallest unit");
+        assert_eq!(hlx("100000").unwrap(), 100_000 * 1_000_000_000);
+    }
+
+    /// The truncating cast signed 2.01 HLX as 2.009999999. Every cent from 0.01 to 99.99, and the
+    /// shape an amount is shown in, must come back as exactly what was typed.
+    #[test]
+    fn a_typed_amount_is_signed_to_the_nano() {
+        assert_eq!(hlx("2.01").unwrap(), 2_010_000_000);
+        for cents in 1..10_000u64 {
+            let text = format!("{}.{:02}", cents / 100, cents % 100);
+            assert_eq!(hlx(&text).unwrap(), cents * 10_000_000, "{text}");
+        }
+        let shown = Hlx(12_345_678_901).to_string();
+        assert_eq!(hlx(&shown).unwrap(), 12_345_678_901, "reads back as shown ({shown})");
     }
 
     fn unsigned_transfer(kp: &KeyPair) -> Transaction {

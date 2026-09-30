@@ -2,6 +2,26 @@ export function hlx(n: number): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: 9 });
 }
 
+/// The amount rule the wallet's backend applies (`helix_core::fee::parse_hlx`): digits, at most one
+/// decimal separator (`.` or `,`), at most nine decimals — a nano-HLX is the smallest amount. The
+/// text itself goes to the backend and is signed exactly as typed; the number returned here is only
+/// for comparing against a balance. `null` when the backend would refuse the text, so a form never
+/// offers to send what will be turned down (`Number("1e3")` is 1000, but "1e3" is not an amount).
+export function amountValue(text: string): number | null {
+  const t = text.trim();
+  if (!/^(\d+([.,]\d{0,9})?|[.,]\d{1,9})$/.test(t)) return null;
+  return Number(t.replace(",", "."));
+}
+
+/// A computed amount (balance minus a reserve, a shortfall) as text the backend reads: at most
+/// `decimals` places, trailing zeros dropped. `String(n)` would hand over whatever a float
+/// subtraction left behind — `9999.999999999998` has twelve decimals and would be refused.
+export function amountInput(n: number, decimals = 9): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  const text = n.toFixed(decimals);
+  return text.includes(".") ? text.replace(/0+$/, "").replace(/\.$/, "") : text;
+}
+
 export function shortAddr(a: string | null | undefined): string {
   if (!a) return "—";
   return a.length > 18 ? `${a.slice(0, 10)}…${a.slice(-6)}` : a;

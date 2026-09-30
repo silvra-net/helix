@@ -5,7 +5,7 @@ use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
-use crate::fee::{hlx_to_nano, price_and_sign};
+use crate::fee::{price_and_sign, Hlx};
 use crate::passphrase::Signer;
 
 #[derive(Subcommand)]
@@ -30,8 +30,8 @@ pub enum ContractCmd {
         /// Contract address (as returned by `deploy`, i.e. the deployer's address)
         address: String,
         /// Amount in HLX to send along with the call (default: 0)
-        #[arg(long, default_value_t = 0.0)]
-        amount: f64,
+        #[arg(long, default_value = "0")]
+        amount: Hlx,
         /// Input data passed to the contract's `call` function via the `get_input` host
         /// import, as a UTF-8 string — the contract's own bytecode decides what this means
         #[arg(long)]
@@ -118,7 +118,7 @@ async fn deploy(
 
 async fn call(
     address: String,
-    amount_hlx: f64,
+    amount: Hlx,
     data: Option<String>,
     signer: Signer,
     fee: Option<u64>,
@@ -131,7 +131,7 @@ async fn call(
     let to_addr = Address::from_str(&address)
         .map_err(|e| anyhow::anyhow!("Invalid contract address: {}", e))?;
 
-    let amount_nano = hlx_to_nano(amount_hlx)?;
+    let amount_nano = amount.nano();
     let nonce = match nonce_override {
         Some(n) => n,
         None => super::fetch_nonce(node, &kf.address).await?,
@@ -155,7 +155,7 @@ async fn call(
     price_and_sign(&mut tx, fee, &kp, node).await?;
 
     println!("Calling contract {}", address);
-    println!("  Amount: {:.9} HLX", amount_hlx);
+    println!("  Amount: {} HLX", amount);
     println!("  Fee   : {} nano-HLX (execution fuel budget)", tx.fee);
     println!("  Nonce : {}", nonce);
 

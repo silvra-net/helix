@@ -127,6 +127,10 @@ helix tx send hlx... 10.5 --key alice.json --fee 20000  # pin the fee yourself; 
 helix tx status <hash>                                 # applied / failed (+ reason) / pending
 ```
 
+Amounts are in HLX and are signed exactly as written: up to nine decimals (one nano-HLX,
+0.000000001, is the smallest unit), with `.` or `,` as the separator. Anything else — `1e3`, a
+tenth decimal, a minus sign — is refused before anything is signed.
+
 ### Fees
 
 Helix charges **per transaction byte**, not per transaction: a block carries a base fee

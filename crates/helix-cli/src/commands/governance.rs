@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
@@ -37,23 +37,18 @@ impl From<GovParamArg> for GovernanceParam {
 /// mempool, printed `New value : 5000`, and failed in block #22 with "below the minimum safe
 /// floor 1000000000000". Safe is not the same as usable, and the one time this command matters
 /// is the one time nobody has a spare block to burn.
-fn on_chain_value(param: &GovParamArg, typed: f64) -> Result<(u64, String)> {
+fn on_chain_value(param: &GovParamArg, typed: &str) -> Result<(u64, String)> {
     match param {
         GovParamArg::MinValidatorStake => {
-            let nano = crate::fee::hlx_to_nano(typed)?;
-            Ok((nano, format!("{typed} HLX ({nano} nano-HLX)")))
+            let amount: crate::fee::Hlx = typed.parse().map_err(anyhow::Error::msg)?;
+            let nano = amount.nano();
+            Ok((nano, format!("{amount} HLX ({nano} nano-HLX)")))
         }
         GovParamArg::FuelPerFeeUnit => {
-            if typed.fract() != 0.0 {
-                bail!("fuel-per-fee-unit is a whole number, not {typed}");
-            }
-            if typed < 0.0 {
-                bail!("fuel-per-fee-unit cannot be negative ({typed})");
-            }
-            if typed > u64::MAX as f64 {
-                bail!("fuel-per-fee-unit {typed} is out of range");
-            }
-            let v = typed as u64;
+            let typed = typed.trim();
+            let v: u64 = typed
+                .parse()
+                .map_err(|_| anyhow!("fuel-per-fee-unit is a whole number, not {typed}"))?;
             Ok((v, format!("{v} (unitless)")))
         }
     }
@@ -68,7 +63,7 @@ pub enum GovernanceCmd {
         #[arg(value_enum)]
         param: GovParamArg,
         /// New value: HLX for min-validator-stake, a plain count for fuel-per-fee-unit
-        new_value: f64,
+        new_value: String,
         #[command(flatten)]
         signer: Signer,
         /// Fee in nano-HLX (default: 10000)
@@ -114,14 +109,14 @@ pub async fn run(cmd: GovernanceCmd, node: &str) -> Result<()> {
 
 async fn propose(
     param: GovParamArg,
-    new_value: f64,
+    new_value: String,
     signer: Signer,
     fee: Option<u64>,
     node: &str,
 ) -> Result<()> {
     // Before anything else, and before the passphrase prompt: a unit mistake should cost
     // nothing, not a fee and a block (see `on_chain_value`).
-    let (new_value, shown) = on_chain_value(&param, new_value)?;
+    let (new_value, shown) = on_chain_value(&param, &new_value)?;
 
     let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
@@ -301,7 +296,7 @@ async fn submit(tx: &Transaction, node: &str) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helix_executor::genesis::{MIN_VALIDATOR_STAKE, NANO_PER_HLX};
+    use helix_executor::genesis::MIN_VALIDATOR_STAKE;
 
     /// Ties the CLI's unit handling to the chain's own floor check rather than restating the
     /// conversion factor — a test that recomputes `typed * 1e9` would pass against any
@@ -315,13 +310,15 @@ mod tests {
     fn a_stake_typed_in_hlx_clears_the_chains_floor() {
         // Governance may lower the minimum to a hundredth of the compiled-in value; typed in HLX,
         // that is what an operator would enter.
-        let floor_hlx = (MIN_VALIDATOR_STAKE / 100) as f64 / NANO_PER_HLX as f64;
+        let floor = MIN_VALIDATOR_STAKE / 100;
+        let floor_hlx = helix_core::fee::nano_as_hlx(floor);
 
-        let (at_floor, _) = on_chain_value(&GovParamArg::MinValidatorStake, floor_hlx).unwrap();
+        let (at_floor, _) = on_chain_value(&GovParamArg::MinValidatorStake, &floor_hlx).unwrap();
         assert_eq!(at_floor, MIN_VALIDATOR_STAKE / 100);
         assert!(GovernanceParam::MinValidatorStake.validate(at_floor).is_ok());
 
-        let (above, shown) = on_chain_value(&GovParamArg::MinValidatorStake, floor_hlx * 5.0).unwrap();
+        let five_times = helix_core::fee::nano_as_hlx(floor * 5);
+        let (above, shown) = on_chain_value(&GovParamArg::MinValidatorStake, &five_times).unwrap();
         assert!(GovernanceParam::MinValidatorStake.validate(above).is_ok());
         assert!(shown.contains("HLX"), "the unit must be visible before signing: {shown}");
     }
@@ -334,16 +331,16 @@ mod tests {
             GovernanceParam::MinValidatorStake.validate(5000).is_err(),
             "if a bare 5000 ever becomes valid, this command's unit handling needs rethinking"
         );
-        let (converted, _) = on_chain_value(&GovParamArg::MinValidatorStake, 5000.0).unwrap();
+        let (converted, _) = on_chain_value(&GovParamArg::MinValidatorStake, "5000").unwrap();
         assert!(GovernanceParam::MinValidatorStake.validate(converted).is_ok());
     }
 
     #[test]
     fn fuel_per_fee_unit_stays_unitless() {
-        let (v, shown) = on_chain_value(&GovParamArg::FuelPerFeeUnit, 5.0).unwrap();
+        let (v, shown) = on_chain_value(&GovParamArg::FuelPerFeeUnit, "5").unwrap();
         assert_eq!(v, 5);
         assert!(!shown.contains("HLX"), "no HLX scaling for a bare count: {shown}");
-        assert!(on_chain_value(&GovParamArg::FuelPerFeeUnit, 2.5).is_err());
-        assert!(on_chain_value(&GovParamArg::FuelPerFeeUnit, -1.0).is_err());
+        assert!(on_chain_value(&GovParamArg::FuelPerFeeUnit, "2.5").is_err());
+        assert!(on_chain_value(&GovParamArg::FuelPerFeeUnit, "-1").is_err());
     }
 }

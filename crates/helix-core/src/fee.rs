@@ -139,6 +139,44 @@ pub fn name_registration_price(name_len: usize) -> u64 {
     }
 }
 
+/// Read an HLX amount as a person writes it — `10`, `2.01`, `0,5` — into nano-HLX, exactly (#257).
+///
+/// Wallets used to multiply a float by 10⁹ and cut off the rest: `2.01` became 2,009,999,999
+/// nano, a nano short, and so did 224 of the 9,999 amounts from 0.01 to 99.99. A person sending
+/// 2.01 HLX sends 2.01 HLX, and an exchange reconciling amounts needs them to the nano. So the
+/// digits are read as digits. More than nine decimals is refused rather than rounded: nothing on
+/// the chain is smaller than one nano, and dropping what someone typed is not a choice to make
+/// for them. Comma or point, no sign, no exponent. Checks against no supply cap — that belongs to
+/// the caller, which knows it.
+pub fn parse_hlx(input: &str) -> Result<u64, String> {
+    let text = input.trim();
+    if text.starts_with('-') {
+        return Err(format!("an amount cannot be negative ({text})"));
+    }
+    let (whole, fraction) = match text.split_once(['.', ',']) {
+        Some((w, f)) => (w, f),
+        None => (text, ""),
+    };
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) {
+        return Err(format!("'{text}' is not an amount — write it like 10, 2.01 or 0,5"));
+    }
+    if fraction.len() > 9 {
+        return Err(format!(
+            "'{text}' has {} decimals; one nano-HLX (0.000000001) is the smallest amount",
+            fraction.len()
+        ));
+    }
+    let whole: u64 = if whole.is_empty() { 0 } else {
+        whole.parse().map_err(|_| format!("'{text}' is too large to be an amount"))?
+    };
+    let fraction: u64 = format!("{fraction:0<9}").parse().expect("nine ASCII digits");
+    whole
+        .checked_mul(1_000_000_000)
+        .and_then(|n| n.checked_add(fraction))
+        .ok_or_else(|| format!("'{text}' is too large to be an amount"))
+}
+
 /// Exact decimal HLX for a nano amount, without trailing zeros (integer arithmetic — a fee
 /// shown to a person deciding whether to pay it should not pass through a float).
 pub fn nano_as_hlx(nano: u64) -> String {
@@ -193,6 +231,29 @@ pub fn wallet_priced_size(tx: &crate::Transaction) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every amount from 0.01 to 99.99 in cents comes out exact — 224 of them lost a nano through
+    /// the float — and the ways not to be an amount are refused, not rounded (#257).
+    #[test]
+    fn an_amount_is_read_as_the_digits_it_is() {
+        for cents in 1..10_000u64 {
+            let text = format!("{}.{:02}", cents / 100, cents % 100);
+            assert_eq!(parse_hlx(&text), Ok(cents * 10_000_000), "{text}");
+        }
+        assert_eq!(parse_hlx("2.01"), Ok(2_010_000_000));
+        assert_eq!(parse_hlx("0,5"), Ok(500_000_000), "a comma is a decimal point");
+        assert_eq!(parse_hlx(" 10 "), Ok(10_000_000_000));
+        assert_eq!(parse_hlx(".5"), Ok(500_000_000));
+        assert_eq!(parse_hlx("0.000000001"), Ok(1), "one nano, the smallest amount");
+        assert_eq!(parse_hlx("12345678.901234567"), Ok(12_345_678_901_234_567));
+        let refused_texts =
+            ["", ".", "-1", "1e3", "abc", "1.2.3", "NaN", "inf", "0.0000000001", "1 000"];
+        for refused in refused_texts {
+            assert!(parse_hlx(refused).is_err(), "{refused:?} must be refused");
+        }
+        assert!(parse_hlx("99999999999").is_err(), "overflows u64 in nano");
+        assert_eq!(nano_as_hlx(parse_hlx("2.01").unwrap()), "2.01", "and it reads back the same");
+    }
 
     #[test]
     fn a_name_costs_more_the_shorter_it_is() {

@@ -55,25 +55,25 @@ export const api = {
   getHistory: (node: string, limit = 25) =>
     invoke<HistoryEntry[]>("get_history", { node, limit }),
 
-  sendHlx: (node: string, to: string, amountHlx: number, fee?: number) =>
+  sendHlx: (node: string, to: string, amountHlx: string, fee?: number) =>
     invoke<SubmitResult>("send_hlx", { node, to, amountHlx, fee: fee ?? null }),
 
   // staking / delegation
-  stake: (node: string, amountHlx: number) =>
+  stake: (node: string, amountHlx: string) =>
     invoke<SubmitResult>("stake", { node, amountHlx }),
 
-  unstake: (node: string, amountHlx: number) =>
+  unstake: (node: string, amountHlx: string) =>
     invoke<SubmitResult>("unstake", { node, amountHlx }),
 
   claimUnbonded: (node: string) => invoke<SubmitResult>("claim_unbonded", { node }),
 
-  delegate: (node: string, validator: string, amountHlx: number) =>
+  delegate: (node: string, validator: string, amountHlx: string) =>
     invoke<SubmitResult>("delegate", { node, validator, amountHlx }),
 
-  undelegate: (node: string, validator: string, amountHlx: number) =>
+  undelegate: (node: string, validator: string, amountHlx: string) =>
     invoke<SubmitResult>("undelegate", { node, validator, amountHlx }),
 
-  redelegate: (node: string, fromValidator: string, toValidator: string, amountHlx: number) =>
+  redelegate: (node: string, fromValidator: string, toValidator: string, amountHlx: string) =>
     invoke<SubmitResult>("redelegate", { node, fromValidator, toValidator, amountHlx }),
 
   setCommission: (node: string, bps: number) =>

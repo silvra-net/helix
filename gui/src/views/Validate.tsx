@@ -3,7 +3,7 @@ import { api, DEFAULT_NODE, LOCAL_NODE, isLocalNode } from "../api";
 import { refusedLocalChain } from "../nodeRefusal";
 import { StakeActionPanel, type StakeAction } from "../components/StakeActionPanel";
 import type { LogLine, NetworkStatus, NodeProcessStatus, Overview, SubmitResult, ValidatorPool, ValidatorStatus } from "../types";
-import { hlx, shortAddr, shortHash } from "../format";
+import { amountInput, amountValue, hlx, shortAddr, shortHash } from "../format";
 
 // Everything to do with being (or becoming) a validator lives here, in one place — status of the
 // node you're connected to, your own stake against the eligibility threshold (stake, unstake,
@@ -167,8 +167,8 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
   const pct = vs && vs.min_validator_stake_hlx > 0
     ? Math.min(100, (vs.effective_stake_hlx / vs.min_validator_stake_hlx) * 100)
     : 0;
-  const amt = Number(amount);
-  const amtValid = amount.trim() !== "" && Number.isFinite(amt) && amt > 0;
+  const amt = amountValue(amount) ?? 0;
+  const amtValid = amt > 0;
   const balance = ov?.balance_hlx ?? 0;
   // Staking moves liquid balance into stake; asking to stake more than you hold only earns a
   // rejected transaction (and its fee). Catch it here, the same way Send guards a transfer.
@@ -319,12 +319,12 @@ export default function Validate({ node, net, onNodeChange, walletEncrypted }: {
         </div>
         <div className="row-actions end">
           {shortfall > 0 && balance > 0 && (
-            <button onClick={() => setAmount(String(Math.min(shortfall, balance)))}>
+            <button onClick={() => setAmount(amountInput(Math.min(shortfall, balance)))}>
               Fill the gap ({hlx(Math.min(shortfall, balance))})
             </button>
           )}
           <button onClick={() => setAction({ kind: "unstake" })}>Unstake…</button>
-          <button className="primary" disabled={!amtValid || overStake} onClick={() => run(() => api.stake(node, amt))}>
+          <button className="primary" disabled={!amtValid || overStake} onClick={() => run(() => api.stake(node, amount.trim()))}>
             Stake
           </button>
         </div>

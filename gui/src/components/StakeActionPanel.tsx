@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { SubmitResult } from "../types";
-import { shortAddr } from "../format";
+import { amountValue, shortAddr } from "../format";
 
 // Shared by Validate.tsx (stake/unstake/commission — actions on your own validator) and
 // Earn.tsx (delegate/undelegate/redelegate — actions on someone else's). One panel because
@@ -59,8 +59,8 @@ export function StakeActionPanel({
     };
   }, [action.kind, payoutTrimmed]);
 
-  const amt = Number(amount);
-  const amtValid = amount.trim() !== "" && Number.isFinite(amt) && amt > 0;
+  const amt = amountValue(amount) ?? 0;
+  const amtValid = amt > 0;
 
   const title: Record<StakeAction["kind"], string> = {
     stake: "Stake HLX",
@@ -78,23 +78,23 @@ export function StakeActionPanel({
   switch (action.kind) {
     case "stake":
       canSubmit = amtValid;
-      submit = () => api.stake(node, amt);
+      submit = () => api.stake(node, amount.trim());
       break;
     case "unstake":
       canSubmit = amtValid;
-      submit = () => api.unstake(node, amt);
+      submit = () => api.unstake(node, amount.trim());
       break;
     case "delegate":
       canSubmit = amtValid && validator.trim().startsWith("hlx");
-      submit = () => api.delegate(node, validator.trim(), amt);
+      submit = () => api.delegate(node, validator.trim(), amount.trim());
       break;
     case "undelegate":
       canSubmit = amtValid;
-      submit = () => api.undelegate(node, action.validator, amt);
+      submit = () => api.undelegate(node, action.validator, amount.trim());
       break;
     case "redelegate":
       canSubmit = amtValid && toValidator.trim().startsWith("hlx");
-      submit = () => api.redelegate(node, action.validator, toValidator.trim(), amt);
+      submit = () => api.redelegate(node, action.validator, toValidator.trim(), amount.trim());
       break;
     case "commission": {
       const p = Number(percent);

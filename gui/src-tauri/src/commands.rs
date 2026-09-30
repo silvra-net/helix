@@ -259,9 +259,9 @@ async fn resolve_recipient(node: &str, to: &str) -> Result<Address, String> {
 }
 
 #[tauri::command]
-pub async fn send_hlx(state: State<'_, WalletState>, node: String, to: String, amount_hlx: f64, fee: Option<u64>) -> Result<rpc::SubmitResult, String> {
+pub async fn send_hlx(state: State<'_, WalletState>, node: String, to: String, amount_hlx: String, fee: Option<u64>) -> Result<rpc::SubmitResult, String> {
     let to_addr = resolve_recipient(&node, &to).await?;
-    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    let amount = pricing::hlx_to_nano(&amount_hlx)?;
     build_sign_submit(&state, &node, TxType::Transfer, Some(to_addr), amount, vec![], fee).await
 }
 
@@ -303,14 +303,14 @@ pub async fn my_name(state: State<'_, WalletState>, node: String) -> Result<Opti
 // ---------- staking ----------
 
 #[tauri::command]
-pub async fn stake(state: State<'_, WalletState>, node: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
-    let amount = pricing::hlx_to_nano(amount_hlx)?;
+pub async fn stake(state: State<'_, WalletState>, node: String, amount_hlx: String) -> Result<rpc::SubmitResult, String> {
+    let amount = pricing::hlx_to_nano(&amount_hlx)?;
     build_sign_submit(&state, &node, TxType::Stake, None, amount, vec![], None).await
 }
 
 #[tauri::command]
-pub async fn unstake(state: State<'_, WalletState>, node: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
-    let amount = pricing::hlx_to_nano(amount_hlx)?;
+pub async fn unstake(state: State<'_, WalletState>, node: String, amount_hlx: String) -> Result<rpc::SubmitResult, String> {
+    let amount = pricing::hlx_to_nano(&amount_hlx)?;
     build_sign_submit(&state, &node, TxType::Unstake, None, amount, vec![], None).await
 }
 
@@ -329,24 +329,24 @@ pub async fn unjail(state: State<'_, WalletState>, node: String) -> Result<rpc::
 }
 
 #[tauri::command]
-pub async fn delegate(state: State<'_, WalletState>, node: String, validator: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
+pub async fn delegate(state: State<'_, WalletState>, node: String, validator: String, amount_hlx: String) -> Result<rpc::SubmitResult, String> {
     let v = parse_validator(&validator)?;
-    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    let amount = pricing::hlx_to_nano(&amount_hlx)?;
     build_sign_submit(&state, &node, TxType::Delegate, Some(v), amount, vec![], None).await
 }
 
 #[tauri::command]
-pub async fn undelegate(state: State<'_, WalletState>, node: String, validator: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
+pub async fn undelegate(state: State<'_, WalletState>, node: String, validator: String, amount_hlx: String) -> Result<rpc::SubmitResult, String> {
     let v = parse_validator(&validator)?;
-    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    let amount = pricing::hlx_to_nano(&amount_hlx)?;
     build_sign_submit(&state, &node, TxType::Undelegate, Some(v), amount, vec![], None).await
 }
 
 #[tauri::command]
-pub async fn redelegate(state: State<'_, WalletState>, node: String, from_validator: String, to_validator: String, amount_hlx: f64) -> Result<rpc::SubmitResult, String> {
+pub async fn redelegate(state: State<'_, WalletState>, node: String, from_validator: String, to_validator: String, amount_hlx: String) -> Result<rpc::SubmitResult, String> {
     let src = parse_validator(&from_validator)?;
     let dst = parse_validator(&to_validator)?;
-    let amount = pricing::hlx_to_nano(amount_hlx)?;
+    let amount = pricing::hlx_to_nano(&amount_hlx)?;
     // The destination rides in `to`; the source travels in `data` as its address string —
     // this is the one transaction that names two validators (mirrors the CLI).
     build_sign_submit(&state, &node, TxType::Redelegate, Some(dst), amount, src.to_string().into_bytes(), None).await

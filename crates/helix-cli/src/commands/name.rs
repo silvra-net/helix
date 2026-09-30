@@ -20,7 +20,7 @@ pub enum NameCmd {
         /// The name's price in HLX, confirming you pay it. Required for names shorter than five
         /// characters (50 HLX for four, 500 HLX for three); the price is burned.
         #[arg(long, value_name = "HLX")]
-        accept_price: Option<f64>,
+        accept_price: Option<crate::fee::Hlx>,
     },
     /// Resolve a name to its owning address
     Resolve {
@@ -48,13 +48,13 @@ pub async fn run(cmd: NameCmd, node: &str) -> Result<()> {
 /// 500 HLX because they typed a short name, so it needs `--accept-price` with exactly the price.
 /// A given `--accept-price` must match for any name. Decided before the wallet is unlocked, so a
 /// refusal never costs a passphrase prompt.
-fn price_to_pay(bare_name: &str, accept_price: Option<f64>) -> Result<u64> {
+fn price_to_pay(bare_name: &str, accept_price: Option<crate::fee::Hlx>) -> Result<u64> {
     let price = helix_core::fee::name_registration_price(bare_name.len());
     let base = helix_core::fee::name_registration_price(usize::MAX);
     let shown = helix_core::fee::nano_as_hlx(price);
     match accept_price {
         Some(hlx) => {
-            if crate::fee::hlx_to_nano(hlx)? != price {
+            if hlx.nano() != price {
                 bail!(
                     "--accept-price {hlx} does not match the price of {bare_name}.hlx, which is \
                      {shown} HLX (burned). Nothing was sent."
@@ -76,7 +76,7 @@ async fn register(
     name: String,
     signer: Signer,
     fee: Option<u64>,
-    accept_price: Option<f64>,
+    accept_price: Option<crate::fee::Hlx>,
     node: &str,
 ) -> Result<()> {
     let bare = name.trim().trim_end_matches(".hlx").to_string();
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn a_long_name_goes_through_at_its_price() {
         assert_eq!(price_to_pay("alice", None).unwrap(), 5 * HLX);
-        assert_eq!(price_to_pay("alice", Some(5.0)).unwrap(), 5 * HLX);
+        assert_eq!(price_to_pay("alice", Some("5".parse().unwrap())).unwrap(), 5 * HLX);
     }
 
     #[test]
@@ -158,14 +158,14 @@ mod tests {
         let refused = price_to_pay("bob", None).unwrap_err().to_string();
         assert!(refused.contains("costs 500 HLX"), "{refused}");
         assert!(refused.contains("--accept-price 500"), "the message says how: {refused}");
-        assert_eq!(price_to_pay("bob", Some(500.0)).unwrap(), 500 * HLX);
-        assert_eq!(price_to_pay("anna", Some(50.0)).unwrap(), 50 * HLX);
+        assert_eq!(price_to_pay("bob", Some("500".parse().unwrap())).unwrap(), 500 * HLX);
+        assert_eq!(price_to_pay("anna", Some("50".parse().unwrap())).unwrap(), 50 * HLX);
     }
 
     #[test]
     fn an_accepted_price_that_does_not_match_is_refused() {
-        for (name, hlx) in [("bob", 50.0), ("anna", 500.0), ("alice", 50.0)] {
-            let refused = price_to_pay(name, Some(hlx)).unwrap_err().to_string();
+        for (name, hlx) in [("bob", "50"), ("anna", "500"), ("alice", "50")] {
+            let refused = price_to_pay(name, Some(hlx.parse().unwrap())).unwrap_err().to_string();
             assert!(refused.contains("does not match"), "{name} at {hlx}: {refused}");
         }
     }

@@ -3,7 +3,7 @@ use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
 
-use crate::fee::{hlx_to_nano, price_and_sign};
+use crate::fee::{price_and_sign, Hlx};
 use crate::passphrase::Signer;
 
 
@@ -14,7 +14,7 @@ pub enum TxCmd {
         /// Recipient address
         to: String,
         /// Amount in HLX (e.g. 1.5)
-        amount: f64,
+        amount: Hlx,
         #[command(flatten)]
         signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
@@ -27,7 +27,7 @@ pub enum TxCmd {
     /// Lock HLX as validator stake
     Stake {
         /// Amount in HLX to stake
-        amount: f64,
+        amount: Hlx,
         #[command(flatten)]
         signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
@@ -39,7 +39,7 @@ pub enum TxCmd {
     /// Begin unbonding staked HLX (7-day lock before claimable)
     Unstake {
         /// Amount in HLX to unstake
-        amount: f64,
+        amount: Hlx,
         #[command(flatten)]
         signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
@@ -77,7 +77,7 @@ pub enum TxCmd {
         /// Validator address to delegate to
         validator: String,
         /// Amount in HLX to delegate
-        amount: f64,
+        amount: Hlx,
         #[command(flatten)]
         signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
@@ -92,7 +92,7 @@ pub enum TxCmd {
         /// Validator address to undelegate from
         validator: String,
         /// Amount in HLX to undelegate (its current value, not raw shares)
-        amount: f64,
+        amount: Hlx,
         #[command(flatten)]
         signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
@@ -110,7 +110,7 @@ pub enum TxCmd {
         /// Validator address to move it to
         to_validator: String,
         /// Amount in HLX to move (its current value, not raw shares)
-        amount: f64,
+        amount: Hlx,
         #[command(flatten)]
         signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
@@ -194,7 +194,7 @@ pub async fn run(cmd: TxCmd, node: &str) -> Result<()> {
 
 async fn send(
     to: String,
-    amount_hlx: f64,
+    amount: Hlx,
     signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
@@ -206,7 +206,7 @@ async fn send(
     let to_addr = Address::from_str(&to)
         .map_err(|e| anyhow::anyhow!("Invalid recipient address: {}", e))?;
 
-    let amount_nano = hlx_to_nano(amount_hlx)?;
+    let amount_nano = amount.nano();
 
     // Fetch current nonce from node if not provided
     let nonce = match nonce_override {
@@ -233,7 +233,7 @@ async fn send(
 
     price_and_sign(&mut tx, fee, &kp, node).await?;
 
-    println!("Sending {:.9} HLX to {}", amount_hlx, to);
+    println!("Sending {} HLX to {}", amount, to);
     println!("  From  : {}", kf.address);
     println!("  Fee   : {} nano-HLX", tx.fee);
     println!("  Nonce : {}", nonce);
@@ -241,10 +241,10 @@ async fn send(
     submit_tx(&tx, node).await
 }
 
-/// Stake / Unstake — sends `amount_hlx` to self (or zero `to`)
+/// Stake / Unstake — sends `amount` to self (or zero `to`)
 async fn simple_amount_tx(
     tx_type: TxType,
-    amount_hlx: f64,
+    amount: Hlx,
     signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
@@ -253,7 +253,7 @@ async fn simple_amount_tx(
     let (kf, kp) = signer.unlock()?;
     let from = Address::from_str(&kf.address)
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
-    let amount_nano = hlx_to_nano(amount_hlx)?;
+    let amount_nano = amount.nano();
     let nonce = match nonce_override {
         Some(n) => n,
         None => super::fetch_nonce(node, &kf.address).await?,
@@ -311,12 +311,12 @@ async fn zero_amount_tx(
     submit_tx(&tx, node).await
 }
 
-/// Delegate / Undelegate — sends `amount_hlx` (the delegation amount, or its current value
+/// Delegate / Undelegate — sends `amount` (the delegation amount, or its current value
 /// to redeem) to a named validator address.
 async fn targeted_amount_tx(
     tx_type: TxType,
     validator: String,
-    amount_hlx: f64,
+    amount: Hlx,
     signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
@@ -327,7 +327,7 @@ async fn targeted_amount_tx(
         .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
     let validator_addr = Address::from_str(&validator)
         .map_err(|e| anyhow::anyhow!("Invalid validator address: {}", e))?;
-    let amount_nano = hlx_to_nano(amount_hlx)?;
+    let amount_nano = amount.nano();
     let nonce = match nonce_override {
         Some(n) => n,
         None => super::fetch_nonce(node, &kf.address).await?,
@@ -350,7 +350,7 @@ async fn targeted_amount_tx(
 
     println!("  From      : {}", kf.address);
     println!("  Validator : {}", validator);
-    println!("  Amount    : {:.9} HLX", amount_hlx);
+    println!("  Amount    : {} HLX", amount);
     println!("  Fee       : {} nano-HLX", tx.fee);
     println!("  Nonce     : {}", nonce);
 
@@ -360,7 +360,7 @@ async fn targeted_amount_tx(
 async fn redelegate(
     from_validator: String,
     to_validator: String,
-    amount_hlx: f64,
+    amount: Hlx,
     signer: Signer,
     fee: Option<u64>,
     nonce_override: Option<u64>,
@@ -373,7 +373,7 @@ async fn redelegate(
         .map_err(|e| anyhow::anyhow!("Invalid source validator address: {}", e))?;
     let dst = Address::from_str(&to_validator)
         .map_err(|e| anyhow::anyhow!("Invalid destination validator address: {}", e))?;
-    let amount_nano = hlx_to_nano(amount_hlx)?;
+    let amount_nano = amount.nano();
     let nonce = match nonce_override {
         Some(n) => n,
         None => super::fetch_nonce(node, &kf.address).await?,
@@ -399,7 +399,7 @@ async fn redelegate(
 
     println!("  From      : {}", kf.address);
     println!("  Moving    : {} -> {}", from_validator, to_validator);
-    println!("  Amount    : {:.9} HLX", amount_hlx);
+    println!("  Amount    : {} HLX", amount);
     println!("  Fee       : {} nano-HLX", tx.fee);
     println!("  Nonce     : {}", nonce);
     println!();

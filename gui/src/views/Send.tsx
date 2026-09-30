@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { SubmitResult } from "../types";
-import { hlx, shortAddr, shortHash } from "../format";
+import { amountInput, amountValue, hlx, shortAddr, shortHash } from "../format";
 
 // Everything here exists to make a mistake visible *before* it is signed. A transfer cannot be
 // undone, and the two ways to get one wrong — a mistyped recipient and an amount you don't have
@@ -77,8 +77,8 @@ export default function Send({
     };
   }, [trimmed, node, looksLikeAddress]);
 
-  const amountNum = Number(amount);
-  const amountParses = amount.trim() !== "" && Number.isFinite(amountNum) && amountNum > 0;
+  const amountNum = amountValue(amount) ?? 0;
+  const amountParses = amountNum > 0;
   const overBalance = balance != null && amountParses && amountNum > balance;
   const recipientOk = looksLikeAddress ? addrValid === true : resolved != null;
   const valid = recipientOk && amountParses && !overBalance;
@@ -89,7 +89,7 @@ export default function Send({
   // remainder nobody notices.
   const setMax = () => {
     if (balance == null) return;
-    setAmount(Math.max(0, balance - FEE_RESERVE_HLX).toFixed(6).replace(/0+$/, "").replace(/\.$/, ""));
+    setAmount(amountInput(Math.max(0, balance - FEE_RESERVE_HLX), 6));
   };
 
   const send = async () => {
@@ -97,7 +97,7 @@ export default function Send({
     setError(null);
     setResult(null);
     try {
-      const r = await api.sendHlx(node, trimmed, amountNum);
+      const r = await api.sendHlx(node, trimmed, amount.trim());
       setResult(r);
     } catch (e) {
       setError(String(e));

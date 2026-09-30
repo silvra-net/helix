@@ -15,25 +15,19 @@ pub const NANO_PER_HLX: u64 = 1_000_000_000;
 /// reject an amount that cannot exist; not consensus, so a local copy is fine.
 const TOTAL_SUPPLY_HLX: u64 = 33_000_000;
 
-/// Convert a user-typed HLX amount to nano-HLX, rejecting what cannot be an amount — the exact
-/// checks from `helix-cli::fee::hlx_to_nano`. `f64 as u64` is a saturating cast that answers for
-/// every input (NaN → 0, inf → u64::MAX), which is how "send NaN HLX" used to sign a zero
-/// transfer the sender still paid a fee for.
-pub fn hlx_to_nano(amount_hlx: f64) -> Result<u64, String> {
-    if amount_hlx.is_nan() {
-        return Err(format!("'{amount_hlx}' is not an amount"));
+/// Read the HLX amount the person typed, exactly, as nano-HLX.
+///
+/// The webview hands over the text from the input field, and `helix_core::fee::parse_hlx` reads
+/// its digits — the same rule as the CLI. It used to arrive as a JavaScript number and be cast
+/// with `f64 × 1e9 as u64`, which truncates: 2.01 became 2_009_999_999 nano, so the wallet signed
+/// one nano less than it showed for about one cent in five. Text also refuses what a number
+/// cannot express honestly (`NaN`, `inf`, more than nine decimals) instead of casting it.
+pub fn hlx_to_nano(amount_hlx: &str) -> Result<u64, String> {
+    let nano = helix_core::fee::parse_hlx(amount_hlx)?;
+    if nano > TOTAL_SUPPLY_HLX * NANO_PER_HLX {
+        return Err(format!("{} HLX is more than the entire supply", amount_hlx.trim()));
     }
-    if amount_hlx.is_infinite() {
-        return Err(format!("an amount must be finite, not {amount_hlx}"));
-    }
-    if amount_hlx < 0.0 {
-        return Err(format!("an amount cannot be negative ({amount_hlx})"));
-    }
-    let nano = amount_hlx * NANO_PER_HLX as f64;
-    if nano > TOTAL_SUPPLY_HLX as f64 * NANO_PER_HLX as f64 {
-        return Err(format!("{amount_hlx} HLX is more than the entire supply"));
-    }
-    Ok(nano as u64)
+    Ok(nano)
 }
 
 /// Assemble a transaction skeleton. The caller then hands it to [`finalize_and_sign`].
@@ -99,10 +93,21 @@ mod tests {
 
     #[test]
     fn nonsense_amounts_are_refused() {
-        assert!(hlx_to_nano(f64::NAN).is_err());
-        assert!(hlx_to_nano(f64::INFINITY).is_err());
-        assert!(hlx_to_nano(-1.0).is_err());
-        assert_eq!(hlx_to_nano(1.5).unwrap(), 1_500_000_000);
+        for text in ["NaN", "inf", "-1", "", "1e3", "0.0000000001", "33000000.000000001"] {
+            assert!(hlx_to_nano(text).is_err(), "{text:?} must not become an amount");
+        }
+        assert_eq!(hlx_to_nano("1.5").unwrap(), 1_500_000_000);
+    }
+
+    /// What the person typed is what is signed — to the nano (the cast signed 2.01 as 2.009999999).
+    #[test]
+    fn a_typed_amount_is_signed_exactly() {
+        assert_eq!(hlx_to_nano("2.01").unwrap(), 2_010_000_000);
+        assert_eq!(hlx_to_nano(" 12345678.123456789 ").unwrap(), 12_345_678_123_456_789);
+        for cents in 1..10_000u64 {
+            let text = format!("{}.{:02}", cents / 100, cents % 100);
+            assert_eq!(hlx_to_nano(&text).unwrap(), cents * 10_000_000, "{text}");
+        }
     }
 
     /// The signed transaction the GUI produces must verify under the same check the node runs —
