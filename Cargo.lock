@@ -1465,7 +1465,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1483,9 +1482,11 @@ dependencies = [
  "helix-executor",
  "helix-identity",
  "helix-mempool",
+ "helix-mesh",
  "helix-p2p",
  "helix-rpc",
  "helix-storage",
+ "helix-walletd",
  "libp2p",
  "reqwest",
  "serde",
@@ -1580,8 +1581,8 @@ dependencies = [
  "serde_json",
  "subtle",
  "tokio",
+ "tower",
  "tracing",
- "tracing-subscriber",
  "zeroize",
 ]
 

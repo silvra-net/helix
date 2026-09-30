@@ -1,7 +1,7 @@
 name: Docker image
 
-# The node image — with helix-mesh and helix-walletd beside it — for everyone who runs Helix in a
-# container, exchanges above all. Its own workflow on purpose: a failing image build must never
+# The node image — one binary, `helix`, with the wallet RPC and the Mesh API inside — for everyone
+# who runs Helix in a container, exchanges above all. Its own workflow on purpose: a failing image build must never
 # hold back the release itself.
 #
 # On a version tag: build and push ghcr.io/<owner>/helix:<version> and :latest.
@@ -55,13 +55,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Every binary in the image starts
+      - name: The image's binary starts, with the exchange services inside
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         run: |
           set -euo pipefail
-          for bin in helix helix-mesh helix-walletd; do
-            docker run --rm --entrypoint "$bin" helix:test --version
-          done
+          docker run --rm --entrypoint helix helix:test --version
+          docker run --rm --entrypoint helix helix:test wallet-rpc --help >/dev/null
+          docker run --rm --entrypoint helix helix:test mesh --help >/dev/null
 
       - name: Build and push
         if: startsWith(github.ref, 'refs/tags/')
@@ -82,8 +82,6 @@ jobs:
           set -euo pipefail
           image="ghcr.io/${{ github.repository_owner }}/helix:${{ steps.meta.outputs.version }}"
           want="${GITHUB_REF_NAME#v}"
-          for bin in helix helix-mesh helix-walletd; do
-            got="$(docker run --rm --entrypoint "$bin" "$image" --version)"
-            echo "$bin: $got"
-            case "$got" in *" $want") ;; *) echo "::error::$bin in $image reports '$got', expected $want"; exit 1;; esac
-          done
+          got="$(docker run --rm --entrypoint helix "$image" --version)"
+          echo "helix: $got"
+          case "$got" in *" $want") ;; *) echo "::error::helix in $image reports '$got', expected $want"; exit 1;; esac

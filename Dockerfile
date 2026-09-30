@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
-RUN cargo build --release --bin helix --bin helix-mesh --bin helix-walletd
+RUN cargo build --release --bin helix
 
 # --- Runtime -----------------------------------------------------------------
 FROM debian:bookworm-slim
@@ -19,16 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/helix /usr/local/bin/helix
-# For exchanges: the Mesh (Rosetta) Data API and the Bitcoin-Core-style wallet RPC, each run as
-# its own container from this image with `--entrypoint helix-mesh` / `--entrypoint helix-walletd`.
-COPY --from=builder /build/target/release/helix-mesh /usr/local/bin/helix-mesh
-COPY --from=builder /build/target/release/helix-walletd /usr/local/bin/helix-walletd
 
 # The node writes validator-key.json and helix-data.redb into its working
 # directory — mount a volume here to persist validator identity + chain state
 # across container restarts/upgrades.
 WORKDIR /data
 
-EXPOSE 8545 8546
+# 8547: the wallet RPC for exchanges, served by the node itself with HELIX_WALLET_RPC set
+# (bind it to 0.0.0.0:8547 inside a container, and keep the port off the internet).
+EXPOSE 8545 8546 8547
 
 ENTRYPOINT ["/usr/local/bin/helix", "start"]

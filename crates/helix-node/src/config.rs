@@ -85,6 +85,21 @@ pub struct NodeConfig {
     /// hub outage otherwise partitions the rest, and relaying consensus votes through a single
     /// hub is fragile. Peer exchange still discovers further peers on top of these.
     pub p2p_seed_peers: Option<String>,
+    /// Serve a Bitcoin-Core-style wallet RPC inside this node, on this address (e.g.
+    /// `127.0.0.1:8547`) — for an exchange's own node, one process like `bitcoind`. Absent: no
+    /// wallet. Not on a validator: a hot wallet does not belong in the consensus process.
+    /// Overridable via `HELIX_WALLET_RPC`.
+    pub wallet_rpc: Option<String>,
+    /// The wallet's directory (`helix-wallet` by default). `HELIX_WALLET_DIR`.
+    pub wallet_dir: Option<String>,
+    /// A user for the wallet RPC's Basic authentication, with the password read from
+    /// `wallet_rpc_password_file` — never written here or in a variable. The cookie in the wallet
+    /// directory works either way. `HELIX_WALLET_RPC_USER`, `HELIX_WALLET_RPC_PASSWORD_FILE`.
+    pub wallet_rpc_user: Option<String>,
+    pub wallet_rpc_password_file: Option<String>,
+    /// A file holding the passphrase that encrypts the wallet made on first start. Unlocking is
+    /// `walletpassphrase`, as in Bitcoin Core. `HELIX_WALLET_PASSPHRASE_FILE`.
+    pub wallet_passphrase_file: Option<String>,
 }
 
 const CONFIG_PATH_ENV: &str = "HELIX_CONFIG";

@@ -6,7 +6,7 @@
 |---|---|
 | **Run a node or validator** (server, headless, no desktop) | `helix-cli-…` for your platform — unpack it and run `helix start`. No installer, no dependencies. |
 | **Use the wallet on my desktop** (send, stake, see your history, run a node from the UI) | `helix-gui-…` for your platform. **The wallet already contains the node** — you do not need the CLI as well. |
-| **Integrate Helix into an exchange** — a Bitcoin-Core-style wallet RPC, or the Mesh (Rosetta) API | `helix-walletd` / `helix-mesh`, inside the Linux and macOS `helix-cli-…` archives and the `ghcr.io/silvra-net/helix` image — see [Integrating Helix](https://github.com/silvra-net/helix/blob/master/docs/exchange-integration.md). |
+| **Integrate Helix into an exchange** — a Bitcoin-Core-style wallet RPC, or the Mesh (Rosetta) API | the same `helix-cli-…` download (or the `ghcr.io/silvra-net/helix` image): `HELIX_WALLET_RPC=127.0.0.1:8547 helix start` serves the wallet RPC from the node itself — see [Integrating Helix](https://github.com/silvra-net/helix/blob/master/docs/exchange-integration.md). |
 | **Browse the chain** (blocks, transactions, any address) | Nothing to download — [explorer.silvra.net](https://explorer.silvra.net). Every node also serves its own status page at its root URL. |
 
 ### Which wallet installer?

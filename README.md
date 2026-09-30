@@ -177,7 +177,7 @@ it is co-signing — compiled into the binary.
 - **[Staking and delegation](docs/staking.md)** — run a validator, or delegate to one
 - **[Internals](docs/internals.md)** — consensus, architecture, cryptography, token economics
 - **[Reference](docs/reference.md)** — REST API, transaction and address formats, crate layout
-- **[Integrating Helix](docs/exchange-integration.md)** — for exchanges and custodians: deposits, withdrawals and nonces over the REST API, a Bitcoin-Core-style wallet RPC (`helix-walletd`), the Mesh (Rosetta) Data API (`helix-mesh`), supply endpoints for listings
+- **[Integrating Helix](docs/exchange-integration.md)** — for exchanges and custodians: deposits, withdrawals and nonces over the REST API, a Bitcoin-Core-style wallet RPC served by the node itself, the Mesh (Rosetta) Data API, supply endpoints for listings
 - **[Tokenomics](TOKENOMICS.md)** — supply, emission, fees
 
 ---

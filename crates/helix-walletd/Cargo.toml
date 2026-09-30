@@ -6,10 +6,6 @@ authors.workspace = true
 license.workspace = true
 description = "A wallet with Bitcoin Core's JSON-RPC interface, in front of a Helix node, for exchanges"
 
-[[bin]]
-name = "helix-walletd"
-path = "src/main.rs"
-
 [dependencies]
 helix-core.workspace = true
 helix-crypto.workspace = true
@@ -21,10 +17,10 @@ serde_json = { workspace = true, features = ["raw_value"] }
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 redb.workspace = true
 rand.workspace = true
 hex.workspace = true
 zeroize.workspace = true
 base64 = "0.22"
 subtle = "2.6"
+tower = { version = "0.5", features = ["util"] }

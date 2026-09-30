@@ -110,17 +110,17 @@ fn fee_for(tx: &Transaction, kp: &KeyPair, base_fee_per_byte: u64) -> Result<u64
 }
 
 impl Daemon {
-    /// Open the wallet in `dir` against the node at `node_url`. Refuses a node on another chain.
-    pub async fn open(dir: &Path, node_url: &str, opts: Options) -> Result<Daemon> {
+    /// Open the wallet in `dir` against `node`. Refuses a node on another chain.
+    pub async fn open(dir: &Path, node: Node, opts: Options) -> Result<Daemon> {
         let keys = Keys::open(dir)?;
-        let node = Node::new(node_url);
         let chain_id = Hash::from_hex(&keys.meta.chain_id)
             .map_err(|_| anyhow!("wallet.json names a malformed chain id {:?}", keys.meta.chain_id))?;
         let genesis = node.header(0).await.context("could not read the node's genesis block")?;
         if genesis.hash != keys.meta.chain_id {
             bail!(
-                "the node at {node_url} is on the chain with genesis {}, and this wallet signs for {} — \
+                "the node at {} is on the chain with genesis {}, and this wallet signs for {} — \
                  refusing to run a wallet against another chain",
+                node.url(),
                 genesis.hash,
                 keys.meta.chain_id
             );

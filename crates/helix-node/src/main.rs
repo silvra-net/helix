@@ -38,8 +38,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the node daemon (block production, P2P, RPC server)
+    /// Run the node daemon (block production, P2P, RPC server). With `HELIX_WALLET_RPC` set it
+    /// also serves a Bitcoin-Core-style wallet RPC for exchanges, in the same process.
     Start,
+    /// A Bitcoin-Core-style wallet RPC for exchanges, as its own process against a node — or,
+    /// simpler, inside the node itself (`HELIX_WALLET_RPC=127.0.0.1:8547 helix start`)
+    #[command(name = "wallet-rpc", subcommand)]
+    WalletRpc(helix_walletd::cli::Command),
+    /// The Mesh (Rosetta) Data API, in front of a node
+    Mesh(helix_mesh::cli::Args),
     /// Client subcommands (wallet, tx, chain, …) — flattened in at the top level
     #[command(flatten)]
     Client(helix_cli::Commands),
@@ -50,6 +57,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Start => run_node().await,
+        // A service for an exchange's own node: never the public network as a fallback — a
+        // hot wallet quietly running against someone else's node is not a default.
+        Command::WalletRpc(command) => {
+            init_service_logging()?;
+            helix_walletd::cli::run(&own_node_url(cli.node.as_deref()), command).await
+        }
+        Command::Mesh(args) => {
+            init_service_logging()?;
+            helix_mesh::cli::serve(&own_node_url(cli.node.as_deref()), args).await
+        }
         Command::Client(command) => {
             let chosen = resolve_client_node(cli.node.as_deref()).await;
             helix_cli::run(chosen.url(), command).await
@@ -98,6 +115,26 @@ fn local_rpc_url(cfg: &config::NodeConfig) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// The node a service subcommand reads: `--node`, else this machine's node — never the public
+/// network, which is the client subcommands' fallback and the wrong one for a wallet.
+fn own_node_url(explicit: Option<&str>) -> String {
+    match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(url) => url.to_string(),
+        None => config::load_node_config()
+            .map(|cfg| local_rpc_url(&cfg))
+            .unwrap_or_else(|_| "http://127.0.0.1:8545".to_string()),
+    }
+}
+
+fn init_service_logging() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+    Ok(())
+}
+
 /// Boot and run the node daemon. Only this path initialises tracing and reads the node's
 /// environment/`helix.toml` config — client subcommands print plain output and never open
 /// the chain database.
@@ -117,4 +154,21 @@ async fn run_node() -> Result<()> {
 
     let node = node::HelixNode::new().await?;
     node.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wallet or Mesh service named no node: it reads this machine's, never the public network —
+    /// the client subcommands' fallback, and the wrong one for an exchange's hot wallet.
+    #[test]
+    fn a_service_without_a_node_named_reads_this_machines_node() {
+        assert_eq!(own_node_url(Some(" http://10.0.0.5:8545 ")), "http://10.0.0.5:8545");
+        for unnamed in [None, Some(""), Some("  ")] {
+            let url = own_node_url(unnamed);
+            assert!(url.starts_with("http://127.0.0.1:"), "{unnamed:?} gave {url}");
+            assert!(!url.contains(helix_core::DEFAULT_SEED_PEER.trim_start_matches("https://")), "{url}");
+        }
+    }
 }

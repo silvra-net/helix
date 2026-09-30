@@ -6,10 +6,6 @@ authors.workspace = true
 license.workspace = true
 description = "Mesh (formerly Rosetta) Data API for Helix, served from a node's own REST API"
 
-[[bin]]
-name = "helix-mesh"
-path = "src/main.rs"
-
 [dependencies]
 helix-core.workspace = true
 axum.workspace = true
@@ -20,7 +16,6 @@ serde_json.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 bincode.workspace = true

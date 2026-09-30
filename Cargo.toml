@@ -123,6 +123,8 @@ reqwest = { version = "0.12", features = ["json", "blocking", "gzip"] }
 # Internal crates
 helix-crypto = { path = "crates/helix-crypto" }
 helix-core = { path = "crates/helix-core" }
+helix-mesh = { path = "crates/helix-mesh" }
+helix-walletd = { path = "crates/helix-walletd" }
 helix-consensus = { path = "crates/helix-consensus" }
 helix-p2p = { path = "crates/helix-p2p" }
 helix-storage = { path = "crates/helix-storage" }

@@ -119,6 +119,11 @@ not start.
 | `HELIX_VALIDATOR_KEY_PASSPHRASE` | (none) | Passphrase of an encrypted validator key. |
 | `HELIX_VALIDATOR_CRYPTO_SCHEME` | `ml-dsa` | Scheme for a newly generated key: `ml-dsa` or `sphincs-plus`. Ignored once a key exists. |
 | `HELIX_RPC_RATE_LIMIT` | `500,100` | Requests per client IP as `burst,refill_per_second`. Behind a Cloudflare tunnel the client IP comes from `CF-Connecting-IP`. |
+| `HELIX_WALLET_RPC` | (off) | Serve a Bitcoin-Core-style wallet RPC from this node, on this address (`127.0.0.1:8547`) — for an exchange's own node, never a validator. See [Integrating Helix](exchange-integration.md#bitcoin-style-wallet-rpc). |
+| `HELIX_WALLET_DIR` | `helix-wallet` | The wallet's keys, issued-address log and ledger. |
+| `HELIX_WALLET_RPC_USER` | (none) | A user for the wallet RPC, with `HELIX_WALLET_RPC_PASSWORD_FILE` (the password only from a file). The cookie in the wallet directory works either way. |
+| `HELIX_WALLET_RPC_PASSWORD_FILE` | (none) | See `HELIX_WALLET_RPC_USER`. |
+| `HELIX_WALLET_PASSPHRASE_FILE` | (none) | Encrypts the wallet made on first start; unlock it with `walletpassphrase`. |
 | `HELIX_MEMPOOL_TX_TTL_SECS` | `1800` | How long an unconfirmed transaction may wait in the pool. |
 | `HELIX_MAX_PROPOSAL_BYTES` | `262144` | Transaction bytes this node packs into a block it proposes. Local policy — every node accepts blocks up to the protocol maximum of 2 MB. |
 | `HELIX_BLOCK_TIME_MS` | `2000` | Block interval. **Every validator of a network must use the same value** — for private chains only. |

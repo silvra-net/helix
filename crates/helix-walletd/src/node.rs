@@ -87,14 +87,24 @@ pub enum TxState {
     Unknown,
 }
 
+/// How requests reach the node: over HTTP to a node elsewhere, or straight into the routes of
+/// the node this wallet runs inside (`helix start` with `HELIX_WALLET_RPC`) — the same handlers,
+/// so the same answers, without a socket or the rate limit that counts every outside client.
+enum Transport {
+    Http { base: String, http: reqwest::Client },
+    InProcess(axum::Router),
+}
+
 pub struct Node {
-    base: String,
-    http: reqwest::Client,
+    transport: Transport,
 }
 
 fn parse_nano(text: &str, what: &str) -> Result<u64> {
     text.parse().map_err(|_| anyhow!("{what}: {text:?} is not a number of nano-HLX"))
 }
+
+/// The largest answer read: a full block rendered as JSON, with room.
+const MAX_ANSWER_BYTES: usize = 64 * 1024 * 1024;
 
 impl Node {
     pub fn new(base: &str) -> Self {
@@ -102,38 +112,70 @@ impl Node {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("a TLS backend is available");
-        Node { base: base.trim_end_matches('/').to_string(), http }
+        Node { transport: Transport::Http { base: base.trim_end_matches('/').to_string(), http } }
+    }
+
+    /// The node this process is — its RPC routes, called directly.
+    pub fn in_process(routes: axum::Router) -> Self {
+        Node { transport: Transport::InProcess(routes) }
     }
 
     pub fn url(&self) -> &str {
-        &self.base
+        match &self.transport {
+            Transport::Http { base, .. } => base,
+            Transport::InProcess(_) => "this node",
+        }
+    }
+
+    /// One request, as status and body bytes.
+    async fn request(&self, post: Option<Vec<u8>>, path: &str) -> Result<(StatusCode, Vec<u8>)> {
+        match &self.transport {
+            Transport::Http { base, http } => {
+                let url = format!("{base}{path}");
+                let builder = match post {
+                    Some(body) => http.post(&url).header("content-type", "application/json").body(body),
+                    None => http.get(&url),
+                };
+                let response = builder.send().await.with_context(|| format!("could not reach the node at {url}"))?;
+                let status = response.status();
+                let bytes = response.bytes().await.with_context(|| format!("{url}: the answer broke off"))?;
+                Ok((status, bytes.to_vec()))
+            }
+            Transport::InProcess(routes) => {
+                use tower::ServiceExt;
+                let request = axum::http::Request::builder()
+                    .method(if post.is_some() { "POST" } else { "GET" })
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(post.unwrap_or_default()))?;
+                let response = routes.clone().oneshot(request).await.map_err(|e| anyhow!("{path}: {e}"))?;
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), MAX_ANSWER_BYTES).await?;
+                Ok((status, bytes.to_vec()))
+            }
+        }
     }
 
     /// A GET, retried while the node rate-limits this service. Returns the status with the body
     /// so each caller decides what a 404 means for it.
     async fn get_raw(&self, path: &str) -> Result<(StatusCode, serde_json::Value)> {
-        let url = format!("{}{}", self.base, path);
         let mut wait = Duration::from_millis(100);
         for _ in 0..8 {
-            let response = self
-                .http
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("could not reach the node at {url}"))?;
-            let status = response.status();
+            let (status, bytes) = self.request(None, path).await?;
             if status == StatusCode::TOO_MANY_REQUESTS {
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_secs(2));
                 continue;
             }
-            let body = response.json().await.with_context(|| format!("{url} did not answer with JSON"))?;
+            let body = serde_json::from_slice(&bytes)
+                .with_context(|| format!("{path} on {} did not answer with JSON", self.url()))?;
             return Ok((status, body));
         }
         Err(anyhow!(
             "the node at {} keeps rate-limiting this service — start it with a higher \
-             HELIX_RPC_RATE_LIMIT (e.g. 5000,1000)",
-            self.base
+             HELIX_RPC_RATE_LIMIT (e.g. 5000,1000), or run the wallet inside the node \
+             (HELIX_WALLET_RPC), which is not rate-limited",
+            self.url()
         ))
     }
 
@@ -209,19 +251,15 @@ impl Node {
     /// Submit a signed transaction. `Err(Refused)` is the node's answer (a 400 with a reason);
     /// any other error means the answer never came, and the transaction may or may not be in.
     pub async fn submit(&self, tx: &Transaction) -> Result<(), Submit> {
-        let url = format!("{}/transactions", self.base);
-        let response = self
-            .http
-            .post(&url)
-            .json(tx)
-            .send()
+        let body = serde_json::to_vec(tx).map_err(|e| Submit::Unreachable(e.to_string()))?;
+        let (status, bytes) = self
+            .request(Some(body), "/transactions")
             .await
             .map_err(|e| Submit::Unreachable(e.to_string()))?;
-        let status = response.status();
-        let body: serde_json::Value = response.json().await.unwrap_or_default();
         if status.is_success() {
             return Ok(());
         }
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         let reason = body["error"].as_str().unwrap_or("refused").to_string();
         if same_transaction_again(&reason) {
             return Ok(());
@@ -264,6 +302,66 @@ pub fn parse_delta(text: &str) -> Result<i128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::{get, post};
+
+    fn stand_in() -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/status",
+                get(|| async {
+                    axum::Json(serde_json::json!({ "height": 7, "best_hash": "h7", "base_fee_per_byte": 3, "version": "x" }))
+                }),
+            )
+            .route(
+                "/accounts/:a",
+                get(|| async {
+                    (reqwest::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({ "error": "not found", "state_height": 7 })))
+                }),
+            )
+            .route(
+                "/transactions",
+                post(|body: String| async move {
+                    // Answers as the node does: the body must be the transaction as JSON.
+                    let tx: helix_core::Transaction = serde_json::from_str(&body).unwrap();
+                    let reason = format!("Transaction {} already in mempool", tx.hash().to_hex());
+                    (reqwest::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({ "error": reason })))
+                }),
+            )
+    }
+
+    /// Inside the node, the wallet calls the node's own routes: the same answers as over HTTP,
+    /// status codes and bodies included, with no socket between them.
+    #[tokio::test]
+    async fn the_node_in_this_process_answers_like_the_node_over_http() {
+        let local = Node::in_process(stand_in());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, stand_in()).await.unwrap() });
+        let remote = Node::new(&format!("http://{addr}"));
+        let kp = helix_crypto::KeyPair::generate();
+        let from = helix_crypto::Address::from_public_key(&kp.public);
+        let tx = Transaction {
+            version: 1,
+            tx_type: helix_core::TxType::Transfer,
+            from: from.clone(),
+            to: Some(from),
+            amount: 1,
+            fee: 1,
+            nonce: 0,
+            data: Vec::new(),
+            crypto_version: kp.scheme,
+            chain_id: helix_crypto::Hash::ZERO,
+            signature: helix_crypto::Signature::from_bytes(vec![]),
+            public_key: Some(kp.public.clone()),
+        };
+        for node in [&local, &remote] {
+            let status = node.status().await.unwrap();
+            assert_eq!((status.height, status.base_fee_per_byte), (7, 3));
+            assert_eq!(node.account("hlxAnyone").await.unwrap(), Account { balance: 0, nonce: 0, state_height: 7 });
+            assert_eq!(node.submit(&tx).await, Ok(()), "the same transaction again is not a refusal");
+        }
+        assert_eq!(local.url(), "this node");
+    }
 
     #[test]
     fn only_this_transaction_already_in_the_pool_counts_as_submitted() {

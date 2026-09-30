@@ -118,6 +118,10 @@ impl Keys {
             bail!("{} already holds a wallet — refusing to make another over it", dir.display());
         }
         std::fs::create_dir_all(dir.join("keys")).with_context(|| format!("could not create {}", dir.display()))?;
+        // Owner only, as bitcoind's data directory: the key files are 0600 already, but the ledger
+        // and the issued log name every deposit address and amount of the exchange.
+        #[cfg(unix)]
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
         let hot = KeyPair::generate();
         let hot_address = Address::from_public_key(&hot.public).to_string();
         write_key(dir, &hot, passphrase)?;
@@ -499,6 +503,16 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         assert!(!keys.is_unlocked());
         assert_eq!(keys.unlocked_until(), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nobody_but_the_owner_can_look_into_the_wallet() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("mode");
+        Keys::create(&dir, "test", "ab", 0, None).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

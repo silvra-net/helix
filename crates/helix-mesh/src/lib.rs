@@ -10,6 +10,7 @@
 //! (#260)** — synced from genesis, not joined from a checkpoint, and not pruned. A block without
 //! the record is refused with error 5 rather than shown incomplete.
 
+pub mod cli;
 pub mod map;
 pub mod node;
 pub mod server;

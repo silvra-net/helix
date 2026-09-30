@@ -64,14 +64,6 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }} --bin helix
 
-      # The exchange services — Mesh (Rosetta) and the Bitcoin-Core-style wallet RPC — are server
-      # components, run on Linux or in a container, so they ship in the unix archives only. CI
-      # builds on Linux alone; a Windows build of a new binary would be compiled for the first
-      # time here, during a release — which is how the first 0.12.0 run failed.
-      - name: Build the exchange services (unix)
-        if: runner.os != 'Windows'
-        run: cargo build --release --target ${{ matrix.target }} --bin helix-mesh --bin helix-walletd
-
       - name: Package archive (unix)
         if: runner.os != 'Windows'
         run: |
@@ -79,8 +71,6 @@ jobs:
           staging="helix-cli-${{ github.ref_name }}-${{ matrix.label }}"
           mkdir -p "$staging"
           cp target/${{ matrix.target }}/release/helix "$staging/"
-          cp target/${{ matrix.target }}/release/helix-mesh "$staging/"
-          cp target/${{ matrix.target }}/release/helix-walletd "$staging/"
           cp README.md "$staging/"
           tar czf "$staging.tar.gz" "$staging"
           echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"

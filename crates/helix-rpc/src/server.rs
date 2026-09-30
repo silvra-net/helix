@@ -177,6 +177,34 @@ fn rate_limit_from_env() -> (f64, f64) {
 /// send a request through exactly what production runs (compression and the rate limiter
 /// included) instead of calling a handler on its own and missing what the layers do to it.
 fn router(state: AppState, limiter: Arc<RateLimiter>) -> Router {
+    routes()
+        .layer(CorsLayer::permissive())
+        // Compress responses for any client that asks (`Accept-Encoding: gzip`). The chain's
+        // bulk payloads are dominated by ML-DSA signatures and public keys, which serde renders
+        // as JSON arrays of decimal numbers — `[56, 87, 212, …]`. A 3,309-byte signature becomes
+        // ~13,000 characters that way, so an *empty* block costs ~38 KB on the wire. Measured
+        // 2026-07-21: 200 empty blocks = 7.6 MB uncompressed, 2.0 MB gzipped — a 3.8x cut on
+        // every historical sync, which is the single largest thing this node serves.
+        //
+        // Until now that saving only existed for nodes sitting behind a CDN that compresses for
+        // them (ours does; a self-hosted one does not), which is exactly backwards: the operator
+        // without a proxy is the one paying for their own bandwidth. Doing it here makes it
+        // uniform. gzip is HTTP content negotiation, so a client that does not ask, or an older
+        // one that cannot decode it, still gets plain JSON.
+        .layer(CompressionLayer::new())
+        .layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
+        .with_state(state)
+}
+
+/// The same routes for a caller inside this process — the node's own wallet RPC — without the
+/// layers that shape traffic from outside. It is not a client to rate-limit (it reads every
+/// block, and the limit counts per address), nor one to compress for. Same handlers, so it sees
+/// exactly what an exchange's client would over HTTP.
+pub fn internal_router(state: AppState) -> Router {
+    routes().with_state(state)
+}
+
+fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(root))
         .route("/logo.png", get(logo))
@@ -222,22 +250,6 @@ fn router(state: AppState, limiter: Arc<RateLimiter>) -> Router {
             post(submit_transaction).layer(DefaultBodyLimit::max(TX_SUBMIT_BODY_LIMIT_BYTES)),
         )
         .route("/transactions/:hash", get(get_transaction_status))
-        .layer(CorsLayer::permissive())
-        // Compress responses for any client that asks (`Accept-Encoding: gzip`). The chain's
-        // bulk payloads are dominated by ML-DSA signatures and public keys, which serde renders
-        // as JSON arrays of decimal numbers — `[56, 87, 212, …]`. A 3,309-byte signature becomes
-        // ~13,000 characters that way, so an *empty* block costs ~38 KB on the wire. Measured
-        // 2026-07-21: 200 empty blocks = 7.6 MB uncompressed, 2.0 MB gzipped — a 3.8x cut on
-        // every historical sync, which is the single largest thing this node serves.
-        //
-        // Until now that saving only existed for nodes sitting behind a CDN that compresses for
-        // them (ours does; a self-hosted one does not), which is exactly backwards: the operator
-        // without a proxy is the one paying for their own bandwidth. Doing it here makes it
-        // uniform. gzip is HTTP content negotiation, so a client that does not ask, or an older
-        // one that cannot decode it, still gets plain JSON.
-        .layer(CompressionLayer::new())
-        .layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
-        .with_state(state)
 }
 
 pub async fn start_rpc_server(state: AppState, bind: SocketAddr) {

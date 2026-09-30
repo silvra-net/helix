@@ -718,6 +718,8 @@ pub struct HelixNode {
     /// raw-TCP address derived from `p2p_port`, which is unreachable for a tunnelled node.
     p2p_public_addr: Option<String>,
     rpc_bind: SocketAddr,
+    /// The wallet RPC to serve inside this node (`HELIX_WALLET_RPC`), if asked for.
+    wallet_rpc: Option<helix_walletd::cli::Settings>,
     /// Set while the startup catch-up runs, cleared when it finishes. Shared with the RPC
     /// server (so `GET /status` can report it) and with `block_production_loop`, which must
     /// not propose anything until it clears — see `run`.
@@ -767,6 +769,7 @@ impl HelixNode {
             std::env::var("HELIX_KEEP_BYTES").ok().as_deref(),
         )?;
         check_seed_peers(&configured_seed_peers(&cfg))?;
+        let wallet_rpc = wallet_rpc_settings(&cfg)?;
         check_trusted_checkpoint_setting(config::resolve("HELIX_TRUSTED_CHECKPOINT", &None).as_deref())?;
 
         let key_path = resolve_validator_key_path(&cfg);
@@ -1221,6 +1224,7 @@ impl HelixNode {
             p2p_port,
             p2p_public_addr,
             rpc_bind,
+            wallet_rpc,
             // Starts true whenever there is a peer to catch up from: `run` clears it once the
             // sync finishes (or immediately, if there is nothing to sync from). Claiming
             // "synced" before checking would be the same lie the old hardcoded `false` told.
@@ -1309,6 +1313,17 @@ impl HelixNode {
                 rpc_bind.to_string()
             };
             info!("Status board      : http://{shown}/ (open in a browser)");
+        }
+        // The wallet RPC, when asked for: in this process, on this node's own routes — no socket
+        // between them and none of the rate limit that counts outside clients.
+        if let Some(settings) = self.wallet_rpc.clone() {
+            let routes = helix_rpc::server::internal_router(rpc_state.clone());
+            info!(listen = %settings.listen, "Wallet RPC enabled (Bitcoin-Core-style, for an exchange)");
+            tokio::spawn(async move {
+                if let Err(e) = helix_walletd::cli::serve_in_process(routes, settings).await {
+                    error!(err = %format!("{e:#}"), "The wallet RPC stopped; the node runs on without it");
+                }
+            });
         }
         tokio::spawn(async move {
             start_rpc_server(rpc_state, rpc_bind).await;
@@ -5444,6 +5459,46 @@ fn configured_seed_peers(cfg: &config::NodeConfig) -> Vec<String> {
 /// how everyone writes an address and is not a multiaddr, so the most natural way to wire a
 /// validator to the others left it wired to none of them. For a validator the seed list is how it
 /// finds the rest of the set, and a node that cannot reach them stalls a chain with no slack.
+/// The wallet RPC's settings, read and checked before anything starts. An unreadable one stops the
+/// node with the reason (#240): a wallet the operator asked for and silently did not get is worse
+/// than a node that did not start.
+fn wallet_rpc_settings(cfg: &config::NodeConfig) -> Result<Option<helix_walletd::cli::Settings>> {
+    let Some(listen) = config::resolve("HELIX_WALLET_RPC", &cfg.wallet_rpc) else {
+        return Ok(None);
+    };
+    let listen: SocketAddr = listen.trim().parse().map_err(|_| {
+        anyhow::anyhow!("HELIX_WALLET_RPC is {listen:?}, which is not an address to listen on — write it like 127.0.0.1:8547")
+    })?;
+    let wallet_dir = PathBuf::from(
+        config::resolve("HELIX_WALLET_DIR", &cfg.wallet_dir).unwrap_or_else(|| "helix-wallet".to_string()),
+    );
+    let user = config::resolve("HELIX_WALLET_RPC_USER", &cfg.wallet_rpc_user);
+    let password_file = config::resolve("HELIX_WALLET_RPC_PASSWORD_FILE", &cfg.wallet_rpc_password_file);
+    let credentials = match (user, password_file) {
+        (Some(user), Some(file)) => Some(format!(
+            "{user}:{}",
+            helix_walletd::cli::read_secret(Path::new(&file)).context("HELIX_WALLET_RPC_PASSWORD_FILE")?
+        )),
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "HELIX_WALLET_RPC_USER and HELIX_WALLET_RPC_PASSWORD_FILE go together — set both, or \
+             neither and use the cookie the wallet writes to its directory"
+        ),
+    };
+    let passphrase = config::resolve("HELIX_WALLET_PASSPHRASE_FILE", &cfg.wallet_passphrase_file)
+        .map(|file| helix_walletd::cli::read_secret(Path::new(&file)).context("HELIX_WALLET_PASSPHRASE_FILE"))
+        .transpose()?;
+    Ok(Some(helix_walletd::cli::Settings {
+        listen,
+        wallet_dir,
+        credentials,
+        passphrase,
+        // The public chain is a testnet; this becomes `main` with the mainnet.
+        network: "test".to_string(),
+        options: Default::default(),
+    }))
+}
+
 fn check_seed_peers(seeds: &[String]) -> Result<()> {
     for entry in seeds {
         if entry.parse::<libp2p::Multiaddr>().is_ok() {
@@ -9713,6 +9768,51 @@ mod validator_health_tests {
 
 #[cfg(test)]
 mod body_cap_tests {
+    /// The wallet RPC's settings are read from `helix.toml` here (the variables win when set, and
+    /// a test cannot rely on them being unset — hence the guard). An unreadable one stops the
+    /// node with its reason; no setting leaves the wallet off.
+    #[test]
+    fn a_wallet_rpc_setting_the_node_cannot_read_stops_it_with_the_reason() {
+        let vars = ["HELIX_WALLET_RPC", "HELIX_WALLET_RPC_USER", "HELIX_WALLET_RPC_PASSWORD_FILE", "HELIX_WALLET_PASSPHRASE_FILE", "HELIX_WALLET_DIR"];
+        if vars.iter().any(|v| std::env::var(v).is_ok()) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("helix-wallet-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pw = dir.join("pw");
+        std::fs::write(&pw, "s3cret\n").unwrap();
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "").unwrap();
+
+        assert!(wallet_rpc_settings(&config::NodeConfig::default()).unwrap().is_none(), "unset: no wallet");
+
+        let cfg = |f: &dyn Fn(&mut config::NodeConfig)| {
+            let mut c = config::NodeConfig { wallet_rpc: Some("127.0.0.1:8547".into()), ..Default::default() };
+            f(&mut c);
+            c
+        };
+        let ok = wallet_rpc_settings(&cfg(&|c| {
+            c.wallet_rpc_user = Some("exchange".into());
+            c.wallet_rpc_password_file = Some(pw.display().to_string());
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(ok.credentials.as_deref(), Some("exchange:s3cret"), "one trailing newline dropped");
+        assert_eq!(ok.wallet_dir, PathBuf::from("helix-wallet"));
+
+        for (setting, why) in [
+            (cfg(&|c| c.wallet_rpc = Some("8547".into())), "not an address"),
+            (cfg(&|c| c.wallet_rpc_user = Some("exchange".into())), "go together"),
+            (cfg(&|c| c.wallet_rpc_password_file = Some(pw.display().to_string())), "go together"),
+            (cfg(&|c| c.wallet_passphrase_file = Some(empty.display().to_string())), "HELIX_WALLET_PASSPHRASE_FILE"),
+            (cfg(&|c| c.wallet_passphrase_file = Some(dir.join("missing").display().to_string())), "HELIX_WALLET_PASSPHRASE_FILE"),
+        ] {
+            let err = format!("{:#}", wallet_rpc_settings(&setting).err().expect("must refuse"));
+            assert!(err.contains(why), "expected {why:?} in {err:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use axum::{routing::get, Router};
 

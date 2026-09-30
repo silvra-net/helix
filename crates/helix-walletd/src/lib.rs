@@ -18,6 +18,7 @@
 //! wallet's birth on** — every node that ran 0.20.2 when those blocks came does.
 
 pub mod amount;
+pub mod cli;
 pub mod daemon;
 pub mod keys;
 pub mod ledger;

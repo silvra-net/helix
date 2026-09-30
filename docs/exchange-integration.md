@@ -24,9 +24,9 @@ status`, the exact amount fields and a syncing node that keeps transaction outco
 | Chain id | the genesis block's hash; every transaction signs it |
 | Nonces | per sender, strictly sequential from 0 |
 | Fee | `base_fee_per_byte × size` burned, anything above it tips the proposer |
-| Ways to integrate | this page's REST API · a **Bitcoin-Core-style wallet RPC** (`helix-walletd`) · the **Mesh (Rosetta)** Data API (`helix-mesh`) |
+| Ways to integrate | this page's REST API · a **Bitcoin-Core-style wallet RPC** served by the node (`HELIX_WALLET_RPC`) · the **Mesh (Rosetta)** Data API (`helix mesh`) |
 | Supply | `GET /supply/circulating`, `/supply/total`, `/supply/max` — a bare number in HLX |
-| Container | `ghcr.io/silvra-net/helix:<version>` (node, `helix-mesh`, `helix-walletd`), from the release after 0.20.2 on |
+| Container | `ghcr.io/silvra-net/helix:<version>`, from the release after 0.20.2 on |
 
 ## Run your own node
 
@@ -150,19 +150,32 @@ the same nonce can never both apply — that is how you replace a stuck withdraw
 ## Bitcoin-style wallet RPC
 
 Most exchanges integrate a chain through the interface they already run for Bitcoin and its
-descendants. `helix-walletd` gives Helix that interface: a wallet service in front of your own
-node, speaking Bitcoin Core's JSON-RPC — same method names, parameters, answers and error codes.
+descendants. The Helix node serves that interface itself — like `bitcoind`, one process: a wallet
+speaking Bitcoin Core's JSON-RPC, with the same method names, parameters, answers and error codes.
 
 ```bash
-helix-walletd --node http://127.0.0.1:8545 --wallet-dir /var/lib/helix-wallet init --passphrase-file pw.txt
-helix-walletd --node http://127.0.0.1:8545 --wallet-dir /var/lib/helix-wallet serve \
-  --rpcuser exchange --rpcpassword-file rpcpw.txt          # listens on 127.0.0.1:8547
+HELIX_WALLET_RPC=127.0.0.1:8547 \
+HELIX_WALLET_PASSPHRASE_FILE=/etc/helix/wallet-passphrase \
+HELIX_WALLET_RPC_USER=exchange HELIX_WALLET_RPC_PASSWORD_FILE=/etc/helix/rpc-password \
+HELIX_RPC_RATE_LIMIT=5000,1000 \
+helix start
 ```
 
-Authentication is HTTP Basic, as with Bitcoin Core: the user and password from the command line
-(the password only from a file), or the cookie `serve` writes to `<wallet-dir>/.cookie` at every
-start. `init` checks the node is on the chain this release is built for (`--chain-id` for
-another) and starts the wallet at the node's current height.
+On the first start the node makes the wallet in `helix-wallet/` next to its database
+(`HELIX_WALLET_DIR` to move it), at the current height, for the chain the node is on — encrypted
+under the passphrase in `HELIX_WALLET_PASSPHRASE_FILE` if one is given (then unlock it with
+`walletpassphrase`, as in Bitcoin Core). Authentication is HTTP Basic: the user and the password
+from its file, or the cookie the wallet writes to `<wallet-dir>/.cookie` at every start. All five
+settings can also go into `helix.toml` (`wallet_rpc`, `wallet_dir`, `wallet_rpc_user`,
+`wallet_rpc_password_file`, `wallet_passphrase_file`); a value the node cannot read stops it at
+startup, with the reason. **Run it on the exchange's own node, not on a validator** — a hot wallet
+does not belong in the consensus process.
+
+To run the wallet as its own process against a node elsewhere instead:
+`helix --node http://<node>:8545 wallet-rpc init --passphrase-file pw.txt`, then
+`helix --node http://<node>:8545 wallet-rpc serve --rpcuser exchange --rpcpassword-file rpcpw.txt`.
+That node then needs a higher rate limit (`HELIX_RPC_RATE_LIMIT=5000,1000`): the wallet reads every
+block, and the node limits requests per client address. Inside the node none of that applies.
 
 | Method | What it does on Helix |
 |---|---|
@@ -200,32 +213,31 @@ Where Helix differs from Bitcoin, the service says so instead of pretending:
 - **Every transaction the wallet signs is recorded before it is submitted**, and submitted again
   if it expires unincluded — after a crash or a node restart nothing it signed is forgotten.
 
-The node behind it must record balance changes for every block from the wallet's start on: 0.20.2
-or later, and raise its rate limit (`HELIX_RPC_RATE_LIMIT=5000,1000`), since the wallet reads
-every block. Back up the wallet directory, or call `backupwallet` — keys are written once and
-never changed, so a backup stays valid for every address made before it.
+The node must record balance changes for every block from the wallet's start on — any node
+running 0.20.2 or later does, for the blocks it executes. Back up the wallet directory, or call
+`backupwallet` — keys are written once and never changed, so a backup stays valid for every address
+made before it.
 
 ## Mesh (Rosetta) Data API
 
-`helix-mesh` serves the read side of the [Mesh API](https://docs.cdp.coinbase.com/mesh/docs/welcome)
+`helix mesh` serves the read side of the [Mesh API](https://docs.cdp.coinbase.com/mesh/docs/welcome)
 (formerly Rosetta) in front of your node: `/network/list`, `/network/options`, `/network/status`,
-`/block`, `/block/transaction`, `/account/balance`, `/mempool`, `/mempool/transaction`. It is a
-separate process that reads the node's REST API — the same endpoints this page describes — so it
-can be restarted or upgraded without touching the node.
+`/block`, `/block/transaction`, `/account/balance`, `/mempool`, `/mempool/transaction`. It runs as
+its own process and reads the node's REST API — the same endpoints this page describes — so it can
+be restarted without touching the node.
 
 ```bash
-helix-mesh --node http://127.0.0.1:8545 --listen 127.0.0.1:8080 --network testnet
+helix --node http://127.0.0.1:8545 mesh --listen 127.0.0.1:8080 --network testnet
 ```
 
-The Linux and macOS `helix-cli-…` archives carry `helix-mesh` next to `helix` from 0.20.2 on;
-from source it is `cargo build --release -p helix-mesh`.
+(0.20.2 shipped it as a separate `helix-mesh` binary; since then it is part of `helix`.)
 
 **Raise the node's rate limit for it.** The node limits requests per client address (500 at once,
-100 a second by default), and `helix-mesh` is one client asking for every block. Start the node
+100 a second by default), and `helix mesh` is one client asking for every block. Start the node
 with, for example, `HELIX_RPC_RATE_LIMIT=5000,1000`; until then a throttled request comes back
 as error 10, retriable, and a sync crawls.
 
-(`HELIX_MESH_NODE`, `HELIX_MESH_LISTEN` and `HELIX_MESH_NETWORK` set the same.) The network
+(`HELIX_NODE`, `HELIX_MESH_LISTEN` and `HELIX_MESH_NETWORK` set the same.) The network
 identifier is `{"blockchain": "Helix", "network": "<--network>"}`; the currency is
 `{"symbol": "HLX", "decimals": 9}`, and every amount is in nano-HLX.
 
