@@ -1027,7 +1027,17 @@ impl HelixNode {
             info!("Genesis block created (height 0)");
 
             store.save_chain_state(&state)?;
-            info!("Genesis: no liquid pre-mine — validator earns via 50/50 fee split plus the halving block reward");
+            // Read from the state just built, not asserted: this line said "no liquid pre-mine" and
+            // "50/50 fee split" long after the genesis gained a liquid reserve and fees moved to
+            // burning their base part (#253).
+            let allocation = state.get(&address);
+            let hlx = |nano: u64| nano / helix_executor::genesis::NANO_PER_HLX;
+            info!(
+                staked_hlx = hlx(allocation.map_or(0, |a| a.staked)),
+                liquid_hlx = hlx(allocation.map_or(0, |a| a.balance)),
+                "Genesis allocation for this validator. Fees burn their base part and tip the rest \
+                 to the block's validator; the block reward halves on schedule"
+            );
             state
         };
 
@@ -4798,6 +4808,9 @@ async fn block_production_loop(
     let mut heartbeat_ticks: u32 = 0;
     // When a block was last applied here — see `quorum_reachable`.
     let mut pulse = ChainPulse::new(*last_applied_height.lock().await);
+    // Whether "not in the active set" has been said for the current stretch — see
+    // `follower_notice_due`.
+    let mut follower_announced = false;
 
     loop {
         interval.tick().await;
@@ -5181,6 +5194,8 @@ async fn block_production_loop(
         } else {
             engine.write().await.produce_block(&keypair, prev_hash, prev_height, prev_state_root, txs)
         };
+        let not_in_set = matches!(produced, Err(ConsensusError::UnknownValidator(_)));
+        let follower_notice = follower_notice_due(not_in_set, &mut follower_announced);
         match produced {
             Ok(block) => {
                 apply_finalized_block(block, true, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &tip_certificate)
@@ -5224,6 +5239,16 @@ async fn block_production_loop(
                 // finalized the stalled round between our timeout check and
                 // this call. The height already advanced normally.
             }
+            Err(ConsensusError::UnknownValidator(_)) => {
+                if follower_notice {
+                    info!(
+                        "This node's key is not in the active validator set, so it follows the \
+                         chain and proposes nothing — expected until a stake is active (pending \
+                         and probation come first), and for a node not meant to validate. Said \
+                         once; said again only if the key is in the set in between."
+                    );
+                }
+            }
             Err(e) => warn!("Block production failed: {}", e),
         }
 
@@ -5238,6 +5263,16 @@ async fn block_production_loop(
             report_double_sign_evidence(ev, &keypair, &chain_state, &mempool, &p2p_tx).await;
         }
     }
+}
+
+/// Whether to say, this tick, that the node is not in the active set (#253): once per stretch
+/// outside it. It used to be a WARN every tick — twice a second on a fast chain — for every node
+/// without an active stake, the desktop wallet's own node included, and a warning that is always
+/// there teaches an operator to read past warnings.
+fn follower_notice_due(not_in_set: bool, announced: &mut bool) -> bool {
+    let due = not_in_set && !*announced;
+    *announced = not_in_set;
+    due
 }
 
 /// Drain the votes this node has cast but not yet sent, and gossip them to the other
@@ -13963,5 +13998,22 @@ mod flag_setting_tests {
             assert!(!flag_setting("HELIX_TEST_FLAG", odd), "{odd:?}");
         }
         assert!(flag_setting("HELIX_TEST_FLAG", "yes"));
+    }
+}
+
+#[cfg(test)]
+mod follower_notice_tests {
+    use super::follower_notice_due;
+
+    /// Said once per stretch outside the set: not every tick, and again after the key was in it.
+    #[test]
+    fn the_follower_notice_comes_once_per_stretch_outside_the_set() {
+        let mut announced = false;
+        let ticks = [true, true, true, false, false, true, true];
+        let said: Vec<bool> = ticks
+            .iter()
+            .map(|&not_in_set| follower_notice_due(not_in_set, &mut announced))
+            .collect();
+        assert_eq!(said, [true, false, false, false, false, true, false]);
     }
 }
