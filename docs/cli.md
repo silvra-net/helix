@@ -1,6 +1,6 @@
 # Using the Helix CLI
 
-> Part of the [Helix documentation](../README.md) — deep reference, split out of the README to keep it short.
+> Part of the [Helix documentation](../README.md).
 
 ## Using the CLI (`helix`)
 
@@ -136,9 +136,12 @@ buys priority. The base fee drifts up to ±12.5% per block toward a 1 MB target,
 load and decays back to its floor of 1 nano/byte when blocks are quiet.
 
 Size matters more here than on most chains, because Helix signs with post-quantum ML-DSA: a
-signature is 3,309 bytes and a public key 1,952, so **a plain transfer is ~5.4 KB and costs
-~5,410 nano-HLX at the floor** — about 0.0000054 HLX. A contract deploy carries its own bytecode
-on top and costs proportionally more (up to ~71,000 nano at the 64 KiB code limit).
+signature is 3,309 bytes and a public key 1,952. **An account's first transaction carries its
+public key and is about 5.4 KB; every later one travels in blocks without it, at about 3.5 KB** —
+the chain already knows the key. At the floor that is about 5,400 and 3,500 nano-HLX, a few
+millionths of an HLX. The CLI and the desktop wallet price each transaction by the size its block
+will carry. A contract deploy carries its bytecode on top (up to ~71,000 nano at the 64 KiB code
+limit).
 
 This is why `--fee` is optional and best left alone: omit it and the CLI asks the node what it
 currently charges, prices the transaction for its actual size, and adds 100% headroom so it still
@@ -244,7 +247,8 @@ Verified personhood matters for one thing: a validator's full stake counts towar
 power instead of half of it. The cap is the same for everyone — 1% of all stake — so
 personhood helps only a validator below it; one already at the cap gains nothing (see
 [Consensus](internals.md#consensus)).
-It is not required to hold, send, or stake HLX.
+It is not required to hold, send, or stake HLX. **The public testnet configures no personhood
+authority**, so personhood proofs are refused there.
 
 ### Social Recovery
 
@@ -273,8 +277,7 @@ helix recovery approve hlx... <new_pubkey_hex> --key guardian2.json
 
 Each guardian holds **one** vote. Approving another key moves that guardian's vote there; it
 does not touch anybody else's, and `recovery status` lists every key currently named with its
-votes. (Before 0.20.0 a vote for a different key restarted the whole request — one guardian
-could undo the others' approvals while the owner, whose key was lost, could do nothing.)
+votes.
 
 **Replacing your guardians works even with a recovery vote in progress**, and doing so
 cancels that vote. An owner who can still sign outranks a guardian's part-way approval —
@@ -285,11 +288,6 @@ A stuck sub-threshold request can also be cleared on its own, without touching t
 set, at the protocol level (`CancelRecoveryRequest`, signed by the account owner). There is no
 `helix recovery` CLI subcommand for either yet; both currently require constructing the
 transaction directly against the REST API.
-
-(Until 2026-09-22 registering guardians was *refused* while any request was pending, and
-cancelling was the documented way out. It did not work: the owner needs two transactions
-landing with nothing in between, a guardian needs one approval to re-open the request, and the
-proposer decides the order inside a block — so a hostile guardian could never be removed.)
 
 ### Governance
 

@@ -8,7 +8,8 @@ use crate::passphrase::Signer;
 
 #[derive(Subcommand)]
 pub enum RecoveryCmd {
-    /// Register (or replace) your social-recovery guardian set (3-of-5 quorum)
+    /// Register (or replace) your social-recovery guardians: 3-10 addresses, of which 3/5 (rounded
+    /// up) must approve a recovery — 2 of 3, 3 of 5, 6 of 10
     RegisterGuardians {
         /// Guardian addresses (3-10)
         #[arg(required = true, num_args = 1..)]
