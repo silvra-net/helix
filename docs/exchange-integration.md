@@ -153,9 +153,11 @@ separate process that reads the node's REST API — the same endpoints this page
 can be restarted or upgraded without touching the node.
 
 ```bash
-cargo build --release -p helix-mesh
-./target/release/helix-mesh --node http://127.0.0.1:8545 --listen 127.0.0.1:8080 --network testnet
+helix-mesh --node http://127.0.0.1:8545 --listen 127.0.0.1:8080 --network testnet
 ```
+
+The Linux and macOS `helix-cli-…` archives carry `helix-mesh` next to `helix` from the first
+release after 0.20.1; from source it is `cargo build --release -p helix-mesh`.
 
 (`HELIX_MESH_NODE`, `HELIX_MESH_LISTEN` and `HELIX_MESH_NETWORK` set the same.) The network
 identifier is `{"blockchain": "Helix", "network": "<--network>"}`; the currency is

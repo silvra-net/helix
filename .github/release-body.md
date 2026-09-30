@@ -6,6 +6,7 @@
 |---|---|
 | **Run a node or validator** (server, headless, no desktop) | `helix-cli-…` for your platform — unpack it and run `helix start`. No installer, no dependencies. |
 | **Use the wallet on my desktop** (send, stake, see your history, run a node from the UI) | `helix-gui-…` for your platform. **The wallet already contains the node** — you do not need the CLI as well. |
+| **Serve the Mesh (Rosetta) API** for an exchange or custodian | `helix-mesh`, inside the Linux and macOS `helix-cli-…` archives — see [Integrating Helix](https://github.com/silvra-net/helix/blob/master/docs/exchange-integration.md#mesh-rosetta-data-api). |
 | **Browse the chain** (blocks, transactions, any address) | Nothing to download — [explorer.silvra.net](https://explorer.silvra.net). Every node also serves its own status page at its root URL. |
 
 ### Which wallet installer?

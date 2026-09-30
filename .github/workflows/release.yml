@@ -64,6 +64,14 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }} --bin helix
 
+      # The Mesh (Rosetta) service is a server component, run on Linux or in a container, so it
+      # ships in the unix archives only. CI builds on Linux alone; a Windows build of a new
+      # binary would be compiled for the first time here, during a release — which is how the
+      # first 0.12.0 run failed.
+      - name: Build the Mesh service (unix)
+        if: runner.os != 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} --bin helix-mesh
+
       - name: Package archive (unix)
         if: runner.os != 'Windows'
         run: |
@@ -71,6 +79,7 @@ jobs:
           staging="helix-cli-${{ github.ref_name }}-${{ matrix.label }}"
           mkdir -p "$staging"
           cp target/${{ matrix.target }}/release/helix "$staging/"
+          cp target/${{ matrix.target }}/release/helix-mesh "$staging/"
           cp README.md "$staging/"
           tar czf "$staging.tar.gz" "$staging"
           echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
