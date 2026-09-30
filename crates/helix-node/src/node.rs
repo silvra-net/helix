@@ -2481,6 +2481,32 @@ async fn settle_applied_height(last: &mut u64, store: &Arc<RwLock<HelixDb>>) {
     }
 }
 
+/// Keep what a block's execution recorded — each transaction's receipt and every liquid balance
+/// it moved (#260) — on every path that applies a block.
+///
+/// The catch-up paths used to execute each block and throw its receipts away. On the live chain
+/// that was not a corner: every block a node took over sync — all of them on joining, after every
+/// restart, and in live following whenever block sync beat the committed-block gossip (2 of 20 in
+/// a measured run) — answered `unknown` at `/transactions/:hash` and in the address history,
+/// failed transfers included (#259). One function for all three paths is what keeps the next
+/// record from being kept on one and forgotten on the others.
+///
+/// A failure to write either does not stop the chain or the sync: the block is valid without
+/// them, and their absence reads as "this node cannot say", never as success.
+fn store_execution_record(
+    store: &mut HelixDb,
+    height: u64,
+    receipts: &[helix_executor::receipt::Receipt],
+    balance_changes: &[helix_executor::BalanceChange],
+) {
+    if let Err(e) = store.put_receipts(receipts) {
+        error!(height, err = %e, "Failed to store the receipts of a block");
+    }
+    if let Err(e) = store.put_balance_changes(height, balance_changes) {
+        error!(height, err = %e, "Failed to store the balance changes of a block");
+    }
+}
+
 /// Verify and apply a block batch a peer sent in answer to our block-sync request (#138).
 ///
 /// Structured exactly like the RPC gap-fill branch above — hold `last_applied_height` across the
@@ -2488,28 +2514,6 @@ async fn settle_applied_height(last: &mut u64, store: &Arc<RwLock<HelixDb>>) {
 /// with one difference that matters: nothing is written until [`verify_block_batch`] has passed on
 /// the batch as a whole, so a peer that lies costs a round trip rather than a corrupted store.
 #[allow(clippy::too_many_arguments)]
-/// Keep what a synced block's transactions did, exactly as `apply_finalized_block` keeps it for a
-/// block this node saw finalize.
-///
-/// Both catch-up paths executed each block and threw its receipts away. On the live chain that is
-/// not a corner: every block a node took over sync — all of them on joining, after every restart,
-/// and in live following whenever block sync beat the committed-block gossip (2 of 20 in a
-/// measured run) — answered `unknown` at `/transactions/:hash` and in the address history, failed
-/// transfers included. A node an exchange runs to see its deposits could not tell a deposit that
-/// arrived from one that failed.
-///
-/// A failure to write them does not stop the sync, for the reason the consensus path gives: the
-/// block is valid without them, and their absence reads as `unknown`, never as success.
-fn store_synced_receipts(
-    store: &mut HelixDb,
-    height: u64,
-    receipts: &[helix_executor::receipt::Receipt],
-) {
-    if let Err(e) = store.put_receipts(receipts) {
-        error!(height, err = %e, "Failed to store receipts for a synced block");
-    }
-}
-
 async fn apply_synced_batch(
     batch: BlockSyncResponse,
     peer: String,
@@ -2616,7 +2620,8 @@ async fn apply_synced_batch(
                 error!(height = block.height(), err = %e, "Failed to store a synced block");
                 break;
             }
-            store_synced_receipts(&mut s, block.height(), &receipt.tx_receipts);
+            let (receipts, changes) = (&receipt.tx_receipts, &receipt.balance_changes);
+            store_execution_record(&mut s, block.height(), receipts, changes);
         }
         if let Err(e) = s.save_chain_state(&cs) {
             fatal_storage_failure("chain state", cs.applied_height, &e);
@@ -3856,7 +3861,7 @@ async fn apply_finalized_block(
     // record of whether a committed transaction did anything, and warning about the count in the
     // log while dropping them left `hlx tx status`, the explorer and Spark all reporting a
     // rejected transfer as `confirmed`.
-    let (tx_receipts, newly_jailed_for_downtime, rotated_validators) = {
+    let (tx_receipts, balance_changes, newly_jailed_for_downtime, rotated_validators) = {
         let mut state = chain_state.write().await;
         let receipt = execute_block(&mut state, &block);
         if receipt.failed_txs() > 0 {
@@ -3874,7 +3879,12 @@ async fn apply_finalized_block(
         // wants to compare running nodes without trawling logs. See ChainState::state_hash's
         // doc comment for exactly what this is and isn't.
         debug!(height, state_hash = %state.state_hash().to_hex(), "Block applied");
-        (receipt.tx_receipts, receipt.newly_jailed, receipt.rotated_validators)
+        (
+            receipt.tx_receipts,
+            receipt.balance_changes,
+            receipt.newly_jailed,
+            receipt.rotated_validators,
+        )
     };
 
     // Double-sign slashing does NOT happen here. It used to: this function unconditionally
@@ -4040,11 +4050,9 @@ async fn apply_finalized_block(
         if let Err(e) = s.put_block(block) {
             fatal_storage_failure("block", height, &e);
         }
-        // A block whose receipts failed to write is still a valid block — the chain is not held
-        // up for it. Their absence reads as `unknown` at the RPC, never as success.
-        if let Err(e) = s.put_receipts(&tx_receipts) {
-            error!("Failed to store receipts for block {}: {}", height, e);
-        }
+        // A block whose record failed to write is still a valid block — the chain is not held up
+        // for it. Its absence reads as `unknown` at the RPC, never as success.
+        store_execution_record(&mut s, height, &tx_receipts, &balance_changes);
         let state = chain_state.read().await;
         if let Err(e) = s.save_chain_state(&state) {
             // Worse than a lost block, because it leaves no gap to notice: the block is on disk
@@ -6933,7 +6941,7 @@ async fn sync_blocks_from_peer(
             // `chain_state` exclusively (`&mut`), so the pair is consistent here too.
             chain_state.applied_height = h;
             store.put_block(block.clone())?;
-            store_synced_receipts(store, h, &receipt.tx_receipts);
+            store_execution_record(store, h, &receipt.tx_receipts, &receipt.balance_changes);
             expected_prev_hash = block.hash();
             total_applied += 1;
             applied_this_batch += 1;
@@ -7959,6 +7967,14 @@ mod sync_blocks_from_peer_tests {
             panic!("{path}: the applied transfer has no receipt")
         });
         assert!(applied.success, "{path}: the applied transfer must be recorded as applied");
+        // And what the block did to balances (#260): the 100 the applied transfer moved arrived.
+        let changes = s.balance_changes(1).unwrap().unwrap_or_else(|| {
+            panic!("{path}: a block this node applied has no record of the balances it moved")
+        });
+        assert!(
+            changes.iter().any(|c| c.tx_index == Some(1) && c.delta == 100),
+            "{path}: the applied transfer's 100 must be among the changes: {changes:?}"
+        );
     }
 
     /// The RPC sync — every node's path on joining, and a follower's while it catches up — keeps
@@ -11686,6 +11702,11 @@ mod handle_p2p_event_tests {
             "the reason has to survive to the caller, not just the log: {:?}",
             receipt.error
         );
+        // What the block did to balances is kept alongside (#260): the refused transfer's fee.
+        let changes =
+            store.read().await.balance_changes(1).unwrap().expect("kept with the receipts");
+        let fee_paid = changes.iter().any(|c| c.account == sender.to_string() && c.delta == -10_000);
+        assert!(fee_paid, "{changes:?}");
     }
 
     /// Regression test for a real race: this node's own BFT engine reaching quorum

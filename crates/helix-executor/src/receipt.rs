@@ -32,6 +32,41 @@ impl Receipt {
     }
 }
 
+/// Which part of a block's effect a [`BalanceChange`] is (#260).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalanceChangeKind {
+    /// What a transaction did to an account itself: its fee, the value it moved, a stake, a claim.
+    #[default]
+    Transaction,
+    /// A validator's income — fee tips, the block reward, commission — paid to its payout
+    /// address. Only its own share: what its delegators earn goes into the pool, which is not a
+    /// liquid balance.
+    Reward,
+    /// A transfer a smart contract made while the transaction ran, out of the contract's balance
+    /// and into the recipient's.
+    Contract,
+}
+
+/// One liquid balance moving in a block (#260).
+///
+/// A block's changes, summed per account, are exactly how much each liquid balance moved in it —
+/// `execute_block` checks that in debug builds, and it is what lets a reader account for every
+/// nano-HLX, including what a contract paid out and what a validator earned, neither of which is
+/// a transaction to the receiving address. Not consensus state: derived from execution, like a
+/// receipt, and kept by each node for the blocks it executes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BalanceChange {
+    /// Position of the transaction in its block; `None` for the block itself (its reward).
+    pub tx_index: Option<u32>,
+    /// The account whose liquid balance moved.
+    pub account: String,
+    pub kind: BalanceChangeKind,
+    /// Signed change in nano-HLX. One entry per account, transaction and kind: several moves of
+    /// the same balance within one transaction are added up.
+    pub delta: i128,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockReceipt {
     pub block_hash: String,
@@ -56,6 +91,8 @@ pub struct BlockReceipt {
     /// voting power and take no proposer turn (backlog #132) — see
     /// `ChainState::rotate_active_validators` and `helix_consensus::Validator::probationary`.
     pub rotated_validators: Option<Vec<(helix_crypto::Address, u64, bool)>>,
+    /// Every liquid balance this block moved, and why (#260).
+    pub balance_changes: Vec<BalanceChange>,
 }
 
 impl BlockReceipt {

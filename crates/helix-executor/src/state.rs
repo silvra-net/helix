@@ -5,6 +5,7 @@ use helix_identity::{GuardianSet, PersonhoodStatus, RecoveryRequest};
 use serde::{Deserialize, Serialize};
 
 use crate::governance::{GovernanceParams, GovernanceProposal};
+use crate::receipt::{BalanceChange, BalanceChangeKind};
 
 /// Unbonding period in blocks — stake stays slashable for 7 days at the actual 2s block
 /// time (`BLOCK_TIME_MS` in `helix-node`). Was 50_400 (7 days at an earlier, since-changed
@@ -317,6 +318,11 @@ pub struct ChainState {
     /// is a theft.
     #[serde(default = "unset_chain_id")]
     pub chain_id: Hash,
+    /// The record of liquid-balance changes a block's execution writes (#260) — `Some` only while
+    /// `execute_block` runs. Not state: never serialized (so snapshots and stored state read the
+    /// same as before) and not part of `state_hash`.
+    #[serde(skip)]
+    pub balance_journal: Option<BalanceJournal>,
     /// address string → account state
     pub accounts: HashMap<String, AccountState>,
     /// Absolute HLX supply ceiling in nano-HLX (`genesis::TOTAL_SUPPLY_HLX`, fixed at
@@ -606,6 +612,37 @@ pub struct ChainState {
     pub jailed_until: HashMap<String, u64>,
 }
 
+/// Liquid-balance changes recorded while a block executes (#260), one entry per account,
+/// transaction and kind.
+#[derive(Debug, Clone, Default)]
+pub struct BalanceJournal {
+    position: Option<u32>,
+    kind: BalanceChangeKind,
+    changes: Vec<BalanceChange>,
+}
+
+impl BalanceJournal {
+    fn note(&mut self, account: &Address, before: u64, after: u64) {
+        if before == after {
+            return;
+        }
+        let delta = after as i128 - before as i128;
+        let account = account.to_string();
+        let (position, kind) = (self.position, self.kind);
+        // Entries are appended in block order, so the same transaction's are all at the end.
+        let same = self
+            .changes
+            .iter_mut()
+            .rev()
+            .take_while(|c| c.tx_index == position)
+            .find(|c| c.account == account && c.kind == kind);
+        match same {
+            Some(entry) => entry.delta += delta,
+            None => self.changes.push(BalanceChange { tx_index: position, account, kind, delta }),
+        }
+    }
+}
+
 impl ChainState {
     /// A state with no chain identity yet — `chain_id` stays [`Hash::ZERO`] until the caller who
     /// knows the genesis block sets it (see `ChainState::chain_id`). Callers that skip that step
@@ -613,6 +650,7 @@ impl ChainState {
     pub fn new(total_supply: u64) -> Self {
         ChainState {
             chain_id: unset_chain_id(),
+            balance_journal: None,
             accounts: HashMap::new(),
             total_supply,
             total_issued: 0,
@@ -676,6 +714,9 @@ impl ChainState {
             .unwrap_or_else(|| AccountState::new(address))
     }
 
+    /// The one way a liquid balance changes during execution (#260): while a block runs, every
+    /// change made here lands in the balance journal. A change made any other way would be missed,
+    /// and `execute_block` says so in debug builds.
     pub fn update_account<F>(&mut self, address: &Address, f: F)
     where
         F: FnOnce(&mut AccountState),
@@ -685,7 +726,38 @@ impl ChainState {
             .accounts
             .entry(key)
             .or_insert_with(|| AccountState::new(address));
+        let before = acc.balance;
         f(acc);
+        let after = acc.balance;
+        if let Some(journal) = self.balance_journal.as_mut() {
+            journal.note(address, before, after);
+        }
+    }
+
+    /// Start recording liquid-balance changes — see [`BalanceJournal`].
+    pub(crate) fn begin_balance_journal(&mut self) {
+        self.balance_journal = Some(BalanceJournal::default());
+    }
+
+    /// Which transaction the changes from here on belong to (`None`: the block itself).
+    pub(crate) fn journal_position(&mut self, tx_index: Option<u32>) {
+        if let Some(journal) = self.balance_journal.as_mut() {
+            journal.position = tx_index;
+        }
+    }
+
+    /// What kind the changes from here on are; returns the previous kind, to put back.
+    pub(crate) fn journal_kind(&mut self, kind: BalanceChangeKind) -> BalanceChangeKind {
+        match self.balance_journal.as_mut() {
+            Some(journal) => std::mem::replace(&mut journal.kind, kind),
+            None => kind,
+        }
+    }
+
+    /// Stop recording and hand over what was recorded, without the entries that netted to zero.
+    pub(crate) fn take_balance_journal(&mut self) -> Vec<BalanceChange> {
+        let changes = self.balance_journal.take().map(|j| j.changes).unwrap_or_default();
+        changes.into_iter().filter(|c| c.delta != 0).collect()
     }
 
     pub fn set_balance(&mut self, address: &Address, balance: u64) {

@@ -5,7 +5,7 @@ pub mod state;
 
 pub use genesis::GenesisConfig;
 pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal};
-pub use receipt::{BlockReceipt, Receipt};
+pub use receipt::{BalanceChange, BalanceChangeKind, BlockReceipt, Receipt};
 pub use state::{
     self_bond_ratio_ok, AccountState, ChainState, DelegationPool, DEFAULT_COMMISSION_BPS,
     MAX_COMMISSION_BPS, MIN_SELF_BOND_RATIO_BPS, UNBONDING_PERIOD,
@@ -81,6 +81,12 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
     let height = block.height();
     let base_fee_per_byte = block.header.base_fee_per_byte;
 
+    // Every liquid balance this block moves, and why (#260). In debug builds the record is
+    // checked against the balances themselves at the end of the block.
+    state.begin_balance_journal();
+    #[cfg(debug_assertions)]
+    let balances_before = liquid_balances(state);
+
     // Downtime-jailing bookkeeping, against the validator set as it stood *entering* this
     // block (i.e. the set `last_commit` — the parent block's precommits — was actually voted
     // by), before any of this block's own transactions (Stake/Unstake/SubmitDoubleSignEvidence,
@@ -119,7 +125,8 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
     // so everyone reaches the same verdict on which calls fit.
     let mut block_fuel = MAX_BLOCK_FUEL;
 
-    for tx in &block.transactions {
+    for (index, tx) in block.transactions.iter().enumerate() {
+        state.journal_position(Some(index as u32));
         let receipt =
             execute_transaction_metered(state, tx, fee_recipient, height, base_fee_per_byte, &mut block_fuel);
         total_burned += receipt.fee_burned;
@@ -127,6 +134,7 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
         receipts.push(receipt);
     }
 
+    state.journal_position(None);
     state.total_burned = state.total_burned.saturating_add(total_burned);
 
     // Redelegations whose source-slashing window has closed stop being consensus state. Done
@@ -157,6 +165,17 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
         state.total_issued = state.total_issued.saturating_add(block_reward_minted);
     }
 
+    let balance_changes = state.take_balance_journal();
+    #[cfg(debug_assertions)]
+    {
+        let missed = journal_mismatches(&balances_before, state, &balance_changes);
+        assert!(
+            missed.is_empty(),
+            "block {height} moved liquid balances its balance journal does not account for — a \
+             change made outside `ChainState::update_account`: {missed:?}"
+        );
+    }
+
     BlockReceipt {
         block_hash: block.hash().to_hex(),
         height: block.height(),
@@ -166,7 +185,40 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
         block_reward_minted,
         newly_jailed,
         rotated_validators,
+        balance_changes,
     }
+}
+
+/// Every account's liquid balance — what the balance journal is checked against (#260).
+#[cfg(any(debug_assertions, test))]
+fn liquid_balances(state: &ChainState) -> std::collections::HashMap<String, u64> {
+    state.accounts.iter().map(|(address, acc)| (address.clone(), acc.balance)).collect()
+}
+
+/// The accounts whose liquid balance moved by something other than what `changes` records, as
+/// `(account, recorded, actual)`. Empty when the journal accounts for every nano-HLX (#260).
+#[cfg(any(debug_assertions, test))]
+fn journal_mismatches(
+    before: &std::collections::HashMap<String, u64>,
+    after: &ChainState,
+    changes: &[BalanceChange],
+) -> Vec<(String, i128, i128)> {
+    let mut recorded: std::collections::HashMap<&str, i128> = std::collections::HashMap::new();
+    for change in changes {
+        *recorded.entry(change.account.as_str()).or_default() += change.delta;
+    }
+    let mut accounts: std::collections::BTreeSet<&str> = recorded.keys().copied().collect();
+    accounts.extend(before.keys().map(String::as_str));
+    accounts.extend(after.accounts.keys().map(String::as_str));
+    accounts
+        .into_iter()
+        .filter_map(|account| {
+            let was = before.get(account).copied().unwrap_or(0) as i128;
+            let is = after.accounts.get(account).map(|a| a.balance).unwrap_or(0) as i128;
+            let noted = recorded.get(account).copied().unwrap_or(0);
+            (is - was != noted).then(|| (account.to_string(), noted, is - was))
+        })
+        .collect()
 }
 
 /// Execute a single transaction on its own, outside any block-level fuel budget: a contract call
@@ -1896,10 +1948,12 @@ fn execute_call_contract(
     for (key, value) in commit.storage_writes {
         state.contract_storage_write(&commit.contract, key, value);
     }
+    let previous = state.journal_kind(BalanceChangeKind::Contract);
     for (to, amount) in commit.transfers {
         state.update_account(&commit.contract, |acc| acc.balance -= amount);
         state.update_account(&to, |acc| acc.balance += amount);
     }
+    state.journal_kind(previous);
 
     distribute_fee(state, validator, tx.fee, base_fee_amount)
         .map(|(burned, reward)| Receipt::success(tx_hash, burned, reward))
@@ -2187,7 +2241,7 @@ fn execute_prove_personhood(
 /// the delegators' share included — to whatever address the validator chose. That is what the
 /// old `HELIX_REWARD_ADDRESS` override did, called "degrading safely"; it was only harmless
 /// because the override was never applied on a multi-validator chain.
-fn credit_validator_reward(state: &mut ChainState, validator: &Address, amount: u64) {
+fn pay_validator_reward(state: &mut ChainState, validator: &Address, amount: u64) {
     if amount == 0 {
         return;
     }
@@ -2216,6 +2270,14 @@ fn credit_validator_reward(state: &mut ChainState, validator: &Address, amount: 
         // Just inserted/confirmed present via the `let Some(pool)` above.
         state.validator_pools.get_mut(&key).unwrap().total_delegated_stake += pool_gain;
     }
+}
+
+/// [`pay_validator_reward`], recorded in the balance journal as a reward rather than as part of
+/// the transaction that paid the tip (#260).
+fn credit_validator_reward(state: &mut ChainState, validator: &Address, amount: u64) {
+    let previous = state.journal_kind(BalanceChangeKind::Reward);
+    pay_validator_reward(state, validator, amount);
+    state.journal_kind(previous);
 }
 
 /// EIP-1559 fee split: the **base fee** portion (`base_fee_amount = block base_fee_per_byte ×
@@ -8669,5 +8731,149 @@ mod account_key_tests {
         let mut b = ChainState::new(0);
         b.record_account_key(&Address::from_public_key(&kp.public), &kp.public);
         assert_ne!(a.state_hash(), b.state_hash());
+    }
+}
+
+#[cfg(test)]
+mod balance_journal_tests {
+    //! The record of every liquid balance a block moves (#260).
+    use super::tests::{empty_block, signed_contract_tx};
+    use super::*;
+    use helix_core::TxType;
+    use helix_crypto::KeyPair;
+
+    fn funded_state(accounts: &[(&Address, u64)]) -> ChainState {
+        let mut state = ChainState::new(genesis::TOTAL_SUPPLY_HLX * genesis::NANO_PER_HLX);
+        for (address, balance) in accounts {
+            state.update_account(address, |acc| acc.balance = *balance);
+        }
+        state
+    }
+
+    fn change(
+        changes: &[BalanceChange],
+        tx: Option<u32>,
+        who: &Address,
+        kind: BalanceChangeKind,
+    ) -> Option<i128> {
+        let who = who.to_string();
+        let entry = changes.iter().find(|c| c.tx_index == tx && c.account == who && c.kind == kind);
+        entry.map(|c| c.delta)
+    }
+
+    /// An applied transfer, a failed one and the block reward, each where it belongs: what the
+    /// sender paid, what arrived, and what the validator earned — its tips per transaction, its
+    /// block reward at block level.
+    #[test]
+    fn a_block_records_every_balance_it_moves() {
+        let sender_kp = KeyPair::generate();
+        let sender = Address::from_public_key(&sender_kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = funded_state(&[(&sender, 1_000_000)]);
+
+        let fee = 20_000;
+        let to = Some(recipient.clone());
+        let sent = signed_contract_tx(&sender_kp, &sender, TxType::Transfer, to.clone(), 5_000, vec![], 0, fee);
+        // A zero amount is refused after the block is committed: the fee is charged, nothing moves.
+        let refused = signed_contract_tx(&sender_kp, &sender, TxType::Transfer, to, 0, vec![], 1, fee);
+        let mut block = empty_block(&validator, 1);
+        block.transactions = vec![sent, refused];
+
+        let receipt = execute_block(&mut state, &block);
+        let changes = &receipt.balance_changes;
+        assert!(receipt.tx_receipts[0].success && !receipt.tx_receipts[1].success, "the premise");
+        assert!(receipt.block_reward_minted > 0, "the premise: this block mints a reward");
+
+        use BalanceChangeKind::*;
+        assert_eq!(change(changes, Some(0), &sender, Transaction), Some(-(5_000 + fee as i128)));
+        assert_eq!(change(changes, Some(0), &recipient, Transaction), Some(5_000));
+        assert_eq!(change(changes, Some(1), &sender, Transaction), Some(-(fee as i128)));
+        let refused_moved = change(changes, Some(1), &recipient, Transaction);
+        assert_eq!(refused_moved, None, "a refused transfer moves nothing");
+        for i in 0..2 {
+            assert_eq!(
+                change(changes, Some(i), &validator, Reward),
+                Some(receipt.tx_receipts[i as usize].fee_to_validator as i128),
+                "the validator's tip for transaction {i}"
+            );
+        }
+        let minted = receipt.block_reward_minted as i128;
+        assert_eq!(change(changes, None, &validator, Reward), Some(minted));
+        assert_eq!(changes.len(), 6, "nothing else moved: {changes:?}");
+    }
+
+    /// What a contract pays out is the contract's change and the recipient's, recorded as a
+    /// contract transfer — the one way a balance can grow without a transaction to it.
+    #[test]
+    fn what_a_contract_pays_out_is_recorded_as_the_contracts() {
+        let deployer_kp = KeyPair::generate();
+        let contract = Address::from_public_key(&deployer_kp.public);
+        let caller_kp = KeyPair::generate();
+        let caller = Address::from_public_key(&caller_kp.public);
+        let recipient = Address::from_public_key(&KeyPair::generate().public);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = funded_state(&[(&contract, 1_000_000), (&caller, 1_000_000)]);
+
+        let addr = recipient.to_string();
+        let wasm = wat::parse_str(format!(
+            r#"(module
+                (import "env" "transfer" (func $transfer (param i32 i32 i64) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{addr}")
+                (func (export "call")
+                    (drop (call $transfer (i32.const 0) (i32.const {len}) (i64.const 300)))))"#,
+            len = addr.len(),
+        ))
+        .unwrap();
+        let deploy =
+            signed_contract_tx(&deployer_kp, &contract, TxType::DeployContract, None, 0, wasm, 0, 10_000);
+        let target = Some(contract.clone());
+        let call =
+            signed_contract_tx(&caller_kp, &caller, TxType::CallContract, target, 1_000, vec![], 0, 10_000);
+        let mut block = empty_block(&validator, 1);
+        block.transactions = vec![deploy, call];
+
+        let receipt = execute_block(&mut state, &block);
+        let all_applied = receipt.tx_receipts.iter().all(|r| r.success);
+        assert!(all_applied, "the premise: {:?}", receipt.tx_receipts);
+        let changes = &receipt.balance_changes;
+
+        use BalanceChangeKind::*;
+        assert_eq!(change(changes, Some(1), &caller, Transaction), Some(-(1_000 + 10_000)));
+        assert_eq!(change(changes, Some(1), &contract, Transaction), Some(1_000), "the call's value");
+        assert_eq!(change(changes, Some(1), &contract, Contract), Some(-300));
+        assert_eq!(change(changes, Some(1), &recipient, Contract), Some(300));
+        assert_eq!(change(changes, Some(1), &recipient, Transaction), None);
+    }
+
+    /// The checker the journal is held to — positive control: a balance moved behind
+    /// `update_account`'s back is named.
+    #[test]
+    fn a_balance_moved_outside_the_journal_is_named() {
+        let someone = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = funded_state(&[(&someone, 100)]);
+        let before = liquid_balances(&state);
+        state.accounts.get_mut(&someone.to_string()).unwrap().balance += 7;
+        assert_eq!(journal_mismatches(&before, &state, &[]), vec![(someone.to_string(), 0, 7)]);
+    }
+
+    /// The journal is not state: it changes neither `state_hash` nor what a snapshot carries, and
+    /// it records nothing outside a block.
+    #[test]
+    fn the_journal_is_not_state() {
+        let someone = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = funded_state(&[(&someone, 100)]);
+        assert!(state.balance_journal.is_none(), "nothing records outside a block");
+
+        let (hash, bytes) = (state.state_hash(), bincode::serialize(&state).unwrap());
+        state.begin_balance_journal();
+        state.update_account(&someone, |acc| acc.balance += 1);
+        state.update_account(&someone, |acc| acc.balance -= 1);
+        assert!(state.balance_journal.is_some());
+        assert_eq!(state.state_hash(), hash);
+        assert_eq!(bincode::serialize(&state).unwrap(), bytes);
+        assert!(state.take_balance_journal().is_empty(), "a change that nets to zero is no change");
+        assert!(state.balance_journal.is_none());
     }
 }

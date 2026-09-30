@@ -64,6 +64,39 @@ pub struct TxResponse {
     pub error: Option<String>,
 }
 
+/// One liquid balance a block moved, and why (#260), as the API shows it. A block's changes,
+/// summed per account, are exactly how much each liquid balance moved in it — including what a
+/// contract paid out and what the validator earned, neither of which is a transaction to the
+/// receiving address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BalanceChangeView {
+    /// Position of the transaction in the block; `null` for the block itself (its reward).
+    pub tx_index: Option<u32>,
+    /// That transaction's hash; `null` for the block itself.
+    pub tx_hash: Option<String>,
+    pub account: String,
+    /// `transaction` (the fee, the value moved, a stake, a claim), `reward` (a validator's tips,
+    /// block reward and commission) or `contract` (a transfer a contract made).
+    pub kind: helix_executor::BalanceChangeKind,
+    /// Signed change in nano-HLX, as a decimal string.
+    pub delta_nano: String,
+}
+
+impl BalanceChangeView {
+    pub fn of(change: &helix_executor::BalanceChange, block: &Block) -> Self {
+        BalanceChangeView {
+            tx_index: change.tx_index,
+            tx_hash: change
+                .tx_index
+                .and_then(|i| block.transactions.get(i as usize))
+                .map(|tx| tx.hash().to_hex()),
+            account: change.account.clone(),
+            kind: change.kind,
+            delta_nano: change.delta.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockResponse {
     pub hash: String,
@@ -80,6 +113,10 @@ pub struct BlockResponse {
     #[serde(default)]
     pub node_version: String,
     pub transactions: Vec<TxResponse>,
+    /// Every liquid balance this block moved (#260). Absent when this node has no record of it:
+    /// a block it did not execute with a build that keeps one, or one pruned away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_changes: Option<Vec<BalanceChangeView>>,
 }
 
 impl BlockResponse {
@@ -126,7 +163,19 @@ impl BlockResponse {
             base_fee_per_byte: block.header.base_fee_per_byte,
             node_version: block.header.node_version.clone(),
             transactions,
+            balance_changes: None,
         }
+    }
+
+    /// The block's balance changes, if this node holds a record of them (#260).
+    pub fn with_balance_changes(
+        mut self,
+        block: &Block,
+        changes: Option<Vec<helix_executor::BalanceChange>>,
+    ) -> Self {
+        self.balance_changes =
+            changes.map(|c| c.iter().map(|change| BalanceChangeView::of(change, block)).collect());
+        self
     }
 }
 
@@ -243,6 +292,12 @@ pub struct TxHistoryEntry {
     /// Why it failed, straight from the executor. Absent unless `status` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// What this transaction did to the balance of the address whose history this is, in
+    /// nano-HLX as a signed decimal string: the fee it paid, the value it moved, what a contract
+    /// paid it, the tip it earned as the block's validator (#260). Absent when this node has no
+    /// record of the block's balance changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_change_nano: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

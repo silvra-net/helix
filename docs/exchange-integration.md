@@ -87,10 +87,19 @@ by its `hash` — the same transaction can never be applied twice.
 **Or read an address's history:** `GET /accounts/<address>/transactions?limit=<n>&offset=<m>`,
 newest first, at most 200 per page, the same fields and statuses as above.
 
-**One transfer at a time, not balances.** A balance can change without a transaction to your
-address in it: block rewards if the address validates, and transfers a smart contract makes, which
-this API does not list yet. Reconcile deposits against transactions, and treat a balance you
-cannot explain as something to investigate, not to credit.
+**Payments from smart contracts.** A contract can pay your address while running a transaction
+that names only the contract. Such a payment is not a `Transfer` to you — it appears in the
+block's `balance_changes` with `kind` `contract`, your address as `account` and a positive
+`delta_nano`, and the transaction then shows in your address history with `balance_change_nano`.
+Credit it by that entry, identified by block height, transaction hash and your address.
+
+**Every balance change, accounted for.** Each block view carries `balance_changes`: every liquid
+balance the block moved, with the transaction (`tx_index`, `tx_hash`; `null` for the block's own
+reward), the `account`, the `kind` (`transaction`, `reward`, `contract`) and a signed
+`delta_nano`. Summed per account they are exactly how much each balance moved, so a balance can be
+reconciled block by block. Every history row has `balance_change_nano` too: what that transaction
+did to the address, fee included. Both come from a node newer than 0.20.1, and only for blocks it
+executed itself — absent means "this node has no record", never "nothing moved".
 
 ## Sending withdrawals
 
@@ -137,7 +146,6 @@ the same nonce can never both apply — that is how you replace a stuck withdraw
 
 ## Not available yet
 
-- **Transfers made by smart contracts** are not listed in the address history or the block view;
-  they only show in balances. On this testnet no contract makes any.
-- **A Mesh (Rosetta) API.** The specification supports ML-DSA-65 as a curve and signature type;
-  whether Helix will serve one has not been decided.
+- **A Mesh (Rosetta) API.** Planned: the read side first (blocks, transactions, balances), built on
+  `balance_changes`. The Mesh specification has supported ML-DSA-65 since July 2026; Coinbase's Go
+  SDK and its `mesh-cli` validator do not yet.

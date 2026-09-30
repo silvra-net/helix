@@ -1576,6 +1576,7 @@ fn tx_history_entry(
         timestamp: block.header.timestamp,
         status,
         error,
+        balance_change_nano: None,
     }
 }
 
@@ -1598,6 +1599,7 @@ fn receipt_outcome(store: &HelixDb, tx_hash: &Hash) -> (String, Option<String>) 
 /// went through.
 fn block_response(block: &Block, store: &HelixDb) -> BlockResponse {
     BlockResponse::new(block, |tx_hash| receipt_outcome(store, tx_hash))
+        .with_balance_changes(block, store.balance_changes(block.height()).ok().flatten())
 }
 
 /// Extracts every transaction touching `address` (as sender or recipient) from `blocks`,
@@ -1693,7 +1695,18 @@ async fn get_account_transactions(
             }
         }
         let outcome = receipt_outcome(&store, &hash);
-        history.push(tx_history_entry(&block, tx, outcome));
+        let mut entry = tx_history_entry(&block, tx, outcome);
+        // What it did to this address's balance, from the block's record (#260) — for a payment a
+        // contract made, the only line that says the address received anything.
+        if let Ok(Some(changes)) = store.balance_changes(height) {
+            let net: i128 = changes
+                .iter()
+                .filter(|c| c.tx_index == Some(tx_index) && c.account == address_str)
+                .map(|c| c.delta)
+                .sum();
+            entry.balance_change_nano = Some(net.to_string());
+        }
+        history.push(entry);
     }
 
     // `history_starts_at_block` is null on an archive node, where the list is simply complete.
@@ -2069,6 +2082,15 @@ async fn get_transaction_status(
             // than a memo, data that is not UTF-8 (#256). Only here, not in listings, where a
             // deployed contract's code would ride along with every page of history.
             entry["data_hex"] = json!(hex::encode(&tx.data));
+            // Every balance it moved (#260) — whom a contract paid, what the validator earned.
+            if let Ok(Some(changes)) = store.balance_changes(height) {
+                let own: Vec<crate::BalanceChangeView> = changes
+                    .iter()
+                    .filter(|c| c.tx_index == Some(tx_index))
+                    .map(|c| crate::BalanceChangeView::of(c, &block))
+                    .collect();
+                entry["balance_changes"] = json!(own);
+            }
             (StatusCode::OK, Json(entry))
         }
         Ok(None) => {
@@ -2618,6 +2640,81 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let account: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(account["balance_nano"], "12345678901234567", "{account}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A payment a contract made is visible where a reader looks for money (#260): in the block,
+    /// in the transaction, and in the payee's history — which no transaction names it in. A block
+    /// this node holds no record for says nothing rather than something wrong.
+    #[tokio::test]
+    async fn a_contract_payment_shows_in_the_block_the_transaction_and_the_payees_history() {
+        use helix_executor::{BalanceChange, BalanceChangeKind::*};
+        let (state, path) = fresh_app_state();
+        let (alice, contract, payee, validator) = (addr(1), addr(2), addr(3), addr(4));
+        let call = tx(&alice, &contract, 1_000, 0);
+        let call_hash = call.hash().to_hex();
+        let block5 = block(5, &validator, vec![call]);
+        let unrecorded = block(6, &validator, vec![tx(&alice, &payee, 7, 1)]);
+        let change = |tx_index, who: &Address, kind, delta| BalanceChange {
+            tx_index,
+            account: who.to_string(),
+            kind,
+            delta,
+        };
+        {
+            let mut store = state.store.write().await;
+            store.put_block(block5).unwrap();
+            store.put_block(unrecorded).unwrap();
+            store
+                .put_balance_changes(5, &[
+                    change(Some(0), &alice, Transaction, -1_100),
+                    change(Some(0), &contract, Transaction, 1_000),
+                    change(Some(0), &contract, Contract, -300),
+                    change(Some(0), &payee, Contract, 300),
+                    change(Some(0), &validator, Reward, 50),
+                    change(None, &validator, Reward, 1_000_000_000),
+                ])
+                .unwrap();
+        }
+        async fn body(response: axum::response::Response) -> Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let block_view =
+            body(get_block_by_height(State(state.clone()), Path(5)).await.into_response()).await;
+        let changes = block_view["balance_changes"].as_array().expect("the block's record");
+        assert_eq!(changes.len(), 6, "{block_view}");
+        assert_eq!(changes[3]["account"], payee.to_string());
+        assert_eq!(changes[3]["kind"], "contract");
+        assert_eq!(changes[3]["delta_nano"], "300");
+        assert_eq!(changes[3]["tx_hash"], call_hash.as_str());
+        let block_level = changes[5]["tx_index"].is_null() && changes[5]["tx_hash"].is_null();
+        assert!(block_level, "the block's own reward");
+
+        let detail = get_transaction_status(State(state.clone()), Path(call_hash)).await;
+        let detail = body(detail.into_response()).await;
+        let own = detail["balance_changes"].as_array().map(Vec::len);
+        assert_eq!(own, Some(5), "the transaction's own: {detail}");
+
+        let history = |who: &Address| {
+            let (state, who) = (state.clone(), who.to_string());
+            async move {
+                let rows = get_account_transactions(State(state), Path(who), Query(Default::default()));
+                body(rows.await.into_response()).await
+            }
+        };
+        let paid = history(&payee).await;
+        let rows = paid["transactions"].as_array().unwrap();
+        let arrived = &rows[rows.len() - 1]["balance_change_nano"];
+        assert_eq!(arrived, "300", "the payee sees what arrived: {paid}");
+        assert_eq!(history(&contract).await["transactions"][0]["balance_change_nano"], "700");
+
+        let unrecorded =
+            body(get_block_by_height(State(state.clone()), Path(6)).await.into_response()).await;
+        assert!(unrecorded.get("balance_changes").is_none(), "no record, no claim: {unrecorded}");
+        assert!(rows[0].get("balance_change_nano").is_none(), "block 6 has no record: {paid}");
 
         let _ = std::fs::remove_file(&path);
     }

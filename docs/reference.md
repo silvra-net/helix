@@ -57,6 +57,16 @@ and every transaction view shows it as `memo` (absent otherwise) — how an exch
 one address tells deposits apart. `helix tx send --memo` sets it. Other bytes stay in `data`,
 visible as `data_hex` in the lookup, but are no memo.
 
+**Balance changes.** Every block view carries `balance_changes`: each liquid balance the block
+moved, as `{"tx_index", "tx_hash", "account", "kind", "delta_nano"}` — `tx_index`/`tx_hash` are
+`null` for the block's own reward, `kind` is `transaction` (the fee, the value moved, a stake or a
+claim), `reward` (a validator's tips, block reward and commission) or `contract` (a transfer a
+contract made), and `delta_nano` is signed. Summed per account they are exactly how much each
+liquid balance moved in the block. `GET /transactions/:hash` lists the transaction's own, and each
+row of an address history carries `balance_change_nano`, what the transaction did to that address.
+A node keeps them for the blocks it executes; absent means it has no record, never that nothing
+moved. An account a contract paid finds that transaction in its history.
+
 **Finality.** A transaction in a block is final: consensus is BFT, a block is committed only with
 two thirds of the voting power behind it, and a committed block is never reverted. There is no
 confirmation count to wait for: `applied` in `/transactions/:hash` is final. (While Helix is a

@@ -4,7 +4,7 @@ use std::path::Path;
 use helix_core::Block;
 use helix_crypto::{Address, Hash, PublicKey};
 use helix_executor::governance::{GovernanceParams, GovernanceProposal};
-use helix_executor::receipt::Receipt;
+use helix_executor::receipt::{BalanceChange, BalanceChangeKind, Receipt};
 use helix_executor::state::{AccountState, ChainState};
 
 use crate::{BlockStore, StorageError, StorageResult};
@@ -123,6 +123,10 @@ const RECEIPTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("receipts")
 /// Small: ~1 KB per account, so the whole set costs a few MB against the gigabytes of blocks it
 /// replaces. Pruned from the front like blocks are.
 const STATE_SNAPSHOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("state_snapshots");
+/// height → bincode(`Vec<BalanceChange>`): every liquid balance that block moved, and why (#260).
+/// Like `RECEIPTS`, a record of execution rather than state — absent for blocks this node did
+/// not execute with a build that keeps it. Pruned with the blocks it describes.
+const BALANCE_CHANGES: TableDefinition<u64, &[u8]> = TableDefinition::new("balance_changes");
 
 /// How often a state snapshot is taken, in heights. `HELIX_SNAPSHOT_INTERVAL` overrides it; `0`
 /// turns it off.
@@ -334,6 +338,7 @@ impl HelixDb {
         tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(RECEIPTS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(STATE_SNAPSHOTS).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(BALANCE_CHANGES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
         Ok(HelixDb {
             db,
@@ -1149,6 +1154,7 @@ impl HelixDb {
         let chain_id = self.get_block_by_height(0).map(|b| b.hash()).unwrap_or(Hash::ZERO);
 
         Ok(ChainState {
+            balance_journal: None,
             validator_keys,
             account_keys,
             chain_id,
@@ -1237,6 +1243,55 @@ impl HelixDb {
     /// `(block_height, tx_index_within_block)` for the transaction with this hash,
     /// if it's been included in a block yet — backed by `TX_HASH_INDEX` instead of
     /// scanning every block looking for the one that happens to contain it.
+    /// Keep what `height`'s block did to liquid balances (#260). An account a contract paid is
+    /// added to the address index for that transaction, so the payment shows in its history —
+    /// it is the one way a balance grows without a transaction naming the account.
+    pub fn put_balance_changes(
+        &mut self,
+        height: u64,
+        changes: &[BalanceChange],
+    ) -> StorageResult<()> {
+        self.ensure_disk_reserve()?;
+        let encoded =
+            bincode::serialize(changes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
+        {
+            let mut table =
+                tx.open_table(BALANCE_CHANGES).map_err(|e| StorageError::Db(e.to_string()))?;
+            table
+                .insert(height, encoded.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut address_tx_index = tx
+                .open_multimap_table(ADDRESS_TX_INDEX)
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            for change in changes.iter().filter(|c| c.kind == BalanceChangeKind::Contract) {
+                let Some(tx_index) = change.tx_index else { continue };
+                let mut value = [0u8; 12];
+                value[..8].copy_from_slice(&height.to_be_bytes());
+                value[8..].copy_from_slice(&tx_index.to_be_bytes());
+                address_tx_index
+                    .insert(change.account.as_str(), value.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+        tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// What `height`'s block did to liquid balances, or `None` when this node has no record of
+    /// it — a block it did not execute with a build that keeps one, or one pruned away. `None`
+    /// means "cannot say", never "nothing moved": a block that moved nothing has an empty list.
+    pub fn balance_changes(&self, height: u64) -> StorageResult<Option<Vec<BalanceChange>>> {
+        let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
+        let table = tx.open_table(BALANCE_CHANGES).map_err(|e| StorageError::Db(e.to_string()))?;
+        match table.get(height).map_err(|e| StorageError::Db(e.to_string()))? {
+            Some(v) => bincode::deserialize(v.value())
+                .map(Some)
+                .map_err(|e| StorageError::Serialization(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
     pub fn tx_location(&self, tx_hash: &Hash) -> StorageResult<Option<(u64, u32)>> {
         let tx = self.db.begin_read().map_err(|e| StorageError::Db(e.to_string()))?;
         let table = tx.open_table(TX_HASH_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1385,8 +1440,11 @@ impl HelixDb {
             let mut blocks = tx.open_table(BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut heights = tx.open_table(HEIGHT_IDX).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut balance_changes =
+                tx.open_table(BALANCE_CHANGES).map_err(|e| StorageError::Db(e.to_string()))?;
 
             for height in from..upto {
+                balance_changes.remove(height).map_err(|e| StorageError::Db(e.to_string()))?;
                 // A height with no entry is not an error: a node that pruned, restarted and
                 // pruned again walks over its own gaps, and so does one that synced a range it
                 // already had.
@@ -1951,6 +2009,43 @@ mod tests {
             db.get_block_by_height(0).is_ok(),
             "genesis must survive a horizon that covers it"
         );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A block's balance changes are kept per height (#260): "no record" and "nothing moved" stay
+    /// different answers, an account a contract paid gains that transaction in its history, and
+    /// pruning takes the record with the block.
+    #[test]
+    fn balance_changes_are_kept_indexed_and_pruned_with_their_block() {
+        let (mut db, path, validator) = db_with_blocks(6);
+        let paid = addr(3);
+        let change = |tx_index, who: &Address, kind, delta| BalanceChange {
+            tx_index,
+            account: who.to_string(),
+            kind,
+            delta,
+        };
+        let changes = vec![
+            change(Some(0), &addr(1), BalanceChangeKind::Transaction, -1_300),
+            change(Some(0), &paid, BalanceChangeKind::Contract, 300),
+            change(None, &validator, BalanceChangeKind::Reward, 1_000),
+        ];
+        db.put_balance_changes(2, &changes).unwrap();
+        db.put_balance_changes(3, &[]).unwrap();
+
+        assert_eq!(db.balance_changes(2).unwrap(), Some(changes));
+        assert_eq!(db.balance_changes(3).unwrap(), Some(vec![]), "a block that moved nothing");
+        assert_eq!(db.balance_changes(4).unwrap(), None, "a block with no record");
+        assert_eq!(
+            db.address_transactions(&paid.to_string(), 10, 0).unwrap(),
+            vec![(2, 0)],
+            "the account a contract paid finds that transaction in its history"
+        );
+
+        db.prune_blocks_below(3, 1000).unwrap();
+        assert_eq!(db.balance_changes(2).unwrap(), None, "pruned with its block");
+        assert_eq!(db.balance_changes(3).unwrap(), Some(vec![]), "above the horizon, kept");
         drop(db);
         let _ = std::fs::remove_file(&path);
     }
