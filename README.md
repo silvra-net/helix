@@ -7,160 +7,117 @@
 > A Layer-1 blockchain secured end-to-end by NIST-standardized post-quantum cryptography.
 > **Public testnet live, with independent validators. Mainnet launches once the validator set is proven — by milestone, not by calendar.**
 
-Helix is built from the ground up for the post-quantum era: every signature is NIST
-ML-DSA-65 (FIPS 204), not a classical curve with a migration roadmap bolted on later. On
-top of that sit Tendermint-style BFT finality, a fuel-metered WASM contract VM, ZK-STARK
-proofs (hash-based, no elliptic curves), human-readable names, and social wallet recovery.
+Helix is built for the post-quantum era from the first line: every signature is ML-DSA-65
+(NIST FIPS 204), not a classical curve with a migration plan attached. On top of that sit
+Tendermint-style BFT finality, a fuel-metered WASM contract VM, ZK-STARK proofs (hash-based, no
+elliptic curves), human-readable `.hlx` names and social wallet recovery.
 
-**What already works, and is tested.** This is not a whitepaper — it runs. The public
-network produces finalized blocks continuously, every client command below talks to it out of
-the box, and the core is covered by an automated test suite that gates every commit (the CI
-badge above is green on `master`). Recently verified end-to-end on real infrastructure:
+**It runs.** The public network finalizes a block every two seconds, co-signed by validators
+that independent operators run on their own hardware. A freshly downloaded binary finds the
+network, checks its genesis against the one compiled in, recomputes the genesis state instead of
+trusting the peer that served it, syncs, and follows the chain — with no configuration. Every
+client command below talks to it out of the box.
 
-- **Post-quantum signatures throughout** — ML-DSA-65 (FIPS 204) on every transaction, block,
-  and vote; deterministic state execution reproduced bit-for-bit across independent nodes.
-- **BFT consensus between independent validators** — proposals and votes finalize blocks
-  across separate nodes, and a validator that drops out halts finality until it returns
-  (quorum is real, not cosmetic).
-- **Validate from anywhere, even behind a firewall** — nodes reach the network over a
-  WebSocket transport that traverses an HTTPS reverse proxy / Cloudflare tunnel, so a new
-  operator can run a full validating node without opening a single inbound port.
-- **Zero-config onboarding** — a freshly downloaded binary discovers the network, verifies
-  genesis independently (it recomputes the genesis state hash rather than trusting the seed),
-  syncs history, and follows live — no manual peer configuration.
+**What it is not yet.** The chain is a **testnet**: it is reset from genesis when its format
+changes, and **HLX on it is a valueless test token, not an investment.** The validator set is
+still small — see [Security](#security) for what that means for its fault tolerance.
 
-**What is honestly not there yet.** Several independent validators now secure the public network,
-but the set is still small and hardening — small enough that `2/3+1` quorum needs every one of
-them, so it tolerates **zero** faults today: if one drops, the chain halts until it returns (four
-independent validators is where it first survives a loss). The chain is still a **testnet**:
-it is reset from genesis when the format changes, and **HLX on it is a valueless test token,
-not an investment.** The consensus and cryptography have not yet had an external security
-audit. The road from here to mainnet is deliberately short and public — see
-[Roadmap to Mainnet](#roadmap-to-mainnet) — and every gap is documented, not hidden; the
-full list is in [Security](#security).
+**Pick your path:**
 
-This README is a practical guide: install it, run a node, use the CLI, stake — as an
-operator or as a regular holder. Deeper reference material (REST API, wire formats, crate
-layout) lives in the [`docs/`](docs/) directory.
-
-**New here? Pick your path:**
-
-- 🖱️ **Prefer a desktop app?** → [Desktop wallet](#desktop-wallet) — download, no shell:
-  balance, send, receive, staking, and even running a validator, console included.
-- 🧑‍💻 **Just want to try it?** → [Quick Start](#quick-start) gets you from clone to first
-  transaction in five commands.
-- 💰 **Holding HLX / want to earn rewards?** → [Using the CLI](docs/cli.md#using-the-cli-helix) and
-  [Staking](docs/staking.md#staking) (you can delegate without running a node).
-- 🖥️ **Running a validator?** → [Installation](docs/installation.md#installation) → [Running a Node](docs/running-a-node.md#running-a-node)
-  (terminal), or the desktop app's **Node** tab if you'd rather not touch a shell — both run the
-  identical `helix` binary.
-- 🔬 **Here for the internals?** → [Consensus](docs/internals.md#consensus), [Cryptography](docs/internals.md#cryptography--determinism),
-  and the [Reference](docs/reference.md#reference).
+- 🖱️ **Prefer a desktop app?** → [Desktop wallet](#desktop-wallet) — balance, send, receive,
+  staking, names, recovery, governance, and running a validator, without a shell.
+- 🧑‍💻 **Want to try it?** → [Quick Start](#quick-start): a wallet and your first look at the
+  chain in three commands.
+- 💰 **Holding HLX, or want to earn rewards?** → [Using the CLI](docs/cli.md#using-the-cli-helix)
+  and [Staking](docs/staking.md#staking) — you can delegate without running a node.
+- 🖥️ **Running a validator?** → [Installation](docs/installation.md#installation) →
+  [Running a Node](docs/running-a-node.md#running-a-node), or the desktop wallet's **Node** tab —
+  both run the same `helix` binary.
+- 🔬 **Here for the internals?** → [Consensus](docs/internals.md#consensus),
+  [Cryptography](docs/internals.md#cryptography--determinism) and the
+  [Reference](docs/reference.md#reference).
 
 ---
 
 ## Why Helix?
 
-| Problem with existing chains | Helix solution |
+| Problem with existing chains | Helix |
 |---|---|
-| SHA-256 / ECDSA broken by quantum computers | ML-DSA-65 — NIST FIPS 204 |
-| PoW wastes energy, PoS creates plutocracy | PoS + Proof of Personhood — 1% voting cap per identity |
-| Hexadecimal addresses, no recovery | `alice.hlx` names + social guardian recovery |
-| No plan for quantum migration | Algorithm versioning built into the protocol |
-| ZK proofs vulnerable (SNARKs use elliptic curves) | ZK-STARKs only — hash-based, quantum-safe |
-| Billions lost to smart contract bugs | WASM VM, fuel-metered, deterministic by construction |
+| ECDSA and Ed25519 signatures fall to a large quantum computer | ML-DSA-65 (NIST FIPS 204) on every transaction, block and vote |
+| Stake buys voting power without limit | Every validator's voting power is capped at 1% of all stake; a verified human reaches the cap with half the stake |
+| Hexadecimal addresses, no way back from a lost key | `alice.hlx` names and social recovery through guardians |
+| No plan for the next cryptographic migration | The signature scheme is versioned in every transaction |
+| ZK proofs that rest on elliptic curves (SNARKs) | ZK-STARKs only — hash-based |
+| A contract that runs forever stalls the chain | WASM VM, fuel-metered per transaction and per block, no floating point |
 
 ---
 
 ## Roadmap to Mainnet
 
-Helix is being built in the open, and the path from today's testnet to a lasting mainnet is
-short and concrete. Nothing here is hidden behind a "coming soon."
-
 | Phase | Status | What it means |
 |---|---|---|
-| **Core protocol** | ✅ Done | PoS + BFT finality, ML-DSA-65 signatures, WASM VM, ZK-STARK proofs, names, social recovery — all implemented and running. |
-| **Public testnet** | ✅ Live | `node.silvra.net` produces finalized blocks continuously; anyone can run a node or use the CLI against it today. |
-| **Remote validation** | ✅ Verified | A node behind any HTTPS proxy / firewall can validate over the WebSocket transport — proven end-to-end with independent validators reaching BFT quorum through a Cloudflare tunnel. |
-| **Independent validators** | 🔄 Underway | The first external operators are already co-signing the live chain from their own hardware. The set is small and still hardening toward surviving a fault — four is where `3f+1` first tolerates losing one. This is the main gate to mainnet. [Become one →](docs/running-a-node.md#bootstrapping-a-multi-validator-network) |
-| **External security audit** | ⏳ Planned | Independent review of consensus and cryptography before value is ever at stake. |
-| **Mainnet** | 🎯 When it's earned | Fresh genesis, a freshly generated validator key, no more resets — launched once several independent validators run stably enough to survive a fault, by milestone rather than a fixed date. This is the chain meant to last. |
-
-If you want to help secure the network as one of the founding independent validators, the
-infrastructure is ready today — see
-[Bootstrapping a Multi-Validator Network](docs/running-a-node.md#bootstrapping-a-multi-validator-network).
+| **Core protocol** | ✅ Done | PoS with BFT finality, ML-DSA-65 signatures, WASM VM, ZK-STARK proofs, names, social recovery — implemented and running. |
+| **Public testnet** | ✅ Live | `node.silvra.net` finalizes blocks continuously; anyone can run a node or use the CLI against it. |
+| **Validation from anywhere** | ✅ Verified | A validator behind a firewall, NAT or HTTPS proxy takes part over the WebSocket transport — the network's own hub runs behind a Cloudflare tunnel. |
+| **Independent validators** | 🔄 Growing | External operators co-sign the live chain from their own hardware. Four validators survive one failure, seven survive two. [Become one →](docs/running-a-node.md#bootstrapping-a-multi-validator-network) |
+| **Continuous adversarial review** | 🔄 Ongoing | See [Security](#security). |
+| **Mainnet** | 🎯 When it's earned | Fresh genesis, a freshly generated validator key, no more resets — launched once enough independent validators run stably to survive failures. |
 
 ---
 
 ## Quick Start
 
-> **This is the public testnet, not mainnet.** `node.silvra.net` is live and stable, but it
-> is still reset from genesis when the chain format changes. **HLX on the testnet is a
-> valueless test token** — it is for trying the network, not for holding value, and it will
-> not carry over to mainnet.
->
-> Point a node at it, send transactions, deploy a contract, break things — that is exactly what
-> it is for. Mainnet launches from a fresh genesis once several independent validators run stably
-> enough to survive a fault — by milestone, not a fixed date; see [Roadmap to Mainnet](#roadmap-to-mainnet).
+> **This is the public testnet.** It is reset from genesis when the chain format changes, and
+> HLX on it is a valueless test token that does not carry over to mainnet. Send transactions,
+> deploy contracts, break things — that is what it is for.
 
-**One binary does everything.** `helix` is both the node and the client: `helix start` runs a
-node, every other subcommand (`helix wallet`, `helix tx`, …) is a thin RPC client. **You don't
-need to run a node to use Helix** — the client talks to the live network out of the box,
-no setup, no config, no local chain to sync.
+**One binary does everything.** `helix start` runs a node; every other subcommand
+(`helix wallet`, `helix tx`, …) is a client. **You don't need a node to use Helix** — the client
+talks to the live network with no setup and no local chain.
 
 ```bash
-# (assumes `helix` is on your PATH — otherwise use ./target/release/helix)
+# (with `helix` on your PATH — otherwise ./target/release/helix)
 
-# 1. Create a wallet (a wallet is just a keypair)
-helix wallet new -o alice.json
+# 1. Create a wallet
+helix wallet new -o alice.json --passphrase     # asks for a passphrase twice
 #   Address    : hlx...
-#   Saved to   : alice.json
 
-# 2. Look at the live chain — this already talks to the public network
+# 2. Look at the live chain
 helix chain status
-helix account <some-address>
+helix account <address>
 
-# 3. Once alice.json has a balance, send some HLX
-helix tx send hlx... 10 --key alice.json     # send 10 HLX to another address
-helix tx status <hash>                        # check it landed
+# 3. Once alice.json holds HLX, send some
+helix tx send <address> 10 --key alice.json
+helix tx status <hash>
 ```
 
-Every client command uses a node running on this machine if one answers, and
-`https://node.silvra.net` (the public testnet) otherwise — so a fresh download works with no
-setup, and running your own node is enough for the client to use it. Override either with
-`--node <url>` or `HELIX_NODE=<url>`.
+Client commands use a node running on this machine if one answers, and the public testnet
+(`https://node.silvra.net`) otherwise. Point them elsewhere with `--node <url>` or
+`HELIX_NODE=<url>`.
 
 ### Running your own node
 
-Want to run infrastructure rather than just use the chain? A node also **joins the public
-network by default** — on first start it fetches the real genesis and syncs the chain, no
-peer to configure:
+A node **joins the public network by default** — on first start it fetches and checks the
+genesis, syncs the chain and follows it. Nothing to configure:
 
 ```bash
-helix start          # or ./target/release/helix start
-# fetches genesis from the public network, syncs history, then follows the live chain
-# REST API on http://127.0.0.1:8545, P2P on 0.0.0.0:8546
+helix start
+# REST API on http://127.0.0.1:8545, P2P on port 8546
 ```
 
-Client commands find it automatically — `helix chain status` now answers from your own node,
-and says so. Use `--node <url>` only to point somewhere else.
+Client commands on the same machine find it by themselves and say so. Everything about operating
+one — settings, disk limits, running behind a proxy, becoming a validator — is in
+[Running a Node](docs/running-a-node.md#running-a-node).
 
-### Running your own private devnet
+### A private chain for development
 
-For development or testing you'll want an isolated chain that doesn't touch the public
-network. Set `HELIX_NEW_CHAIN=1` — the node self-signs its own genesis and runs standalone:
+`HELIX_NEW_CHAIN=1` starts a chain of your own instead: the node signs its own genesis and runs
+standalone. Its validator key (`./validator-key.json`, a regular CLI wallet file) starts with
+10,000 HLX staked and 90,000 liquid, so it can fund other wallets:
 
 ```bash
 HELIX_NEW_CHAIN=1 helix start
-```
-
-Its genesis allocates stake only to the validator's own address (there's no faucet), so to
-get spendable HLX to a new wallet, send from the validator key itself — it lives at
-`./validator-key.json` and is already a valid CLI wallet (same JSON format `helix wallet`
-produces):
-
-```bash
-helix --node http://127.0.0.1:8545 tx send hlx... 100 --key validator-key.json
+helix --node http://127.0.0.1:8545 tx send <address> 100 --key validator-key.json
 ```
 
 ### Building from source
@@ -168,174 +125,118 @@ helix --node http://127.0.0.1:8545 tx send hlx... 100 --key validator-key.json
 ```bash
 git clone https://github.com/silvra-net/helix.git
 cd helix
-cargo build --release
-# single binary: target/release/helix (node + client)
-```
-
-**`master` is ahead of the public network.** It carries the next version's rules — changes to
-consensus, state and transaction format that the running chain does not have. A node built from
-`master` and pointed at the public network verifies the genesis and starts syncing, and as soon
-as the state it computes parts from the chain's it stops with an error that says so; a validator
-running it drops out of the set. To **join the public network**, build the release it runs:
-
-```bash
 git checkout v0.20.0   # the latest release tag
-cargo build --release
+cargo build --release  # one binary: target/release/helix
 ```
 
-To **try `master`**, run it on a chain of its own — a single node:
-
-```bash
-HELIX_NEW_CHAIN=1 ./target/release/helix start
-```
-
-or several on one machine, each in its own directory with its own ports, pointing the others
-at the first with `HELIX_SYNC_PEER=http://127.0.0.1:<its RPC port>` (see
-[running a node](docs/running-a-node.md) for the settings). The public network moves to the
-new rules with the next release, together with a reset.
+Build a **release tag** to join the public network. Between releases `master` can carry the
+next version's rules — consensus, state or transaction format the running chain does not have
+yet — and a node built from it stops with an error as soon as the state it computes departs from
+the chain's. Try `master` on a private chain (`HELIX_NEW_CHAIN=1`).
 
 ---
 
 ## Desktop wallet
 
-Prefer not to touch a shell? **Helix Wallet** (`helix-gui`) is a desktop app (Linux, macOS,
-Windows) that does everything the CLI does — wallet, send/receive, staking/delegation, names,
-recovery, governance — **including running a full validator node**, with a live console. Pick
-either the GUI or the [CLI](docs/cli.md#using-the-cli-helix); neither is missing functionality the other has.
+**Helix Wallet** is a desktop app for Linux, macOS and Windows that does everything the CLI does
+— wallet, send and receive, staking and delegation, names, recovery, governance — **including
+running a validator node**, with a live console.
 
-- **Download** the installer for your OS from the
-  [latest release](https://github.com/silvra-net/helix/releases/latest) —
-  `helix-gui-*.AppImage` / `.deb` (Linux), `.dmg` (macOS), `.msi` (Windows). The paired CLI
-  archive is named `helix-cli-*` — same versioning, same release, consistent naming.
-- **Your key stays on your machine.** It is generated locally, encrypted at rest with the same
-  `KeyFile` format the CLI uses, and never leaves the app — the wallet signs transactions itself
-  and only talks to a node over its public REST API. The 24-word recovery phrase is shown once
-  and also works in the Spark mobile app.
-- **It locks itself after 10 minutes without use.** The key is cleared from memory, not just
-  hidden behind a screen, and a laptop closed with the wallet open wakes up locked. A send that
-  is under way always shows you its result first. The lock protects a wallet that has a
-  passphrase — without one, unlocking is a single click. Choose one when you create or restore
-  the wallet, or add or change it later under **Settings → Passphrase**.
-- **It uses your own node if you have one.** The wallet checks whether a node is running on this
-  machine — whether it started it or you did, from a terminal, systemd or pm2 — and reads balances
-  from that instead of a public server, switching back on its own if that node goes away. It also
-  asks once, on first use, whether you want to run one at all, rather than leaving the default
-  unmentioned.
-- **Run a node without a terminal.** The exact `helix` binary the CLI ships is bundled into the
-  app as a companion process (a Tauri "sidecar" — same code, not a reimplementation). The
-  **Node** tab starts/stops it and streams its output live, so becoming a validator is: stake
-  enough (same tab), click Start, watch the console for `Block committed`. Prefer a server
-  instead? `helix start` in a terminal does the same thing — the two are interchangeable, and
-  switching between them later costs nothing (same `validator-key.json`/wallet file either way).
-- Same honest caveat as everywhere: it points at the public **testnet** by default, and HLX
-  there is a valueless test token that does not survive a chain reset.
+- **Download** it from the [latest release](https://github.com/silvra-net/helix/releases/latest):
+  `helix-gui-*.AppImage`, `.deb` or `.rpm` (Linux), `.dmg` (macOS), `.msi` or `.exe`
+  (Windows). The command-line tools are the `helix-cli-*` archives of the same release.
+- **Your key never leaves your machine.** It is generated locally and stored in the same
+  encrypted key-file format as the CLI's; the wallet signs itself and talks to a node only over
+  its public API. The 24-word recovery phrase also restores the wallet in the Spark mobile app.
+- **It locks itself after 10 minutes without use** and clears the key from memory; a laptop
+  closed with the wallet open wakes up locked. The lock protects a wallet with a passphrase — set
+  one when you create the wallet, or later under **Settings → Passphrase**.
+- **It never pays more than 1 HLX in fees on its own.** A node that lies about the fee level
+  cannot make the wallet sign away its balance.
+- **It uses your own node if one is running** on the machine, and the public network otherwise.
+- **Run a validator without a terminal.** The app bundles the same `helix` binary the CLI ships.
+  The **Node** tab starts and stops it and shows its output; stake, click Start, and watch for
+  `Block committed`. Switching to a server later costs nothing — same key file either way.
 
-Source and build steps are in [`gui/`](gui/README.md).
+Source and build steps: [`gui/`](gui/README.md).
 
-There is also a browser **block explorer** at
-[explorer.silvra.net](https://explorer.silvra.net) — blocks, transactions, accounts, validators
-and search, including who co-signed each block. It talks to a node's public RPC from your own
-browser and can be pointed at your own node instead of the public one; source in
-[silvra-net/helix-explorer](https://github.com/silvra-net/helix-explorer).
-
-Every node separately serves a **status page for itself** at its own root URL: height, sync
-state, peers, memory, and whether it is co-signing. That page is compiled into the binary and
-works with no internet at all.
+The **block explorer** at [explorer.silvra.net](https://explorer.silvra.net) shows blocks,
+transactions, accounts and validators, including who co-signed each block. It talks to a node
+from your own browser and can be pointed at yours; source in
+[silvra-net/helix-explorer](https://github.com/silvra-net/helix-explorer). Every node also serves
+a **status page about itself** at its own root URL — height, sync state, peers, memory, whether
+it is co-signing — compiled into the binary.
 
 ---
 
 ## Documentation
 
-The README covers what Helix is and how to get started. The full reference lives in [`docs/`](docs/):
-
-- **[Installation](docs/installation.md)** — system requirements, prerequisites, release download, building from source
-- **[Running &amp; operating a node](docs/running-a-node.md)** — config, environment variables, joining the network, running behind a proxy/tunnel, bootstrapping a multi-validator set, Docker
-- **[Using the CLI](docs/cli.md)** — wallets, sending, fees, names, smart contracts, personhood, recovery, governance
-- **[Staking &amp; delegation](docs/staking.md)** — run a validator, or delegate to one
+- **[Installation](docs/installation.md)** — system requirements, downloads, building from source
+- **[Running a node](docs/running-a-node.md)** — settings, disk limits, joining the network, proxies and tunnels, validators, Docker
+- **[Using the CLI](docs/cli.md)** — wallets, sending, fees, names, contracts, personhood, recovery, governance
+- **[Staking and delegation](docs/staking.md)** — run a validator, or delegate to one
 - **[Internals](docs/internals.md)** — consensus, architecture, cryptography, token economics
-- **[Reference](docs/reference.md)** — REST API, transaction/address formats, crate structure
+- **[Reference](docs/reference.md)** — REST API, transaction and address formats, crate layout
+- **[Tokenomics](TOKENOMICS.md)** — supply, emission, fees
 
 ---
 
 ## Security
 
-**Hardening that's in place:**
+**Continuous adversarial review.** Helix is developed with Claude, Anthropic's AI model, which
+reviews the codebase continuously as part of development — not as a one-off. It attacks the
+protocol, networking, wallets and RPC the way an adversary would, runs each attack as a test
+before fixing it, and confirms each fix by reverting it and watching that test fail. Dozens of
+issues have been found and fixed this way; every one is described in the commit that fixes it.
 
-- **The validator key can be encrypted at rest** (`helix wallet encrypt` +
-  `HELIX_VALIDATOR_KEY_PASSPHRASE`). Note the default is *un*encrypted, so the file matters:
-  anyone who reads `validator-key.json` can sign blocks as you and get you slashed
-- The P2P transport uses libp2p's classical Noise (X25519) encryption; this is fine because all
-  P2P traffic is public ledger data — see [Cryptography](docs/internals.md#cryptography--determinism) for the full
-  quantum-safety picture
-- Per-IP rate limiting and connection limits protect the public RPC and P2P surface from
-  simple flood/spam abuse
-- Minimum fee (1,000 nano-HLX) prevents zero-cost transaction spam
-- Transactions are signature-bound to their sender address, replay-protected by per-account
-  nonces, and money-path arithmetic is overflow-checked; delegation uses shares-based accounting
-  hardened against rounding/inflation loss
-- Double-signing is provable on-chain and slashed; misbehaving peers are scored and banned
-- **A node can be diagnosed without reading its log.** `GET /diagnostics` reports uptime, sync
-  state, how many validators' votes are not arriving, when this node last co-signed, memory
-  against the machine's total, and **how the previous run ended** — so a crash, an OOM kill and an
-  orderly stop are no longer indistinguishable after the fact. The response is enumerated rather
-  than free-form log text, which is what makes it safe to share when asking for help: no
-  addresses, no paths, no keys. See [Reference](docs/reference.md#diagnostics-response)
-- A validator that goes silent is **downtime-jailed** on-chain (`last_commit` +
-  `ChainState::jailed_until`) after ~1800 blocks of confirmed absence (~30-60 minutes) — removed from the active set
-  until it submits an explicit `Unjail` transaction, surviving node restarts and carrying no slash
-  for downtime alone. That recovers a large-enough set automatically; a set so small that quorum
-  needs every validator halts instead — the safe failure, never a fork. See
-  [Consensus](docs/internals.md#consensus) and [Staking](docs/staking.md#staking)
+**In place:**
 
-**Known limitations (honest status, not finished guarantees):**
+- **Keys.** Wallet files are readable by their owner only and can be encrypted with a
+  passphrase (Argon2id + AES-256-GCM); passphrases are never typed on the command line. The
+  validator key can be encrypted too (`HELIX_VALIDATOR_KEY_PASSPHRASE`) — it is not by default,
+  so treat `validator-key.json` like the key it is: whoever reads it can sign as your validator
+  and get it slashed.
+- **Transactions** are bound to their sender, to a per-account nonce and to the chain they were
+  signed for — the chain id is the genesis hash, so a signature is valid on exactly one chain.
+- **Fees.** Every transaction pays a base fee per byte, which is burned and moves with demand
+  (at most ±12.5% per block). Wallets cap a fee they price themselves at 1 HLX.
+- **Validators.** Signing two different votes for the same height and round is provable on-chain
+  and costs 5% of stake, once per offence. A validator that stops signing is jailed: one that is
+  completely silent after 1,800 blocks (about an hour), and one that signs less than two thirds
+  of its blocks over time as well. It returns with an explicit `Unjail` transaction.
+- **Network.** A node forwards only messages it has decoded and accepted, holds the author —
+  never the relaying node — responsible for bad data, bounds every message and response it
+  reads, and answers other nodes' requests without holding up its own votes.
+- **Node.** It refuses to start on a database from another chain or on a setting it cannot read,
+  instead of guessing, and stops writing — with its database intact — before the disk is full
+  (Linux and macOS).
+  `GET /diagnostics` reports its state, including how its previous run ended, without addresses,
+  paths or keys ([Reference](docs/reference.md#diagnostics-response)).
 
-- **The live chain is a testnet and is reset from genesis without warning.** Any
-  time the chain format changes — a new transaction type, a new state field, a signature or
-  hash change — the public chain is wiped and restarted, and this will keep happening until
-  the format settles and mainnet launches. Balances do not survive it.
-  Nothing on this chain is money. This is a deliberate trade while the protocol is still moving:
-  a format change is cheap to make now because there is exactly one account and no external
-  holders, and expensive to make once there are. The chain that is meant to persist will be
-  launched explicitly, with at least four independent validators; treat every chain before that
-  as disposable.
+**Known limitations:**
 
-- **The public network runs a small validator set, so it still tolerates zero faults.** Several
-  independent validators now co-sign the live chain, but the set is small and still hardening —
-  with an equal-stake set that small, `2/3+1` quorum needs every one of them, so if any single
-  validator drops, block production halts until it returns (see [Consensus](docs/internals.md#consensus)). The BFT
-  machinery is real and tested against a 4-validator set (including killing one mid-flight), but
-  fault tolerance is a property of the *deployed* set, not the code: it begins at four independent
-  validators (`3f+1`) on separate machines and operators, where the network first survives losing
-  one. Until the set is both larger and proven, treat the public chain's liveness as depending on
-  its weakest operator. See
-  [Bootstrapping a Multi-Validator Network](docs/running-a-node.md#bootstrapping-a-multi-validator-network).
+- **The testnet is reset** whenever the chain format changes, until mainnet. Balances do not
+  survive a reset; nothing on this chain is money.
+- **Fault tolerance is a property of the running set, not of the code.** `n` validators survive
+  `⌊(n−1)/3⌋` failures: four survive one, seven survive two. The public set is still small, so
+  the chain depends on its operators keeping their nodes up; when too many are missing it stops
+  and waits — it does not fork. The [explorer](https://explorer.silvra.net) shows the current
+  set.
+- **Consensus at scale is shown in tests, not yet in production.** Vote locking, re-proposal and
+  equivocation handling are exercised by fault-injection and chaos tests — five engines with a
+  third of all messages lost, no fork in any run — and by multi-node tests with real processes.
+  The live network is still small.
+- **Proof of personhood rests on trusted authorities**, any one of which can vouch for a human.
+  The public testnet configures none, so personhood is off there.
+- **The P2P transport is encrypted with classical cryptography** (libp2p Noise, X25519). What it
+  carries is public ledger data, and every transaction, block and vote in it is ML-DSA-signed: a
+  quantum attacker could read the traffic but not forge any of it. Details in
+  [Cryptography](docs/internals.md#cryptography--determinism).
 
-- **BFT cross-round vote locking is implemented but not yet battle-tested at scale.** The
-  engine now does Tendermint-style locking: once a validator sees a prevote-quorum for a value
-  it locks on it (`locked_value`/`locked_round`), re-proposes that value with a proof-of-lock
-  certificate when it proposes a later round, and withholds its prevote from any conflicting
-  value that isn't backed by a new-enough POL — the mechanism that prevents two different blocks
-  from finalizing at the same height across rounds. This is unit-tested (abstention, controlled
-  unlock, POL verification, re-proposal) and the multi-validator integration test passes, but it
-  has **not** yet been exercised against a large, genuinely adversarial ≥4-validator network with
-  real partitions. Treat fork-safety as implemented-and-tested, not yet independently audited —
-  see the [Consensus](docs/internals.md#consensus) maturity note.
-- The personhood *authority* is a trust anchor: any one configured authority can vouch for a
-  human. This removes a single point of failure for availability, but is not (yet) M-of-N
-  threshold issuance.
-- **No pruning or archival mode.** `helix-data.redb` keeps every block and every piece of state
-  forever and grows without bound — see [System Requirements](docs/installation.md#system-requirements) for measured
-  growth on prod. Fine for a young, low-traffic testnet; a real capacity plan (pruning, snapshot
-  sync, or a separate archival tier) is needed before disk growth becomes anyone's problem.
-
-Report security issues privately before public disclosure.
+Please report security issues privately before public disclosure.
 
 ---
 
 ## License
 
-MIT — see LICENSE file.
-
----
-
-*Built with Rust. Quantum-secure by design.*
+MIT — see [LICENSE](LICENSE).
