@@ -1563,6 +1563,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "helix-walletd"
+version = "0.20.2"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "helix-core",
+ "helix-crypto",
+ "hex",
+ "rand 0.8.6",
+ "redb",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "helix-zkp"
 version = "0.20.2"
 dependencies = [

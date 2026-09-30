@@ -24,6 +24,9 @@ status`, the exact amount fields and a syncing node that keeps transaction outco
 | Chain id | the genesis block's hash; every transaction signs it |
 | Nonces | per sender, strictly sequential from 0 |
 | Fee | `base_fee_per_byte × size` burned, anything above it tips the proposer |
+| Ways to integrate | this page's REST API · a **Bitcoin-Core-style wallet RPC** (`helix-walletd`) · the **Mesh (Rosetta)** Data API (`helix-mesh`) |
+| Supply | `GET /supply/circulating`, `/supply/total`, `/supply/max` — a bare number in HLX |
+| Container | `ghcr.io/silvra-net/helix:<version>` (node, `helix-mesh`, `helix-walletd`), from the release after 0.20.2 on |
 
 ## Run your own node
 
@@ -143,6 +146,64 @@ the node answers with. Poll `GET /transactions/<id>`:
 Submitting the same signed transaction twice is harmless: while it is pending the node answers
 "already in mempool", once it is applied "Nonce already spent". Two *different* transactions with
 the same nonce can never both apply — that is how you replace a stuck withdrawal.
+
+## Bitcoin-style wallet RPC
+
+Most exchanges integrate a chain through the interface they already run for Bitcoin and its
+descendants. `helix-walletd` gives Helix that interface: a wallet service in front of your own
+node, speaking Bitcoin Core's JSON-RPC — same method names, parameters, answers and error codes.
+
+```bash
+helix-walletd --node http://127.0.0.1:8545 --wallet-dir /var/lib/helix-wallet init --passphrase-file pw.txt
+helix-walletd --node http://127.0.0.1:8545 --wallet-dir /var/lib/helix-wallet serve \
+  --rpcuser exchange --rpcpassword-file rpcpw.txt          # listens on 127.0.0.1:8547
+```
+
+Authentication is HTTP Basic, as with Bitcoin Core: the user and password from the command line
+(the password only from a file), or the cookie `serve` writes to `<wallet-dir>/.cookie` at every
+start. `init` checks the node is on the chain this release is built for (`--chain-id` for
+another) and starts the wallet at the node's current height.
+
+| Method | What it does on Helix |
+|---|---|
+| `getnewaddress [label]` | A new deposit address, never handed out before — recorded on disk before it is returned. A locked wallet hands out addresses it made ahead (`keypoolrefill`). |
+| `listsinceblock [blockhash] [target_confirmations]` | Deposits (`receive`) and sends since that block; `lastblock` to pass next time. |
+| `gettransaction txid`, `listtransactions`, `getreceivedbyaddress` | As in Bitcoin Core. |
+| `getbalance` | Everything the wallet's addresses hold, less what its own unconfirmed sends take. |
+| `sendtoaddress address amount … [subtractfeefromamount]` | A withdrawal from the hot address; returns the transaction id. |
+| `validateaddress`, `getaddressinfo` | Address checks; `ismine` for the wallet's own. |
+| `walletpassphrase`, `walletlock`, `keypoolrefill`, `backupwallet` | As in Bitcoin Core. |
+| `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getnetworkinfo`, `getwalletinfo`, `estimatesmartfee` | Chain and wallet state. |
+
+Where Helix differs from Bitcoin, the service says so instead of pretending:
+
+- **An account per address, not coins.** Each deposit is **swept** to the wallet's hot address as
+  soon as a block holds it, and every send pays from there. A sweep moves nothing out of the
+  wallet but its fee (one base fee, a few millionths of an HLX); it is listed as a `send` of 0 with
+  that fee and `helix_sweep: true`, so `getbalance` and the list add up. Deposits are swept while
+  the wallet is unlocked — keep it unlocked, or unlock it before withdrawals.
+- **Amounts have nine decimals**, written as JSON numbers with nine fixed places (`1.250000000`)
+  and read exactly as sent — never through a floating-point number. Parse them as decimals.
+  Bitcoin client libraries usually round what they *send* to eight decimals (python-bitcoinrpc
+  sends `float(round(amount, 8))`); up to eight arrive exactly, and a ninth has to go as a string
+  (`"0.123456789"`), which the wallet reads digit by digit.
+- **One confirmation is final** (BFT); there are no reorganisations, and `removed` is always empty.
+- **A send that did not go through shows `confirmations: -1`** — one the chain charged but did not
+  apply (with `helix_error`), or one whose nonce another transaction used (`abandoned: true`) — as
+  Bitcoin Core shows a conflicted transaction. A client waiting for confirmations never counts it
+  as paid.
+- **`sendmany` is refused:** a Helix transaction pays one recipient. Call `sendtoaddress` once per
+  recipient.
+- **Fees** are set by the wallet from the node's base fee, with headroom, and refused above 1 HLX —
+  a node reporting an absurd base fee cannot spend the exchange's money. `estimatesmartfee`
+  reports the rate per kB.
+- **Every transaction the wallet signs is recorded before it is submitted**, and submitted again
+  if it expires unincluded — after a crash or a node restart nothing it signed is forgotten.
+
+The node behind it must record balance changes for every block from the wallet's start on: 0.20.2
+or later, and raise its rate limit (`HELIX_RPC_RATE_LIMIT=5000,1000`), since the wallet reads
+every block. Back up the wallet directory, or call `backupwallet` — keys are written once and
+never changed, so a backup stays valid for every address made before it.
 
 ## Mesh (Rosetta) Data API
 
