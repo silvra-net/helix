@@ -39,8 +39,19 @@ pub struct TxResponse {
     pub hash: String,
     pub from: String,
     pub to: Option<String>,
+    /// For display only — a float cannot hold every nano-HLX amount exactly. Account in
+    /// `amount_nano`.
     pub amount_hlx: f64,
     pub fee_hlx: f64,
+    /// Exact amount in nano-HLX, as a decimal string (#256) so a client whose numbers are
+    /// doubles (JavaScript) does not round it.
+    #[serde(default)]
+    pub amount_nano: String,
+    #[serde(default)]
+    pub fee_nano: String,
+    /// A transfer's memo — see `Transaction::memo`. Absent when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
     pub tx_type: String,
     pub nonce: u64,
     /// What execution did with it: `applied`, `failed`, or `unknown` for blocks committed
@@ -94,6 +105,9 @@ impl BlockResponse {
                     to: tx.to.as_ref().map(|a| a.to_string()),
                     amount_hlx: tx.amount as f64 / 1_000_000_000.0,
                     fee_hlx: tx.fee as f64 / 1_000_000_000.0,
+                    amount_nano: tx.amount.to_string(),
+                    fee_nano: tx.fee.to_string(),
+                    memo: tx.memo().map(str::to_string),
                     tx_type: format!("{:?}", tx.tx_type),
                     nonce: tx.nonce,
                     status,
@@ -207,8 +221,15 @@ pub struct TxHistoryEntry {
     pub hash: String,
     pub from: String,
     pub to: Option<String>,
+    /// For display only; account in `amount_nano` (see `TxResponse`).
     pub amount_hlx: f64,
     pub fee_hlx: f64,
+    #[serde(default)]
+    pub amount_nano: String,
+    #[serde(default)]
+    pub fee_nano: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
     pub tx_type: String,
     pub nonce: u64,
     pub block_height: u64,
@@ -227,10 +248,18 @@ pub struct TxHistoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountResponse {
     pub address: String,
+    /// For display only; account in `balance_nano` (see `TxResponse`).
     pub balance_hlx: f64,
     pub staked_hlx: f64,
     /// Stake in unbonding period (still slashable, not yet liquid)
     pub unbonding_stake_hlx: f64,
+    /// The same three amounts exact, in nano-HLX, as decimal strings (#256).
+    #[serde(default)]
+    pub balance_nano: String,
+    #[serde(default)]
+    pub staked_nano: String,
+    #[serde(default)]
+    pub unbonding_stake_nano: String,
     /// Block height at which `unbonding_stake` becomes claimable (0 = no active unbonding)
     pub unbonding_unlock_height: u64,
     /// Whose misbehavior `unbonding_stake` is still slashable for: the validator it was
@@ -500,6 +529,11 @@ pub struct NodeStatus {
     pub total_accounts: usize,
     pub circulating_supply_hlx: f64,
     pub total_burned_hlx: f64,
+    /// The same two exact, in nano-HLX, as decimal strings (#256).
+    #[serde(default)]
+    pub circulating_supply_nano: String,
+    #[serde(default)]
+    pub total_burned_nano: String,
     /// Deterministic hash of this node's full chain state (`ChainState::state_hash`) — a
     /// diagnostic tool, not a protocol-level state root. It isn't committed to a block or
     /// checked as part of consensus. See `state_hash`'s doc comment for what it does and

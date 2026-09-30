@@ -208,6 +208,10 @@ pub fn personhood_authority_preimage(commitment: &[u8; 16], claimant: &Address) 
     msg
 }
 
+/// The longest transfer `data` that reads as a memo (#256) — see [`Transaction::memo`]. Wallets
+/// refuse a longer one; the node shows a longer one as raw data only.
+pub const MEMO_MAX_BYTES: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     /// Protocol version — allows future tx format upgrades
@@ -291,6 +295,22 @@ impl Transaction {
         // signature. The payload itself is canonical bincode (length-prefixed), so the
         // tag + payload has no cross-encoding ambiguity.
         Hash::digest_many(&[b"helix-tx-v1:", &payload])
+    }
+
+    /// The memo of a transfer: its `data`, when that is non-empty UTF-8 of at most
+    /// [`MEMO_MAX_BYTES`] (#256). This is how an exchange tells deposits to one shared address
+    /// apart — the payer writes the memo the exchange gave them, and it is signed with the
+    /// transfer. One rule for the node that displays it and the wallets that write it; `None` for
+    /// every other transaction type, whose `data` is contract code, call input or a name.
+    ///
+    /// The chain itself does not restrict a transfer's `data`; it is paid for per byte like
+    /// everything else. What this bounds is what counts as a memo.
+    pub fn memo(&self) -> Option<&str> {
+        let fits = !self.data.is_empty() && self.data.len() <= MEMO_MAX_BYTES;
+        if self.tx_type != TxType::Transfer || !fits {
+            return None;
+        }
+        std::str::from_utf8(&self.data).ok()
     }
 
     /// The transaction id — what a wallet is told at submission and watches for, and what the
@@ -483,6 +503,28 @@ mod tests {
         };
         tx.signature = keypair.sign(tx.signing_hash().as_bytes()).unwrap();
         tx
+    }
+
+    /// A memo is a transfer's `data` when it is non-empty UTF-8 of at most `MEMO_MAX_BYTES` —
+    /// both edges, and every way to not be one (#256).
+    #[test]
+    fn a_memo_is_short_utf8_on_a_transfer_and_nothing_else() {
+        let keypair = KeyPair::generate();
+        let with = |tx_type: TxType, data: Vec<u8>| {
+            let mut tx = build_tx(Address::from_public_key(&keypair.public), &keypair);
+            tx.tx_type = tx_type;
+            tx.data = data;
+            tx
+        };
+        assert_eq!(with(TxType::Transfer, b"customer-4711".to_vec()).memo(), Some("customer-4711"));
+        let longest = "é".repeat(MEMO_MAX_BYTES / 2); // two bytes a character: exactly the limit
+        let at_limit = with(TxType::Transfer, longest.clone().into_bytes());
+        assert_eq!(at_limit.memo(), Some(longest.as_str()));
+        assert_eq!(with(TxType::Transfer, vec![b'a'; MEMO_MAX_BYTES + 1]).memo(), None, "too long");
+        assert_eq!(with(TxType::Transfer, vec![0xff, 0xfe]).memo(), None, "not UTF-8");
+        assert_eq!(with(TxType::Transfer, vec![]).memo(), None, "empty is no memo");
+        assert_eq!(with(TxType::CallContract, b"input".to_vec()).memo(), None, "only transfers");
+        assert_eq!(with(TxType::RegisterName, b"alice".to_vec()).memo(), None);
     }
 
     /// The measurement that produced backlog #174, turned into a test.

@@ -383,6 +383,8 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
         total_accounts: chain.account_count(),
         circulating_supply_hlx: chain.circulating_supply() as f64 / 1_000_000_000.0,
         total_burned_hlx: chain.total_burned as f64 / 1_000_000_000.0,
+        circulating_supply_nano: chain.circulating_supply().to_string(),
+        total_burned_nano: chain.total_burned.to_string(),
         // Both taken from `chain`, under the one read lock held for this whole response — that
         // is what makes them a matched pair. `height`/`best_hash` above come from the block
         // store and can legitimately be one behind mid-commit.
@@ -1061,6 +1063,9 @@ async fn get_account(
                 balance_hlx: acc.balance_hlx(),
                 staked_hlx: acc.staked_hlx(),
                 unbonding_stake_hlx: acc.unbonding_stake as f64 / 1_000_000_000.0,
+                balance_nano: acc.balance.to_string(),
+                staked_nano: acc.staked.to_string(),
+                unbonding_stake_nano: acc.unbonding_stake.to_string(),
                 unbonding_unlock_height: acc.unbonding_unlock_height,
                 unbonding_source: acc.unbonding_source.clone(),
                 nonce: acc.nonce,
@@ -1561,6 +1566,9 @@ fn tx_history_entry(
         to: tx.to.as_ref().map(|a| a.to_string()),
         amount_hlx: tx.amount as f64 / 1_000_000_000.0,
         fee_hlx: tx.fee as f64 / 1_000_000_000.0,
+        amount_nano: tx.amount.to_string(),
+        fee_nano: tx.fee.to_string(),
+        memo: tx.memo().map(str::to_string),
         tx_type: format!("{:?}", tx.tx_type),
         nonce: tx.nonce,
         block_height: block.height(),
@@ -2054,7 +2062,13 @@ async fn get_transaction_status(
             if let Ok(Some(r)) = store.get_receipt(&tx_hash) {
                 entry["fee_burned_hlx"] = json!(r.fee_burned as f64 / 1_000_000_000.0);
                 entry["fee_to_validator_hlx"] = json!(r.fee_to_validator as f64 / 1_000_000_000.0);
+                entry["fee_burned_nano"] = json!(r.fee_burned.to_string());
+                entry["fee_to_validator_nano"] = json!(r.fee_to_validator.to_string());
             }
+            // The raw bytes, for whoever needs more than the memo: contract input, a memo longer
+            // than a memo, data that is not UTF-8 (#256). Only here, not in listings, where a
+            // deployed contract's code would ride along with every page of history.
+            entry["data_hex"] = json!(hex::encode(&tx.data));
             (StatusCode::OK, Json(entry))
         }
         Ok(None) => {
@@ -2553,6 +2567,57 @@ mod tests {
             "unknown",
             "no receipt means unknown — never a silent success"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What an exchange accounts with (#256): amounts exact in nano as strings — here one no
+    /// double can hold — and a transfer's memo, in the detail view, the block view and history;
+    /// the raw data only in the detail view.
+    #[tokio::test]
+    async fn amounts_are_exact_in_nano_and_a_transfer_carries_its_memo() {
+        let (state, path) = fresh_app_state();
+        let alice = addr(1);
+        let exchange = addr(2);
+        let amount: u64 = 12_345_678_901_234_567; // ~12.3M HLX
+        assert_ne!(amount as f64 as u64, amount, "premise: a double cannot hold this amount");
+
+        let mut deposit = tx(&alice, &exchange, amount, 0);
+        deposit.data = b"customer-4711".to_vec();
+        let mut raw = tx(&alice, &exchange, 5, 1);
+        raw.data = vec![0xff, 0xfe];
+        let (deposit_hash, raw_hash) = (deposit.hash(), raw.hash());
+        let block5 = block(5, &alice, vec![deposit, raw]);
+        state.store.write().await.put_block(block5.clone()).unwrap();
+        state.chain_state.write().await.update_account(&exchange, |acc| acc.balance = amount);
+
+        let read = |hash: Hash| {
+            let state = state.clone();
+            async move {
+                let response =
+                    get_transaction_status(State(state), Path(hash.to_hex())).await.into_response();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+        let detail = read(deposit_hash).await;
+        assert_eq!(detail["amount_nano"], "12345678901234567", "{detail}");
+        assert_eq!(detail["fee_nano"], "100");
+        assert_eq!(detail["memo"], "customer-4711");
+        assert_eq!(detail["data_hex"], hex::encode(b"customer-4711"));
+        let other = read(raw_hash).await;
+        assert!(other["memo"].is_null(), "bytes that are not UTF-8 are no memo: {other}");
+        assert_eq!(other["data_hex"], "fffe", "but the detail view still shows them");
+
+        let view = crate::BlockResponse::new(&block5, |_| ("applied".into(), None));
+        assert_eq!(view.transactions[0].amount_nano, "12345678901234567");
+        assert_eq!(view.transactions[0].memo.as_deref(), Some("customer-4711"));
+
+        let response =
+            get_account(State(state.clone()), Path(exchange.to_string())).await.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let account: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(account["balance_nano"], "12345678901234567", "{account}");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -3750,6 +3815,8 @@ mod tests {
             total_accounts: 0,
             circulating_supply_hlx: 0.0,
             total_burned_hlx: 0.0,
+            circulating_supply_nano: "0".into(),
+            total_burned_nano: "0".into(),
             state_hash: String::new(),
             state_height: 1,
             p2p_port: 0,

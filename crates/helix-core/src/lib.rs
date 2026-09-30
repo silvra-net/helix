@@ -7,4 +7,4 @@ pub use block::{genesis_block, precommit_signing_bytes, transactions_root, Block
 pub use chain::{
     chain_id_source, default_chain_id, ChainIdSource, DEFAULT_GENESIS_HASH, DEFAULT_SEED_PEER,
 };
-pub use transaction::{Amount, Transaction, TxType};
+pub use transaction::{Amount, Transaction, TxType, MEMO_MAX_BYTES};
