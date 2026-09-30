@@ -49,6 +49,9 @@ or compares amounts must read the `…_nano` fields. They are: `balance_nano`, `
 `/status`; `amount_nano` and `fee_nano` on every transaction a block, the history or the lookup
 returns.
 
+How an exchange or custodian puts these together — deposits, withdrawals, nonces — is in
+[Integrating Helix](exchange-integration.md).
+
 **Memo.** A `Transfer` whose `data` is UTF-8 of at most 256 bytes carries that text as its memo,
 and every transaction view shows it as `memo` (absent otherwise) — how an exchange that receives on
 one address tells deposits apart. `helix tx send --memo` sets it. Other bytes stay in `data`,
