@@ -125,7 +125,7 @@ helix --node http://127.0.0.1:8545 tx send <address> 100 --key validator-key.jso
 ```bash
 git clone https://github.com/silvra-net/helix.git
 cd helix
-git checkout v0.20.1   # the latest release tag
+git checkout v0.20.2   # the latest release tag
 cargo build --release  # one binary: target/release/helix
 ```
 
