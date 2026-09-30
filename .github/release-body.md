@@ -17,8 +17,7 @@
 ### Running a validator?
 
 Start the node **first**, confirm `peer_count` is above zero, and only then send the stake
-transaction — see the founding-validator checklist in the
-[README](https://github.com/silvra-net/helix#readme). The wait itself is safe (a validator
+transaction — see [Staking](https://github.com/silvra-net/helix/blob/master/docs/staking.md#running-a-validator). The wait itself is safe (a validator
 serving its one-epoch activation delay is no longer charged with missed blocks), but a node
 that isn't connected can't vote once it *is* activated.
 

@@ -6,9 +6,18 @@ Spark's hand-maintained TypeScript mirror of `helix_core::Transaction`/`TxPayloa
 whenever `helix-core`'s signing format changes (it already did once, 2026-07-20). See this
 crate's `src/lib.rs` doc comment for the full incident and design rationale.
 
-Deliberately narrow: `derive_address(seed)` and `sign_transaction(seed, tx)` only — not a
-general Helix SDK. `data` payloads for contract/governance/personhood transactions stay the
-caller's responsibility (opaque bytes, never signature-critical structure), exactly as before.
+Deliberately narrow — not a general Helix SDK:
+
+- `derive_address(seed)` — the `hlx…` address for a 32-byte seed (the seed a 24-word phrase
+  encodes).
+- `sign_transaction(seed, tx)` — builds and signs a transaction and returns the exact JSON body for
+  `POST /transactions`. It refuses a `from` that is not the seed's own address, and a fee above
+  1 HLX, which no app should sign because a node reported a high base fee.
+- `name_registration_price_nano(name)` — what registering a `.hlx` name costs, burned; the exact
+  `amount` a `RegisterName` transaction must carry.
+
+`data` payloads for contract/governance/personhood transactions stay the caller's responsibility
+(opaque bytes, never signature-critical structure).
 
 Own Cargo workspace (see `Cargo.toml`), same reason as `gui/src-tauri`: uniffi's dependency tree
 has no business in `cargo build/test --workspace` for the chain itself.
@@ -72,7 +81,7 @@ matching update (it is not generated, unlike `helix_mobile.kt`).
 
 ## Verified so far
 
-- `cargo test`: 5/5, including a real `Transaction::verify_signature()` round-trip.
+- `cargo test`, including a real `Transaction::verify_signature()` round-trip.
 - Cross-compiled cleanly for all 4 Android ABIs.
 - UniFFI Kotlin bindings generated successfully (`uniffi/helix_mobile/helix_mobile.kt`,
   `deriveAddress(seed: ByteArray): String` / `signTransaction(seed: ByteArray, tx: UnsignedTx):

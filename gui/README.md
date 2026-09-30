@@ -1,29 +1,31 @@
 # Helix Wallet (desktop GUI)
 
 A desktop wallet for the Helix blockchain — see your balance and transaction history, receive,
-send HLX, and run your own node or validator, all without touching a shell. Backlog #83, stage
-2+ (stage 1, the read-only explorer, is now its own project at
-[silvra-net/helix-explorer](https://github.com/silvra-net/helix-explorer); a node serves only
-its own status page at `GET /`).
+send HLX, stake and delegate, manage names, recovery and governance, and run your own node or
+validator, all without touching a shell. (The block explorer is its own project,
+[silvra-net/helix-explorer](https://github.com/silvra-net/helix-explorer).)
 
 **CLI/GUI parity:** `helix-cli` and `helix-gui` are two front ends over the same node/wallet
 core — neither is a subset of the other. The GUI bundles the real `helix` binary as a sidecar
 (see [Validate](#validate) below), so installing the wallet alone is a complete validator setup —
 no separate CLI download needed, and vice versa.
 
-> **Status:** wallet create/restore/unlock, overview (balance/staked/history), receive, and
-> locally-signed transactions — transfers, staking/delegation, `.hlx` names, social recovery
-> (guardians), governance, a validator panel with a live console, and persistent application
-> logging for bug reports.
+**Protecting the person using it:**
 
-## Navigation: six tabs, not nine
+- The key never leaves the Rust backend — see [Why Tauri](#why-tauri-not-a-browser-page).
+- **It locks itself after 10 minutes without use** and clears the key from memory; the lock is
+  enforced by the backend, not by timers in the webview, and counts time a closed laptop spent
+  asleep. A send in flight always shows its result first. The lock protects a wallet with a
+  passphrase, which can be set at creation or later under **Settings → Passphrase**.
+- **A fee it prices itself never exceeds 1 HLX** — a node lying about the base fee cannot make it
+  sign away the balance.
+- **A wallet file whose address does not belong to its key does not open.**
+- If its node refuses the chain stored on the machine (after a reset, for one), it says so and
+  opens **Validate → Reset local chain**, which renames the old data instead of deleting it.
 
-Earlier versions had a flat `Overview / Send / Receive / Staking / Names / Recovery / Governance
-/ Node / Settings` sidebar, which put the same number — your own stake — in two unrelated-looking
-places at once: a "Staking" tab framed around a generic delegate-to-earn product, and a "Node" tab
-framed around running a validator. If you *are* the validator, those are the same money, and
-seeing it twice under different framings was the actual bug, not a display glitch. Current
-grouping:
+## Navigation
+
+Six tabs:
 
 - **Home** — balance, address, recent activity. Send/Receive are actions reached from here, not
   their own sidebar entries (nobody browses to "send", they decide to send and then do it).
@@ -85,7 +87,7 @@ for downtime — unjail it, all from the same window as the wallet.
 
 The bundled node is set up for a desktop rather than a server: it keeps about **4 GB of recent
 chain history** (`HELIX_KEEP_BYTES=4G`, a file of at most 8 GB) instead of every block since
-genesis, which on this chain grows by ~1.7 GB a day, and runs with `MALLOC_ARENA_MAX=2` so it does
+genesis, which on this chain grows by roughly 2 GB a day, and runs with `MALLOC_ARENA_MAX=2` so it does
 not grow in memory for days on Linux. Start the wallet with `HELIX_KEEP_BYTES` or
 `HELIX_KEEP_BLOCKS` in its environment to choose your own limit — the wallet then adds none.
 
@@ -153,21 +155,22 @@ available in the authoring sandbox, so the actual running app (sidecar spawn, th
 console, click-through UX) was never seen rendered. Run `npm run tauri dev` on a machine with the
 Tauri prerequisites installed to check that by eye.
 
-## Roadmap (stages of backlog #83)
+## What it covers
 
-- **SA1** ✅ read-only explorer — now [its own project](https://github.com/silvra-net/helix-explorer); the node serves its own status page at `GET /`
-- **SA2/SA3** ✅ local wallet + balance/history + signed send
-- **SA4** ✅ staking / delegation UI — stake, unstake, claim, delegate, redelegate, commission
+- ✅ local wallet, balance and history, signed send and receive (with QR code)
+- ✅ staking and delegation — stake, unstake, claim, delegate, undelegate, redelegate, commission,
+  reward address
 - **Identity** ✅ `.hlx` names (register, resolve) + social recovery (guardians, approve/cancel a
   recovery)
 - **Governance** ✅ view parameters + proposals, vote, propose a change
-- **Settings** ✅ re-reveal the recovery phrase (re-auth'd), view address / public key, view the
-  diagnostic log folder
+- **Settings** ✅ show the recovery phrase again (derived from the key after re-entering the
+  passphrase — it is never stored), set or change the passphrase, view address / public key,
+  view the diagnostic log folder
 - **Validate** ✅ run a bundled node/validator as a sidecar with a live console (start/stop,
   unjail), or connect to a remote one — status (height/peers/sync), your own stake vs the entry
   threshold with a stake-toward-validator assistant, live "blocks you proposed" signal, your
   validator pool if delegators back you
 - **Earn** ✅ delegating to other validators, separate from Validate — see
-  [Navigation](#navigation-six-tabs-not-nine) for why
+  [Navigation](#navigation)
 - smart-contract deploy/call is a developer feature left out of the wallet, and proof-of-personhood
   is deferred (verification is authority-gated and can't be a self-serve wallet flow)
