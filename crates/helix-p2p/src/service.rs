@@ -1558,10 +1558,23 @@ impl P2PService {
                                     // it teaches an operator to skip exactly the warning that
                                     // matters. Measured live on 2026-08-05: 92 of these in 300 log
                                     // lines while the chain was finalizing blocks normally.
+                                    let connected = swarm.connected_peers().count();
                                     if matches!(e, gossipsub::PublishError::Duplicate) {
                                         debug!("Proposal re-offer deduplicated — already published");
+                                    } else if publish_failure_is_news(&e, connected) {
+                                        warn!(
+                                            error = %e,
+                                            peers = connected,
+                                            "Proposal broadcast failed although peers are \
+                                             connected — no other validator receives it, so \
+                                             unless this node is the whole validator set the \
+                                             round cannot finish"
+                                        );
                                     } else {
-                                        warn!(error = %e, "Proposal broadcast failed — this round cannot reach a quorum");
+                                        debug!(
+                                            error = %e,
+                                            "Proposal not broadcast — no peer connected"
+                                        );
                                     }
                                     if proposal_reached_the_network(&Err(e)) {
                                         proposal_on_the_wire = Some(id);
@@ -1636,10 +1649,21 @@ impl P2PService {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub
                                     .publish(committed_topic.clone(), data)
                                 {
+                                    let connected = swarm.connected_peers().count();
                                     if matches!(e, gossipsub::PublishError::Duplicate) {
                                         debug!("Committed-block re-offer deduplicated — already published");
+                                    } else if publish_failure_is_news(&e, connected) {
+                                        warn!(
+                                            error = %e,
+                                            peers = connected,
+                                            "Committed block broadcast failed although peers are \
+                                             connected — they will have to fetch this block instead"
+                                        );
                                     } else {
-                                        warn!(error = %e, "Committed block broadcast failed — peers will have to fetch this block instead");
+                                        debug!(
+                                            error = %e,
+                                            "Committed block not sent — no peer connected"
+                                        );
                                     }
                                 }
                             }
@@ -1894,6 +1918,23 @@ fn redial_verdict(connected: usize, last_logged_for: Option<usize>) -> RedialVer
     // lines, so it speaks once per change instead.
     let log = dial && (connected == 0 || last_logged_for != Some(connected));
     RedialVerdict { dial, log }
+}
+
+/// Whether a failed publish deserves a warning (#254).
+///
+/// With **no peer connected**, nothing can be published and there is nothing to learn from it: the
+/// health line already says "NO peers" every minute. Warning per block on top of that said "this
+/// round cannot reach a quorum" twice a block for a validator that is the whole set and finalizes
+/// alone — V1 right after a reset, for as long as the operators take to update, ~3600 lines an
+/// hour, all false. With peers **connected** and still nobody to receive, the connection is the
+/// half-open one of #232, and that warning is the one that found it; it stays. So does every
+/// failure that is not about peers at all (a message too large, a transform or signing error).
+fn publish_failure_is_news(err: &gossipsub::PublishError, connected_peers: usize) -> bool {
+    match err {
+        gossipsub::PublishError::Duplicate => false,
+        gossipsub::PublishError::NoPeersSubscribedToTopic => connected_peers > 0,
+        _ => true,
+    }
 }
 
 /// Is this proposal now beyond the reach of a retry — either sent, or sitting in gossipsub's
@@ -5085,8 +5126,20 @@ mod redial_target_tests {
 
 #[cfg(test)]
 mod proposal_reoffer_tests {
-    use super::proposal_reached_the_network;
+    use super::{proposal_reached_the_network, publish_failure_is_news};
     use libp2p::gossipsub::{MessageId, PublishError};
+
+    /// A node with no peer at all cannot publish, and says so in its health line; a node whose
+    /// connected peers receive nothing is the #232 case and must still be told (#254).
+    #[test]
+    fn only_a_publish_that_fails_with_peers_connected_is_worth_a_warning() {
+        let nobody = PublishError::NoPeersSubscribedToTopic;
+        assert!(!publish_failure_is_news(&nobody, 0), "alone: nothing to report");
+        assert!(publish_failure_is_news(&nobody, 1), "connected and unheard: #232");
+        assert!(!publish_failure_is_news(&PublishError::Duplicate, 3));
+        assert!(publish_failure_is_news(&PublishError::MessageTooLarge, 0), "size is always news");
+        assert!(publish_failure_is_news(&PublishError::AllQueuesFull(2), 2));
+    }
 
     /// The half that suppresses the noise: once the bytes are out, or gossipsub is holding them in
     /// its duplicate cache, every further attempt is refused and only produces a WARN line.
