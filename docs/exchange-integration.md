@@ -299,13 +299,14 @@ running 0.20.2 or later does, for the blocks it executes. Back up the wallet dir
 `backupwallet` — keys are written once and never changed, so a backup stays valid for every address
 made before it.
 
-## Mesh (Rosetta) Data API
+## Mesh (Rosetta) API
 
-`helix mesh` serves the read side of the [Mesh API](https://docs.cdp.coinbase.com/mesh/docs/welcome)
-(formerly Rosetta) in front of your node: `/network/list`, `/network/options`, `/network/status`,
-`/block`, `/block/transaction`, `/account/balance`, `/mempool`, `/mempool/transaction`. It runs as
-its own process and reads the node's REST API — the same endpoints this page describes — so it can
-be restarted without touching the node.
+`helix mesh` serves the [Mesh API](https://docs.cdp.coinbase.com/mesh/docs/welcome) (formerly
+Rosetta) in front of your node — the Data API (`/network/list`, `/network/options`,
+`/network/status`, `/block`, `/block/transaction`, `/account/balance`, `/mempool`,
+`/mempool/transaction`) and the Construction API for a transfer of HLX (below). It runs as its own
+process and reads the node's REST API — the same endpoints this page describes — so it can be
+restarted without touching the node.
 
 ```bash
 helix --node http://127.0.0.1:8545 mesh --listen 127.0.0.1:8080 --network testnet
@@ -344,6 +345,35 @@ Staked and unbonding amounts are not liquid balance and are not shown as one.
 Balances are available at the current block only (`historical_balance_lookup: false`); asked for
 another block, `/account/balance` answers error 7 rather than a balance from the wrong one.
 
-**Not served yet:** the Construction API (building and signing transactions). The Mesh
-specification has supported ML-DSA-65 since July 2026, but Coinbase's Go SDK and `mesh-cli` do not;
-sign with the CLI (`--offline`, [Sending withdrawals](#sending-withdrawals)) until they do.
+### Construction API
+
+`/construction/derive`, `/preprocess`, `/metadata`, `/payloads`, `/combine`, `/parse`, `/hash` and
+`/submit`, for one kind of transaction: **a transfer of HLX** — two `TRANSFER` operations, one
+taking an amount from the sender, one giving the same amount to the recipient. Anything else is
+refused (error 11) rather than built approximately.
+
+- **Keys and signatures are `ml_dsa_65`** (FIPS 204 ML-DSA-65, in the Mesh specification since
+  July 2026): public keys 1952 bytes, signatures 3309. `/construction/payloads` returns one payload
+  to sign: the transaction's **signing hash, 32 bytes**. Helix verifies it as ML-DSA-65 with an
+  **empty context string** over exactly those 32 bytes, so any conforming signer — randomised or
+  deterministic — produces a signature that verifies. `/combine` checks it before anything reaches
+  the node (error 14 if it does not verify, or is not the sender's).
+- **`/preprocess`** asks for the sender's public key (`required_public_keys`): an account's first
+  transaction carries it. A **memo** goes in its `metadata` (`{"memo": "…"}`, UTF-8, at most 256
+  bytes), and so does a **nonce** you choose, to build several transfers from one account before the
+  first is in a block; otherwise `/metadata` takes the account's next nonce from the node.
+- **`/metadata`** returns the nonce, the chain to sign for (the genesis hash) and the fee, by the
+  wallets' rule — priced on the size of the *signed* transaction, refused above 1 HLX — also as
+  `suggested_fee`. `/payloads` builds nothing with a fee above 1 HLX.
+- **The blobs** (`unsigned_transaction`, `signed_transaction`) are the transaction's canonical bytes
+  in hex. `/hash` gives the id the node will report; `/submit` answers error 12 with the node's
+  reason when it refuses, and treats the same transaction already in the pool as submitted.
+- **Offline:** `helix mesh --offline` serves `/network/list`, `/network/options` and the steps that
+  need no node (derive, preprocess, payloads, combine, parse, hash) on the machine that signs;
+  everything else answers error 13 there.
+
+**Checked how:** Coinbase's `mesh-cli check:construction` cannot run yet — its Go SDK signs no
+ML-DSA. The flow is checked end to end against a real chain instead (`crates/helix-mesh/tests/
+construction_live.rs`): built through the offline endpoints, signed with this repository's
+ML-DSA-65, submitted, and each balance checked to the nano — an account's first transaction (key
+carried) and its second (key known, priced without it).

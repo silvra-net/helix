@@ -8,6 +8,9 @@ description = "Mesh (formerly Rosetta) Data API for Helix, served from a node's 
 
 [dependencies]
 helix-core.workspace = true
+helix-crypto.workspace = true
+hex.workspace = true
+bincode.workspace = true
 axum.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
@@ -18,9 +21,7 @@ anyhow.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-bincode.workspace = true
 # The node's own response types: a test renders them and reads them back through this crate's,
 # so a field renamed on one side fails here instead of in production.
 helix-rpc.workspace = true
 helix-executor.workspace = true
-helix-crypto.workspace = true

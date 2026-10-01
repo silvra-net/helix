@@ -1460,6 +1460,7 @@ dependencies = [
  "helix-crypto",
  "helix-executor",
  "helix-rpc",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",

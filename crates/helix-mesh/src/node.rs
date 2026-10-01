@@ -16,6 +16,8 @@ pub struct Status {
     pub is_syncing: bool,
     #[serde(default)]
     pub sync_target_height: Option<u64>,
+    #[serde(default)]
+    pub base_fee_per_byte: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +97,10 @@ pub struct Balance {
     pub nano: u64,
     pub state_height: u64,
 }
+
+/// The node took a transaction into its pool (or already had exactly this one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Submitted;
 
 /// Why a request to the node did not produce an answer.
 #[derive(Debug)]
@@ -200,6 +206,45 @@ impl Node {
             None => 0, // the 404 answer for an address with no history
         };
         Ok(Balance { nano, state_height })
+    }
+
+    /// The next nonce of `address`: 0 for an address the chain has never seen.
+    pub async fn nonce(&self, address: &str) -> Result<u64, NodeError> {
+        let url = format!("/accounts/{address}");
+        let value = self.get_value(&url).await?;
+        match value.get("nonce") {
+            Some(n) => n.as_u64().ok_or_else(|| NodeError::Unavailable(anyhow!("{url}: nonce {n} is not a number"))),
+            None => Ok(0), // the 404 answer for an address with no history
+        }
+    }
+
+    /// Hand a signed transaction to the node. Its refusal (HTTP 400) is `Invalid` with the
+    /// node's reason — except that this very transaction is already in the pool, which a
+    /// resubmission after a lost answer is, and is not a refusal.
+    pub async fn submit(&self, tx: &helix_core::Transaction) -> Result<Submitted, NodeError> {
+        let url = format!("{}/transactions", self.base);
+        let response = self
+            .http
+            .post(&url)
+            .json(tx)
+            .send()
+            .await
+            .with_context(|| format!("could not reach the node at {url}"))
+            .map_err(NodeError::Unavailable)?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        if status.is_success() {
+            return Ok(Submitted);
+        }
+        let reason = body["error"].as_str().unwrap_or("refused").to_string();
+        if reason == format!("Transaction {} already in mempool", tx.hash().to_hex()) {
+            return Ok(Submitted);
+        }
+        match status {
+            StatusCode::BAD_REQUEST => Err(NodeError::Invalid(reason)),
+            StatusCode::TOO_MANY_REQUESTS => Err(NodeError::RateLimited),
+            s => Err(NodeError::Unavailable(anyhow!("{url} answered HTTP {s}: {reason}"))),
+        }
     }
 
     pub async fn mempool(&self) -> Result<Vec<String>, NodeError> {

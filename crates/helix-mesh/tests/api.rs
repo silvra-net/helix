@@ -77,7 +77,7 @@ async fn options_announce_every_type_and_no_history() {
     assert_eq!(body["version"]["node_version"], "0.20.1");
     // The specification lets a client refuse an error code it was not told about.
     let codes: Vec<u64> = body["allow"]["errors"].as_array().unwrap().iter().map(|e| e["code"].as_u64().unwrap()).collect();
-    assert_eq!(codes, (1..=10).collect::<Vec<u64>>());
+    assert_eq!(codes, (1..=14).collect::<Vec<u64>>());
 }
 
 #[tokio::test]

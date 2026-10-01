@@ -1,6 +1,6 @@
 //! The part of the Mesh (formerly Rosetta) data model this service speaks — the Data API
-//! (network, block, account, mempool). Field names and shapes follow the specification at
-//! <https://github.com/coinbase/mesh-specifications>.
+//! (network, block, account, mempool) and the Construction API. Field names and shapes follow the
+//! specification at <https://github.com/coinbase/mesh-specifications>.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -134,4 +134,87 @@ pub struct AccountBalanceRequest {
 pub struct MempoolTransactionRequest {
     pub network_identifier: NetworkIdentifier,
     pub transaction_identifier: TransactionIdentifier,
+}
+
+// ---------- construction ----------
+
+/// A public key as the specification carries it: hex bytes and the scheme (`curve_type`, a name
+/// kept from the elliptic-curve days — `ml_dsa_65` here).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicKey {
+    pub hex_bytes: String,
+    pub curve_type: String,
+}
+
+/// What the caller signs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SigningPayload {
+    /// Deprecated by `account_identifier` in the specification; written for older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier: Option<AccountIdentifier>,
+    pub hex_bytes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signature {
+    pub signing_payload: SigningPayload,
+    pub public_key: PublicKey,
+    pub signature_type: String,
+    pub hex_bytes: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConstructionDeriveRequest {
+    pub network_identifier: NetworkIdentifier,
+    pub public_key: PublicKey,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConstructionPreprocessRequest {
+    pub network_identifier: NetworkIdentifier,
+    pub operations: Vec<Operation>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConstructionMetadataRequest {
+    pub network_identifier: NetworkIdentifier,
+    #[serde(default)]
+    pub options: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConstructionPayloadsRequest {
+    pub network_identifier: NetworkIdentifier,
+    pub operations: Vec<Operation>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+    #[serde(default)]
+    pub public_keys: Option<Vec<PublicKey>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConstructionCombineRequest {
+    pub network_identifier: NetworkIdentifier,
+    pub unsigned_transaction: String,
+    pub signatures: Vec<Signature>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConstructionParseRequest {
+    pub network_identifier: NetworkIdentifier,
+    pub signed: bool,
+    pub transaction: String,
+}
+
+/// `/construction/hash` and `/construction/submit`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignedTransactionRequest {
+    pub network_identifier: NetworkIdentifier,
+    pub signed_transaction: String,
 }

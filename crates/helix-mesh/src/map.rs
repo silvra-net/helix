@@ -17,6 +17,8 @@ use crate::types::{
 
 /// The fee a transaction paid.
 pub const FEE: &str = "FEE";
+/// What a transfer moved: taken from the sender, given to the recipient.
+pub const TRANSFER: &str = "TRANSFER";
 /// A validator's income: fee tips, the block reward, commission.
 pub const REWARD: &str = "REWARD";
 /// A transfer a smart contract made while a transaction ran.
@@ -33,7 +35,7 @@ pub const SUCCESS: &str = "SUCCESS";
 /// shows it.
 pub fn op_type(tx_type: &TxType) -> &'static str {
     match tx_type {
-        TxType::Transfer => "TRANSFER",
+        TxType::Transfer => TRANSFER,
         TxType::Stake => "STAKE",
         TxType::Unstake => "UNSTAKE",
         TxType::RegisterIdentity => "REGISTER_IDENTITY",
@@ -252,8 +254,8 @@ pub fn pending(p: &node::Pending) -> Result<Transaction, MapError> {
     }
     if let (TxType::Transfer, Some(to)) = (&p.tx_type, &p.to) {
         if amount > 0 {
-            ops.push(("TRANSFER", p.from.as_str(), -amount));
-            ops.push(("TRANSFER", to.as_str(), amount));
+            ops.push((TRANSFER, p.from.as_str(), -amount));
+            ops.push((TRANSFER, to.as_str(), amount));
         }
     }
     Ok(Transaction {
