@@ -350,7 +350,7 @@ Example: `hlxmtJXFwsfj1VE4rxseZaS3JvN9dC4vHR7z`
 | `helix-vm` | WASM contract execution (`wasmi`, fuel-metered, deterministic) |
 | `helix-zkp` | ZK-STARK proof generation/verification for Proof of Personhood |
 | `helix-rpc` | Axum REST API server (`:8545`) |
-| `helix-mesh` | `helix mesh` — a Mesh (Rosetta) Data API in front of a node's REST API, see [Integrating Helix](exchange-integration.md#mesh-rosetta-data-api) |
+| `helix-mesh` | `helix mesh` — the Mesh (Rosetta) Data and Construction API in front of a node's REST API (`--offline` for the signing machine), see [Integrating Helix](exchange-integration.md#mesh-rosetta-api) |
 | `helix-walletd` | The Bitcoin-Core-style wallet RPC for exchanges — served by `helix start` with `server=1` in the wallet's `helix.conf` (or `HELIX_WALLET_RPC`), or as `helix wallet-rpc`; `helix-cli`/`helix rpc` is its `bitcoin-cli`; see [Integrating Helix](exchange-integration.md#bitcoin-style-wallet-rpc) |
 | `helix-node` | The `helix` binary — `helix start` orchestrates all subsystems; other subcommands are the CLI client |
 | `helix-cli` | Client subcommand library (wallet, tx, chain, …) linked into the `helix` binary |

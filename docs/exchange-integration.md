@@ -24,7 +24,7 @@ status`, the exact amount fields and a syncing node that keeps transaction outco
 | Chain id | the genesis block's hash; every transaction signs it |
 | Nonces | per sender, strictly sequential from 0 |
 | Fee | `base_fee_per_byte × size` burned, anything above it tips the proposer |
-| Ways to integrate | this page's REST API · a **Bitcoin-Core-style wallet RPC** served by the node (`server=1` in `helix.conf`, called with `helix-cli`) · the **Mesh (Rosetta)** Data API (`helix mesh`) |
+| Ways to integrate | this page's REST API · a **Bitcoin-Core-style wallet RPC** served by the node (`server=1` in `helix.conf`, called with `helix-cli`) · the **Mesh (Rosetta)** Data and Construction API (`helix mesh`) |
 | Supply | `GET /supply/circulating`, `/supply/total`, `/supply/max` — a bare number in HLX |
 | Container | `ghcr.io/silvra-net/helix:<version>`, from the release after 0.20.2 on |
 
