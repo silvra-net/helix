@@ -9,9 +9,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Hash, KeyPair, Signature};
 
+use crate::amount::{Decimals, Hlx};
 use crate::keys::{KeyError, Keys};
 use crate::ledger::{pending_entry, Ledger, Pending, PendingKind};
 use crate::node::{Node, Submit, TxState};
+use crate::notify::Notifier;
 use crate::rpc::{code, RpcError};
 
 #[derive(Debug, Clone)]
@@ -24,11 +26,31 @@ pub struct Options {
     pub scan_batch: u64,
     /// Sweeps signed per tick at most (each decrypts one key).
     pub sweeps_per_tick: usize,
+    /// Run for every change to a wallet transaction (`walletnotify`).
+    pub walletnotify: Option<String>,
+    /// Run when the wallet's view of the chain moves on (`blocknotify`).
+    pub blocknotify: Option<String>,
+    /// A fee rate sends pay at least, nano-HLX per kB (`paytxfee`, and `settxfee` at runtime).
+    pub paytxfee: Option<u64>,
+    /// No transaction is signed with a larger fee (`maxtxfee`), nano-HLX.
+    pub max_fee: u64,
+    /// Decimals amounts are written and read with (`amountdecimals`).
+    pub decimals: Decimals,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { sweep_min: 100_000, keypool: 100, scan_batch: 500, sweeps_per_tick: 10 }
+        Options {
+            sweep_min: 100_000,
+            keypool: 100,
+            scan_batch: 500,
+            sweeps_per_tick: 10,
+            walletnotify: None,
+            blocknotify: None,
+            paytxfee: None,
+            max_fee: helix_core::fee::WALLET_AUTO_FEE_CEILING_NANO,
+            decimals: Decimals::Nine,
+        }
     }
 }
 
@@ -52,6 +74,9 @@ pub struct Daemon {
     pub chain_id: Hash,
     pub opts: Options,
     pub sync: RwLock<SyncState>,
+    /// The fee rate sends pay at least, nano-HLX per kB: `paytxfee`, changed by `settxfee`.
+    pub paytxfee: RwLock<Option<u64>>,
+    notifier: Notifier,
     send_lock: tokio::sync::Mutex<()>,
 }
 
@@ -95,18 +120,31 @@ fn transfer(from: &Address, to: &Address, nonce: u64, chain_id: Hash, kp: &KeyPa
 
 /// The fee `tx` pays at `base_fee_per_byte`, by the wallets' one rule — headroom over the base
 /// fee, refused above 1 HLX (a node that reports an absurd base fee is not someone whose word
-/// spends an exchange's money).
+/// spends an exchange's money). A `rate` the operator set (`paytxfee`/`settxfee`, nano-HLX per kB)
+/// is paid if it comes to more; nothing above `max_fee` (`maxtxfee`) is ever signed.
 ///
 /// **Priced on the signed transaction.** A signature is 3,309 bytes, and the base fee is charged
 /// per byte: pricing `tx` before it is signed undercharged by exactly that, and the node refused
 /// every sweep ("Fee below the block base fee: got 4268, need at least 5443") — found on a real
 /// node, not by a unit test. So a copy is signed first and priced; amount and fee are fixed-width,
 /// so setting them afterwards does not change the size.
-fn fee_for(tx: &Transaction, kp: &KeyPair, base_fee_per_byte: u64) -> Result<u64> {
+fn fee_for(tx: &Transaction, kp: &KeyPair, base_fee_per_byte: u64, rate: Option<u64>, max_fee: u64) -> Result<u64> {
     let mut signed = tx.clone();
     sign(&mut signed, kp)?;
-    helix_core::fee::wallet_auto_fee(base_fee_per_byte, helix_core::fee::wallet_priced_size(&signed))
-        .map_err(|e| anyhow!("{e}"))
+    let size = helix_core::fee::wallet_priced_size(&signed);
+    let auto = helix_core::fee::wallet_auto_fee(base_fee_per_byte, size).map_err(|e| anyhow!("{e}"))?;
+    let chosen = match rate {
+        Some(per_kb) => auto.max(per_kb.saturating_mul(size).div_ceil(1000)),
+        None => auto,
+    };
+    if chosen > max_fee {
+        bail!(
+            "the fee would be {} HLX, above maxtxfee ({} HLX)",
+            Hlx::exact(chosen as i128).literal(),
+            Hlx::exact(max_fee as i128).literal()
+        );
+    }
+    Ok(chosen)
 }
 
 impl Daemon {
@@ -135,10 +173,28 @@ impl Daemon {
             keys: Mutex::new(keys),
             ledger,
             chain_id,
+            paytxfee: RwLock::new(opts.paytxfee),
+            notifier: Notifier::new(opts.walletnotify.clone(), opts.blocknotify.clone()),
             opts,
             sync: RwLock::new(SyncState::default()),
             send_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// An amount as answers write it: in the wallet's decimals, never shown in the exchange's
+    /// favour (a credit not larger, a debit not smaller).
+    pub fn shown(&self, nano: i128) -> Hlx {
+        Hlx::down(nano, self.opts.decimals)
+    }
+
+    /// A fee rate as answers write it: never shown below what is charged.
+    pub fn rate(&self, nano: i128) -> Hlx {
+        Hlx::up(nano, self.opts.decimals)
+    }
+
+    /// An amount from a request, in the wallet's decimals.
+    pub fn parse_amount(&self, raw: &serde_json::value::RawValue) -> Result<u64, RpcError> {
+        crate::amount::parse(raw, self.opts.decimals).map_err(|e| RpcError::new(code::TYPE, e))
     }
 
     pub fn hot_address(&self) -> String {
@@ -203,6 +259,7 @@ impl Daemon {
     async fn scan(&self, tip: u64) -> Result<()> {
         let (mut height, _) = self.ledger.scanned()?.ok_or_else(|| anyhow!("the ledger has no start"))?;
         let until = tip.min(height + self.opts.scan_batch);
+        let mut newest: Option<String> = None;
         while height < until {
             let block = self.node.block_at(height + 1).await?;
             let outcome = {
@@ -218,7 +275,16 @@ impl Daemon {
             if outcome.received > 0 || outcome.settled > 0 {
                 tracing::info!(height = block.height, received = outcome.received, settled = outcome.settled, "wallet activity");
             }
+            for txid in &outcome.txids {
+                self.notifier.wallet_tx(txid, Some((&block.hash, block.height)));
+            }
             height = block.height;
+            newest = Some(block.hash);
+        }
+        // Once per round, with the newest block: catching up a thousand blocks does not start a
+        // thousand commands.
+        if let Some(hash) = newest {
+            self.notifier.block(&hash);
         }
         Ok(())
     }
@@ -234,6 +300,7 @@ impl Daemon {
                     if account.nonce > p.nonce {
                         tracing::warn!(txid = %p.txid, nonce = p.nonce, "abandoned: another transaction used its nonce");
                         self.ledger.abandon(&p.txid)?;
+                        self.notifier.wallet_tx(&p.txid, None);
                     } else {
                         let tx: Transaction = serde_json::from_str(&p.signed)?;
                         match self.node.submit(&tx).await {
@@ -276,7 +343,8 @@ impl Daemon {
             let signed = tokio::task::block_in_place(|| -> Result<Option<Transaction>> {
                 let kp = access.pair()?;
                 let mut tx = transfer(&from, &hot_address, account.nonce, self.chain_id, &kp);
-                let fee = fee_for(&tx, &kp, base_fee_per_byte)?;
+                // A sweep moves nothing out of the wallet; it pays the going fee, not `paytxfee`.
+                let fee = fee_for(&tx, &kp, base_fee_per_byte, None, self.opts.max_fee)?;
                 if balance <= fee {
                     return Ok(None);
                 }
@@ -302,7 +370,10 @@ impl Daemon {
                 },
             )?;
             match self.node.submit(&tx).await {
-                Ok(()) => tracing::info!(%address, %txid, amount = tx.amount, fee = tx.fee, "swept"),
+                Ok(()) => {
+                    tracing::info!(%address, %txid, amount = tx.amount, fee = tx.fee, "swept");
+                    self.notifier.wallet_tx(&txid, None);
+                }
                 Err(Submit::Refused(reason)) => {
                     tracing::warn!(%address, %reason, "the node refused a sweep");
                     self.ledger.discard(&txid)?;
@@ -349,12 +420,13 @@ impl Daemon {
             .unwrap_or(0)
             .max(account.nonce);
         let base_fee = self.node.status().await.map_err(|e| RpcError::new(code::NOT_CONNECTED, e.to_string()))?.base_fee_per_byte;
+        let rate = *self.paytxfee.read().expect("paytxfee");
 
         let tx = tokio::task::block_in_place(|| -> Result<Transaction, RpcError> {
             let mut keys = self.keys.lock().expect("keys");
             let kp = keys.hot().map_err(key_error)?;
             let mut tx = transfer(&hot_address, &to_address, nonce, self.chain_id, kp);
-            let fee = fee_for(&tx, kp, base_fee).map_err(|e| RpcError::new(code::WALLET, format!("not sent: {e}")))?;
+            let fee = fee_for(&tx, kp, base_fee, rate, self.opts.max_fee).map_err(|e| RpcError::new(code::WALLET, format!("not sent: {e}")))?;
             let amount = if subtract_fee {
                 amount.checked_sub(fee).filter(|a| *a > 0).ok_or_else(|| {
                     RpcError::new(code::WALLET, "the amount does not cover the fee it should pay")
@@ -390,8 +462,8 @@ impl Daemon {
                 code::INSUFFICIENT_FUNDS,
                 format!(
                     "Insufficient funds: the hot address can spend {} HLX, this send needs {} HLX{hint}",
-                    crate::amount::Hlx(spendable.max(0)).literal(),
-                    crate::amount::Hlx(needed).literal()
+                    Hlx::exact(spendable.max(0)).literal(),
+                    Hlx::exact(needed).literal()
                 ),
             ));
         }
@@ -415,7 +487,10 @@ impl Daemon {
             )
             .map_err(misc)?;
         match self.node.submit(&tx).await {
-            Ok(()) => Ok(txid),
+            Ok(()) => {
+                self.notifier.wallet_tx(&txid, None);
+                Ok(txid)
+            }
             Err(Submit::Refused(reason)) => {
                 self.ledger.discard(&txid).map_err(misc)?;
                 Err(RpcError::new(code::VERIFY_REJECTED, format!("the node refused the transaction: {reason}")))
@@ -423,6 +498,7 @@ impl Daemon {
             // Recorded, so it is submitted again until a block holds it or its nonce is spent.
             Err(Submit::Unreachable(e)) => {
                 tracing::warn!(%txid, err = %e, "send recorded but not confirmed submitted; will retry");
+                self.notifier.wallet_tx(&txid, None);
                 Ok(txid)
             }
         }
@@ -443,7 +519,7 @@ mod tests {
         let to = Address::from_public_key(&KeyPair::generate().public);
         for (nonce, base) in [(0u64, 1u64), (0, 7), (5, 1), (5, 3)] {
             let mut tx = transfer(&from, &to, nonce, Hash::ZERO, &kp);
-            let fee = fee_for(&tx, &kp, base).unwrap();
+            let fee = fee_for(&tx, &kp, base, None, u64::MAX).unwrap();
             tx.fee = fee;
             tx.amount = 123_456_789;
             sign(&mut tx, &kp).unwrap();
@@ -453,5 +529,25 @@ mod tests {
                 assert!(fee >= base * tx.size_bytes(), "a first transaction carries its key and pays for it");
             }
         }
+    }
+
+    /// `paytxfee` raises a send's fee to its rate when that comes to more than the going fee, and
+    /// nothing above `maxtxfee` is ever signed — the operator's ceiling, as in Bitcoin Core.
+    #[test]
+    fn paytxfee_raises_the_fee_and_maxtxfee_caps_it() {
+        let kp = KeyPair::generate();
+        let from = Address::from_public_key(&kp.public);
+        let to = Address::from_public_key(&KeyPair::generate().public);
+        let tx = transfer(&from, &to, 0, Hash::ZERO, &kp);
+        let mut signed = tx.clone();
+        sign(&mut signed, &kp).unwrap();
+        let size = helix_core::fee::wallet_priced_size(&signed);
+        let auto = fee_for(&tx, &kp, 1, None, u64::MAX).unwrap();
+        assert_eq!(fee_for(&tx, &kp, 1, Some(1), u64::MAX).unwrap(), auto, "a rate below the going fee changes nothing");
+        let per_kb = 1_000_000;
+        assert_eq!(fee_for(&tx, &kp, 1, Some(per_kb), u64::MAX).unwrap(), (per_kb * size).div_ceil(1000));
+        let err = fee_for(&tx, &kp, 1, Some(1_000_000_000), helix_core::fee::WALLET_AUTO_FEE_CEILING_NANO).unwrap_err();
+        assert!(err.to_string().contains("maxtxfee"), "{err}");
+        assert!(fee_for(&tx, &kp, 1, None, auto - 1).is_err(), "the going fee is capped too");
     }
 }

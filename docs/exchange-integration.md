@@ -24,7 +24,7 @@ status`, the exact amount fields and a syncing node that keeps transaction outco
 | Chain id | the genesis block's hash; every transaction signs it |
 | Nonces | per sender, strictly sequential from 0 |
 | Fee | `base_fee_per_byte × size` burned, anything above it tips the proposer |
-| Ways to integrate | this page's REST API · a **Bitcoin-Core-style wallet RPC** served by the node (`HELIX_WALLET_RPC`) · the **Mesh (Rosetta)** Data API (`helix mesh`) |
+| Ways to integrate | this page's REST API · a **Bitcoin-Core-style wallet RPC** served by the node (`server=1` in `helix.conf`, called with `helix-cli`) · the **Mesh (Rosetta)** Data API (`helix mesh`) |
 | Supply | `GET /supply/circulating`, `/supply/total`, `/supply/max` — a bare number in HLX |
 | Container | `ghcr.io/silvra-net/helix:<version>`, from the release after 0.20.2 on |
 
@@ -151,31 +151,87 @@ the same nonce can never both apply — that is how you replace a stuck withdraw
 
 Most exchanges integrate a chain through the interface they already run for Bitcoin and its
 descendants. The Helix node serves that interface itself — like `bitcoind`, one process: a wallet
-speaking Bitcoin Core's JSON-RPC, with the same method names, parameters, answers and error codes.
+speaking Bitcoin Core's JSON-RPC, with the same method names, parameters, answers and error codes,
+configured by a `bitcoin.conf`-style file and called with a `bitcoin-cli`-style tool.
 
-```bash
-HELIX_WALLET_RPC=127.0.0.1:8547 \
-HELIX_WALLET_PASSPHRASE_FILE=/etc/helix/wallet-passphrase \
-HELIX_WALLET_RPC_USER=exchange HELIX_WALLET_RPC_PASSWORD_FILE=/etc/helix/rpc-password \
-HELIX_RPC_RATE_LIMIT=5000,1000 \
-helix start
+### helix.conf
+
+The wallet lives in `helix-wallet/` next to the node's database (`HELIX_WALLET_DIR` to move it) —
+Bitcoin's data directory. Its settings go into `helix.conf` there, in `bitcoin.conf`'s format:
+
+```ini
+server=1
+rpcport=8547
+rpcauth=exchange:6a3f…$9c1e…          # from Bitcoin Core's share/rpcauth/rpcauth.py
+walletnotify=/opt/exchange/deposit.sh %s
+blocknotify=/opt/exchange/newblock.sh %s
 ```
 
-On the first start the node makes the wallet in `helix-wallet/` next to its database
-(`HELIX_WALLET_DIR` to move it), at the current height, for the chain the node is on — encrypted
-under the passphrase in `HELIX_WALLET_PASSPHRASE_FILE` if one is given (then unlock it with
-`walletpassphrase`, as in Bitcoin Core). Authentication is HTTP Basic: the user and the password
-from its file, or the cookie the wallet writes to `<wallet-dir>/.cookie` at every start. All five
-settings can also go into `helix.toml` (`wallet_rpc`, `wallet_dir`, `wallet_rpc_user`,
-`wallet_rpc_password_file`, `wallet_passphrase_file`); a value the node cannot read stops it at
-startup, with the reason. **Run it on the exchange's own node, not on a validator** — a hot wallet
-does not belong in the consensus process.
+```bash
+HELIX_WALLET_PASSPHRASE_FILE=/etc/helix/wallet-passphrase helix start
+```
 
-To run the wallet as its own process against a node elsewhere instead:
+On the first start the node makes the wallet at the current height, for the chain the node is on —
+encrypted under the passphrase in `HELIX_WALLET_PASSPHRASE_FILE` if one is given (then unlock it
+with `walletpassphrase`, as in Bitcoin Core). **Run it on the exchange's own node, not on a
+validator** — a hot wallet does not belong in the consensus process.
+
+| Key | |
+|---|---|
+| `server=1` | Switches the wallet RPC on. Without it the file is read by `helix-cli` only. |
+| `rpcbind`, `rpcport` | Where it listens. Default `127.0.0.1:8547`. |
+| `rpcallowip` | Who may connect besides this machine: an address or a network (`10.0.0.5`, `10.0.0.0/8`, `10.0.0.0/255.0.0.0`, `fd00::/8`); repeat it for more. **Without it, only this machine** — and listening beyond it without one stops the start, as Bitcoin Core requires. Anyone else gets HTTP 403. |
+| `rpcuser` + `rpcpassword`, `rpcauth` | HTTP Basic authentication; `rpcauth` lines take Bitcoin Core's salted hash, so the password is not in the file. The cookie the wallet writes to `.cookie` at every start works always (`rpccookiefile` to move it). |
+| `walletnotify` | A command run for every change to a wallet transaction: when it is signed and submitted, when a block holds it (deposits, sends, sweeps), when it is given up. `%s` the transaction id, `%b` the block hash (`unconfirmed` before), `%h` the height (`-1` before), `%w` the wallet name (`''`). |
+| `blocknotify` | A command run when the wallet's view of the chain moves on, `%s` the newest block's hash — once per round, so catching up many blocks runs it once. |
+| `paytxfee` | A fee rate in HLX per kB that sends pay at least; `settxfee` changes it until restart. Sweeps pay the going fee. |
+| `maxtxfee` | No transaction is signed with a larger fee, in HLX. Default 1. |
+| `keypool` | Addresses an encrypted wallet makes ahead, to hand out while locked. Default 100. |
+| `amountdecimals=8` | Amounts with eight decimals instead of nine — see below. |
+
+Commands run through the shell, at most 16 at a time; one that fails is logged, not retried —
+`listsinceblock` is what catches up, as with Bitcoin Core. Sections `[main]` and `[test]` apply on
+their network (the public chain is `test`). **Bitcoin options that mean nothing for a Helix wallet**
+(`txindex`, `dbcache`, `printtoconsole`, …) are accepted and named once in the log, so a copied
+`bitcoin.conf` works. **An unknown key stops the start with the reason**, and so does `zmqpub…`:
+Helix does not publish over ZMQ, and an exchange waiting for it would wait forever — use
+`walletnotify` and `blocknotify`.
+
+The wallet RPC can be configured from the node's environment or `helix.toml` instead
+(`HELIX_WALLET_RPC=127.0.0.1:8547`, `HELIX_WALLET_RPC_USER` with `HELIX_WALLET_RPC_PASSWORD_FILE`;
+in `helix.toml` `wallet_rpc`, `wallet_rpc_user`, `wallet_rpc_password_file`), but **one thing in
+one place**: an address or a user set in both stops the start, with both named. The passphrase
+for a new wallet comes only from `HELIX_WALLET_PASSPHRASE_FILE` (`wallet_passphrase_file`).
+
+### helix-cli
+
+`helix-cli` is `bitcoin-cli` for this wallet — the same binary under that name (a link: `ln -s
+"$(command -v helix)" /usr/local/bin/helix-cli`; the container image has it), or `helix rpc`:
+
+```bash
+helix-cli -datadir=/var/lib/helix/helix-wallet getbalance
+helix-cli walletpassphrase "$(cat /etc/helix/wallet-passphrase)" 600
+helix-cli -named getblock blockhash=4dd5… verbosity=2
+```
+
+The options are `bitcoin-cli`'s: `-datadir` (the wallet directory), `-conf`, `-rpcconnect`,
+`-rpcport`, `-rpcuser`/`-rpcpassword`, `-rpccookiefile`, `-named`, `-stdin`, `-stdinrpcpass`,
+`-rpcwait`, `-rpcclienttimeout`. Credentials come from the options, else `rpcuser`/`rpcpassword`
+in `helix.conf`, else the cookie. A string result is printed bare, anything else as JSON with every
+amount's digits kept; an error prints `error code: -N` and `error message:` and exits with `N`, as
+`bitcoin-cli` does. `-stdin` takes further parameters from standard input — a passphrase given
+there stays out of the shell history.
+
+### As its own process
+
+To run the wallet against a node elsewhere instead:
 `helix --node http://<node>:8545 wallet-rpc init --passphrase-file pw.txt`, then
-`helix --node http://<node>:8545 wallet-rpc serve --rpcuser exchange --rpcpassword-file rpcpw.txt`.
-That node then needs a higher rate limit (`HELIX_RPC_RATE_LIMIT=5000,1000`): the wallet reads every
-block, and the node limits requests per client address. Inside the node none of that applies.
+`helix --node http://<node>:8545 wallet-rpc serve` (it reads `helix.conf` in `--wallet-dir` as the
+node does). That node then needs a higher rate limit (`HELIX_RPC_RATE_LIMIT=5000,1000`): the wallet
+reads every block, and the node limits requests per client address. Inside the node none of that
+applies.
+
+### Methods
 
 | Method | What it does on Helix |
 |---|---|
@@ -184,22 +240,46 @@ block, and the node limits requests per client address. Inside the node none of 
 | `gettransaction txid`, `listtransactions`, `getreceivedbyaddress` | As in Bitcoin Core. |
 | `getbalance` | Everything the wallet's addresses hold, less what its own unconfirmed sends take. |
 | `sendtoaddress address amount … [subtractfeefromamount]` | A withdrawal from the hot address; returns the transaction id. |
+| `settxfee amount` | The fee rate per kB sends pay at least; `0` goes back to the going fee. |
+| `getblock blockhash [verbosity]` | 1: the block with its transaction ids; 2: with each transaction as `getrawtransaction` shows it. |
+| `getrawtransaction txid true` | Any transaction in a block or in the pool, with `vin` and `vout` — see below. |
 | `validateaddress`, `getaddressinfo` | Address checks; `ismine` for the wallet's own. |
 | `walletpassphrase`, `walletlock`, `keypoolrefill`, `backupwallet` | As in Bitcoin Core. |
-| `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getnetworkinfo`, `getwalletinfo`, `estimatesmartfee` | Chain and wallet state. |
+| `getinfo`, `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getnetworkinfo`, `getwalletinfo`, `estimatesmartfee` | Chain and wallet state. `getinfo` is the old all-in-one call (removed from Bitcoin Core in 0.16), kept because many integrations still make it. Versions are numbers in Bitcoin Core's form: 0.20.2 is `200200`. |
 
-Where Helix differs from Bitcoin, the service says so instead of pretending:
+### Where Helix differs
+
+The service says so instead of pretending:
 
 - **An account per address, not coins.** Each deposit is **swept** to the wallet's hot address as
   soon as a block holds it, and every send pays from there. A sweep moves nothing out of the
   wallet but its fee (one base fee, a few millionths of an HLX); it is listed as a `send` of 0 with
   that fee and `helix_sweep: true`, so `getbalance` and the list add up. Deposits are swept while
   the wallet is unlocked — keep it unlocked, or unlock it before withdrawals.
+- **`vout` is whom a transaction paid, `vin` the account it came from.** `getblock 2` and
+  `getrawtransaction` show each account the transaction's execution credited — the recipient of a
+  transfer, whoever a contract paid — from the block's balance record, as `vout` with
+  `scriptPubKey.address`. **A transfer that failed paid nobody and has no `vout`**, so a block
+  scanner never credits it; `helix_status` says `applied` or `failed` (with `helix_error`). The
+  sender's own debit and the validator's share of the fee are not outputs; `fee` is the fee. `vin`
+  holds the sending `address` — there are no previous outputs to point to. A transaction still in
+  the pool has no `vout` yet: it can still fail. All of this is the chain as the wallet has read it
+  (`getblockcount`): a transaction in a block it reads a moment later shows as `pending` until then,
+  so every `blockhash` it gives can be passed to `getblock`.
+- **No serialized forms.** `getblock` with verbosity 0 and `getrawtransaction` without `true` are
+  refused (-8): Helix's blocks and transactions are not in Bitcoin's format, and bytes no client
+  can decode would only look like an answer.
 - **Amounts have nine decimals**, written as JSON numbers with nine fixed places (`1.250000000`)
   and read exactly as sent — never through a floating-point number. Parse them as decimals.
   Bitcoin client libraries usually round what they *send* to eight decimals (python-bitcoinrpc
   sends `float(round(amount, 8))`); up to eight arrive exactly, and a ninth has to go as a string
   (`"0.123456789"`), which the wallet reads digit by digit.
+- **Or eight, with `amountdecimals=8`** — for an integration that stores eight and would cut a
+  ninth off. Every amount is then written with eight, rounded the way that can never cost the
+  exchange: a deposit or a balance is never shown larger than it is (1.234567891 HLX received shows
+  `1.23456789`), a send or a fee never smaller, a fee rate rounds up. An amount sent with a ninth
+  decimal is refused (-3), as Bitcoin Core refuses a ninth. What the wallet holds is unchanged; the
+  rounding is only in what it shows.
 - **One confirmation is final** (BFT); there are no reorganisations, and `removed` is always empty.
 - **A send that did not go through shows `confirmations: -1`** — one the chain charged but did not
   apply (with `helix_error`), or one whose nonce another transaction used (`abandoned: true`) — as
@@ -208,8 +288,9 @@ Where Helix differs from Bitcoin, the service says so instead of pretending:
 - **`sendmany` is refused:** a Helix transaction pays one recipient. Call `sendtoaddress` once per
   recipient.
 - **Fees** are set by the wallet from the node's base fee, with headroom, and refused above 1 HLX —
-  a node reporting an absurd base fee cannot spend the exchange's money. `estimatesmartfee`
-  reports the rate per kB.
+  a node reporting an absurd base fee cannot spend the exchange's money. `paytxfee`/`settxfee` raise
+  them, `maxtxfee` caps them; `estimatesmartfee` reports the rate per kB.
+- **No ZMQ.** `walletnotify` and `blocknotify` are the push side.
 - **Every transaction the wallet signs is recorded before it is submitted**, and submitted again
   if it expires unincluded — after a crash or a node restart nothing it signed is forgotten.
 

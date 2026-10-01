@@ -1,11 +1,13 @@
 //! HTTP in front of the methods: Basic authentication as Bitcoin Core does it (a configured user
-//! and password, and a cookie file written at start), single calls and batches.
+//! and password, `rpcauth` hashes, and a cookie file written at start), `rpcallowip`, single calls
+//! and batches.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -13,18 +15,20 @@ use base64::Engine;
 use serde_json::value::RawValue;
 use subtle::ConstantTimeEq;
 
+use crate::conf::{allowed, RpcAuth};
 use crate::daemon::Daemon;
 use crate::methods;
 use crate::rpc::{code, envelope, status_of, Params, Request, RpcError};
 
-/// The `user:password` pairs accepted.
+/// Who may call: `user:password` pairs (the cookie, `rpcuser`/`rpcpassword`) and `rpcauth` users.
 pub struct Auth {
     accepted: Vec<Vec<u8>>,
+    rpcauth: Vec<RpcAuth>,
 }
 
 impl Auth {
-    pub fn new(pairs: Vec<String>) -> Self {
-        Auth { accepted: pairs.into_iter().map(String::into_bytes).collect() }
+    pub fn new(pairs: Vec<String>, rpcauth: Vec<RpcAuth>) -> Self {
+        Auth { accepted: pairs.into_iter().map(String::into_bytes).collect(), rpcauth }
     }
 
     /// Whether this `Authorization` header carries an accepted pair. Compared in constant time
@@ -38,6 +42,14 @@ impl Auth {
                 ok |= pair.as_slice().ct_eq(&given);
             }
         }
+        if let Some((user, password)) = std::str::from_utf8(&given).ok().and_then(|g| g.split_once(':')) {
+            for auth in &self.rpcauth {
+                let same_user = auth.user.len() == user.len() && bool::from(auth.user.as_bytes().ct_eq(user.as_bytes()));
+                if same_user && auth.accepts(password) {
+                    ok |= subtle::Choice::from(1u8);
+                }
+            }
+        }
         bool::from(ok)
     }
 }
@@ -46,11 +58,14 @@ impl Auth {
 struct AppState {
     daemon: Arc<Daemon>,
     auth: Arc<Auth>,
+    allow: Arc<Vec<ipnet::IpNet>>,
     started: Instant,
 }
 
-pub fn router(daemon: Arc<Daemon>, auth: Auth) -> Router {
-    let state = AppState { daemon, auth: Arc::new(auth), started: Instant::now() };
+/// The service. Serve it with `into_make_service_with_connect_info::<SocketAddr>()`: who connects
+/// decides whether they may (`rpcallowip`) before any password is looked at.
+pub fn router(daemon: Arc<Daemon>, auth: Auth, allow: Vec<ipnet::IpNet>) -> Router {
+    let state = AppState { daemon, auth: Arc::new(auth), allow: Arc::new(allow), started: Instant::now() };
     // Bitcoin Core answers on `/` and `/wallet/<name>`; clients use either.
     Router::new().fallback(handle).with_state(state)
 }
@@ -78,7 +93,17 @@ async fn one(state: &AppState, raw: &RawValue) -> (u16, String) {
     (status_of(&answer), envelope(request.id, &answer))
 }
 
-async fn handle(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // As Bitcoin Core: an address not allowed gets 403 and nothing else, whatever it sends.
+    if !allowed(peer.ip(), &state.allow) {
+        tracing::warn!(%peer, "refused a client rpcallowip does not name");
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let authorization = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     if !state.auth.allows(authorization) {
         return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"jsonrpc\"")], "").into_response();
@@ -126,7 +151,7 @@ mod tests {
 
     #[test]
     fn only_an_accepted_pair_gets_in() {
-        let auth = Auth::new(vec!["exchange:s3cret".into(), "__cookie__:abc".into()]);
+        let auth = Auth::new(vec!["exchange:s3cret".into(), "__cookie__:abc".into()], Vec::new());
         assert!(auth.allows(Some(&basic("exchange:s3cret"))));
         assert!(auth.allows(Some(&basic("__cookie__:abc"))));
         for refused in ["exchange:s3cre", "exchange:s3cret ", "Exchange:s3cret", "", ":"] {
@@ -135,5 +160,18 @@ mod tests {
         assert!(!auth.allows(None));
         assert!(!auth.allows(Some("Bearer exchange:s3cret")));
         assert!(!auth.allows(Some("Basic not-base64!")));
+    }
+
+    /// An `rpcauth` line from Bitcoin Core's own test admits its user with that password, and
+    /// nobody else with it.
+    #[test]
+    fn an_rpcauth_user_gets_in_with_the_password_and_only_then() {
+        let rt = RpcAuth::parse("rt:93648e835a54c573682c2eb19f882535$7681e9c5b74bdd85e78166031d2058e1069b3ed7ed967c93fc63abba06f31144").unwrap();
+        let auth = Auth::new(vec!["__cookie__:abc".into()], vec![rt]);
+        assert!(auth.allows(Some(&basic("rt:cA773lm788buwYe4g4WT+05pKyNruVKjQ25x3n0DQcM="))));
+        assert!(auth.allows(Some(&basic("__cookie__:abc"))), "the cookie still works");
+        for refused in ["rt:wrong", "rt2:cA773lm788buwYe4g4WT+05pKyNruVKjQ25x3n0DQcM=", "rt:", "rt"] {
+            assert!(!auth.allows(Some(&basic(refused))), "{refused:?} must not get in");
+        }
     }
 }

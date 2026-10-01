@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn the_envelope_keeps_result_and_id_raw() {
         let id = RawValue::from_string("\"42\"".into()).unwrap();
-        let answer = result(&crate::amount::Hlx(1)).unwrap();
+        let answer = result(&crate::amount::Hlx::exact(1)).unwrap();
         assert_eq!(
             envelope(Some(&id), &Ok(answer)),
             r#"{"result":0.000000001,"error":null,"id":"42"}"#

@@ -19,10 +19,13 @@
 
 pub mod amount;
 pub mod cli;
+pub mod client;
+pub mod conf;
 pub mod daemon;
 pub mod keys;
 pub mod ledger;
 pub mod methods;
 pub mod node;
+pub mod notify;
 pub mod rpc;
 pub mod server;

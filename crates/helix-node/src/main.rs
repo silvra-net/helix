@@ -47,16 +47,38 @@ enum Command {
     WalletRpc(helix_walletd::cli::Command),
     /// The Mesh (Rosetta) Data API, in front of a node
     Mesh(helix_mesh::cli::Args),
+    /// Call the wallet RPC as bitcoin-cli calls Bitcoin Core (`helix rpc getbalance`). The same
+    /// binary under the name `helix-cli` — a link to it — is this command.
+    #[command(disable_help_flag = true)]
+    Rpc {
+        /// bitcoin-cli's options (-rpcport=…, -datadir=…, -named, -stdin …), the method, its
+        /// parameters. `helix rpc -help` lists them.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
     /// Client subcommands (wallet, tx, chain, …) — flattened in at the top level
     #[command(flatten)]
     Client(helix_cli::Commands),
 }
 
+/// Whether this binary was started as `helix-cli` — a link to it, as bitcoin-cli is to scripts
+/// that call it by that name.
+fn invoked_as_helix_cli() -> bool {
+    std::env::args_os()
+        .next()
+        .and_then(|program| std::path::Path::new(&program).file_stem().map(|s| s == "helix-cli"))
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if invoked_as_helix_cli() {
+        std::process::exit(helix_walletd::client::main(std::env::args().skip(1).collect()).await);
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Start => run_node().await,
+        Command::Rpc { args } => std::process::exit(helix_walletd::client::main(args).await),
         // A service for an exchange's own node: never the public network as a fallback — a
         // hot wallet quietly running against someone else's node is not a default.
         Command::WalletRpc(command) => {

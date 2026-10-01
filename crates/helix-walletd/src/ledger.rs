@@ -92,6 +92,17 @@ pub struct BlockOutcome {
     pub settled: usize,
     /// Wallet addresses that received something in this block.
     pub paid: Vec<String>,
+    /// Every wallet transaction the block wrote an entry for, once each, in block order — what
+    /// `walletnotify` is run for.
+    pub txids: Vec<String>,
+}
+
+impl BlockOutcome {
+    fn touched(&mut self, txid: &str) {
+        if !self.txids.iter().any(|t| t == txid) {
+            self.txids.push(txid.to_string());
+        }
+    }
 }
 
 pub struct Ledger {
@@ -356,6 +367,7 @@ impl Ledger {
                         pend.remove(tx.hash.as_str())?;
                     }
                     outcome.settled += 1;
+                    outcome.touched(&tx.hash);
                 }
 
                 if to_mine && !from_mine {
@@ -379,6 +391,7 @@ impl Ledger {
                         Self::put_entry(&mut entries, &mut txids, &entry)?;
                         outcome.received += 1;
                         outcome.paid.push(to.clone());
+                        outcome.touched(&tx.hash);
                     }
                 }
             }
@@ -418,6 +431,7 @@ impl Ledger {
                     abandoned: false,
                 };
                 Self::put_entry(&mut entries, &mut txids, &entry)?;
+                outcome.touched(&entry.txid);
                 if category == Category::Receive {
                     outcome.received += 1;
                     outcome.paid.push(account.clone());
@@ -551,6 +565,7 @@ mod tests {
             Some(vec![change(Some(0), EXT, "transaction", -7_000_005_001), change(Some(0), DEP, "transaction", 7_000_000_001)]));
         let outcome = l.apply_block(&b, mine).unwrap();
         assert_eq!((outcome.received, outcome.paid.clone()), (1, vec![DEP.to_string()]));
+        assert_eq!(outcome.txids, vec!["t1".to_string()], "what walletnotify is run for");
         let e = &l.by_txid("t1").unwrap()[0];
         assert_eq!((e.category, e.address.as_str(), e.amount, e.height), (Category::Receive, DEP, 7_000_000_001, Some(11)));
         assert_eq!(l.balance(DEP).unwrap(), 7_000_000_001);
@@ -567,9 +582,10 @@ mod tests {
             txid: "s1".into(), kind: PendingKind::Sweep, from: DEP.into(), nonce: 0, outflow: 1_000,
             wallet_outflow: 10, signed: "{}".into(), entry_seq: 0, submitted: 0 }).unwrap();
         assert_eq!(l.pending().unwrap().len(), 1);
-        l.apply_block(&block(12, vec![tx("s1", DEP, HOT, 990, 10, "applied")],
+        let outcome = l.apply_block(&block(12, vec![tx("s1", DEP, HOT, 990, 10, "applied")],
             Some(vec![change(Some(0), DEP, "transaction", -1_000), change(Some(0), HOT, "transaction", 990)])), mine).unwrap();
         assert!(l.pending().unwrap().is_empty());
+        assert_eq!(outcome.txids, vec!["s1".to_string()], "a settled send is a wallet transaction too");
         let e = &l.by_txid("s1").unwrap()[0];
         assert_eq!((e.category, e.amount, e.fee, e.sweep, e.height), (Category::Send, 0, -10, true, Some(12)));
         assert_eq!((l.balance(DEP).unwrap(), l.balance(HOT).unwrap()), (0, 990));
@@ -598,8 +614,9 @@ mod tests {
         let (l, path) = ledger("contract");
         let mut call = tx("c1", EXT, "hlxContract", 0, 9, "applied");
         call["tx_type"] = json!("CallContract");
-        l.apply_block(&block(11, vec![call],
+        let outcome = l.apply_block(&block(11, vec![call],
             Some(vec![change(Some(0), EXT, "transaction", -9), change(Some(0), DEP, "contract", 300)])), mine).unwrap();
+        assert_eq!(outcome.txids, vec!["c1".to_string()]);
         let e = &l.by_txid("c1").unwrap()[0];
         assert_eq!((e.category, e.address.as_str(), e.amount), (Category::Receive, DEP, 300));
         assert_eq!(l.balance(DEP).unwrap(), 300);

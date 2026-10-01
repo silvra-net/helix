@@ -40,6 +40,8 @@ pub struct Block {
     /// Every liquid balance the block moved (#260); `None` when the node has no record of it.
     #[serde(default)]
     pub balance_changes: Option<Vec<BalanceChange>>,
+    #[serde(default)]
+    pub merkle_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +58,37 @@ pub struct Tx {
     pub status: String,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub memo: Option<String>,
+}
+
+/// What `GET /transactions/:hash` says about a transaction in a block or in the pool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TxDetail {
+    pub hash: String,
+    /// `applied`, `failed`, `unknown`, or `pending` while in the pool.
+    pub status: String,
+    pub from: String,
+    #[serde(default)]
+    pub to: Option<String>,
+    pub amount_nano: String,
+    pub fee_nano: String,
+    pub tx_type: String,
+    pub nonce: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub memo: Option<String>,
+    #[serde(default)]
+    pub block_hash: Option<String>,
+    #[serde(default)]
+    pub block_height: Option<u64>,
+    /// Milliseconds, the block's.
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+    /// What it did to balances (#260), `None` when the node has no record of its block.
+    #[serde(default)]
+    pub balance_changes: Option<Vec<BalanceChange>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -226,6 +259,22 @@ impl Node {
                 state_height,
             }),
             StatusCode::NOT_FOUND => Ok(Account { balance: 0, nonce: 0, state_height }),
+            s => Err(anyhow!("{path}: HTTP {s}: {body}")),
+        }
+    }
+
+    /// A transaction in a block or in the pool, `None` if the node has none by that id.
+    pub async fn transaction(&self, hash: &str) -> Result<Option<TxDetail>> {
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let path = format!("/transactions/{hash}");
+        let (status, body) = self.get_raw(&path).await?;
+        match status {
+            s if s.is_success() => {
+                serde_json::from_value(body).map(Some).with_context(|| format!("{path}: an answer this service does not understand"))
+            }
+            StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST => Ok(None),
             s => Err(anyhow!("{path}: HTTP {s}: {body}")),
         }
     }

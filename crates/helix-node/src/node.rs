@@ -5452,23 +5452,18 @@ fn configured_seed_peers(cfg: &config::NodeConfig) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Refuses a seed peer that is not a P2P address, naming what it probably meant.
-///
-/// The P2P layer parses each entry as a multiaddr and used to drop the ones that are not — without
-/// a word, while still passing them on to every peer through peer exchange. `203.0.113.7:8546` is
-/// how everyone writes an address and is not a multiaddr, so the most natural way to wire a
-/// validator to the others left it wired to none of them. For a validator the seed list is how it
-/// finds the rest of the set, and a node that cannot reach them stalls a chain with no slack.
-/// The wallet RPC's settings, read and checked before anything starts. An unreadable one stops the
-/// node with the reason (#240): a wallet the operator asked for and silently did not get is worse
-/// than a node that did not start.
+/// The wallet RPC's settings, read and checked before anything starts. On when `HELIX_WALLET_RPC`
+/// (or `wallet_rpc` in helix.toml) names an address, or when `helix.conf` in the wallet's
+/// directory says `server=1`, as `bitcoin.conf` does. An unreadable setting — or one given in both
+/// places — stops the node with the reason (#240): a wallet the operator asked for and silently
+/// did not get is worse than a node that did not start.
 fn wallet_rpc_settings(cfg: &config::NodeConfig) -> Result<Option<helix_walletd::cli::Settings>> {
-    let Some(listen) = config::resolve("HELIX_WALLET_RPC", &cfg.wallet_rpc) else {
-        return Ok(None);
+    let listen = match config::resolve("HELIX_WALLET_RPC", &cfg.wallet_rpc) {
+        Some(listen) => Some(listen.trim().parse::<SocketAddr>().map_err(|_| {
+            anyhow::anyhow!("HELIX_WALLET_RPC is {listen:?}, which is not an address to listen on — write it like 127.0.0.1:8547")
+        })?),
+        None => None,
     };
-    let listen: SocketAddr = listen.trim().parse().map_err(|_| {
-        anyhow::anyhow!("HELIX_WALLET_RPC is {listen:?}, which is not an address to listen on — write it like 127.0.0.1:8547")
-    })?;
     let wallet_dir = PathBuf::from(
         config::resolve("HELIX_WALLET_DIR", &cfg.wallet_dir).unwrap_or_else(|| "helix-wallet".to_string()),
     );
@@ -5488,17 +5483,17 @@ fn wallet_rpc_settings(cfg: &config::NodeConfig) -> Result<Option<helix_walletd:
     let passphrase = config::resolve("HELIX_WALLET_PASSPHRASE_FILE", &cfg.wallet_passphrase_file)
         .map(|file| helix_walletd::cli::read_secret(Path::new(&file)).context("HELIX_WALLET_PASSPHRASE_FILE"))
         .transpose()?;
-    Ok(Some(helix_walletd::cli::Settings {
-        listen,
-        wallet_dir,
-        credentials,
-        passphrase,
-        // The public chain is a testnet; this becomes `main` with the mainnet.
-        network: "test".to_string(),
-        options: Default::default(),
-    }))
+    let explicit = helix_walletd::cli::Explicit { listen, credentials, passphrase, ..Default::default() };
+    helix_walletd::cli::resolve(wallet_dir, explicit, helix_walletd::cli::NETWORK, false)
 }
 
+/// Refuses a seed peer that is not a P2P address, naming what it probably meant.
+///
+/// The P2P layer parses each entry as a multiaddr and used to drop the ones that are not — without
+/// a word, while still passing them on to every peer through peer exchange. `203.0.113.7:8546` is
+/// how everyone writes an address and is not a multiaddr, so the most natural way to wire a
+/// validator to the others left it wired to none of them. For a validator the seed list is how it
+/// finds the rest of the set, and a node that cannot reach them stalls a chain with no slack.
 fn check_seed_peers(seeds: &[String]) -> Result<()> {
     for entry in seeds {
         if entry.parse::<libp2p::Multiaddr>().is_ok() {
@@ -9797,8 +9792,24 @@ mod body_cap_tests {
         }))
         .unwrap()
         .unwrap();
-        assert_eq!(ok.credentials.as_deref(), Some("exchange:s3cret"), "one trailing newline dropped");
+        assert_eq!(ok.credentials, vec!["exchange:s3cret".to_string()], "one trailing newline dropped");
         assert_eq!(ok.wallet_dir, PathBuf::from("helix-wallet"));
+
+        // `server=1` in the wallet's helix.conf switches it on as bitcoin.conf does — and the address
+        // named in both places is refused, not guessed at.
+        let wallet = dir.join("wallet");
+        std::fs::create_dir_all(&wallet).unwrap();
+        std::fs::write(wallet.join("helix.conf"), "server=1\nrpcport=18999\n").unwrap();
+        let by_conf = config::NodeConfig { wallet_dir: Some(wallet.display().to_string()), ..Default::default() };
+        let on = wallet_rpc_settings(&by_conf).unwrap().expect("server=1 asks for it");
+        assert_eq!(on.listen, "127.0.0.1:18999".parse::<SocketAddr>().unwrap());
+        let both = config::NodeConfig {
+            wallet_rpc: Some("127.0.0.1:8547".into()),
+            wallet_dir: Some(wallet.display().to_string()),
+            ..Default::default()
+        };
+        let err = format!("{:#}", wallet_rpc_settings(&both).err().expect("must refuse"));
+        assert!(err.contains("set twice"), "{err}");
 
         for (setting, why) in [
             (cfg(&|c| c.wallet_rpc = Some("8547".into())), "not an address"),

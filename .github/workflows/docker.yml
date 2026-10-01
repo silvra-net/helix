@@ -62,6 +62,8 @@ jobs:
           docker run --rm --entrypoint helix helix:test --version
           docker run --rm --entrypoint helix helix:test wallet-rpc --help >/dev/null
           docker run --rm --entrypoint helix helix:test mesh --help >/dev/null
+          # helix-cli is the same binary under bitcoin-cli's other name.
+          docker run --rm --entrypoint helix-cli helix:test -version | grep -q "Helix RPC client"
 
       - name: Build and push
         if: startsWith(github.ref, 'refs/tags/')
