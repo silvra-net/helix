@@ -7,11 +7,13 @@
 This page describes the interface an integration builds on, so that one can be written and
 tested now; it is not an invitation to list a testnet coin.
 
-**Use 0.20.3 or later.** `--memo`, `--offline`, `helix tx submit`, the chain id in `helix chain
+**Use 0.20.4 or later.** `--memo`, `--offline`, `helix tx submit`, the chain id in `helix chain
 status`, the exact amount fields and a syncing node that keeps transaction outcomes arrived in
 0.20.1; every balance change of a block, recorded and served, and the Mesh Data API in 0.20.2;
 the Bitcoin-style wallet RPC (`helix.conf`, `helix-cli`), the Mesh Construction API and the
-container image in 0.20.3.
+container image in 0.20.3; the wallet RPC's fixes from an attack round in 0.20.4 — among them a
+withdrawal that paid but could show as given up, and a payment to another customer's deposit
+address listed without its receive.
 
 ## At a glance
 
