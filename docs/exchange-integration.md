@@ -7,9 +7,11 @@
 This page describes the interface an integration builds on, so that one can be written and
 tested now; it is not an invitation to list a testnet coin.
 
-**Use 0.20.2 or later.** `--memo`, `--offline`, `helix tx submit`, the chain id in `helix chain
+**Use 0.20.3 or later.** `--memo`, `--offline`, `helix tx submit`, the chain id in `helix chain
 status`, the exact amount fields and a syncing node that keeps transaction outcomes arrived in
-0.20.1; every balance change of a block, recorded and served, and the Mesh service in 0.20.2.
+0.20.1; every balance change of a block, recorded and served, and the Mesh Data API in 0.20.2;
+the Bitcoin-style wallet RPC (`helix.conf`, `helix-cli`), the Mesh Construction API and the
+container image in 0.20.3.
 
 ## At a glance
 
@@ -26,7 +28,7 @@ status`, the exact amount fields and a syncing node that keeps transaction outco
 | Fee | `base_fee_per_byte × size` burned, anything above it tips the proposer |
 | Ways to integrate | this page's REST API · a **Bitcoin-Core-style wallet RPC** served by the node (`server=1` in `helix.conf`, called with `helix-cli`) · the **Mesh (Rosetta)** Data and Construction API (`helix mesh`) |
 | Supply | `GET /supply/circulating`, `/supply/total`, `/supply/max` — a bare number in HLX |
-| Container | `ghcr.io/silvra-net/helix:<version>`, from the release after 0.20.2 on |
+| Container | `ghcr.io/silvra-net/helix:<version>` (and `:latest`), from 0.20.3 on |
 
 ## Run your own node
 

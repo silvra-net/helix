@@ -1,8 +1,8 @@
-//! `helix mesh` — the Mesh (formerly Rosetta) Data API, served in front of a node.
+//! `helix mesh` — the Mesh (formerly Rosetta) Data and Construction API, served in front of a node.
 
 use std::net::SocketAddr;
 
-/// Serve the Mesh (Rosetta) Data API in front of a node.
+/// Serve the Mesh (Rosetta) Data and Construction API in front of a node.
 #[derive(clap::Args)]
 pub struct Args {
     /// Where to serve the Mesh API.

@@ -8,9 +8,10 @@ mod node;
 mod run_record;
 mod signing_guard;
 
-/// Helix — one binary for everything. `helix start` runs the node daemon; every other
-/// subcommand (`wallet`, `tx`, `chain`, …) is a thin RPC client against a node, defaulting
-/// to the public network so a freshly downloaded binary works out of the box.
+/// Helix — one binary for everything. `helix start` runs the node daemon; `wallet-rpc` and `mesh`
+/// are services for an exchange's own node; every other subcommand (`wallet`, `tx`, `chain`, …)
+/// is a thin RPC client against a node, defaulting to the public network so a freshly downloaded
+/// binary works out of the box.
 #[derive(Parser)]
 #[command(
     name = "helix",
@@ -21,9 +22,10 @@ mod signing_guard;
                   `helix chain`, etc. to manage keys and interact with the chain over RPC."
 )]
 struct Cli {
-    /// Node RPC endpoint for client subcommands. Unset, a node running on this machine is used if
-    /// one answers, and the public Helix network otherwise — so a freshly downloaded binary works
+    /// Node RPC endpoint. Unset, a client subcommand uses a node running on this machine if one
+    /// answers, and the public Helix network otherwise — so a freshly downloaded binary works
     /// against the live chain out of the box, and running your own node is enough to be asked.
+    /// `wallet-rpc` and `mesh` use this machine's node and never fall back to the public network.
     /// Ignored by `helix start`, which configures itself from the environment / `helix.toml`.
     ///
     /// No `default_value` on purpose: with one, "the operator asked for the public network" and
@@ -45,7 +47,8 @@ enum Command {
     /// simpler, inside the node itself (`HELIX_WALLET_RPC=127.0.0.1:8547 helix start`)
     #[command(name = "wallet-rpc", subcommand)]
     WalletRpc(helix_walletd::cli::Command),
-    /// The Mesh (Rosetta) Data API, in front of a node
+    /// The Mesh (Rosetta) Data and Construction API, in front of a node (`--offline` on the
+    /// signing machine)
     Mesh(helix_mesh::cli::Args),
     /// Call the wallet RPC as bitcoin-cli calls Bitcoin Core (`helix rpc getbalance`). The same
     /// binary under the name `helix-cli` — a link to it — is this command.

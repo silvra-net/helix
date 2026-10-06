@@ -395,21 +395,24 @@ Previous run (v0.20.0) did NOT shut down cleanly. It ran 9 min, last seen at hei
 
 ## Docker Deployment
 
+Each release from 0.20.3 on is published as `ghcr.io/silvra-net/helix:<version>` (and
+`:latest`); `docker build -t helix-node .` in a checkout builds the same image.
+
 ```bash
-docker build -t helix-node .
+docker pull ghcr.io/silvra-net/helix:0.20.3
 
 docker run -d --name helix \
   -p 8545:8545 -p 8546:8546 \
   -v helix-data:/data \
   -e HELIX_RPC_BIND=0.0.0.0:8545 \
   -e MALLOC_ARENA_MAX=2 -e HELIX_KEEP_BYTES=20G \
-  helix-node
+  ghcr.io/silvra-net/helix:0.20.3
 ```
 
-- The image holds only the `helix` binary and runs `helix start` in `/data`. Mount a volume there
+- The image holds the `helix` binary (also as `helix-cli`, for the [wallet
+  RPC](exchange-integration.md#helix-cli)) and runs `helix start` in `/data`. Mount a volume there
   so the key, its signing state and the database survive recreating the container.
 - `HELIX_RPC_BIND=0.0.0.0:8545` makes the API reachable from outside the container; the default
   binds `127.0.0.1` only.
 - It joins the public network by default. Set `HELIX_P2P_PUBLIC_ADDR` if the host has a public
   address, so other nodes find it.
-- The image is not published to a registry; build it yourself.
