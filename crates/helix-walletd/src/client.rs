@@ -271,13 +271,15 @@ pub async fn main(args: Vec<String>) -> i32 {
         Ok(parsed) => parsed,
         Err(e) => return fail(format!("error: {e}")),
     };
-    if o.help || (rest.is_empty() && !o.stdin) {
-        println!("{USAGE}");
-        return if o.help { 0 } else { 1 };
-    }
+    // Before the check for a missing command: `-version` comes without one, and asking it after that
+    // check printed the usage and exited 1 — what 0.20.3 shipped.
     if o.version {
         println!("Helix RPC client version v{}", env!("CARGO_PKG_VERSION"));
         return 0;
+    }
+    if o.help || (rest.is_empty() && !o.stdin) {
+        println!("{USAGE}");
+        return if o.help { 0 } else { 1 };
     }
     if o.stdin || o.stdinrpcpass {
         let mut lines = std::io::stdin().lock().lines();
@@ -391,6 +393,17 @@ pub async fn main(args: Vec<String>) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// `helix-cli -version` names the version and exits 0, as `bitcoin-cli -version` does — with
+    /// no command after it, which is how it is called. Without one and without `-version` it is the
+    /// usage and exit 1, again as `bitcoin-cli`.
+    #[tokio::test]
+    async fn the_version_is_answered_without_a_command() {
+        assert_eq!(main(vec!["-version".into()]).await, 0);
+        assert_eq!(main(vec!["-help".into()]).await, 0);
+        assert_eq!(main(Vec::new()).await, 1);
+    }
+
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {
