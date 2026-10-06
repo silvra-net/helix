@@ -257,7 +257,10 @@ The service says so instead of pretending:
   soon as a block holds it, and every send pays from there. A sweep moves nothing out of the
   wallet but its fee (one base fee, a few millionths of an HLX); it is listed as a `send` of 0 with
   that fee and `helix_sweep: true`, so `getbalance` and the list add up. Deposits are swept while
-  the wallet is unlocked — keep it unlocked, or unlock it before withdrawals.
+  the wallet is unlocked — keep it unlocked, or unlock it before withdrawals. A withdrawal to one
+  of the wallet's own deposit addresses — one customer paying another — is not a sweep: it is a
+  `send` and, for that address, a `receive`, as Bitcoin Core lists a payment to the wallet's own
+  address, so the receiving customer is credited like any deposit.
 - **`vout` is whom a transaction paid, `vin` the account it came from.** `getblock 2` and
   `getrawtransaction` show each account the transaction's execution credited — the recipient of a
   transfer, whoever a contract paid — from the block's balance record, as `vout` with

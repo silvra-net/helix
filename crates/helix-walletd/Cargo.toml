@@ -27,3 +27,7 @@ tower = { version = "0.5", features = ["util"] }
 ipnet = "2.12"
 hmac = "0.13"
 sha2 = "0.11"
+
+[dev-dependencies]
+# A paused clock: the wait for a wrong password is measured exactly, not against a busy machine.
+tokio = { workspace = true, features = ["test-util"] }

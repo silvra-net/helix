@@ -118,6 +118,17 @@ fn transfer(from: &Address, to: &Address, nonce: u64, chain_id: Hash, kp: &KeyPa
     }
 }
 
+/// How a send to `to` stands in the ledger until a block holds it, and what it takes out of the
+/// wallet as a whole. A send to one of the wallet's own addresses keeps its value in the wallet —
+/// only the fee leaves — but only a send to the hot address is a sweep: one to a deposit address
+/// pays that address's customer, shows its amount, and the block adds the receive (#265).
+fn send_record(txid: &str, to: &str, hot: &str, internal: bool, amount: u64, fee: u64) -> (crate::ledger::Entry, u64) {
+    let sweep = to == hot;
+    let shown = if sweep { 0 } else { -(amount as i128) };
+    let wallet_outflow = if internal { fee } else { amount + fee };
+    (pending_entry(txid, to, shown, -(fee as i128), sweep), wallet_outflow)
+}
+
 /// The fee `tx` pays at `base_fee_per_byte`, by the wallets' one rule — headroom over the base
 /// fee, refused above 1 HLX (a node that reports an absurd base fee is not someone whose word
 /// spends an exchange's money). A `rate` the operator set (`paytxfee`/`settxfee`, nano-HLX per kB)
@@ -264,7 +275,8 @@ impl Daemon {
             let block = self.node.block_at(height + 1).await?;
             let outcome = {
                 let mut keys = self.keys.lock().expect("keys");
-                let outcome = self.ledger.apply_block(&block, |a| keys.is_mine(a))?;
+                let hot = keys.meta.hot_address.clone();
+                let outcome = self.ledger.apply_block(&block, &hot, |a| keys.is_mine(a))?;
                 // An address that has been paid counts as handed out, whatever the issued log
                 // says — after a restore from an older backup it must not be handed out again.
                 for address in &outcome.paid {
@@ -298,6 +310,16 @@ impl Daemon {
                 TxState::Expired | TxState::Unknown => {
                     let account = self.node.account(&p.from).await?;
                     if account.nonce > p.nonce {
+                        // Its nonce is spent — by another transaction, or by this one, in a block the
+                        // node applied after it answered that it knows no such transaction. Asked one
+                        // after the other, the pool and the account are not one snapshot, and a
+                        // withdrawal that paid would be given up as `confirmations: -1`: the one
+                        // answer that makes an exchange pay it again. So it is given up only once the
+                        // wallet has read every block of the state that spent the nonce — had this
+                        // transaction been in one of them, reading it would have settled it.
+                        if self.scanned_height() < account.state_height {
+                            continue;
+                        }
                         tracing::warn!(txid = %p.txid, nonce = p.nonce, "abandoned: another transaction used its nonce");
                         self.ledger.abandon(&p.txid)?;
                         self.notifier.wallet_tx(&p.txid, None);
@@ -469,10 +491,10 @@ impl Daemon {
         }
 
         let txid = tx.hash().to_hex();
-        let wallet_outflow = if internal { tx.fee } else { tx.amount + tx.fee };
+        let (entry, wallet_outflow) = send_record(&txid, to, &hot, internal, tx.amount, tx.fee);
         self.ledger
             .record_pending(
-                pending_entry(&txid, to, if internal { 0 } else { -(tx.amount as i128) }, -(tx.fee as i128), internal),
+                entry,
                 Pending {
                     txid: txid.clone(),
                     kind: PendingKind::Send,
@@ -508,6 +530,95 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    const CHAIN: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// A node that has forgotten a transaction — it left the pool unincluded — while the sender's
+    /// account stands at `nonce` as of block `state_height`; it counts what is submitted to it.
+    fn forgetful_node(nonce: Arc<AtomicU64>, state_height: Arc<AtomicU64>, submits: Arc<AtomicU64>) -> axum::Router {
+        use axum::routing::{get, post};
+        let genesis = serde_json::json!({ "hash": CHAIN, "height": 0, "timestamp": 0, "prev_hash": "00".repeat(32) });
+        axum::Router::new()
+            .route("/blocks/height/:h/header", get(move || {
+                let genesis = genesis.clone();
+                async move { axum::Json(genesis) }
+            }))
+            .route("/accounts/:a", get(move || {
+                let (nonce, state_height) = (nonce.clone(), state_height.clone());
+                async move {
+                    axum::Json(serde_json::json!({ "balance_nano": "0", "nonce": nonce.load(SeqCst), "state_height": state_height.load(SeqCst) }))
+                }
+            }))
+            .route("/transactions/:h", get(|| async {
+                (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({ "status": "expired" })))
+            }))
+            .route("/transactions", post(move || {
+                let submits = submits.clone();
+                async move {
+                    submits.fetch_add(1, SeqCst);
+                    axum::Json(serde_json::json!({}))
+                }
+            }))
+    }
+
+    /// Until a block holds it, a send to a deposit address of the wallet shows its amount and takes
+    /// only the fee out of the wallet; a send to the hot address is a sweep; a send outside takes
+    /// amount and fee.
+    #[test]
+    fn a_send_inside_the_wallet_keeps_its_value_and_only_a_send_to_the_hot_address_is_a_sweep() {
+        let (to_deposit, out) = send_record("t", "hlxDeposit", "hlxHot", true, 3_000, 7);
+        assert_eq!((to_deposit.amount, to_deposit.fee, to_deposit.sweep, out), (-3_000, -7, false, 7));
+        let (to_hot, out) = send_record("t", "hlxHot", "hlxHot", true, 3_000, 7);
+        assert_eq!((to_hot.amount, to_hot.sweep, out), (0, true, 7));
+        let (outside, out) = send_record("t", "hlxElsewhere", "hlxHot", false, 3_000, 7);
+        assert_eq!((outside.amount, outside.sweep, out), (-3_000, false, 3_007));
+    }
+
+    /// The pool and the account are asked one after the other, and a block can land between the
+    /// answers: "no such transaction", then "its nonce is spent" — spent by this very withdrawal.
+    /// Given up then, a withdrawal that paid shows `confirmations: -1`, and an exchange pays it
+    /// again. It is given up only once the wallet has read the block that spent the nonce.
+    #[tokio::test]
+    async fn a_send_whose_nonce_went_in_a_block_the_wallet_has_not_read_is_not_given_up() {
+        let dir = std::env::temp_dir().join(format!("helix-walletd-given-up-{}", rand::random::<u64>()));
+        let hot = Keys::create(&dir, "test", CHAIN, 0, None).unwrap().meta.hot_address.clone();
+        // The wallet has read the chain up to block 5.
+        Ledger::open(&dir.join("ledger.redb")).unwrap().start_at(5, "h5").unwrap();
+        let (nonce, state_height, submits) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(5)), Arc::new(AtomicU64::new(0)));
+        let node = Node::in_process(forgetful_node(nonce.clone(), state_height.clone(), submits.clone()));
+        let daemon = Daemon::open(&dir, node, Options::default()).await.unwrap();
+        let kp = KeyPair::generate();
+        let from = Address::from_str(&hot).unwrap();
+        let to = Address::from_public_key(&KeyPair::generate().public);
+        let signed = serde_json::to_string(&transfer(&from, &to, 0, daemon.chain_id, &kp)).unwrap();
+        let txid = "cd".repeat(32);
+        daemon.ledger.record_pending(pending_entry(&txid, &to.to_string(), -5_000, -7, false), Pending {
+            txid: txid.clone(), kind: PendingKind::Send, from: hot.clone(), nonce: 0, outflow: 5_007,
+            wallet_outflow: 5_007, signed, entry_seq: 0, submitted: 0 }).unwrap();
+
+        // Its nonce unspent: the pool lost it, so it is submitted again.
+        daemon.check_pending().await.unwrap();
+        assert_eq!(submits.load(SeqCst), 1, "the stand-in must answer as a node that lost the transaction");
+        assert_eq!(daemon.ledger.pending().unwrap().len(), 1);
+
+        // Spent as of block 7, and the wallet has read up to 5: block 6 or 7 may hold this very
+        // withdrawal.
+        nonce.store(1, SeqCst);
+        state_height.store(7, SeqCst);
+        daemon.check_pending().await.unwrap();
+        assert_eq!(daemon.ledger.pending().unwrap().len(), 1, "given up on a nonce spent in a block the wallet has not read");
+        assert!(!daemon.ledger.by_txid(&txid).unwrap()[0].abandoned);
+
+        // Spent as of a block the wallet has read: that block did not hold it, or reading it would
+        // have settled it. Given up.
+        state_height.store(5, SeqCst);
+        daemon.check_pending().await.unwrap();
+        assert!(daemon.ledger.pending().unwrap().is_empty(), "a send whose nonce another transaction took is given up");
+        assert!(daemon.ledger.by_txid(&txid).unwrap()[0].abandoned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// What the node charges is the base fee times the bytes the block carries of the *signed*
     /// transaction; the wallet's fee must cover that for a first transaction (key carried) and a

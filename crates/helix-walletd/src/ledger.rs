@@ -55,8 +55,9 @@ pub struct Entry {
     pub time: u64,
     /// A send the chain charged but did not apply, with the reason.
     pub failed: Option<String>,
-    /// A move between the wallet's own addresses — a sweep from a deposit address to the hot
-    /// address: nothing left the wallet but the fee.
+    /// A sweep: a move to the hot address from one of the wallet's own — nothing left the wallet
+    /// but the fee. A payment to one of the wallet's deposit addresses is not one: it is a send and,
+    /// for that address, a receive, as Bitcoin Core lists a payment to the wallet's own address.
     pub sweep: bool,
     /// A send that can never apply: its nonce went to another transaction.
     pub abandoned: bool,
@@ -266,9 +267,32 @@ impl Ledger {
         Ok(())
     }
 
-    /// Read one block into the ledger. `is_mine` names the wallet's addresses. The block must
-    /// follow the last one read.
-    pub fn apply_block(&self, block: &Block, is_mine: impl Fn(&str) -> bool) -> Result<BlockOutcome> {
+    /// The entry of a send this wallet gave up on, if `txid` names one. A block that holds the
+    /// transaction settles it: the block is what happened, while giving up was the wallet's reading
+    /// of a nonce — and a withdrawal that paid must never go on showing `confirmations: -1`.
+    fn abandoned_send(
+        entries: &redb::Table<u64, &[u8]>,
+        txids: &redb::Table<&str, &[u8]>,
+        txid: &str,
+    ) -> Result<Option<Entry>> {
+        let seqs: Vec<u64> = match txids.get(txid)? {
+            Some(v) => serde_json::from_slice(v.value())?,
+            None => return Ok(None),
+        };
+        for seq in seqs {
+            if let Some(v) = entries.get(seq)? {
+                let entry: Entry = serde_json::from_slice(v.value())?;
+                if entry.category == Category::Send && entry.abandoned {
+                    return Ok(Some(entry));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read one block into the ledger. `hot` is the wallet's hot address, `is_mine` names all of
+    /// its addresses. The block must follow the last one read.
+    pub fn apply_block(&self, block: &Block, hot: &str, is_mine: impl Fn(&str) -> bool) -> Result<BlockOutcome> {
         let (last_height, last_hash) = self.scanned()?.ok_or_else(|| anyhow!("the ledger has no starting block"))?;
         if block.height != last_height + 1 {
             bail!("block {} does not follow the last block read ({last_height})", block.height);
@@ -313,6 +337,11 @@ impl Ledger {
                 let from_mine = is_mine(&tx.from);
                 let to = tx.to.clone().unwrap_or_default();
                 let to_mine = !to.is_empty() && is_mine(&to);
+                // A sweep moves value to the hot address from one of the wallet's own: nothing
+                // leaves the wallet but the fee, and nobody was paid. A payment from the wallet to
+                // one of its deposit addresses — one customer of an exchange paying another — is a
+                // send and a receive: the receiving customer is credited by the receive.
+                let is_sweep = from_mine && to == hot;
                 let delta_of = |account: &str, kind: &str| {
                     moved.get(&(Some(index), account.to_string(), kind.to_string())).copied().unwrap_or(0)
                 };
@@ -329,9 +358,7 @@ impl Ledger {
                         _ => Some("the transaction was charged its fee but not applied".into()),
                     };
                     let fee_paid = if failed.is_some() { -from_delta } else { Block::tx_fee(tx)? as i128 };
-                    // Between two of the wallet's own addresses — a sweep to the hot address, or any
-                    // other move inside the wallet: nothing leaves it but the fee.
-                    let sweep = to_mine;
+                    let sweep = is_sweep;
                     let pending: Option<Pending> = match pend.get(tx.hash.as_str())? {
                         Some(v) => Some(serde_json::from_slice(v.value())?),
                         None => None,
@@ -341,20 +368,26 @@ impl Ledger {
                             Some(v) => serde_json::from_slice::<Entry>(v.value())?,
                             None => bail!("pending {} names entry {} which is missing", p.txid, p.entry_seq),
                         },
-                        None => Entry {
-                            seq: Self::next_seq(&mut meta)?,
-                            txid: tx.hash.clone(),
-                            category: Category::Send,
-                            address: to.clone(),
-                            amount: if sweep { 0 } else { -amount },
-                            fee: 0,
-                            height: None,
-                            blockhash: None,
-                            blocktime: None,
-                            time: blocktime,
-                            failed: None,
-                            sweep,
-                            abandoned: false,
+                        None => match Self::abandoned_send(&entries, &txids, &tx.hash)? {
+                            Some(mut given_up) => {
+                                given_up.abandoned = false;
+                                given_up
+                            }
+                            None => Entry {
+                                seq: Self::next_seq(&mut meta)?,
+                                txid: tx.hash.clone(),
+                                category: Category::Send,
+                                address: to.clone(),
+                                amount: if sweep { 0 } else { -amount },
+                                fee: 0,
+                                height: None,
+                                blockhash: None,
+                                blocktime: None,
+                                time: blocktime,
+                                failed: None,
+                                sweep,
+                                abandoned: false,
+                            },
                         },
                     };
                     entry.height = Some(block.height);
@@ -370,7 +403,7 @@ impl Ledger {
                     outcome.touched(&tx.hash);
                 }
 
-                if to_mine && !from_mine {
+                if to_mine && !is_sweep {
                     let received = delta_of(&to, "transaction");
                     if received > 0 {
                         let entry = Entry {
@@ -563,7 +596,7 @@ mod tests {
         let (l, path) = ledger("deposit");
         let b = block(11, vec![tx("t1", EXT, DEP, 7_000_000_001, 5_000, "applied")],
             Some(vec![change(Some(0), EXT, "transaction", -7_000_005_001), change(Some(0), DEP, "transaction", 7_000_000_001)]));
-        let outcome = l.apply_block(&b, mine).unwrap();
+        let outcome = l.apply_block(&b, HOT, mine).unwrap();
         assert_eq!((outcome.received, outcome.paid.clone()), (1, vec![DEP.to_string()]));
         assert_eq!(outcome.txids, vec!["t1".to_string()], "what walletnotify is run for");
         let e = &l.by_txid("t1").unwrap()[0];
@@ -577,13 +610,13 @@ mod tests {
     fn a_sweep_settles_its_pending_record_and_leaves_only_the_fee_behind() {
         let (l, path) = ledger("sweep");
         l.apply_block(&block(11, vec![tx("t1", EXT, DEP, 1_000, 5, "applied")],
-            Some(vec![change(Some(0), EXT, "transaction", -1_005), change(Some(0), DEP, "transaction", 1_000)])), mine).unwrap();
+            Some(vec![change(Some(0), EXT, "transaction", -1_005), change(Some(0), DEP, "transaction", 1_000)])), HOT, mine).unwrap();
         l.record_pending(pending_entry("s1", HOT, 0, -10, true), Pending {
             txid: "s1".into(), kind: PendingKind::Sweep, from: DEP.into(), nonce: 0, outflow: 1_000,
             wallet_outflow: 10, signed: "{}".into(), entry_seq: 0, submitted: 0 }).unwrap();
         assert_eq!(l.pending().unwrap().len(), 1);
         let outcome = l.apply_block(&block(12, vec![tx("s1", DEP, HOT, 990, 10, "applied")],
-            Some(vec![change(Some(0), DEP, "transaction", -1_000), change(Some(0), HOT, "transaction", 990)])), mine).unwrap();
+            Some(vec![change(Some(0), DEP, "transaction", -1_000), change(Some(0), HOT, "transaction", 990)])), HOT, mine).unwrap();
         assert!(l.pending().unwrap().is_empty());
         assert_eq!(outcome.txids, vec!["s1".to_string()], "a settled send is a wallet transaction too");
         let e = &l.by_txid("s1").unwrap()[0];
@@ -596,11 +629,11 @@ mod tests {
     fn a_send_the_chain_charged_but_did_not_apply_is_marked_failed_with_the_fee_it_cost() {
         let (l, path) = ledger("failed");
         l.apply_block(&block(11, vec![tx("t1", EXT, HOT, 1_000, 5, "applied")],
-            Some(vec![change(Some(0), EXT, "transaction", -1_005), change(Some(0), HOT, "transaction", 1_000)])), mine).unwrap();
+            Some(vec![change(Some(0), EXT, "transaction", -1_005), change(Some(0), HOT, "transaction", 1_000)])), HOT, mine).unwrap();
         let mut failed = tx("w1", HOT, EXT, 5_000, 7, "failed");
         failed["error"] = json!("insufficient balance");
         l.apply_block(&block(12, vec![failed, tx("w2", HOT, EXT, 100, 7, "applied")],
-            Some(vec![change(Some(0), HOT, "transaction", -7), change(Some(1), HOT, "transaction", -107), change(Some(1), EXT, "transaction", 100)])), mine).unwrap();
+            Some(vec![change(Some(0), HOT, "transaction", -7), change(Some(1), HOT, "transaction", -107), change(Some(1), EXT, "transaction", 100)])), HOT, mine).unwrap();
         let f = &l.by_txid("w1").unwrap()[0];
         assert_eq!((f.fee, f.failed.as_deref()), (-7, Some("insufficient balance")));
         let ok = &l.by_txid("w2").unwrap()[0];
@@ -615,7 +648,7 @@ mod tests {
         let mut call = tx("c1", EXT, "hlxContract", 0, 9, "applied");
         call["tx_type"] = json!("CallContract");
         let outcome = l.apply_block(&block(11, vec![call],
-            Some(vec![change(Some(0), EXT, "transaction", -9), change(Some(0), DEP, "contract", 300)])), mine).unwrap();
+            Some(vec![change(Some(0), EXT, "transaction", -9), change(Some(0), DEP, "contract", 300)])), HOT, mine).unwrap();
         assert_eq!(outcome.txids, vec!["c1".to_string()]);
         let e = &l.by_txid("c1").unwrap()[0];
         assert_eq!((e.category, e.address.as_str(), e.amount), (Category::Receive, DEP, 300));
@@ -626,7 +659,7 @@ mod tests {
     #[test]
     fn a_block_without_its_balance_record_stops_the_ledger_instead_of_missing_deposits() {
         let (l, path) = ledger("norecord");
-        let err = l.apply_block(&block(11, vec![tx("t1", EXT, DEP, 1, 1, "applied")], None), mine).unwrap_err();
+        let err = l.apply_block(&block(11, vec![tx("t1", EXT, DEP, 1, 1, "applied")], None), HOT, mine).unwrap_err();
         assert!(err.to_string().contains("0.20.2"), "{err}");
         assert_eq!(l.scanned().unwrap(), Some((10, "h10".to_string())), "nothing read");
         let _ = std::fs::remove_file(path);
@@ -637,8 +670,8 @@ mod tests {
         let (l, path) = ledger("fork");
         let mut b = block(11, vec![], Some(vec![]));
         b.prev_hash = "somewhere-else".into();
-        assert!(l.apply_block(&b, mine).unwrap_err().to_string().contains("another chain"));
-        assert!(l.apply_block(&block(12, vec![], Some(vec![])), mine).is_err(), "a gap is refused too");
+        assert!(l.apply_block(&b, HOT, mine).unwrap_err().to_string().contains("another chain"));
+        assert!(l.apply_block(&block(12, vec![], Some(vec![])), HOT, mine).is_err(), "a gap is refused too");
         let _ = std::fs::remove_file(path);
     }
 
@@ -646,7 +679,7 @@ mod tests {
     fn a_balance_that_would_go_negative_says_the_history_is_incomplete() {
         let (l, path) = ledger("negative");
         let err = l.apply_block(&block(11, vec![tx("w1", HOT, EXT, 5, 1, "applied")],
-            Some(vec![change(Some(0), HOT, "transaction", -6), change(Some(0), EXT, "transaction", 5)])), mine).unwrap_err();
+            Some(vec![change(Some(0), HOT, "transaction", -6), change(Some(0), EXT, "transaction", 5)])), HOT, mine).unwrap_err();
         assert!(err.to_string().contains("missed a block"), "{err}");
         let _ = std::fs::remove_file(path);
     }
@@ -661,6 +694,76 @@ mod tests {
         assert!(l.pending().unwrap().is_empty());
         assert!(l.by_txid("w1").unwrap().is_empty());
         assert!(l.entries().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A withdrawal to one of the wallet's own deposit addresses — one customer of an exchange
+    /// paying another — is a send and a receive, as Bitcoin Core lists a payment to the wallet's
+    /// own address: the receiving customer is credited by the receive. Read with the wallet's own
+    /// pending record and without one (a wallet restored from a backup), the same.
+    #[test]
+    fn a_send_to_one_of_the_wallets_deposit_addresses_is_a_send_and_a_receive() {
+        for with_pending in [true, false] {
+            let (l, path) = ledger(if with_pending { "internal-pending" } else { "internal-restored" });
+            l.apply_block(&block(11, vec![tx("t1", EXT, HOT, 10_000, 5, "applied")],
+                Some(vec![change(Some(0), EXT, "transaction", -10_005), change(Some(0), HOT, "transaction", 10_000)])), HOT, mine).unwrap();
+            if with_pending {
+                l.record_pending(pending_entry("i1", DEP, -3_000, -7, false), Pending {
+                    txid: "i1".into(), kind: PendingKind::Send, from: HOT.into(), nonce: 0, outflow: 3_007,
+                    wallet_outflow: 7, signed: "{}".into(), entry_seq: 0, submitted: 0 }).unwrap();
+            }
+            let outcome = l.apply_block(&block(12, vec![tx("i1", HOT, DEP, 3_000, 7, "applied")],
+                Some(vec![change(Some(0), HOT, "transaction", -3_007), change(Some(0), DEP, "transaction", 3_000)])), HOT, mine).unwrap();
+            assert_eq!(outcome.paid, vec![DEP.to_string()], "the deposit address counts as paid");
+            let mut entries = l.by_txid("i1").unwrap();
+            entries.sort_by_key(|e| e.amount);
+            let got: Vec<_> = entries.iter().map(|e| (e.category, e.address.as_str(), e.amount, e.fee, e.sweep)).collect();
+            assert_eq!(got, vec![
+                (Category::Send, DEP, -3_000, -7, false),
+                (Category::Receive, DEP, 3_000, 0, false),
+            ], "pending record: {with_pending}");
+            assert_eq!((l.balance(HOT).unwrap(), l.balance(DEP).unwrap()), (6_993, 3_000));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A sweep — a deposit address to the hot address — stays a sweep: a send of nothing but its
+    /// fee, and no receive, because nobody was paid.
+    #[test]
+    fn a_sweep_to_the_hot_address_has_no_receive() {
+        let (l, path) = ledger("sweep-no-receive");
+        l.apply_block(&block(11, vec![tx("t1", EXT, DEP, 1_000, 5, "applied")],
+            Some(vec![change(Some(0), EXT, "transaction", -1_005), change(Some(0), DEP, "transaction", 1_000)])), HOT, mine).unwrap();
+        l.apply_block(&block(12, vec![tx("s1", DEP, HOT, 990, 10, "applied")],
+            Some(vec![change(Some(0), DEP, "transaction", -1_000), change(Some(0), HOT, "transaction", 990)])), HOT, mine).unwrap();
+        let entries = l.by_txid("s1").unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!((entries[0].category, entries[0].amount, entries[0].sweep), (Category::Send, 0, true));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A withdrawal the wallet gave up on — its nonce looked spent — that a block then holds is
+    /// what the block says: one entry, in that block, not abandoned. Two entries with the first one
+    /// abandoned would show the paid withdrawal as `confirmations: -1` for good (`gettransaction`
+    /// reads the first), which is how an exchange comes to pay it twice.
+    #[test]
+    fn a_block_holding_a_send_the_wallet_gave_up_on_settles_it() {
+        let (l, path) = ledger("given-up");
+        l.apply_block(&block(11, vec![tx("t1", EXT, HOT, 10_000, 5, "applied")],
+            Some(vec![change(Some(0), EXT, "transaction", -10_005), change(Some(0), HOT, "transaction", 10_000)])), HOT, mine).unwrap();
+        l.record_pending(pending_entry("w1", EXT, -5_000, -7, false), Pending {
+            txid: "w1".into(), kind: PendingKind::Send, from: HOT.into(), nonce: 0, outflow: 5_007,
+            wallet_outflow: 5_007, signed: "{}".into(), entry_seq: 0, submitted: 0 }).unwrap();
+        l.abandon("w1").unwrap();
+        assert!(l.by_txid("w1").unwrap()[0].abandoned, "precondition: given up");
+        let outcome = l.apply_block(&block(12, vec![tx("w1", HOT, EXT, 5_000, 7, "applied")],
+            Some(vec![change(Some(0), HOT, "transaction", -5_007), change(Some(0), EXT, "transaction", 5_000)])), HOT, mine).unwrap();
+        assert_eq!(outcome.txids, vec!["w1".to_string()], "walletnotify runs for it");
+        let entries = l.by_txid("w1").unwrap();
+        assert_eq!(entries.len(), 1, "one withdrawal, one entry: {entries:?}");
+        let e = &entries[0];
+        assert_eq!((e.abandoned, e.height, e.amount, e.fee, e.failed.clone()), (false, Some(12), -5_000, -7, None));
+        assert_eq!(l.balance(HOT).unwrap(), 4_993);
         let _ = std::fs::remove_file(path);
     }
 }
