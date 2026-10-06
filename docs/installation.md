@@ -49,7 +49,7 @@ Build the latest release tag:
 ```bash
 git clone https://github.com/silvra-net/helix.git
 cd helix
-git checkout v0.20.3
+git checkout v0.20.4
 cargo build --release
 # target/release/helix — the node (`helix start`) and the client (`helix wallet`, `helix tx`, …)
 ```
