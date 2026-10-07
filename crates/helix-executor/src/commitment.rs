@@ -408,7 +408,10 @@ impl ChainState {
     /// Debug builds: the commitment kept from writes equals the one recomputed from every entry.
     /// A difference means a write reached the state without passing through its tracked
     /// collection — on a live node that would be a root no restarted node agrees with.
-    #[cfg(debug_assertions)]
+    ///
+    /// Also compiled for tests in any profile: CI runs part of this crate's tests with
+    /// `--release` (the overflow-check pin), and a test calling this would not compile there.
+    #[cfg(any(debug_assertions, test))]
     pub(crate) fn assert_commitment_is_exact(&self) {
         if let Some(incremental) = self.incremental_lattice() {
             let full = self.full_lattice();
