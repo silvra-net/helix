@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use helix_crypto::{Address, Hash, PublicKey};
 use helix_identity::{GuardianSet, PersonhoodStatus, RecoveryRequest};
@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::governance::{GovernanceParams, GovernanceProposal, ScheduledUpgrade, GENESIS_PROTOCOL_VERSION};
 use crate::receipt::{BalanceChange, BalanceChangeKind};
+use crate::commitment::Commitment;
+use crate::tracked::{TrackedMap, TrackedSet};
 
 /// Unbonding period in blocks — stake stays slashable for 7 days at the actual 2s block
 /// time (`BLOCK_TIME_MS` in `helix-node`). Was 50_400 (7 days at an earlier, since-changed
@@ -328,7 +330,7 @@ pub struct ChainState {
     #[serde(skip)]
     pub balance_journal: Option<BalanceJournal>,
     /// address string → account state
-    pub accounts: HashMap<String, AccountState>,
+    pub accounts: TrackedMap<String, AccountState>,
     /// Absolute HLX supply ceiling in nano-HLX (`genesis::TOTAL_SUPPLY_HLX`, fixed at
     /// genesis) — the hard cap that `total_issued` may asymptotically approach but never
     /// exceed. Distinct from `total_issued`: this never changes after genesis.
@@ -344,16 +346,16 @@ pub struct ChainState {
     /// Cumulative burned fees — reduces circulating supply
     pub total_burned: u64,
     /// Registered human-readable names (without the `.hlx` suffix) → owning address string.
-    pub names: HashMap<String, String>,
+    pub names: TrackedMap<String, String>,
     /// Proof of Personhood status per address string. Absent entries are `Unverified`.
-    pub personhood: HashMap<String, PersonhoodStatus>,
+    pub personhood: TrackedMap<String, PersonhoodStatus>,
     /// Registered social-recovery guardians per address string. Absent = no guardians.
-    pub guardians: HashMap<String, GuardianSet>,
+    pub guardians: TrackedMap<String, GuardianSet>,
     /// In-progress guardian approval votes to rotate an address's controlling key.
-    pub recovery_requests: HashMap<String, RecoveryRequest>,
+    pub recovery_requests: TrackedMap<String, RecoveryRequest>,
     /// Active recovery override key per address string. Once set, this key (not the one
     /// the address was originally derived from) must produce transaction signatures for it.
-    pub recovery_keys: HashMap<String, PublicKey>,
+    pub recovery_keys: TrackedMap<String, PublicKey>,
     /// The signing key each staker holds, recorded when it stakes.
     ///
     /// An `Address` is a 160-bit truncation of a hash of the key, so it is one-way: nothing can
@@ -369,7 +371,7 @@ pub struct ChainState {
     ///
     /// Populated from the staking transaction, whose own signature check has already proved the
     /// key derives the sender — so nothing here is taken on trust that was not already required.
-    pub validator_keys: HashMap<String, PublicKey>,
+    pub validator_keys: TrackedMap<String, PublicKey>,
     /// The key each address derives from, recorded the first time it signs a transaction that
     /// carries it (#243) — what lets a transaction from a known sender travel without its
     /// 1952-byte key (`Transaction::public_key`).
@@ -383,11 +385,11 @@ pub struct ChainState {
     /// Recorded only after `Transaction::signing_key` has checked that the key derives the
     /// sender, so nothing here is taken on trust that was not already required; the lookup
     /// checks it again anyway.
-    pub account_keys: HashMap<String, PublicKey>,
+    pub account_keys: TrackedMap<String, PublicKey>,
     /// Runtime-adjustable protocol parameters — changed only via passed governance proposals.
     pub governance_params: GovernanceParams,
     /// Governance proposals by id, both pending and resolved.
-    pub proposals: HashMap<u64, GovernanceProposal>,
+    pub proposals: TrackedMap<u64, GovernanceProposal>,
     /// Next id to assign to a new proposal.
     pub next_proposal_id: u64,
     /// The protocol version blocks are executed under — [`GENESIS_PROTOCOL_VERSION`] until a passed
@@ -406,13 +408,13 @@ pub struct ChainState {
     /// `ProvePersonhood` tx from a different address and be granted the same
     /// `Verified` status for free, defeating Sybil resistance entirely.
     #[serde(default)]
-    pub used_personhood_commitments: std::collections::HashSet<[u8; 16]>,
+    pub used_personhood_commitments: TrackedSet<[u8; 16]>,
     /// Double-sign incidents (`"{validator}:{height}:{round}"`) already slashed via
     /// `SubmitDoubleSignEvidence`. A validator can only meaningfully double-sign once per
     /// (height, round); without this, the same proven incident could be resubmitted
     /// (by the same or a different reporter) to slash the validator repeatedly.
     #[serde(default)]
-    pub slashed_double_sign_incidents: std::collections::HashSet<String>,
+    pub slashed_double_sign_incidents: TrackedSet<String>,
     /// The network's configured personhood-issuing authorities — set once at genesis (see
     /// `GenesisConfig`), never overridden afterward. `ProvePersonhood` transactions require
     /// a signature over the claimed commitment from ANY ONE of these keys; an empty list
@@ -439,19 +441,19 @@ pub struct ChainState {
     /// == 0` never actually occurs for a present entry outside of pathological 100%-slash
     /// scenarios (see `execute_delegate`'s doc comment for how new delegations handle that).
     #[serde(default)]
-    pub validator_pools: HashMap<String, DelegationPool>,
+    pub validator_pools: TrackedMap<String, DelegationPool>,
     /// Delegator shares per validator address string: validator -> {delegator -> shares}.
     /// Split from `validator_pools` (rather than nesting shares inside the pool struct)
     /// because the pool itself is small and hashed/read every reward/slash, while this can
     /// grow large per popular validator and is only read/written on delegate/undelegate.
     #[serde(default)]
-    pub delegator_shares: HashMap<String, HashMap<String, u64>>,
+    pub delegator_shares: TrackedMap<String, HashMap<String, u64>>,
     /// Where a validator's own rewards are paid, set by `TxType::SetRewardAddress` (#229):
     /// validator address -> payout address. Absent entry = paid to the validator itself.
     /// Only the validator's own share moves — see `credit_validator_reward`, which finds the
     /// delegation pool by the validator and never by this address.
     #[serde(default)]
-    pub reward_addresses: HashMap<String, Address>,
+    pub reward_addresses: TrackedMap<String, Address>,
     /// Capital moved straight from one validator's pool into another's via
     /// `TxType::Redelegate`, keyed by the **source** validator it is still slashable for.
     /// Absent entry = nothing is currently redelegating away from that validator.
@@ -464,7 +466,7 @@ pub struct ChainState {
     /// destination. Entries are pruned by `prune_expired_redelegations` once their window
     /// closes.
     #[serde(default)]
-    pub redelegations: HashMap<String, Vec<Redelegation>>,
+    pub redelegations: TrackedMap<String, Vec<Redelegation>>,
     /// Per-contract persistent key-value storage: contract address string -> {key -> value}.
     /// Written only via `TxType::CallContract`'s `storage_write` host call (see
     /// `helix_vm::HostContext`) — a contract can only ever read/write its *own* entry here
@@ -472,7 +474,7 @@ pub struct ChainState {
     /// to even name another contract's storage). Absent entry = this contract has never
     /// written anything, not an error.
     #[serde(default)]
-    pub contract_storage: HashMap<String, HashMap<Vec<u8>, Vec<u8>>>,
+    pub contract_storage: TrackedMap<String, HashMap<Vec<u8>, Vec<u8>>>,
     /// The bootstrap stake (nano-HLX) the genesis validator was given at height 0 — a record of
     /// what genesis originally configured, so a node joining long after startup via `GET /genesis`
     /// can rebuild byte-for-byte identical genesis state instead of only ever seeing today's
@@ -518,7 +520,7 @@ pub struct ChainState {
     /// this one (mirrors the asymmetry already established for slashing/jailing, which acts
     /// immediately on the way out but never early on the way in).
     #[serde(default)]
-    pub pending_validators: std::collections::HashSet<Address>,
+    pub pending_validators: TrackedSet<Address>,
     /// The addresses actually entitled to vote in the current epoch — the set every block is
     /// proposed and precommitted against, rebuilt at each epoch boundary by
     /// `rotate_active_validators`.
@@ -540,20 +542,13 @@ pub struct ChainState {
     /// jail costs at most `EPOCH_LENGTH` blocks of downtime accounting, whereas an early jail
     /// punishes the innocent.
     ///
-    /// **Deliberately excluded from `state_hash`** (unlike `pending_validators`), and that is a
-    /// considered trade, not an oversight. `state_hash` is nominally a diagnostic, but
-    /// `verify_genesis_reconstruction` compares it when joining a chain — so adding a field to
-    /// it changes the reconstructed genesis and locks every existing chain out of the upgrade.
-    /// Measured on 2026-07-21: hashing this field made the binary rebuild genesis as
-    /// `c5474b79…` against the live chain's `44e1c9d9…`, i.e. a running devnet would have needed
-    /// a full reset purely to deploy a bug fix.
-    ///
-    /// Little detection is given up for that. This set has no effect of its own — it decides
-    /// who `record_block_participation` scores, and that shows up in `missed_blocks` and
-    /// `jailed_until`, which *are* hashed. Two nodes that disagreed here would diverge on those
-    /// within a block or two and be caught anyway, one step later.
+    /// **In the state commitment since #270** (2026-10-07). It was deliberately left out until
+    /// then: adding a field to the hash changed the reconstructed genesis and would have locked
+    /// every running chain out of the upgrade (measured 2026-07-21). That reason ends with the last
+    /// reset, and leaving it out cost detection — two nodes that disagreed here were caught only a
+    /// block or two later, through `missed_blocks` and `jailed_until`.
     #[serde(default)]
-    pub active_validators: std::collections::HashSet<Address>,
+    pub active_validators: TrackedSet<Address>,
     /// Validators serving their one-epoch **probation** (backlog #132): promoted out of
     /// `pending_validators` into the live signing set — so their precommits are gathered and land
     /// in `last_commit` — but carrying zero voting power and no proposer turn (see
@@ -563,7 +558,7 @@ pub struct ChainState {
     /// `pending_validators`, so joining nodes agree on the signing set that shapes the proposer
     /// schedule.
     #[serde(default)]
-    pub probationary_validators: std::collections::HashSet<Address>,
+    pub probationary_validators: TrackedSet<Address>,
     /// Probationary validators whose signature has appeared in a committed `last_commit` during
     /// the current probation epoch — the on-chain, identical-on-every-node proof that a real node
     /// is running this key. Populated by `record_probation_liveness` from the same verified signer
@@ -577,7 +572,7 @@ pub struct ChainState {
     /// it is a state change, and #141 needs it) and `/validators` exposes it as
     /// `probation_liveness_seen`, which is what made the problem measurable in the first place.
     #[serde(default)]
-    pub probation_seen: std::collections::HashSet<Address>,
+    pub probation_seen: TrackedSet<Address>,
     /// Height of the block whose execution produced the state currently in memory.
     ///
     /// Exists so `GET /status` can report a `state_hash` together with the height it belongs to.
@@ -614,14 +609,20 @@ pub struct ChainState {
     /// stalled node *logs*, nothing else) — this is the persisted, on-chain layer that survives
     /// node restarts and has an actual consequence (`jailed_until`).
     #[serde(default)]
-    pub missed_blocks: HashMap<String, u32>,
+    pub missed_blocks: TrackedMap<String, u32>,
     /// Address string -> height at which a downtime-jailed validator may submit
     /// `TxType::Unjail`. Presence in this map (regardless of whether that height has passed)
     /// is what `stakers()` excludes on — jailing is never automatic-undone, an explicit
     /// `Unjail` transaction removes the entry. See `TxType::Unjail`'s doc comment for why
     /// auto-rejoining the instant a validator reappears would defeat the point.
     #[serde(default)]
-    pub jailed_until: HashMap<String, u64>,
+    pub jailed_until: TrackedMap<String, u64>,
+    /// The state commitment as of the last settlement (#270, see `crate::commitment`). Never
+    /// serialized: a state that arrives as bytes has its commitment recomputed, not trusted.
+    /// Public so a state can be built from parts; outside this crate the only value there is to
+    /// put in is `Commitment::default()` — "none yet", which recomputes.
+    #[serde(skip)]
+    pub commitment: Commitment,
 }
 
 /// Liquid-balance changes recorded while a block executes (#260), one entry per account,
@@ -663,39 +664,40 @@ impl ChainState {
         ChainState {
             chain_id: unset_chain_id(),
             balance_journal: None,
-            accounts: HashMap::new(),
+            accounts: Default::default(),
             total_supply,
             total_issued: 0,
             total_burned: 0,
-            names: HashMap::new(),
-            personhood: HashMap::new(),
-            guardians: HashMap::new(),
-            recovery_requests: HashMap::new(),
-            recovery_keys: HashMap::new(),
-            validator_keys: HashMap::new(),
-            account_keys: HashMap::new(),
+            names: Default::default(),
+            personhood: Default::default(),
+            guardians: Default::default(),
+            recovery_requests: Default::default(),
+            recovery_keys: Default::default(),
+            validator_keys: Default::default(),
+            account_keys: Default::default(),
             governance_params: GovernanceParams::default(),
-            proposals: HashMap::new(),
+            proposals: Default::default(),
             next_proposal_id: 0,
             protocol_version: GENESIS_PROTOCOL_VERSION,
             scheduled_upgrade: None,
-            used_personhood_commitments: std::collections::HashSet::new(),
-            slashed_double_sign_incidents: std::collections::HashSet::new(),
+            used_personhood_commitments: Default::default(),
+            slashed_double_sign_incidents: Default::default(),
             personhood_authorities: Vec::new(),
-            validator_pools: HashMap::new(),
-            delegator_shares: HashMap::new(),
-            reward_addresses: HashMap::new(),
-            redelegations: HashMap::new(),
-            contract_storage: HashMap::new(),
+            validator_pools: Default::default(),
+            delegator_shares: Default::default(),
+            reward_addresses: Default::default(),
+            redelegations: Default::default(),
+            contract_storage: Default::default(),
             genesis_validator_stake: 0,
             genesis_allocations: Vec::new(),
-            pending_validators: std::collections::HashSet::new(),
-            active_validators: std::collections::HashSet::new(),
-            probationary_validators: std::collections::HashSet::new(),
-            probation_seen: std::collections::HashSet::new(),
+            pending_validators: Default::default(),
+            active_validators: Default::default(),
+            probationary_validators: Default::default(),
+            probation_seen: Default::default(),
             applied_height: 0,
-            missed_blocks: HashMap::new(),
-            jailed_until: HashMap::new(),
+            missed_blocks: Default::default(),
+            jailed_until: Default::default(),
+            commitment: Commitment::default(),
         }
     }
 
@@ -1089,10 +1091,23 @@ impl ChainState {
     /// (see `execute_block`) — without it every redelegation ever made would stay in consensus
     /// state forever, and each source validator's slash would walk a list that only grows.
     pub fn prune_expired_redelegations(&mut self, height: u64) {
-        self.redelegations.retain(|_, entries| {
-            entries.retain(|e| height < e.unlock_height && e.amount > 0);
-            !entries.is_empty()
-        });
+        let open = |e: &Redelegation| height < e.unlock_height && e.amount > 0;
+        // Only the delegators with something to drop are written — this runs every block.
+        let stale: Vec<String> = self
+            .redelegations
+            .iter()
+            .filter(|(_, entries)| !entries.iter().all(open))
+            .map(|(delegator, _)| delegator.clone())
+            .collect();
+        for delegator in stale {
+            let kept: Vec<Redelegation> =
+                self.redelegations[&delegator].iter().filter(|e| open(e)).cloned().collect();
+            if kept.is_empty() {
+                self.redelegations.remove(&delegator);
+            } else {
+                self.redelegations.insert(delegator, kept);
+            }
+        }
     }
 
     /// Drop governance proposals whose voting period is over. Called once per block (see
@@ -1416,8 +1431,8 @@ impl ChainState {
             .cloned()
             .collect();
 
-        self.probationary_validators = new_probationary;
-        self.pending_validators = new_pending;
+        self.probationary_validators.replace_with(new_probationary);
+        self.pending_validators.replace_with(new_pending);
         self.probation_seen.clear(); // fresh window for the new probation cohort
 
         // On the very first rotation of a migrated chain (empty `active_validators`) this returns
@@ -1521,168 +1536,6 @@ impl ChainState {
         Some((shares as u128 * pool.total_delegated_stake as u128 / pool.total_shares as u128) as u64)
     }
 
-    /// A deterministic hash of the entire chain state — the chain's state commitment. Every block
-    /// carries the hash of the state its predecessor produced (`BlockHeader::prev_state_root`,
-    /// #194), signed by its proposer and checked by every node that applies it: in consensus, in
-    /// the P2P block sync and in the RPC sync (#242). Two nodes whose execution diverged therefore
-    /// find out at the next block, and a snapshot can be checked against a signed header
-    /// (`HELIX_TRUSTED_CHECKPOINT`). Anything that belongs to the state goes in here, or a node
-    /// that differs in it is not caught.
-    ///
-    /// This comment said until 2026-10-07 that the hash was "deliberately NOT a protocol-level state
-    /// root … not in `BlockHeader` … a separate, unstarted piece of work" — true before #194 and
-    /// wrong for the month after it; a comment saying a check does not exist is how someone decides
-    /// it can be skipped.
-    ///
-    /// **It rehashes the whole state on every call**: one serialization of every account, pool and
-    /// proposal, asked several times per block. Nothing at a few hundred accounts, linear in them.
-    ///
-    /// `HashMap`/`HashSet` iteration order is not stable across processes — Rust's default
-    /// hasher (SipHash) uses a random per-process seed — so bincode-serializing one
-    /// directly would make this hash different on every node even when their *contents*
-    /// are identical, producing constant false positives. Every such collection is
-    /// therefore rewritten into a sorted `BTreeMap`/`BTreeSet`/sorted `Vec` first,
-    /// including ones nested inside stored values — `GovernanceProposal::voters` is a
-    /// `HashSet<String>`, so proposals get the same treatment via `CanonicalProposal`
-    /// rather than being hashed as-is.
-    pub fn state_hash(&self) -> Hash {
-        #[derive(Serialize)]
-        struct CanonicalProposal<'a> {
-            id: u64,
-            proposer: &'a str,
-            param: &'a crate::governance::GovernanceParam,
-            new_value: u64,
-            created_at_height: u64,
-            voters: Vec<&'a str>,
-            yes_stake: u64,
-            quorum_denominator: u64,
-            activation_height: u64,
-            executed: bool,
-        }
-
-        #[derive(Serialize)]
-        struct Canonical<'a> {
-            accounts: BTreeMap<&'a str, &'a AccountState>,
-            total_supply: u64,
-            total_issued: u64,
-            total_burned: u64,
-            names: BTreeMap<&'a str, &'a str>,
-            personhood: BTreeMap<&'a str, &'a PersonhoodStatus>,
-            guardians: BTreeMap<&'a str, &'a GuardianSet>,
-            recovery_requests: BTreeMap<&'a str, &'a RecoveryRequest>,
-            recovery_keys: BTreeMap<&'a str, &'a PublicKey>,
-            validator_keys: BTreeMap<&'a str, &'a PublicKey>,
-            // Decides which transactions verify without a key of their own (#243): a node that
-            // forgot one would refuse a block every other node applies.
-            account_keys: BTreeMap<&'a str, &'a PublicKey>,
-            governance_params: &'a GovernanceParams,
-            proposals: BTreeMap<u64, CanonicalProposal<'a>>,
-            next_proposal_id: u64,
-            used_personhood_commitments: std::collections::BTreeSet<[u8; 16]>,
-            slashed_double_sign_incidents: std::collections::BTreeSet<&'a str>,
-            // Sorted by raw bytes (PublicKey has no Ord impl) — treated as a set for
-            // hashing purposes even though it's stored as an insertion-ordered Vec, so two
-            // configs listing the same authorities in a different order still hash equal.
-            personhood_authorities: std::collections::BTreeSet<&'a [u8]>,
-            validator_pools: BTreeMap<&'a str, &'a DelegationPool>,
-            // Nested HashMap -> HashMap, same non-determinism problem as everything else
-            // here — flattened to a sorted map of maps rather than hashed as-is.
-            delegator_shares: BTreeMap<&'a str, BTreeMap<&'a str, u64>>,
-            // Decides whose balance every block reward lands on, so it is consensus state like
-            // any other — a node that forgot a payout would credit a different account.
-            reward_addresses: BTreeMap<&'a str, &'a str>,
-            // Only the outer map needs sorting: each `Vec<Redelegation>` is built by pushing
-            // in transaction order and pruned with `retain`, both of which every node performs
-            // identically, so the vector order is already consensus-deterministic.
-            redelegations: BTreeMap<&'a str, &'a Vec<Redelegation>>,
-            // Byte-string keys have no Ord impl conflict to worry about (unlike
-            // PublicKey above) — Vec<u8> already implements Ord lexicographically.
-            contract_storage: BTreeMap<&'a str, BTreeMap<&'a Vec<u8>, &'a Vec<u8>>>,
-            genesis_validator_stake: u64,
-            genesis_allocations: BTreeMap<&'a str, u64>,
-            pending_validators: std::collections::BTreeSet<&'a str>,
-            // `active_validators` is deliberately NOT hashed — see the note below the struct.
-            probationary_validators: std::collections::BTreeSet<&'a str>,
-            probation_seen: std::collections::BTreeSet<&'a str>,
-            missed_blocks: BTreeMap<&'a str, u32>,
-            jailed_until: BTreeMap<&'a str, u64>,
-            // Which rules the next block runs under, and which ones it will: a node that forgot
-            // either would execute a block under rules no other node uses.
-            protocol_version: u64,
-            scheduled_upgrade: Option<(u64, u64)>,
-        }
-
-        let canonical = Canonical {
-            accounts: self.accounts.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            total_supply: self.total_supply,
-            total_issued: self.total_issued,
-            total_burned: self.total_burned,
-            names: self.names.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
-            personhood: self.personhood.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            guardians: self.guardians.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            recovery_requests: self.recovery_requests.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            recovery_keys: self.recovery_keys.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            validator_keys: self.validator_keys.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            account_keys: self.account_keys.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            governance_params: &self.governance_params,
-            proposals: self
-                .proposals
-                .iter()
-                .map(|(id, p)| {
-                    let mut voters: Vec<&str> = p.voters.iter().map(|v| v.as_str()).collect();
-                    voters.sort_unstable();
-                    (
-                        *id,
-                        CanonicalProposal {
-                            id: p.id,
-                            proposer: &p.proposer,
-                            param: &p.param,
-                            new_value: p.new_value,
-                            created_at_height: p.created_at_height,
-                            voters,
-                            yes_stake: p.yes_stake,
-                            quorum_denominator: p.quorum_denominator,
-                            activation_height: p.activation_height,
-                            executed: p.executed,
-                        },
-                    )
-                })
-                .collect(),
-            next_proposal_id: self.next_proposal_id,
-            used_personhood_commitments: self.used_personhood_commitments.iter().copied().collect(),
-            slashed_double_sign_incidents: self.slashed_double_sign_incidents.iter().map(|s| s.as_str()).collect(),
-            personhood_authorities: self.personhood_authorities.iter().map(|k| k.as_bytes()).collect(),
-            validator_pools: self.validator_pools.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            delegator_shares: self
-                .delegator_shares
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.iter().map(|(dk, dv)| (dk.as_str(), *dv)).collect()))
-                .collect(),
-            reward_addresses: self.reward_addresses.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
-            redelegations: self.redelegations.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            contract_storage: self
-                .contract_storage
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.iter().collect()))
-                .collect(),
-            genesis_validator_stake: self.genesis_validator_stake,
-            genesis_allocations: self
-                .genesis_allocations
-                .iter()
-                .map(|(a, b)| (a.as_str(), *b))
-                .collect(),
-            pending_validators: self.pending_validators.iter().map(|a| a.as_str()).collect(),
-            probationary_validators: self.probationary_validators.iter().map(|a| a.as_str()).collect(),
-            probation_seen: self.probation_seen.iter().map(|a| a.as_str()).collect(),
-            missed_blocks: self.missed_blocks.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
-            jailed_until: self.jailed_until.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
-            protocol_version: self.protocol_version,
-            scheduled_upgrade: self.scheduled_upgrade.map(|u| (u.version, u.height)),
-        };
-
-        let bytes = bincode::serialize(&canonical).expect("canonical chain state serialization is infallible");
-        Hash::digest(&bytes)
-    }
 
     /// Why a build that executes protocols up to `supported` must not execute block `height` on
     /// this state — `None` if it may.
@@ -1889,37 +1742,20 @@ mod tests {
         assert_ne!(probation.state_hash(), reference, "probation must be hashed");
     }
 
-    /// `active_validators` must stay out of `state_hash`, and this pins that as a decision
-    /// rather than an accident. `verify_genesis_reconstruction` compares `state_hash` when a
-    /// node joins a chain, so any field added to it changes the reconstructed genesis and
-    /// locks every existing chain out of the upgrade — measured on 2026-07-21, where hashing
-    /// this one field alone would have forced a full devnet reset just to ship a bug fix.
-    ///
-    /// Whoever "fixes" this by adding the field back: read the field's doc comment first, and
-    /// be aware that doing so requires a chain reset. Nothing is lost by leaving it out —
-    /// `missed_blocks`/`jailed_until`, the state this set actually drives, remain hashed, so a
-    /// real disagreement still surfaces there within a block or two.
+    /// `active_validators` is in the state commitment since #270 (2026-10-07). It was left out
+    /// from 2026-07-21 on, and a test pinned that, because adding a field to the hash changed the
+    /// reconstructed genesis and would have locked every running chain out of the upgrade; that
+    /// test said the field could come back only with a reset. The last reset is that reset. Left
+    /// out, a node that disagreed here was caught only a block or two later, through
+    /// `missed_blocks`/`jailed_until`; in, it is caught at the next block.
     #[test]
-    fn active_validators_stays_out_of_the_state_hash() {
+    fn active_validators_is_in_the_state_commitment() {
         let mut state = ChainState::new(1_000_000);
         stake(&mut state, 1, 1_000);
         let before = state.state_hash();
 
         state.active_validators.insert(addr(1));
-        assert_eq!(
-            state.state_hash(),
-            before,
-            "hashing active_validators would change genesis reconstruction and shut every \
-             running chain out of the upgrade — see the field's doc comment"
-        );
-
-        // The state it drives is still hashed, so a genuine divergence is not invisible.
-        state.missed_blocks.insert(addr(1).to_string(), 1);
-        assert_ne!(
-            state.state_hash(),
-            before,
-            "missed_blocks must stay in the hash — that is what makes the exclusion detectable"
-        );
+        assert_ne!(state.state_hash(), before, "a node that disagrees on the active set must disagree on the root");
     }
 
     /// `applied_height` labels the hash; it must not be an input to it. Hashing it would change

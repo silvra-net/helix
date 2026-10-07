@@ -3661,7 +3661,7 @@ fn key_from_state(state: &ChainState) -> impl Fn(&Address) -> Option<PublicKey> 
 async fn validator_key_snapshot(
     chain_state: &Arc<RwLock<ChainState>>,
 ) -> std::collections::HashMap<String, PublicKey> {
-    chain_state.read().await.validator_keys.clone()
+    (*chain_state.read().await.validator_keys).clone()
 }
 
 /// A key resolver over a snapshot taken by `validator_key_snapshot`.
@@ -6710,7 +6710,7 @@ async fn snapshot_sync_from_peer(
         resp.status()
     );
     let bytes = read_body_capped(resp, MAX_SNAPSHOT_BYTES, &url).await?;
-    let snapshot: helix_executor::state::StateSnapshot = bincode::deserialize(&bytes)
+    let mut snapshot: helix_executor::state::StateSnapshot = bincode::deserialize(&bytes)
         .with_context(|| format!("{url} did not answer with a state snapshot"))?;
 
     // The peer serves the newest snapshot at or below what was asked. Anything below the
@@ -6757,6 +6757,9 @@ async fn snapshot_sync_from_peer(
              vouching for itself."
         );
     };
+    // It arrived as bytes, so its commitment is computed here once from every entry (#270) — and
+    // kept, so nothing after this recomputes it.
+    snapshot.state.settle_commitment();
     let snapshot_root = snapshot.state.state_hash();
     anyhow::ensure!(
         &snapshot_root == expected_root,

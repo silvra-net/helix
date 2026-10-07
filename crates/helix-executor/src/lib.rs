@@ -1,7 +1,9 @@
+pub mod commitment;
 pub mod genesis;
 pub mod governance;
 pub mod receipt;
 pub mod state;
+pub mod tracked;
 
 pub use genesis::GenesisConfig;
 pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal, ScheduledUpgrade};
@@ -195,6 +197,15 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
              change made outside `ChainState::update_account`: {missed:?}"
         );
     }
+
+    // Fold what the block wrote into the state commitment (#270), so `state_hash` — asked for
+    // every proposal sent and received and every `/status` — costs nothing until the next block
+    // writes. Debug builds first hold the incrementally kept commitment against a full
+    // recomputation, as the journal is held above: every executor test and every debug node of
+    // the multi-node suite checks it on every block.
+    #[cfg(debug_assertions)]
+    state.assert_commitment_is_exact();
+    state.settle_commitment();
 
     BlockReceipt {
         block_hash: block.hash().to_hex(),
@@ -6202,6 +6213,23 @@ mod tests {
         assert!(
             !state.jailed_until.contains_key(&newcomer.to_string()),
             "and must certainly not be jailed for the wait the protocol imposed on it"
+        );
+    }
+
+    /// `execute_block` folds what the block wrote into the state commitment (#270): reading the
+    /// root afterwards — for every proposal and every `/status` — then costs nothing until the
+    /// next block writes.
+    #[test]
+    fn a_block_leaves_its_commitment_settled() {
+        let proposer = Address::from_public_key(&KeyPair::generate().public);
+        let mut state = ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+        state.settle_commitment();
+        execute_block(&mut state, &empty_block(&proposer, 1));
+        assert!(state.get(&proposer).is_some(), "positive control: the block reward wrote an account");
+        assert!(state.commitment.0.is_some(), "the block leaves a settled commitment");
+        assert!(
+            state.accounts.touched().is_empty(),
+            "the block's writes are folded in, not left for every reader to fold again"
         );
     }
 

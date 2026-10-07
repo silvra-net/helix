@@ -309,6 +309,7 @@ impl GenesisConfig {
         state.total_issued = issued;
         state.personhood_authorities = self.personhood_authorities.clone();
 
+        state.settle_commitment();
         state
     }
 }

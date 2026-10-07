@@ -142,6 +142,20 @@ CLI ←→ REST API :8545 ←→ node ←→ P2P :8546 ←→ other nodes
 > that never actually encrypted anything, so it was misleading complexity rather than added
 > security.
 
+**State commitment:** every block carries the root of the state its predecessor produced
+(`prev_state_root`), signed by its proposer and checked by every node that applies the block, so
+two nodes whose execution differs find out at the next block. The root is a **lattice hash**
+(LtHash, the construction Solana commits its accounts with, via `solana-lattice-hash`): every
+entry of the state — an account, a name, a delegation share, one contract storage slot — is
+encoded with a tag for its kind, mapped by BLAKE3's extendable output onto 1024 sixteen-bit
+lanes, and the lanes of all entries are summed; the root is BLAKE3 over the sum. A sum does not
+depend on the order entries are written in, and it can be updated: a block subtracts the old
+encoding of each entry it changed and adds the new one, so it costs what the block wrote, not what
+the chain holds (0.13 ms per block at 100,000 accounts, against 55 ms for rehashing everything).
+A state that arrives whole — a snapshot, a database at start — is summed once from every entry.
+There are no membership proofs (nothing needs them yet); they can be added later through a
+protocol upgrade without a reset.
+
 **Contract determinism:** `helix-vm` disables WASM floats entirely (via wasmi's
 `WasmFeatures` validator gate, rejected at deploy time) — every validator must reach the
 identical execution result for the identical call, and floats are a known cross-platform

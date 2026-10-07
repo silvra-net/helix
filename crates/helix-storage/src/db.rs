@@ -955,7 +955,7 @@ impl HelixDb {
                     on_disk.insert(addr.to_string(), state.accounts[addr].clone());
                 }
             }
-            None => *persisted = Some(state.accounts.clone()),
+            None => *persisted = Some((*state.accounts).clone()),
         }
         Ok(())
     }
@@ -1263,43 +1263,48 @@ impl HelixDb {
         // value — the node writes genesis moments later and reloads.
         let chain_id = self.get_block_by_height(0).map(|b| b.hash()).unwrap_or(Hash::ZERO);
 
-        Ok(ChainState {
+        let mut state = ChainState {
             balance_journal: None,
-            validator_keys,
-            account_keys,
+            commitment: Default::default(),
+            validator_keys: validator_keys.into(),
+            account_keys: account_keys.into(),
             chain_id,
-            accounts,
+            accounts: accounts.into(),
             applied_height,
             total_supply,
             total_issued,
             total_burned,
-            names,
-            personhood,
-            guardians,
-            recovery_requests,
-            recovery_keys,
+            names: names.into(),
+            personhood: personhood.into(),
+            guardians: guardians.into(),
+            recovery_requests: recovery_requests.into(),
+            recovery_keys: recovery_keys.into(),
             governance_params,
-            proposals,
+            proposals: proposals.into(),
             next_proposal_id,
             protocol_version,
             scheduled_upgrade,
-            used_personhood_commitments,
-            slashed_double_sign_incidents,
+            used_personhood_commitments: used_personhood_commitments.into(),
+            slashed_double_sign_incidents: slashed_double_sign_incidents.into(),
             personhood_authorities,
-            validator_pools,
-            delegator_shares,
-            reward_addresses,
-            redelegations,
-            contract_storage,
+            validator_pools: validator_pools.into(),
+            delegator_shares: delegator_shares.into(),
+            reward_addresses: reward_addresses.into(),
+            redelegations: redelegations.into(),
+            contract_storage: contract_storage.into(),
             genesis_validator_stake,
             genesis_allocations,
-            pending_validators,
-            active_validators,
-            probationary_validators,
-            probation_seen,
-            missed_blocks,
-            jailed_until,
-        })
+            pending_validators: pending_validators.into(),
+            active_validators: active_validators.into(),
+            probationary_validators: probationary_validators.into(),
+            probation_seen: probation_seen.into(),
+            missed_blocks: missed_blocks.into(),
+            jailed_until: jailed_until.into(),
+        };
+        // The one full computation of the commitment a loaded state needs; every block after it
+        // is folded in from what it wrote (#270).
+        state.settle_commitment();
+        Ok(state)
     }
 
     pub fn get_account(&self, address: &str) -> StorageResult<Option<AccountState>> {

@@ -99,8 +99,9 @@ testnet, a reset replaces the whole chain — see the README.)
 }
 ```
 
-`state_hash` is an operator-facing diagnostic (not part of consensus, not signed) — compare it
-across nodes to spot execution divergence. **Match on `state_height`, not on `height`:** `height`
+`state_hash` is the state root the next block commits to as `prev_state_root` — signed by its
+proposer, checked by every node that applies it ([how it is computed](internals.md#cryptography--determinism)).
+Compare it across nodes to spot execution divergence. **Match on `state_height`, not on `height`:** `height`
 and `best_hash` come from the block store while `state_hash` comes from the in-memory chain state,
 and a response sampled mid-commit carries height N−1 next to the state of N. `state_height` is read
 under the same lock as `state_hash`, so those two always belong together — comparing `state_hash`
