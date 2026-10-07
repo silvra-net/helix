@@ -12,22 +12,22 @@ use helix_crypto::Hash;
 /// endpoint whose answers about *which chain this is* are never believed (see [`ChainIdSource`]).
 pub const DEFAULT_SEED_PEER: &str = "https://node.silvra.net";
 
-/// The public Helix network's genesis hash, compiled in.
+/// The public Helix network's genesis hash, compiled in: the mainnet's, since 1.0.0.
 ///
 /// Bitcoin puts its genesis in the source and asserts the hash (`chainparams.cpp`), so a node
 /// cannot be talked onto another chain and nobody configures anything. Same idea, one deliberate
-/// softening: this is the *default*, not a law, because a Helix devnet reset produces a new genesis
-/// and a hard-coded hash that outlived a reset would lock every operator out until a release
-/// shipped — trading a real outage for a hypothetical impersonation.
+/// softening: this is the *default*, not a law — `HELIX_GENESIS_HASH` points a node at another
+/// network (a private one, or a test chain). The mainnet is not reset; its rules change through
+/// protocol upgrades scheduled on the chain (#267), so this value is meant never to change again.
 ///
-/// **Update this together with any chain reset**, in the release that accompanies it. That
+/// **Should a chain ever be started over anyway, update this in the release that accompanies it.** That
 /// instruction was already written down on 2026-08-07 and was missed anyway: the chain was reset,
 /// this constant kept the dead chain's hash, and every operator on the published binary was refused
 /// at the join by a message that read as though *they* had configured it. `scripts/check-genesis-
 /// pin.sh` exists because no unit test can catch this — the stale hash was perfectly well-formed
 /// and every suite was green. The check needs the live network.
 pub const DEFAULT_GENESIS_HASH: &str =
-    "0f0c3a8336d5d8dcc8f7d5d9c6497b26f5cc1619fd4dc61d3068738c39814276";
+    "dcec68407464aae51a9b1c2b6817d0a64b439b5b6c1234b125f901a59a13f390";
 
 /// [`DEFAULT_GENESIS_HASH`] as a [`Hash`].
 ///
