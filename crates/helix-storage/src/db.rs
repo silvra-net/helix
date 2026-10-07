@@ -238,6 +238,19 @@ pub struct HelixDb {
     snapshot_interval: u64,
     /// Set by [`HelixDb::open_temporary`]: the file is removed when this handle is dropped.
     delete_on_drop: Option<std::path::PathBuf>,
+    /// The accounts as this handle last wrote them to the table or read them from it, so
+    /// `save_chain_state` writes only the ones a block changed. `None` until then: the first save
+    /// writes every account.
+    ///
+    /// Before this, every block wrote every account back — at 100,000 accounts 545 ms and 3.9 MB of
+    /// pages per block for a block that moved 20 of them (point B, `tests/state_scale.rs`).
+    /// `save_chain_state` is the one writer of the table, and this is updated only after its
+    /// commit, so it can lag the disk (and then a save writes more than it needs) but never claim
+    /// a value the disk does not hold — the one direction that would lose an account on restart.
+    persisted_accounts: std::sync::Mutex<Option<std::collections::HashMap<String, AccountState>>>,
+    /// How many accounts the last save wrote — what the tests look at.
+    #[cfg(test)]
+    accounts_written: std::sync::atomic::AtomicUsize,
 }
 
 impl Drop for HelixDb {
@@ -357,6 +370,9 @@ impl HelixDb {
             min_free_bytes: MIN_FREE_DISK_BYTES,
             snapshot_interval: configured_snapshot_interval(),
             delete_on_drop: None,
+            persisted_accounts: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            accounts_written: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -488,6 +504,17 @@ impl HelixDb {
         } else {
             None
         };
+        // Held across the write: the table and this record of it change together or not at all.
+        let mut persisted = match self.persisted_accounts.lock() {
+            Ok(guard) => guard,
+            // A panic mid-save may have left it ahead of the disk; forget it and write everything.
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = None;
+                guard
+            }
+        };
+        let changed_accounts: Vec<&str>;
         let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
         {
             if let Some(bytes) = &snapshot_bytes {
@@ -523,10 +550,19 @@ impl HelixDb {
             let mut genesis_allocations = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut meta = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
 
-            for (addr, account) in &state.accounts {
-                let encoded = bincode::serialize(account)
+            changed_accounts = match persisted.as_ref() {
+                Some(on_disk) => state
+                    .accounts
+                    .iter()
+                    .filter(|(addr, account)| on_disk.get(addr.as_str()) != Some(*account))
+                    .map(|(addr, _)| addr.as_str())
+                    .collect(),
+                None => state.accounts.keys().map(String::as_str).collect(),
+            };
+            for addr in &changed_accounts {
+                let encoded = bincode::serialize(&state.accounts[*addr])
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                accounts.insert(addr.as_str(), encoded.as_slice())
+                accounts.insert(*addr, encoded.as_slice())
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
             // A name leaves the state when its owner registers another (#252: one name per
@@ -888,7 +924,19 @@ impl HelixDb {
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
         }
-        tx.commit().map_err(|e| StorageError::Db(e.to_string()))
+        tx.commit().map_err(|e| StorageError::Db(e.to_string()))?;
+        // Only now: the disk holds these values.
+        #[cfg(test)]
+        self.accounts_written.store(changed_accounts.len(), std::sync::atomic::Ordering::Relaxed);
+        match persisted.as_mut() {
+            Some(on_disk) => {
+                for addr in changed_accounts {
+                    on_disk.insert(addr.to_string(), state.accounts[addr].clone());
+                }
+            }
+            None => *persisted = Some(state.accounts.clone()),
+        }
+        Ok(())
     }
 
     pub fn load_chain_state(&self, total_supply: u64) -> StorageResult<ChainState> {
@@ -927,6 +975,8 @@ impl HelixDb {
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             accounts.insert(k.value().to_string(), account);
         }
+        // What the table holds is now known; the next save writes only what differs from it.
+        *self.persisted_accounts.lock().unwrap_or_else(|p| p.into_inner()) = Some(accounts.clone());
 
         let mut names = std::collections::HashMap::new();
         let mut name_iter = names_table.iter().map_err(|e| StorageError::Db(e.to_string()))?;
@@ -2324,6 +2374,63 @@ mod tests {
             "a lower horizon must leave the stored one alone"
         );
         drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn account(address: &str, balance: u64) -> AccountState {
+        AccountState {
+            address: address.to_string(),
+            balance,
+            staked: 0,
+            unbonding_stake: 0,
+            unbonding_unlock_height: 0,
+            unbonding_source: None,
+            nonce: 0,
+            code: None,
+        }
+    }
+
+    fn written(db: &HelixDb) -> usize {
+        db.accounts_written.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A block writes back the accounts it changed and no others (point B: every account, every
+    /// block, was 545 ms and 3.9 MB at 100,000 accounts) — and every change still survives a
+    /// restart, which is the half that would cost a fork if it went wrong.
+    #[test]
+    fn a_save_writes_only_changed_accounts_and_every_change_survives_reopening() {
+        let path = std::env::temp_dir().join(format!("helix-db-changed-accounts-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut state = ChainState::new(0);
+        for (i, addr) in ["hlxa", "hlxb", "hlxc"].iter().enumerate() {
+            state.accounts.insert(addr.to_string(), account(addr, 10 + i as u64));
+        }
+        {
+            let db = HelixDb::open(&path).unwrap();
+            db.save_chain_state(&state).unwrap();
+            assert_eq!(written(&db), 3, "a handle that knows nothing writes everything");
+            state.accounts.get_mut("hlxb").unwrap().balance += 5;
+            db.save_chain_state(&state).unwrap();
+            assert_eq!(written(&db), 1, "one account changed, one written");
+            db.save_chain_state(&state).unwrap();
+            assert_eq!(written(&db), 0, "nothing changed, nothing written");
+            state.accounts.insert("hlxd".to_string(), account("hlxd", 1));
+            state.accounts.get_mut("hlxa").unwrap().nonce += 1;
+            db.save_chain_state(&state).unwrap();
+            assert_eq!(written(&db), 2, "a new account and a changed one");
+        }
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(0).unwrap();
+        assert_eq!(loaded.accounts, state.accounts, "every change is on disk");
+        db.save_chain_state(&loaded).unwrap();
+        assert_eq!(written(&db), 0, "what was just read needs no writing");
+        let mut moved = loaded;
+        moved.accounts.get_mut("hlxc").unwrap().balance = 0;
+        db.save_chain_state(&moved).unwrap();
+        assert_eq!(written(&db), 1);
+        drop(db);
+        let reloaded = HelixDb::open(&path).unwrap().load_chain_state(0).unwrap();
+        assert_eq!(reloaded.accounts, moved.accounts, "and the change after a reload too");
         let _ = std::fs::remove_file(&path);
     }
 

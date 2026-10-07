@@ -106,7 +106,7 @@ pub const BLOCKS_OF_SILENCE_TO_JAIL: u32 = DOWNTIME_JAIL_THRESHOLD_BLOCKS / MISS
 pub const MIN_JAIL_BLOCKS: u64 = 300;
 
 /// Per-account ledger state
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountState {
     pub address: String,
     /// Liquid balance in nano-HLX (1 HLX = 1_000_000_000 nano-HLX)
