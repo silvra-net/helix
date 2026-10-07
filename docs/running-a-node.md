@@ -149,8 +149,8 @@ HELIX_SYNC_PEER=https://node.other-network.example HELIX_GENESIS_HASH=<its genes
 
 To run a **chain of your own** — for development, or as the first node of a new network — set
 `HELIX_NEW_CHAIN=1`. Its validator key starts with 15,000 HLX staked and 1,000 liquid, and the
-genesis credits the network's launch reserve (`GENESIS_PREFUND` in `crates/helix-executor/src/genesis.rs`
-— change it for a network of your own). A devnet that funds its validators from the bootstrap
+genesis credits the network's launch reserve and operators (`GENESIS_PREFUND` in
+`crates/helix-executor/src/genesis.rs` — change it for a network of your own). A devnet that funds its validators from the bootstrap
 validator raises its balance at launch with `HELIX_GENESIS_VALIDATOR_LIQUID_HLX=<hlx>`.
 
 ### Verifying which chain you joined

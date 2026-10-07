@@ -192,15 +192,17 @@ advances, since real compute was spent either way.
 
 - **Hard cap:** 33,000,000 HLX — never more, forever. This is an *honest* ceiling: it sits
   just above what the emission schedule actually pays out (the 1 HLX halving subsidy converges
-  to ~31.5M emitted, plus the 100k genesis allocation ≈ 31.6M real max supply), not an
+  to ~31.5M emitted, plus the 161k genesis allocation ≈ 31.7M real max supply), not an
   aspirational round number the chain could never reach. The same asymptotic shape as Bitcoin's
   21M cap — approached over time, not handed out at genesis.
-- **Genesis allocation:** 100,000 HLX — the bootstrap validator's 15k stake (half again the
+- **Genesis allocation:** 161,000 HLX — the bootstrap validator's 15k stake (half again the
   minimum the rules demand of any validator, `MIN_VALIDATOR_STAKE`, so a slash does not drop it
-  out of the set) and 1k liquid for fees, plus an 84k launch reserve (`GENESIS_PREFUND`) on a key
-  that never touches a server. The network's operators are funded out of the reserve (15k
-  apiece), signed offline. That is ~0.3% of the supply the chain eventually reaches; everything
-  else is earned block by block. There is no founder pre-mine beyond this.
+  out of the set) and 1k liquid for fees, a 100k launch reserve on a key that never touches a
+  server, and 15k liquid for each of the three operators validating at the end of the test network
+  (`GENESIS_PREFUND`). The operators get a balance, not a stake: they stake once their node is on
+  the chain, so no key counts in the quorum before a node is behind it. That is ~0.5% of the
+  supply the chain eventually reaches; everything else is earned block by block. There is no
+  founder pre-mine beyond this.
 - **Denomination:** 1 HLX = 1,000,000,000 nano-HLX
 - **Fee split:** the base fee (`base_fee_per_byte × transaction size`) is burned in full; the
   rest of what the sender paid is the validator's tip. Not a fixed ratio — a sender who pays
@@ -223,6 +225,6 @@ advances, since real compute was spent either way.
   still unbonding out of either, and any stake that redelegated away inside the window — so no
   exit taken ahead of the evidence escapes it.
 - **Circulating supply** = total issued − total burned. Total issued starts at the genesis
-  allocation (100,000 HLX) and grows block by block via the emission schedule above.
+  allocation (161,000 HLX) and grows block by block via the emission schedule above.
 
 ---

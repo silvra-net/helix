@@ -10,11 +10,12 @@ else is fixed at genesis.
 
 ## The one-paragraph version
 
-A small, bounded genesis allocation instead of a pre-mine: the chain starts with 100,000 HLX. The
+A small, bounded genesis allocation instead of a pre-mine: the chain starts with 161,000 HLX. The
 bootstrap validator holds 15,000 staked — half again the minimum every validator needs, so the
 chain can produce blocks at all and a slash does not drop it out of the set — and 1,000 liquid for
-fees. The other 84,000 are a launch reserve on a key that never touches a server, from which the
-first operators are funded to stake. That is about 0.3% of the supply the chain ever reaches. Every other coin is *earned* by producing blocks, on a Bitcoin-shaped halving schedule.
+fees. The three operators who were validating when the test network ended hold 15,000 each, as a
+balance they stake once their node is on the chain. The other 100,000 are a launch reserve on a
+key that never touches a server. That is about 0.5% of the supply the chain ever reaches. Every other coin is *earned* by producing blocks, on a Bitcoin-shaped halving schedule.
 Each transaction burns a base fee proportional to its size and tips the block's proposer whatever
 was paid above it. Security comes from staked HLX, not from the emission schedule — the two are
 deliberately decoupled.
@@ -26,8 +27,9 @@ deliberately decoupled.
 | Hard supply cap (`TOTAL_SUPPLY_HLX`) | 33,000,000 HLX |
 | Genesis stake (bootstrap validator) | 15,000 HLX (`MIN_VALIDATOR_STAKE` is 10,000) |
 | Genesis liquid balance (bootstrap validator) | 1,000 HLX, for fees |
-| Launch reserve (`GENESIS_PREFUND`) | 84,000 HLX on `hlxf2ToZiQrv2XFAVvRgXU8ygDiH9TarQTuc`, a key kept offline |
-| Genesis total | 100,000 HLX (~0.3% of what the chain ever reaches) |
+| Launch reserve (`GENESIS_PREFUND`) | 100,000 HLX on `hlxf2ToZiQrv2XFAVvRgXU8ygDiH9TarQTuc`, a key kept offline |
+| Operators (`GENESIS_PREFUND`) | 15,000 HLX each, liquid, on `hlxk6QWXDZjCtvBunTwdVscNnYpYb6bg1pvQ`, `hlxRy5cA5oNJ4n2KU5JQSSCcu78Y5Dq1i5QF`, `hlxSpsWWU1CDPF84cexCCGZrAEVttzay5NMz` |
+| Genesis total | 161,000 HLX (~0.5% of what the chain ever reaches) |
 | Other genesis allocations | none |
 | Initial block reward | 1 HLX per block, to its proposer |
 | Halving interval | 15,768,000 blocks (~1 year at 2 s blocks) |
@@ -148,9 +150,10 @@ that a security budget should not be designed once it is already too thin.
 
 ## History
 
-- **The last reset (mainnet):** still 100,000 HLX, split differently — 15,000 staked, 1,000
-  liquid on the validator, 84,000 as a launch reserve on an offline key. On the validator the
-  reserve was the largest balance on the chain, held by the one key that has to stay online.
+- **2026-10-07 (1.0.0, mainnet):** 161,000 HLX — 15,000 staked and 1,000 liquid on the
+  validator, 100,000 as a launch reserve on an offline key, 15,000 liquid for each of the three
+  operators validating at the end of the test network. On the validator the reserve had been the
+  largest balance on the chain, held by the one key that has to stay online.
 - **2026-09-30 (0.20.0):** genesis allocation 100,000 HLX — 10,000 staked, 90,000 liquid.
 - **2026-08-26:** minimum validator stake 100,000 → 10,000 HLX (governance floor 1,000 → 100);
   the genesis reserve had been raised to 500,000 on 2026-07-22 to fund the first operators.
