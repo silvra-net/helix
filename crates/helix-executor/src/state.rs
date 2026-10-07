@@ -4,7 +4,7 @@ use helix_crypto::{Address, Hash, PublicKey};
 use helix_identity::{GuardianSet, PersonhoodStatus, RecoveryRequest};
 use serde::{Deserialize, Serialize};
 
-use crate::governance::{GovernanceParams, GovernanceProposal};
+use crate::governance::{GovernanceParams, GovernanceProposal, ScheduledUpgrade, GENESIS_PROTOCOL_VERSION};
 use crate::receipt::{BalanceChange, BalanceChangeKind};
 
 /// Unbonding period in blocks — stake stays slashable for 7 days at the actual 2s block
@@ -278,6 +278,10 @@ fn unset_chain_id() -> Hash {
     Hash::ZERO
 }
 
+fn genesis_protocol_version() -> u64 {
+    GENESIS_PROTOCOL_VERSION
+}
+
 /// A whole chain state plus the height it belongs to — what a joining node fetches instead of
 /// replaying every block (backlog #194, Masterplan stage 4).
 ///
@@ -386,6 +390,14 @@ pub struct ChainState {
     pub proposals: HashMap<u64, GovernanceProposal>,
     /// Next id to assign to a new proposal.
     pub next_proposal_id: u64,
+    /// The protocol version blocks are executed under — [`GENESIS_PROTOCOL_VERSION`] until a passed
+    /// upgrade moves it on at its activation height. Every rule that changes without a reset asks
+    /// this.
+    #[serde(default = "genesis_protocol_version")]
+    pub protocol_version: u64,
+    /// The upgrade a passed proposal has scheduled and that has not taken effect yet — at most one.
+    #[serde(default)]
+    pub scheduled_upgrade: Option<ScheduledUpgrade>,
     /// ZK personhood commitments that have already been claimed by some address.
     /// A `commitment`+`proof_bytes` pair becomes public the moment it's included in
     /// a block, and the STARK circuit only proves knowledge of a secret matching
@@ -665,6 +677,8 @@ impl ChainState {
             governance_params: GovernanceParams::default(),
             proposals: HashMap::new(),
             next_proposal_id: 0,
+            protocol_version: GENESIS_PROTOCOL_VERSION,
+            scheduled_upgrade: None,
             used_personhood_commitments: std::collections::HashSet::new(),
             slashed_double_sign_incidents: std::collections::HashSet::new(),
             personhood_authorities: Vec::new(),
@@ -1227,8 +1241,8 @@ impl ChainState {
     /// incident (two operators, both freshly synced, both stalled at the first epoch after a
     /// reset).
     ///
-    /// Prefer `active_validators` — the post-rotation truth, folded into `state_hash`, and the
-    /// exact set `rotate_active_validators` produced (so a staker still serving its one-epoch
+    /// Prefer `active_validators` — the post-rotation truth (derived from hashed state at each
+    /// rotation, though not itself in `state_hash`; see the field), and the exact set `rotate_active_validators` produced (so a staker still serving its one-epoch
     /// activation delay is correctly *excluded*, unlike raw `stakers()` which would wrongly
     /// include it). Fall back to `stakers()` only when the field is empty, which on a chain
     /// launched fresh no longer happens: `GenesisConfig::build_state` seeds the genesis
@@ -1507,16 +1521,21 @@ impl ChainState {
         Some((shares as u128 * pool.total_delegated_stake as u128 / pool.total_shares as u128) as u64)
     }
 
-    /// A deterministic hash of the entire chain state — a diagnostic tool for noticing
-    /// when two nodes have (for whatever reason) computed different results from the same
-    /// block history. This is deliberately NOT a protocol-level state root: it isn't in
-    /// `BlockHeader`, isn't signed, isn't checked as part of block validity, and doesn't
-    /// gate consensus in any way. A real state root — committed in the header, verified by
-    /// every node as part of applying a block — is a materially bigger change (wire format,
-    /// full state-commitment scheme) and remains a separate, unstarted piece of work. What
-    /// this DOES give operators today: call it after applying the same block on two nodes
-    /// and compare. If they differ, something has diverged; if they match, nothing has (for
-    /// everything covered by this hash).
+    /// A deterministic hash of the entire chain state — the chain's state commitment. Every block
+    /// carries the hash of the state its predecessor produced (`BlockHeader::prev_state_root`,
+    /// #194), signed by its proposer and checked by every node that applies it: in consensus, in
+    /// the P2P block sync and in the RPC sync (#242). Two nodes whose execution diverged therefore
+    /// find out at the next block, and a snapshot can be checked against a signed header
+    /// (`HELIX_TRUSTED_CHECKPOINT`). Anything that belongs to the state goes in here, or a node
+    /// that differs in it is not caught.
+    ///
+    /// This comment said until 2026-10-07 that the hash was "deliberately NOT a protocol-level state
+    /// root … not in `BlockHeader` … a separate, unstarted piece of work" — true before #194 and
+    /// wrong for the month after it; a comment saying a check does not exist is how someone decides
+    /// it can be skipped.
+    ///
+    /// **It rehashes the whole state on every call**: one serialization of every account, pool and
+    /// proposal, asked several times per block. Nothing at a few hundred accounts, linear in them.
     ///
     /// `HashMap`/`HashSet` iteration order is not stable across processes — Rust's default
     /// hasher (SipHash) uses a random per-process seed — so bincode-serializing one
@@ -1537,6 +1556,7 @@ impl ChainState {
             voters: Vec<&'a str>,
             yes_stake: u64,
             quorum_denominator: u64,
+            activation_height: u64,
             executed: bool,
         }
 
@@ -1586,6 +1606,10 @@ impl ChainState {
             probation_seen: std::collections::BTreeSet<&'a str>,
             missed_blocks: BTreeMap<&'a str, u32>,
             jailed_until: BTreeMap<&'a str, u64>,
+            // Which rules the next block runs under, and which ones it will: a node that forgot
+            // either would execute a block under rules no other node uses.
+            protocol_version: u64,
+            scheduled_upgrade: Option<(u64, u64)>,
         }
 
         let canonical = Canonical {
@@ -1618,6 +1642,7 @@ impl ChainState {
                             voters,
                             yes_stake: p.yes_stake,
                             quorum_denominator: p.quorum_denominator,
+                            activation_height: p.activation_height,
                             executed: p.executed,
                         },
                     )
@@ -1651,10 +1676,48 @@ impl ChainState {
             probation_seen: self.probation_seen.iter().map(|a| a.as_str()).collect(),
             missed_blocks: self.missed_blocks.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
             jailed_until: self.jailed_until.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
+            protocol_version: self.protocol_version,
+            scheduled_upgrade: self.scheduled_upgrade.map(|u| (u.version, u.height)),
         };
 
         let bytes = bincode::serialize(&canonical).expect("canonical chain state serialization is infallible");
         Hash::digest(&bytes)
+    }
+
+    /// Why a build that executes protocols up to `supported` must not execute block `height` on
+    /// this state — `None` if it may.
+    ///
+    /// One cause, two moments: the chain has moved, or moves at `height`, to a protocol this build
+    /// does not know. Executing the block anyway would run it under the rules this build knows,
+    /// which are no longer the chain's — a fork, on this node alone, that no later block repairs.
+    /// Stopping is the only safe answer, and it is temporary: a release that knows the version goes
+    /// on from exactly where this one stopped.
+    pub fn refuses_block(&self, height: u64, supported: u64) -> Option<String> {
+        if self.protocol_version > supported {
+            return Some(format!(
+                "the chain runs protocol {} and this build executes protocol {supported} at most — \
+                 install a release that supports protocol {}",
+                self.protocol_version, self.protocol_version
+            ));
+        }
+        match self.scheduled_upgrade {
+            Some(upgrade) if height >= upgrade.height && upgrade.version > supported => Some(format!(
+                "the chain upgrades to protocol {} at block {} and this build executes protocol \
+                 {supported} at most — install a release that supports protocol {} to go on from \
+                 block {}",
+                upgrade.version, upgrade.height, upgrade.version, upgrade.height
+            )),
+            _ => None,
+        }
+    }
+
+    /// Take a scheduled upgrade into effect if `height` is its activation height: the version
+    /// moves on and the schedule is cleared. Returns the version that took effect.
+    pub fn activate_due_upgrade(&mut self, height: u64) -> Option<u64> {
+        let upgrade = self.scheduled_upgrade.filter(|u| u.height == height)?;
+        self.protocol_version = upgrade.version;
+        self.scheduled_upgrade = None;
+        Some(upgrade.version)
     }
 
     pub fn proposal(&self, id: u64) -> Option<&GovernanceProposal> {
@@ -1669,6 +1732,54 @@ impl ChainState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A build stops exactly where the chain leaves the protocols it knows: not before the
+    /// activation height, at it and after it, and on a chain that has already moved on — the case
+    /// of an old build restarted on new data.
+    #[test]
+    fn a_build_refuses_blocks_from_the_height_of_a_version_it_does_not_know() {
+        let mut state = ChainState::new(0);
+        assert_eq!(state.refuses_block(5, 1), None, "nothing scheduled");
+        state.scheduled_upgrade = Some(ScheduledUpgrade { version: 2, height: 100 });
+        assert_eq!(state.refuses_block(99, 1), None, "the block before runs the old rules");
+        for height in [100, 101, 5_000] {
+            let reason = state.refuses_block(height, 1).expect("refused from the activation height on");
+            assert!(reason.contains("protocol 2 at block 100"), "{reason}");
+        }
+        assert_eq!(state.refuses_block(100, 2), None, "a build that knows it goes on");
+        state.scheduled_upgrade = None;
+        state.protocol_version = 2;
+        assert!(state.refuses_block(1, 1).is_some(), "an old build on a chain already past it");
+        assert_eq!(state.refuses_block(1, 2), None);
+    }
+
+    /// The version moves at the activation height and only there, and the schedule goes with it.
+    #[test]
+    fn an_upgrade_takes_effect_at_its_height_and_only_there() {
+        let mut state = ChainState::new(0);
+        state.scheduled_upgrade = Some(ScheduledUpgrade { version: 2, height: 100 });
+        assert_eq!(state.activate_due_upgrade(99), None);
+        assert_eq!((state.protocol_version, state.scheduled_upgrade.is_some()), (1, true));
+        assert_eq!(state.activate_due_upgrade(100), Some(2));
+        assert_eq!((state.protocol_version, state.scheduled_upgrade), (2, None));
+        assert_eq!(state.activate_due_upgrade(100), None, "once");
+    }
+
+    /// Which rules a block runs under is consensus state: two nodes that disagree on the version
+    /// or on the schedule must not report the same state hash.
+    #[test]
+    fn the_protocol_version_and_the_schedule_are_in_the_state_hash() {
+        let base = ChainState::new(0);
+        let mut moved = base.clone();
+        moved.protocol_version = 2;
+        assert_ne!(base.state_hash(), moved.state_hash());
+        let mut scheduled = base.clone();
+        scheduled.scheduled_upgrade = Some(ScheduledUpgrade { version: 2, height: 100 });
+        assert_ne!(base.state_hash(), scheduled.state_hash());
+        let mut later = base.clone();
+        later.scheduled_upgrade = Some(ScheduledUpgrade { version: 2, height: 101 });
+        assert_ne!(scheduled.state_hash(), later.state_hash());
+    }
     use crate::governance::GovernanceParam;
     use helix_crypto::KeyPair;
 
@@ -1676,16 +1787,6 @@ mod tests {
         Address::from_public_key(&helix_crypto::PublicKey::from_bytes(vec![seed; 8]))
     }
 
-    /// `active_validators` must stay out of `state_hash`, and this pins that as a decision
-    /// rather than an accident. `verify_genesis_reconstruction` compares `state_hash` when a
-    /// node joins a chain, so any field added to it changes the reconstructed genesis and
-    /// locks every existing chain out of the upgrade — measured on 2026-07-21, where hashing
-    /// this one field alone would have forced a full devnet reset just to ship a bug fix.
-    ///
-    /// Whoever "fixes" this by adding the field back: read the field's doc comment first, and
-    /// be aware that doing so requires a chain reset. Nothing is lost by leaving it out —
-    /// `missed_blocks`/`jailed_until`, the state this set actually drives, remain hashed, so a
-    /// real disagreement still surfaces there within a block or two.
     /// The state hash must not depend on the order things were inserted.
     ///
     /// Every collection in `Canonical` is a `BTreeMap`/`BTreeSet` for exactly this reason, with
@@ -1788,6 +1889,16 @@ mod tests {
         assert_ne!(probation.state_hash(), reference, "probation must be hashed");
     }
 
+    /// `active_validators` must stay out of `state_hash`, and this pins that as a decision
+    /// rather than an accident. `verify_genesis_reconstruction` compares `state_hash` when a
+    /// node joins a chain, so any field added to it changes the reconstructed genesis and
+    /// locks every existing chain out of the upgrade — measured on 2026-07-21, where hashing
+    /// this one field alone would have forced a full devnet reset just to ship a bug fix.
+    ///
+    /// Whoever "fixes" this by adding the field back: read the field's doc comment first, and
+    /// be aware that doing so requires a chain reset. Nothing is lost by leaving it out —
+    /// `missed_blocks`/`jailed_until`, the state this set actually drives, remain hashed, so a
+    /// real disagreement still surfaces there within a block or two.
     #[test]
     fn active_validators_stays_out_of_the_state_hash() {
         let mut state = ChainState::new(1_000_000);
@@ -1954,6 +2065,7 @@ mod tests {
             voters: voters_a,
             yes_stake: 400,
             quorum_denominator: 1000,
+            activation_height: 0,
             executed: false,
         };
 

@@ -12,11 +12,36 @@ pub const DEFAULT_FUEL_PER_FEE_UNIT: u64 = 1;
 /// Blocks a proposal stays open for voting before it expires unexecuted.
 pub const VOTING_PERIOD_BLOCKS: u64 = 1000;
 
+/// The protocol version a chain starts at. A passed [`GovernanceParam::ProtocolUpgrade`] moves the
+/// chain to the next one at its activation height (`ChainState::protocol_version`).
+pub const GENESIS_PROTOCOL_VERSION: u64 = 1;
+
+/// How far ahead of its proposal an upgrade may take effect: 30 days at the 2-second block target.
+///
+/// Without a bound, one typo in the height — passed by a voter who read the version and not the
+/// digits — would schedule an upgrade nobody lives to see, and with one upgrade at a time it would
+/// block every other upgrade until then. There is no cancelling a scheduled upgrade; a bound is
+/// the simpler of the two ways out.
+pub const MAX_UPGRADE_LEAD_BLOCKS: u64 = 30 * 24 * 60 * 30;
+
+/// An upgrade a passed proposal has scheduled: from `height` on, blocks are executed under protocol
+/// `version`. A node whose build does not know `version` stops before that block instead of going
+/// on under the rules it knows — which would split the chain (`ChainState::refuses_block`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledUpgrade {
+    pub version: u64,
+    pub height: u64,
+}
+
 /// Protocol parameters that a governance proposal may change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GovernanceParam {
     MinValidatorStake,
     FuelPerFeeUnit,
+    /// Move the chain to protocol `new_value` — the next one — at the proposal's
+    /// `activation_height`. Changes rules without a reset: a node that does not know the version
+    /// stops at that height and says so; a node that does goes on under the new rules.
+    ProtocolUpgrade,
 }
 
 impl GovernanceParam {
@@ -24,6 +49,7 @@ impl GovernanceParam {
         match v {
             0 => Some(GovernanceParam::MinValidatorStake),
             1 => Some(GovernanceParam::FuelPerFeeUnit),
+            2 => Some(GovernanceParam::ProtocolUpgrade),
             _ => None,
         }
     }
@@ -32,6 +58,7 @@ impl GovernanceParam {
         match self {
             GovernanceParam::MinValidatorStake => 0,
             GovernanceParam::FuelPerFeeUnit => 1,
+            GovernanceParam::ProtocolUpgrade => 2,
         }
     }
 
@@ -67,6 +94,9 @@ impl GovernanceParam {
         match self {
             GovernanceParam::MinValidatorStake => MIN_VALIDATOR_STAKE / 100,
             GovernanceParam::FuelPerFeeUnit => 1,
+            // The first version a chain can move to. That it is exactly the next one is checked
+            // against the chain's state, which this static floor cannot see.
+            GovernanceParam::ProtocolUpgrade => GENESIS_PROTOCOL_VERSION + 1,
         }
     }
 
@@ -82,7 +112,10 @@ impl GovernanceParam {
 
 #[derive(Debug, Error)]
 pub enum GovernanceError {
-    #[error("proposal payload must be exactly 9 bytes: 1 param byte + 8 value bytes")]
+    #[error(
+        "proposal payload must be 1 param byte + 8 value bytes, and a protocol upgrade 8 more for \
+         its activation height"
+    )]
     MalformedProposal,
     #[error("unknown governance parameter byte {0}")]
     UnknownParam(u8),
@@ -100,14 +133,30 @@ pub fn encode_proposal(param: GovernanceParam, new_value: u64) -> Vec<u8> {
     buf
 }
 
-pub fn decode_proposal(data: &[u8]) -> Result<(GovernanceParam, u64), GovernanceError> {
-    if data.len() != 9 {
+/// Encode a protocol-upgrade proposal: 1 byte param, 8 bytes version, 8 bytes activation height
+/// (both LE).
+pub fn encode_upgrade_proposal(version: u64, activation_height: u64) -> Vec<u8> {
+    let mut buf = encode_proposal(GovernanceParam::ProtocolUpgrade, version);
+    buf.extend_from_slice(&activation_height.to_le_bytes());
+    buf
+}
+
+/// A proposal payload: the parameter, its new value, and — for a protocol upgrade, and only for
+/// it — the activation height (0 otherwise).
+pub fn decode_proposal(data: &[u8]) -> Result<(GovernanceParam, u64, u64), GovernanceError> {
+    let Some(&first) = data.first() else { return Err(GovernanceError::MalformedProposal) };
+    let param = GovernanceParam::from_u8(first).ok_or(GovernanceError::UnknownParam(first))?;
+    let expected = if param == GovernanceParam::ProtocolUpgrade { 17 } else { 9 };
+    if data.len() != expected {
         return Err(GovernanceError::MalformedProposal);
     }
-    let param = GovernanceParam::from_u8(data[0]).ok_or(GovernanceError::UnknownParam(data[0]))?;
-    let mut value_bytes = [0u8; 8];
-    value_bytes.copy_from_slice(&data[1..9]);
-    Ok((param, u64::from_le_bytes(value_bytes)))
+    let word = |at: usize| {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&data[at..at + 8]);
+        u64::from_le_bytes(bytes)
+    };
+    let activation_height = if param == GovernanceParam::ProtocolUpgrade { word(9) } else { 0 };
+    Ok((param, word(1), activation_height))
 }
 
 /// Encode a `VoteProposal` tx payload: 8 bytes proposal id (LE).
@@ -174,6 +223,13 @@ pub struct GovernanceProposal {
     /// mid-vote raises the bar too, which is right: the threshold is a share of the stakers, and
     /// they are who it must be a share of.
     pub quorum_denominator: u64,
+    /// For a [`GovernanceParam::ProtocolUpgrade`]: the first height executed under the new
+    /// version, named by the proposer and voted on with the rest — whoever votes yes agrees to the
+    /// time it leaves operators to update. Past the end of the voting period by construction
+    /// (`execute_create_proposal`), so an upgrade never takes effect while it is still being voted
+    /// on. 0 for every other parameter.
+    #[serde(default)]
+    pub activation_height: u64,
     pub executed: bool,
 }
 
@@ -197,9 +253,24 @@ mod tests {
     fn proposal_payload_roundtrips() {
         let encoded = encode_proposal(GovernanceParam::FuelPerFeeUnit, 42);
         assert_eq!(encoded.len(), 9);
-        let (param, value) = decode_proposal(&encoded).unwrap();
+        let (param, value, activation) = decode_proposal(&encoded).unwrap();
         assert_eq!(param, GovernanceParam::FuelPerFeeUnit);
         assert_eq!(value, 42);
+        assert_eq!(activation, 0);
+    }
+
+    /// An upgrade proposal carries its activation height; every other proposal is the nine bytes
+    /// it always was, and the two lengths are not interchangeable.
+    #[test]
+    fn an_upgrade_proposal_carries_its_activation_height() {
+        let encoded = encode_upgrade_proposal(2, 12_345);
+        assert_eq!(encoded.len(), 17);
+        assert_eq!(decode_proposal(&encoded).unwrap(), (GovernanceParam::ProtocolUpgrade, 2, 12_345));
+        assert!(decode_proposal(&encode_proposal(GovernanceParam::ProtocolUpgrade, 2)).is_err(), "an upgrade without a height");
+        let mut long = encode_proposal(GovernanceParam::FuelPerFeeUnit, 3);
+        long.extend_from_slice(&7u64.to_le_bytes());
+        assert!(decode_proposal(&long).is_err(), "a height on a proposal that has none");
+        assert!(decode_proposal(&[]).is_err());
     }
 
     #[test]
@@ -237,6 +308,7 @@ mod tests {
             voters: Default::default(),
             yes_stake: 0,
             quorum_denominator: 0,
+            activation_height: 0,
             executed: false,
         };
         assert!(!proposal.is_expired(10 + VOTING_PERIOD_BLOCKS));

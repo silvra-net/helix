@@ -416,6 +416,9 @@ async fn get_status(State(state): State<AppState>) -> Json<NodeStatus> {
         // (`publish_base_fee`) — the same value admission here charges, so a client that prices
         // against it gets a transaction this node will actually accept.
         base_fee_per_byte: mempool.base_fee_per_byte(),
+        protocol_version: chain.protocol_version,
+        supported_protocol_version: helix_executor::PROTOCOL_VERSION,
+        scheduled_upgrade: crate::ScheduledUpgradeResponse::of(&chain),
     })
 }
 
@@ -1139,16 +1142,18 @@ async fn get_governance_params(State(state): State<AppState>) -> Json<Value> {
     Json(json!(GovernanceParamsResponse {
         min_validator_stake_hlx: chain.governance_params.min_validator_stake as f64 / 1_000_000_000.0,
         fuel_per_fee_unit: chain.governance_params.fuel_per_fee_unit,
+        protocol_version: chain.protocol_version,
+        scheduled_upgrade: crate::ScheduledUpgradeResponse::of(&chain),
     }))
 }
 
 const DEFAULT_PROPOSALS_LIMIT: u64 = 50;
 const MAX_PROPOSALS_LIMIT: u64 = 200;
 
-/// `GET /governance/proposals?limit=<n>&offset=<n>` — proposals are never pruned
-/// (they're the permanent governance record, like blocks), so without pagination
-/// this response grows unbounded as proposals accumulate over the chain's
-/// lifetime. Same `limit`/`offset` convention as `/accounts/{address}/transactions`.
+/// `GET /governance/proposals?limit=<n>&offset=<n>` — the proposals the chain still holds.
+/// A proposal leaves the state once its voting period is over (#249), passed or not, so this
+/// lists the open ones and those closed within the last voting period. Same `limit`/`offset`
+/// convention as `/accounts/{address}/transactions`.
 async fn get_governance_proposals(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, u64>>,
@@ -4034,6 +4039,9 @@ mod tests {
             p2p_port: 0,
             p2p_public_addr: None,
             base_fee_per_byte: 1,
+            protocol_version: 1,
+            supported_protocol_version: 1,
+            scheduled_upgrade: None,
         })
         .unwrap();
         assert!(
@@ -4434,6 +4442,7 @@ mod tests {
             voters: Default::default(),
             yes_stake: 0,
             quorum_denominator: 0,
+            activation_height: 0,
             executed: false,
         }
     }

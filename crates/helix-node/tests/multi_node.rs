@@ -2497,3 +2497,91 @@ async fn a_star_around_one_hub_heals_a_one_sided_cut_and_a_restart_by_itself() {
          through the hub — the blocks it applies say so (#234)"
     );
 }
+
+const UP_A_RPC: u16 = 29_791;
+const UP_A_P2P: u16 = 29_792;
+const UP_B_RPC: u16 = 29_801;
+const UP_B_P2P: u16 = 29_802;
+
+/// A protocol upgrade passed by governance stops every node whose build does not run it, at the
+/// same block, without a fork — and a stopped node keeps serving its RPC and stays stopped across
+/// a restart (#267). Over the real binary: the upgrade is proposed and voted with the real CLI.
+///
+/// This build runs protocol 1 only, so the upgrade to 2 is one *it* does not run — exactly the
+/// position of an operator who has not updated. What the test can tell apart: without the node's
+/// own refusal, the sole validator would reach the executor's last-line assert in its production
+/// loop, and the process would end (`Block loop panicked`). It must instead stand at the block
+/// before, answering.
+#[tokio::test]
+#[ignore = "spawns 2 real node processes and runs a chain past a 1000-block voting period (~5 min at an accelerated block time) — run explicitly with --ignored"]
+async fn a_protocol_upgrade_this_build_does_not_run_stops_every_node_at_the_same_block() {
+    let _serialized = NODE_TEST_LOCK.lock().await;
+    let fast = [("HELIX_BLOCK_TIME_MS", "20")];
+    let kp = KeyPair::generate();
+    let (_key_dir, key) = temp_keyfile(&kp);
+    let key = key.to_str().unwrap().to_string();
+    let me = Address::from_public_key(&kp.public).to_string();
+
+    let a = spawn_node_with(UP_A_RPC, UP_A_P2P, None, &fast, Some(&kp));
+    wait_for_height(UP_A_RPC, 3, Duration::from_secs(60)).await;
+    let b = spawn_node_with(UP_B_RPC, UP_B_P2P, Some(UP_A_RPC), &fast, None);
+    wait_for_height(UP_B_RPC, 3, Duration::from_secs(120)).await;
+    let url = format!("http://127.0.0.1:{UP_A_RPC}");
+
+    let s = status(UP_A_RPC).await.expect("A answers");
+    assert_eq!(s["protocol_version"], 1, "{s}");
+    assert_eq!(s["supported_protocol_version"], 1, "{s}");
+    assert!(s["scheduled_upgrade"].is_null(), "{s}");
+
+    // Refused before signing: a version that skips one, and a height inside the vote. Neither
+    // costs a fee — the nonce does not move.
+    let at = s["height"].as_u64().unwrap() + 1100;
+    assert!(!run_cli(&url, &["governance", "propose-upgrade", "3", "--at-height", &at.to_string(), "--key", &key]));
+    let soon = (s["height"].as_u64().unwrap() + 10).to_string();
+    assert!(!run_cli(&url, &["governance", "propose-upgrade", "2", "--at-height", &soon, "--key", &key]));
+    assert_eq!(account(UP_A_RPC, &me).await.expect("genesis account")["nonce"], 0, "nothing was sent");
+
+    // Proposed and voted with the real CLI. A holds all the stake, so its vote passes it.
+    assert!(run_cli(&url, &["governance", "propose-upgrade", "2", "--at-height", &at.to_string(), "--key", &key]));
+    let proposed = wait_for_account(UP_A_RPC, &me, |acc| acc["nonce"].as_u64().unwrap_or(0) >= 1, Duration::from_secs(60)).await;
+    assert!(proposed, "the proposal never landed");
+    assert!(run_cli(&url, &["governance", "vote", "0", "--key", &key]));
+
+    let expected = serde_json::json!({ "version": 2, "height": at, "supported": false });
+    for port in [UP_A_RPC, UP_B_RPC] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let s = status(port).await;
+            if s.as_ref().is_some_and(|s| s["scheduled_upgrade"] == expected) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "port {port} never reported the upgrade: {s:?}");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    // Up to the block before, and no further — on both.
+    wait_for_height(UP_A_RPC, at - 1, Duration::from_secs(900)).await;
+    wait_for_height(UP_B_RPC, at - 1, Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    for port in [UP_A_RPC, UP_B_RPC] {
+        let s = status(port).await.unwrap_or_else(|| panic!("port {port} stopped answering at the halt"));
+        assert_eq!(s["height"], at - 1, "port {port} went past the activation block or fell back: {s}");
+        assert_eq!(s["protocol_version"], 1, "{s}");
+        assert_eq!(s["scheduled_upgrade"], expected, "{s}");
+    }
+    let (ha, hb) = (block_header(UP_A_RPC, at - 1).await, block_header(UP_B_RPC, at - 1).await);
+    assert_eq!(ha.as_ref().map(|h| h["hash"].clone()), hb.as_ref().map(|h| h["hash"].clone()), "same last block on both");
+    let (sa, sb) = (status(UP_A_RPC).await.unwrap(), status(UP_B_RPC).await.unwrap());
+    assert_eq!(sa["state_hash"], sb["state_hash"], "same state on both");
+
+    // A restart does not carry it past either: the schedule is in the stored state.
+    let dir = b.stop().await;
+    let _b = start_node_in(dir, UP_B_RPC, UP_B_P2P, Some(UP_A_RPC), &fast);
+    wait_until_reachable(UP_B_RPC, Duration::from_secs(60)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let s = status(UP_B_RPC).await.expect("B answers after its restart");
+    assert_eq!(s["height"], at - 1, "{s}");
+    assert_eq!(s["scheduled_upgrade"], expected, "{s}");
+    drop(a);
+}

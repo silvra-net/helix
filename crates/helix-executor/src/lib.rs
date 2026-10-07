@@ -4,7 +4,7 @@ pub mod receipt;
 pub mod state;
 
 pub use genesis::GenesisConfig;
-pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal};
+pub use governance::{GovernanceParam, GovernanceParams, GovernanceProposal, ScheduledUpgrade};
 pub use receipt::{BalanceChange, BalanceChangeKind, BlockReceipt, Receipt};
 pub use state::{
     self_bond_ratio_ok, AccountState, ChainState, DelegationPool, DEFAULT_COMMISSION_BPS,
@@ -62,6 +62,12 @@ pub const MAX_TX_FUEL: u64 = 100_000_000;
 /// behaviour than the problem warrants.
 pub const MAX_BLOCK_FUEL: u64 = 400_000_000;
 
+/// The highest protocol version this build executes. Raised in the release that implements a new
+/// version's rules — and only there: a build that claimed a version it does not implement would
+/// execute that version's blocks under the wrong rules. A chain that schedules a version above it
+/// stops this build at the activation height (`ChainState::refuses_block`) instead.
+pub const PROTOCOL_VERSION: u64 = governance::GENESIS_PROTOCOL_VERSION;
+
 /// Execute all transactions in a block, updating chain state in place, distribute fees, and mint
 /// this block's scheduled issuance (see `genesis::scheduled_block_reward`). Skips invalid
 /// transactions (records failure in receipt) rather than reverting the whole block — validators
@@ -80,6 +86,20 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
 
     let height = block.height();
     let base_fee_per_byte = block.header.base_fee_per_byte;
+
+    // A scheduled protocol upgrade takes effect before anything in its activation block runs: the
+    // whole block is executed under the new rules. A rule that changes asks `state.protocol_version`,
+    // and a version whose state needs migrating does it here, once. The node refuses to get this
+    // far with a build that does not know the version (`ChainState::refuses_block`); this is the
+    // last line, and it stops rather than going on — a block executed under rules the chain has
+    // left is a fork that no later block repairs.
+    if let Some(version) = state.activate_due_upgrade(height) {
+        assert!(
+            version <= PROTOCOL_VERSION,
+            "block {height} runs protocol {version}, and this build executes protocol {PROTOCOL_VERSION} at most — \
+             the node must refuse the block before executing it"
+        );
+    }
 
     // Every liquid balance this block moves, and why (#260). In debug builds the record is
     // checked against the balances themselves at the end of the block.
@@ -1993,7 +2013,7 @@ fn execute_create_proposal(
         );
     }
 
-    let (param, new_value) = match governance::decode_proposal(&tx.data) {
+    let (param, new_value, activation_height) = match governance::decode_proposal(&tx.data) {
         Ok(p) => p,
         Err(e) => return Receipt::failure(tx_hash, &format!("invalid proposal payload: {e}"), 0, 0),
     };
@@ -2024,6 +2044,42 @@ fn execute_create_proposal(
         }
     }
 
+    // An upgrade names the next version, and a height past the end of its own voting period. The
+    // next version only: a chain that skipped one would claim rules it never executed. Past the
+    // voting period: an upgrade that could take effect while it is still being voted on would leave
+    // the operators no time to update. Not further than `MAX_UPGRADE_LEAD_BLOCKS`: a mistyped height
+    // would otherwise block every other upgrade for as long as it says. And one at a time — two
+    // scheduled upgrades would need an order nobody voted on.
+    if let GovernanceParam::ProtocolUpgrade = param {
+        let next = state.protocol_version + 1;
+        let earliest = height + governance::VOTING_PERIOD_BLOCKS + 1;
+        let latest = height.saturating_add(governance::MAX_UPGRADE_LEAD_BLOCKS);
+        let refusal = if new_value != next {
+            Some(format!("a protocol upgrade names the next version, {next}; this one names {new_value}"))
+        } else if let Some(upgrade) = state.scheduled_upgrade {
+            Some(format!(
+                "an upgrade to protocol {} at block {} is already scheduled — one at a time",
+                upgrade.version, upgrade.height
+            ))
+        } else if activation_height < earliest {
+            Some(format!(
+                "the activation height must come after the voting period ends: block {earliest} at \
+                 the earliest, this one names {activation_height}"
+            ))
+        } else if activation_height > latest {
+            Some(format!(
+                "the activation height may be at most {} blocks ahead: block {latest} at the latest, \
+                 this one names {activation_height}",
+                governance::MAX_UPGRADE_LEAD_BLOCKS
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            return Receipt::failure(tx_hash, &reason, 0, 0);
+        }
+    }
+
     let id = state.next_proposal_id;
     state.next_proposal_id += 1;
     state.set_proposal(GovernanceProposal {
@@ -2037,6 +2093,7 @@ fn execute_create_proposal(
         // The starting denominator. It is raised at every vote and never lowered — see the
         // field's doc comment for why it needs both directions.
         quorum_denominator: state.total_staked(),
+        activation_height,
         executed: false,
     });
 
@@ -2124,6 +2181,22 @@ fn execute_vote_proposal(
             GovernanceParam::FuelPerFeeUnit => {
                 state.governance_params.fuel_per_fee_unit = proposal.new_value;
                 proposal.executed = true;
+            }
+            GovernanceParam::ProtocolUpgrade => {
+                // Re-checked at passing, as the minimum stake's ceiling is: up to
+                // `VOTING_PERIOD_BLOCKS` after the proposal, another upgrade may have been
+                // scheduled or have taken effect. Not passing is then the safe side — the proposal
+                // stays open, and expires.
+                if state.scheduled_upgrade.is_none()
+                    && proposal.new_value == state.protocol_version + 1
+                    && proposal.activation_height > height
+                {
+                    state.scheduled_upgrade = Some(governance::ScheduledUpgrade {
+                        version: proposal.new_value,
+                        height: proposal.activation_height,
+                    });
+                    proposal.executed = true;
+                }
             }
         }
     }
@@ -4743,6 +4816,91 @@ mod tests {
 
         let tx = signed_governance_tx(&full_kp, &full, TxType::CreateProposal, data(), 0, 10_000);
         assert!(execute_transaction(&mut state, &tx, &validator, 0, 0).success, "at the minimum it may");
+    }
+
+    /// One proposer holding all the stake there is, at the chain's minimum, so its own vote passes
+    /// whatever it proposes.
+    fn sole_staker(state: &mut ChainState) -> (KeyPair, Address) {
+        let kp = KeyPair::generate();
+        let addr = Address::from_public_key(&kp.public);
+        state.governance_params.min_validator_stake = 1;
+        state.update_account(&addr, |acc| {
+            acc.balance = 1_000_000;
+            acc.staked = 1;
+        });
+        (kp, addr)
+    }
+
+    fn propose_upgrade(state: &mut ChainState, kp: &KeyPair, from: &Address, nonce: u64, version: u64, at: u64, height: u64) -> Receipt {
+        let data = governance::encode_upgrade_proposal(version, at);
+        let tx = signed_governance_tx(kp, from, TxType::CreateProposal, data, nonce, 10_000);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        execute_transaction(state, &tx, &validator, height, 0)
+    }
+
+    fn vote(state: &mut ChainState, kp: &KeyPair, from: &Address, nonce: u64, id: u64, height: u64) -> Receipt {
+        let tx = signed_governance_tx(kp, from, TxType::VoteProposal, governance::encode_vote(id), nonce, 10_000);
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        execute_transaction(state, &tx, &validator, height, 0)
+    }
+
+    /// An upgrade names the next version — never one further — and an activation height after the
+    /// end of its own voting period, so it never takes effect while it is still being voted on.
+    #[test]
+    fn an_upgrade_names_the_next_version_and_a_height_after_its_vote() {
+        let mut state = ChainState::new(0);
+        let (kp, me) = sole_staker(&mut state);
+        let after_vote = 100 + governance::VOTING_PERIOD_BLOCKS + 1;
+        let skip = propose_upgrade(&mut state, &kp, &me, 0, 3, after_vote, 100);
+        assert!(!skip.success && skip.error.as_deref().unwrap_or("").contains("next version, 2"), "{:?}", skip.error);
+        let early = propose_upgrade(&mut state, &kp, &me, 1, 2, after_vote - 1, 100);
+        assert!(!early.success && early.error.as_deref().unwrap_or("").contains("after the voting period"), "{:?}", early.error);
+        let too_far = 100 + governance::MAX_UPGRADE_LEAD_BLOCKS + 1;
+        let far = propose_upgrade(&mut state, &kp, &me, 2, 2, too_far, 100);
+        assert!(!far.success && far.error.as_deref().unwrap_or("").contains("at most"), "{:?}", far.error);
+        assert!(state.proposals.is_empty(), "nothing refused was recorded");
+        assert!(propose_upgrade(&mut state, &kp, &me, 3, 2, too_far - 1, 100).success, "the bound itself is allowed");
+        let ok = propose_upgrade(&mut state, &kp, &me, 4, 2, after_vote, 100);
+        assert!(ok.success, "{:?}", ok.error);
+        assert_eq!(state.proposal(1).map(|p| (p.new_value, p.activation_height)), Some((2, after_vote)));
+        assert_eq!(state.scheduled_upgrade, None, "proposed is not scheduled");
+    }
+
+    /// Passing schedules the upgrade; the chain stays on its version up to the block before the
+    /// activation height. And a build that does not know the version stops at that block instead
+    /// of executing it under the rules it knows — the last line behind the node's own refusal.
+    #[test]
+    #[should_panic(expected = "the node must refuse the block before executing it")]
+    fn a_passed_upgrade_is_scheduled_and_a_build_without_it_stops_at_its_height() {
+        let mut state = ChainState::new(0);
+        let (kp, me) = sole_staker(&mut state);
+        let at = 10 + governance::VOTING_PERIOD_BLOCKS + 1;
+        assert!(propose_upgrade(&mut state, &kp, &me, 0, 2, at, 10).success);
+        assert!(vote(&mut state, &kp, &me, 1, 0, 11).success);
+        assert_eq!(state.scheduled_upgrade, Some(governance::ScheduledUpgrade { version: 2, height: at }));
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        execute_block(&mut state, &empty_block(&validator, at - 1));
+        assert_eq!(state.protocol_version, 1, "the block before the activation height runs the old rules");
+        assert!(state.scheduled_upgrade.is_some());
+        execute_block(&mut state, &empty_block(&validator, at));
+    }
+
+    /// One upgrade at a time, checked again when a proposal passes: a second proposal for the same
+    /// version, made before the first passed, reaches its quorum and is not executed — it stays
+    /// open, and expires.
+    #[test]
+    fn a_second_upgrade_does_not_pass_while_one_is_scheduled() {
+        let mut state = ChainState::new(0);
+        let (kp, me) = sole_staker(&mut state);
+        let at = 10 + governance::VOTING_PERIOD_BLOCKS + 1;
+        assert!(propose_upgrade(&mut state, &kp, &me, 0, 2, at, 10).success);
+        assert!(propose_upgrade(&mut state, &kp, &me, 1, 2, at + 50, 10).success);
+        assert!(vote(&mut state, &kp, &me, 2, 0, 11).success);
+        assert!(vote(&mut state, &kp, &me, 3, 1, 11).success, "the vote itself is recorded");
+        assert!(!state.proposal(1).unwrap().executed, "the second did not pass");
+        assert_eq!(state.scheduled_upgrade, Some(governance::ScheduledUpgrade { version: 2, height: at }), "the first stands");
+        let third = propose_upgrade(&mut state, &kp, &me, 4, 2, at + 100, 12);
+        assert!(third.error.as_deref().unwrap_or("").contains("already scheduled"), "{:?}", third.error);
     }
 
     /// The bar is read when the proposal is made, so a vote that moves the minimum moves it too —

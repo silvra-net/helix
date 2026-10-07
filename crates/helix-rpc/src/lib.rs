@@ -388,6 +388,10 @@ pub struct PendingRecoveryKey {
 pub struct GovernanceParamsResponse {
     pub min_validator_stake_hlx: f64,
     pub fuel_per_fee_unit: u64,
+    /// The protocol version blocks are executed under (#267). Moved only by a passed
+    /// `ProtocolUpgrade` proposal, at its activation height.
+    pub protocol_version: u64,
+    pub scheduled_upgrade: Option<ScheduledUpgradeResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +423,10 @@ pub struct GovernanceProposalResponse {
     /// proposal was indistinguishable from a live one over this API: the wallet offered a "Vote
     /// yes" button on proposals whose votes the chain had been rejecting for thousands of blocks.
     pub expires_at_height: u64,
+    /// For a `ProtocolUpgrade`: the first height executed under `new_value` if it passes.
+    /// Absent for every other parameter, which takes effect in the block that passes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_height: Option<u64>,
 }
 
 impl From<&helix_executor::GovernanceProposal> for GovernanceProposalResponse {
@@ -438,6 +446,9 @@ impl From<&helix_executor::GovernanceProposal> for GovernanceProposalResponse {
                 / 1_000_000_000.0,
             expires_at_height: p.created_at_height
                 + helix_executor::governance::VOTING_PERIOD_BLOCKS,
+            activation_height: (p.param
+                == helix_executor::governance::GovernanceParam::ProtocolUpgrade)
+                .then_some(p.activation_height),
         }
     }
 }
@@ -636,4 +647,33 @@ pub struct NodeStatus {
     /// tx.size_bytes()`, and paying less means the transaction is rejected — so a flat,
     /// hardcoded fee is only ever right until the network gets busy enough to move this.
     pub base_fee_per_byte: u64,
+    /// The protocol version the chain's blocks are executed under (#267).
+    pub protocol_version: u64,
+    /// The highest protocol version this build executes. Below `scheduled_upgrade.version`, this
+    /// node stops at the activation height.
+    pub supported_protocol_version: u64,
+    /// An upgrade passed by governance and not yet in effect.
+    pub scheduled_upgrade: Option<ScheduledUpgradeResponse>,
+}
+
+/// A protocol upgrade governance has passed and the chain has not yet reached (#267).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledUpgradeResponse {
+    /// The protocol version blocks are executed under from `height` on.
+    pub version: u64,
+    /// The first height executed under `version`.
+    pub height: u64,
+    /// Whether **this** node's build executes `version`. `false` means it stops before executing
+    /// block `height` and waits there, serving its RPC, until the binary is replaced.
+    pub supported: bool,
+}
+
+impl ScheduledUpgradeResponse {
+    pub fn of(chain: &helix_executor::ChainState) -> Option<Self> {
+        chain.scheduled_upgrade.map(|u| ScheduledUpgradeResponse {
+            version: u.version,
+            height: u.height,
+            supported: u.version <= helix_executor::PROTOCOL_VERSION,
+        })
+    }
 }

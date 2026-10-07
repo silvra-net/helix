@@ -237,6 +237,13 @@ pub enum P2PCommand {
     /// so it won every `best_blocksync_peer` choice, which is precisely the wrong peer to prefer
     /// when a real validator needs to catch up.
     BlocksyncPeerOnAnotherChain(String),
+    /// This node executes nothing from this block on: the chain moves there to a protocol its
+    /// build does not run (#267). Every block it fetched from that height would be thrown away, so
+    /// the catch-up driver stops asking — otherwise a node left on an old release pulls a batch
+    /// from its peers on every tick for as long as it stays installed, and on a hub like V1 that is
+    /// the link the whole network shares. Kept until the process ends: the release that runs the
+    /// protocol is a new process.
+    StopCatchingUpAt(u64),
     /// A synced batch is on disk and `tip_height` has moved — ask for the next one now instead of
     /// waiting out the rest of `blocksync_interval`.
     ///
@@ -611,6 +618,8 @@ impl P2PService {
         let mut blocksync_progress_tip: u64 = 0;
         let mut blocksync_stall_ticks: u32 = 0;
         let mut blocksync_stall_reported = false;
+        // The height this node executes nothing from — see `P2PCommand::StopCatchingUpAt`.
+        let mut blocksync_halt: Option<u64> = None;
         if let Some(addr) = &config.public_addr {
             known_addrs.insert(addr.clone());
         }
@@ -1296,6 +1305,12 @@ impl P2PService {
                         *ticks > 0
                     });
                     let our_tip = tip_height.load(Ordering::Relaxed);
+                    // Stopped at a protocol upgrade: nothing to ask for, and the stall report
+                    // below would name a cause that is not the one (#267).
+                    if blocksync_halted(our_tip, blocksync_halt) {
+                        blocksync_stall_ticks = 0;
+                        continue;
+                    }
                     request_blocks_if_behind(
                         &mut swarm,
                         &peer_tips,
@@ -1716,6 +1731,18 @@ impl P2PService {
                                 Err(_) => warn!(peer = %peer, "Unparseable peer id in block-sync report"),
                             }
                         }
+                        P2PCommand::StopCatchingUpAt(height) => {
+                            // The lowest wins: a later report cannot reopen a height an earlier one
+                            // closed.
+                            if blocksync_halt.is_none_or(|h| height < h) {
+                                blocksync_halt = Some(height);
+                                info!(
+                                    height,
+                                    "No longer asking peers for blocks from this height — this \
+                                     build does not run the protocol the chain moves to there"
+                                );
+                            }
+                        }
                         P2PCommand::BlocksyncBatchRejected(peer) => {
                             // The node verified the batch and threw it away. From the service's own
                             // view that is indistinguishable from success — it only ever sees a
@@ -1738,6 +1765,9 @@ impl P2PService {
                             // only: this races the 5s announce loop, and a command that waited in
                             // the queue must never walk the tip backwards.
                             let our_tip = tip_height.fetch_max(new_tip, Ordering::Relaxed).max(new_tip);
+                            if blocksync_halted(our_tip, blocksync_halt) {
+                                continue;
+                            }
                             request_blocks_if_behind(
                                 &mut swarm,
                                 &peer_tips,
@@ -2775,6 +2805,12 @@ fn best_blocksync_peer<F: Fn(&PeerId) -> bool>(
         .map(|(peer, range)| (*peer, range.tip))
 }
 
+/// Whether the catch-up driver is stopped at a protocol upgrade: the next block it would ask for
+/// is one this node will not execute (`P2PCommand::StopCatchingUpAt`).
+fn blocksync_halted(our_tip: u64, halt: Option<u64>) -> bool {
+    halt.is_some_and(|h| our_tip.saturating_add(1) >= h)
+}
+
 /// Send one block-sync request if we are behind and a usable peer is available. Returns whether
 /// a request went out. No-op while one is already in flight.
 ///
@@ -3125,6 +3161,22 @@ fn note_dropped_peer_transaction() {
              excess instead of stalling the network loop. Votes, proposals and blocks are never \
              dropped; a transaction dropped here is still held by the peers that sent it."
         );
+    }
+}
+
+#[cfg(test)]
+mod blocksync_halt_tests {
+    use super::blocksync_halted;
+
+    /// Asking continues up to the block before the stop and not for the stop itself (#267), and
+    /// without a stop it never halts.
+    #[test]
+    fn catching_up_stops_at_the_block_this_node_will_not_execute() {
+        assert!(!blocksync_halted(98, Some(100)), "block 99 is still one to fetch");
+        assert!(blocksync_halted(99, Some(100)), "block 100 is the stop");
+        assert!(blocksync_halted(150, Some(100)));
+        assert!(!blocksync_halted(u64::MAX - 1, None));
+        assert!(blocksync_halted(u64::MAX, Some(u64::MAX)), "no overflow at the end of the range");
     }
 }
 

@@ -2,7 +2,10 @@ use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use helix_core::{Transaction, TxType};
 use helix_crypto::{Address, Signature};
-use helix_executor::governance::{encode_proposal, encode_vote, GovernanceParam};
+use helix_executor::governance::{
+    encode_proposal, encode_upgrade_proposal, encode_vote, GovernanceParam, MAX_UPGRADE_LEAD_BLOCKS,
+    VOTING_PERIOD_BLOCKS,
+};
 
 use crate::fee::price_and_sign;
 use crate::passphrase::Signer;
@@ -66,7 +69,24 @@ pub enum GovernanceCmd {
         new_value: String,
         #[command(flatten)]
         signer: Signer,
-        /// Fee in nano-HLX (default: 10000)
+        /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
+        #[arg(long)]
+        fee: Option<u64>,
+    },
+    /// Propose moving the chain to the next protocol version at a block height (requires a stake
+    /// of at least the chain's current minimum validator stake)
+    ///
+    /// A node whose build does not execute that version stops before the activation height and
+    /// waits there until it is updated; a node that does goes on under the new rules. No reset.
+    ProposeUpgrade {
+        /// The protocol version to move to — the chain's current one plus one
+        version: u64,
+        /// First block executed under the new version. At least one voting period (1000 blocks)
+        /// after the proposal, at most 30 days ahead; leave the operators time to update
+        #[arg(long)]
+        at_height: u64,
+        #[command(flatten)]
+        signer: Signer,
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -77,7 +97,6 @@ pub enum GovernanceCmd {
         proposal_id: u64,
         #[command(flatten)]
         signer: Signer,
-        /// Fee in nano-HLX (default: 10000)
         /// Fee in nano-HLX. Omit to price it against the chain's current base fee.
         #[arg(long)]
         fee: Option<u64>,
@@ -97,6 +116,9 @@ pub async fn run(cmd: GovernanceCmd, node: &str) -> Result<()> {
     match cmd {
         GovernanceCmd::Propose { param, new_value, signer, fee } => {
             propose(param, new_value, signer, fee, node).await
+        }
+        GovernanceCmd::ProposeUpgrade { version, at_height, signer, fee } => {
+            propose_upgrade(version, at_height, signer, fee, node).await
         }
         GovernanceCmd::Vote { proposal_id, signer, fee } => {
             vote(proposal_id, signer, fee, node).await
@@ -148,6 +170,108 @@ async fn propose(
     println!();
     println!("  Note: creating a proposal does not vote on it. Cast your own vote with");
     println!("        `helix governance vote <id>` once the proposal is on-chain.");
+
+    let res = submit(&tx, node).await?;
+    println!();
+    super::report_submitted(&res);
+    Ok(())
+}
+
+/// What the chain would refuse, said before anything is signed.
+///
+/// The executor checks the same three things (`execute_create_proposal`), and a refusal there
+/// costs a fee and a block — the same reasoning as `on_chain_value`. Checked against the node's
+/// `/status`, which is a read and not a promise: the transaction lands some blocks later, so the
+/// earliest height carries a margin of a few blocks rather than the bare minimum.
+fn upgrade_refusal(status: &serde_json::Value, version: u64, at_height: u64) -> Option<String> {
+    let Some(current) = status["protocol_version"].as_u64() else {
+        return Some(
+            "this node does not report a protocol version — it predates protocol upgrades, and its \
+             chain cannot schedule one"
+                .to_string(),
+        );
+    };
+    let height = status["height"].as_u64().unwrap_or(0);
+    if let Some(u) = status.get("scheduled_upgrade").filter(|u| !u.is_null()) {
+        return Some(format!(
+            "an upgrade to protocol {} at block {} is already scheduled — one at a time",
+            u["version"], u["height"]
+        ));
+    }
+    if version != current + 1 {
+        return Some(format!(
+            "the chain runs protocol {current}; an upgrade names the next version, {}, not {version}",
+            current + 1
+        ));
+    }
+    // The proposal lands at `height + 1` at the soonest; give it a few blocks of travel.
+    let earliest = height + 1 + UPGRADE_HEIGHT_MARGIN + VOTING_PERIOD_BLOCKS + 1;
+    if at_height < earliest {
+        return Some(format!(
+            "block {at_height} comes before the vote can end: the chain is at {height}, a proposal is \
+             open for {VOTING_PERIOD_BLOCKS} blocks — name block {earliest} or later, and leave the \
+             operators time to update"
+        ));
+    }
+    let latest = height + 1 + MAX_UPGRADE_LEAD_BLOCKS;
+    if at_height > latest {
+        return Some(format!(
+            "block {at_height} is more than {MAX_UPGRADE_LEAD_BLOCKS} blocks (30 days at the \
+             2-second target) ahead; the chain refuses it — name block {latest} or earlier"
+        ));
+    }
+    None
+}
+
+/// Blocks between reading the chain's height and the proposal landing in one.
+const UPGRADE_HEIGHT_MARGIN: u64 = 20;
+
+async fn propose_upgrade(
+    version: u64,
+    at_height: u64,
+    signer: Signer,
+    fee: Option<u64>,
+    node: &str,
+) -> Result<()> {
+    // Before the passphrase prompt: a refusal should cost nothing.
+    let status = super::get_json(node, "/status", "read the chain's protocol version").await?;
+    if let Some(reason) = upgrade_refusal(&status, version, at_height) {
+        return Err(anyhow!("Not sent: {reason}"));
+    }
+    let height = status["height"].as_u64().unwrap_or(0);
+
+    let (kf, kp) = signer.unlock()?;
+    let from = Address::from_str(&kf.address)
+        .map_err(|e| anyhow::anyhow!("Invalid sender address: {}", e))?;
+
+    let nonce = super::fetch_nonce(node, &kf.address).await?;
+
+    let mut tx = Transaction {
+        version: 1,
+        tx_type: TxType::CreateProposal,
+        from: from.clone(),
+        to: None,
+        amount: 0,
+        fee: 0, // replaced by price_and_sign below
+        nonce,
+        data: encode_upgrade_proposal(version, at_height),
+        crypto_version: kp.scheme,
+        chain_id: super::resolve_chain_id(node).await?,
+
+        signature: Signature::from_bytes(vec![]),
+        public_key: Some(kp.public.clone()),
+    };
+    price_and_sign(&mut tx, fee, &kp, node).await?;
+
+    println!("Proposing protocol upgrade from {}", kf.address);
+    println!("  Version   : {version}");
+    println!("  At height : {at_height} (the chain is at {height}, {} blocks from now)", at_height - height);
+    println!("  Fee       : {} nano-HLX", tx.fee);
+    println!("  Nonce     : {nonce}");
+    println!();
+    println!("  If it passes, every node whose build does not run protocol {version} stops before");
+    println!("  block {at_height} and waits there until it is updated. Release that build first.");
+    println!("  Creating a proposal does not vote on it: `helix governance vote <id>`.");
 
     let res = submit(&tx, node).await?;
     println!();
@@ -229,7 +353,38 @@ async fn params(node: &str) -> Result<()> {
         "  fuel_per_fee_unit   : {}",
         res["fuel_per_fee_unit"].as_u64().unwrap_or(0)
     );
+    // Older nodes do not report it; leaving the line out beats printing a version they never had.
+    if let Some(version) = res["protocol_version"].as_u64() {
+        println!("  protocol_version    : {version}");
+    }
+    if let Some(u) = res.get("scheduled_upgrade").filter(|u| !u.is_null()) {
+        println!("{}", scheduled_upgrade_line(u));
+    }
     Ok(())
+}
+
+/// The scheduled upgrade, and whether the build answering runs it — said as what it means for
+/// that node, because a `false` there is a stop at a known height.
+fn scheduled_upgrade_line(u: &serde_json::Value) -> String {
+    let base = format!("  scheduled upgrade   : protocol {} from block {}", u["version"], u["height"]);
+    match u["supported"].as_bool() {
+        Some(false) => format!(
+            "{base} — the node answering does NOT run it and stops before that block until updated"
+        ),
+        _ => base,
+    }
+}
+
+/// The chain's current height, or `None` if it cannot be had.
+///
+/// Best-effort on purpose: it decides only whether a proposal is *labelled* expired, and a
+/// listing that fails because the status line could not be filled in would be a worse trade than
+/// a listing that says "open" without knowing.
+async fn chain_height(node: &str) -> Option<u64> {
+    super::get_json(node, "/status", "read the chain height")
+        .await
+        .ok()
+        .and_then(|v| v["height"].as_u64())
 }
 
 /// One proposal, printed so the two questions a voter actually has are answerable from it: how
@@ -247,23 +402,14 @@ async fn params(node: &str) -> Result<()> {
 /// deadline: `VOTING_PERIOD_BLOCKS` is a protocol constant no client knows, so an expired proposal
 /// printed exactly like a live one. Both now come from the node (`quorum_stake_hlx`,
 /// `expires_at_height`); `chain_height`, when known, turns the second into a plain verdict.
-/// The chain's current height, or `None` if it cannot be had.
-///
-/// Best-effort on purpose: it decides only whether a proposal is *labelled* expired, and a
-/// listing that fails because the status line could not be filled in would be a worse trade than
-/// a listing that says "open" without knowing.
-async fn chain_height(node: &str) -> Option<u64> {
-    super::get_json(node, "/status", "read the chain height")
-        .await
-        .ok()
-        .and_then(|v| v["height"].as_u64())
-}
-
 fn print_proposal(p: &serde_json::Value, chain_height: Option<u64>) {
     println!("Proposal #{}", p["id"]);
     println!("  Proposer   : {}", p["proposer"].as_str().unwrap_or("?"));
     println!("  Param      : {}", p["param"].as_str().unwrap_or("?"));
     println!("  New value  : {}", p["new_value"]);
+    if let Some(at) = p["activation_height"].as_u64() {
+        println!("  Takes effect at height {at}, if it passes");
+    }
     println!("  Created at : height {}", p["created_at_height"]);
     let yes = p["yes_stake_hlx"].as_f64().unwrap_or(0.0);
     match p["quorum_stake_hlx"].as_f64() {
@@ -297,6 +443,48 @@ async fn submit(tx: &Transaction, node: &str) -> Result<serde_json::Value> {
 mod tests {
     use super::*;
     use helix_executor::genesis::MIN_VALIDATOR_STAKE;
+    use serde_json::json;
+
+    /// What the chain would refuse is refused before signing — and what it accepts is let
+    /// through. Every bound is checked on both sides, so a check that refuses everything fails here
+    /// as surely as one that refuses nothing.
+    #[test]
+    fn an_upgrade_the_chain_would_refuse_is_not_signed() {
+        let status = json!({ "height": 5000, "protocol_version": 1, "scheduled_upgrade": null });
+        let earliest = 5000 + 1 + UPGRADE_HEIGHT_MARGIN + VOTING_PERIOD_BLOCKS + 1;
+        let latest = 5000 + 1 + MAX_UPGRADE_LEAD_BLOCKS;
+
+        assert_eq!(upgrade_refusal(&status, 2, earliest), None);
+        assert_eq!(upgrade_refusal(&status, 2, latest), None);
+        let skip = upgrade_refusal(&status, 3, earliest).unwrap();
+        assert!(skip.contains("next version, 2"), "{skip}");
+        assert!(upgrade_refusal(&status, 1, earliest).is_some(), "the current version is no upgrade");
+        let early = upgrade_refusal(&status, 2, earliest - 1).unwrap();
+        assert!(early.contains(&earliest.to_string()), "the refusal names the earliest block: {early}");
+        let far = upgrade_refusal(&status, 2, latest + 1).unwrap();
+        assert!(far.contains(&latest.to_string()), "the refusal names the latest block: {far}");
+
+        let scheduled = json!({
+            "height": 5000, "protocol_version": 1,
+            "scheduled_upgrade": { "version": 2, "height": 9000, "supported": true },
+        });
+        let busy = upgrade_refusal(&scheduled, 2, earliest).unwrap();
+        assert!(busy.contains("already scheduled"), "{busy}");
+
+        let old_node = json!({ "height": 5000 });
+        assert!(upgrade_refusal(&old_node, 2, earliest).unwrap().contains("predates"));
+    }
+
+    /// A build that does not run the scheduled version says so — that line is the one an operator
+    /// must not miss.
+    #[test]
+    fn a_scheduled_upgrade_this_node_does_not_run_is_said_plainly() {
+        let unsupported = json!({ "version": 2, "height": 9000, "supported": false });
+        assert!(scheduled_upgrade_line(&unsupported).contains("does NOT run it"));
+        let supported = json!({ "version": 2, "height": 9000, "supported": true });
+        let line = scheduled_upgrade_line(&supported);
+        assert!(line.contains("protocol 2 from block 9000") && !line.contains("NOT"), "{line}");
+    }
 
     /// Ties the CLI's unit handling to the chain's own floor check rather than restating the
     /// conversion factor — a test that recomputes `typed * 1e9` would pass against any

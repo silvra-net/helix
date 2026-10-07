@@ -1918,6 +1918,35 @@ async fn rebuild_compact_block(
     rebuilt
 }
 
+/// Whether this build may apply, propose or vote on block `height` (#267): `Some(reason)` when the
+/// chain has moved, or moves at `height`, to a protocol this build does not execute
+/// (`ChainState::refuses_block`). One rule for every path that takes a block — the consensus commit,
+/// both syncs, proposing and voting — because a single path that forgot it would carry this node
+/// past the activation height under the old rules: a fork, on this node alone.
+///
+/// Every path asks on every attempt, so the reason is logged at most once a minute: an operator
+/// needs the line, not a flood of it. Nothing here touches the data — a release that knows the
+/// version goes on from exactly this block.
+fn upgrade_refusal(state: &ChainState, height: u64) -> Option<String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_LOGGED: AtomicU64 = AtomicU64::new(0);
+    let reason = state.refuses_block(height, helix_executor::PROTOCOL_VERSION)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_LOGGED.load(Ordering::Relaxed);
+    if now >= last.saturating_add(60) && LAST_LOGGED.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        error!(
+            height,
+            "{reason}. This node stops at this block: it applies, proposes and votes on nothing from \
+             here until it runs such a release. Its data stays as it is — the new release goes on \
+             from here, nothing needs resetting."
+        );
+    }
+    Some(reason)
+}
+
 /// Fold a proposal from a peer into the engine and act on the outcome.
 ///
 /// Extracted so the gossip path and the round-sync pull cannot drift apart: both must cast this
@@ -1937,6 +1966,14 @@ async fn apply_peer_proposal(
     signing_guard: &Arc<std::sync::Mutex<SigningGuard>>,
     tip_certificate: &Arc<RwLock<TipCertificate>>,
 ) {
+    // A build that does not know the protocol of this height votes on nothing at it (#267). The
+    // decisive refusal is the one in `apply_finalized_block`, under the height lock: read here, the
+    // state may still be a block short of the one that scheduled the upgrade, and a prevote cast in
+    // that window is harmless — it does not execute anything.
+    if upgrade_refusal(&*chain_state.read().await, proposal.block.height()).is_some() {
+        return;
+    }
+
     // What this node's own execution produced for the block below the proposed one — the number
     // the proposer has to agree with (#194). `None` whenever this node cannot say, which is not a
     // rare corner: a node that is behind, or one whose store has moved past its executed state,
@@ -2627,6 +2664,13 @@ async fn apply_synced_batch(
         let mut s = store.write().await;
         let mut cs = chain_state.write().await;
         for block in &batch.blocks[..proven] {
+            // The batch is valid; this build is what cannot go on (#267). Stop without blaming
+            // the peer — what applied before this block stays — and stop asking: every later
+            // batch would end here too.
+            if upgrade_refusal(&cs, block.height()).is_some() {
+                let _ = p2p_tx.try_send(P2PCommand::StopCatchingUpAt(block.height()));
+                break;
+            }
             let receipt = execute_block(&mut cs, block);
             cs.applied_height = block.height();
             if let Err(e) = s.put_block(block.clone()) {
@@ -3856,6 +3900,15 @@ async fn apply_finalized_block(
         return;
     }
 
+    // A finalized block is still not one this build may execute if the chain has left its
+    // protocol (#267): applying it under the old rules would be this node's own fork. Asked here,
+    // under the height lock and after the chain check, because only here is the state known to
+    // be the one just below this block — the block before it may be the one that scheduled the
+    // upgrade.
+    if upgrade_refusal(&*chain_state.read().await, height).is_some() {
+        return;
+    }
+
     *applied_guard = height;
 
     // `should_broadcast == false` means this block arrived already fully committed
@@ -4160,6 +4213,35 @@ enum HealthVerdict {
     Validating { last_signed: u64, age: u64 },
     NotValidating { last_signed: Option<u64>, stalled_secs: Option<u64> },
     Settling,
+}
+
+/// What an operator must hear about a scheduled protocol upgrade before it takes effect (#267).
+///
+/// `Ok` — this build runs it, said once: nothing to do. `Err` — it does not, and the node will stop
+/// before block `upgrade.height` until it runs a release that does; said every heartbeat until
+/// then, with the blocks left, because it is the one line in the log that asks for something by a
+/// deadline. After the height, `upgrade_refusal` speaks instead.
+fn upgrade_notice(
+    upgrade: helix_executor::ScheduledUpgrade,
+    supported: u64,
+    height: u64,
+) -> Result<String, String> {
+    if upgrade.version <= supported {
+        Ok(format!(
+            "Protocol upgrade scheduled: protocol {} from block {} — this build runs it, nothing to do",
+            upgrade.version, upgrade.height
+        ))
+    } else {
+        Err(format!(
+            "Protocol upgrade scheduled: protocol {} from block {}, {} block(s) from now — this build \
+             runs protocol {supported} at most and STOPS before that block until it is updated. \
+             Install a release that runs protocol {} before then; the data stays, nothing is reset.",
+            upgrade.version,
+            upgrade.height,
+            upgrade.height.saturating_sub(height),
+            upgrade.version,
+        ))
+    }
 }
 
 /// Pure verdict for the health heartbeat. `last_signed` is `Some((height, age_secs))` if this node
@@ -4579,6 +4661,8 @@ async fn validator_health_loop(
     let mut last_production_ticks = production_ticks.load(Ordering::Relaxed);
     let mut stall_beats = 0u32;
     let mut reported_dead = false;
+    // The supported upgrade last announced, so that one is said once (#267).
+    let mut announced_upgrade: Option<helix_executor::ScheduledUpgrade> = None;
 
     loop {
         ticker.tick().await;
@@ -4596,7 +4680,7 @@ async fn validator_health_loop(
         let peers = peer_count.load(Ordering::Relaxed);
         let addr_str = address.to_string();
 
-        let (staked, in_active, jailed_until) = {
+        let (staked, in_active, jailed_until, scheduled_upgrade) = {
             let cs = chain_state.read().await;
             let staked = cs.stakers().iter().any(|(a, _)| a == &address);
             // An empty `active_validators` means the chain has never rotated yet (genesis /
@@ -4605,8 +4689,20 @@ async fn validator_health_loop(
             let in_active =
                 cs.active_validators.is_empty() || cs.active_validators.contains(&address);
             let jailed = cs.jailed_until.get(&addr_str).copied().filter(|&h| h > height);
-            (staked, in_active, jailed)
+            (staked, in_active, jailed, cs.scheduled_upgrade)
         };
+
+        // Before the health verdict: a stop at a known height outranks how this node is doing now.
+        if let Some(upgrade) = scheduled_upgrade {
+            match upgrade_notice(upgrade, helix_executor::PROTOCOL_VERSION, height) {
+                Ok(line) if announced_upgrade != Some(upgrade) => {
+                    announced_upgrade = Some(upgrade);
+                    info!("{line}");
+                }
+                Ok(_) => {}
+                Err(line) => warn!("{line}"),
+            }
+        }
 
         // Scan the recent window for my own co-signature only when I'm an active validator —
         // that's the only verdict that depends on it. last_commit in block h carries the precommits
@@ -5232,6 +5328,11 @@ async fn block_production_loop(
                 state_height,
                 "Not proposing: this node's state has not caught up with its own store yet"
             );
+            continue;
+        }
+
+        // Nothing proposed at a height whose protocol this build does not execute (#267).
+        if upgrade_refusal(&*chain_state.read().await, prev_height + 1).is_some() {
             continue;
         }
 
@@ -6723,6 +6824,12 @@ async fn sync_blocks_from_peer(
     let mut binary_encoding = true;
 
     loop {
+        // A node stopped at a protocol upgrade (#267) fetches nothing: every block from here would
+        // be thrown away, and the callers poll — without this, each poll moved a whole batch
+        // across the sync peer's link, for as long as this build stays installed.
+        if upgrade_refusal(&*chain_state.read().await, from).is_some() {
+            return Ok(total_applied);
+        }
         // **Nothing is locked while this fetches.** Until 2026-08-27 the caller took the store and
         // chain-state write locks and held both for the *entire* sync, so every RPC route that
         // reads the chain blocked for as long as catching up took — around forty minutes at
@@ -6983,6 +7090,13 @@ async fn sync_blocks_from_peer(
                     e,
                     total_applied
                 );
+            }
+            // The chain moves to a protocol this build does not run (#267). Not an error of the
+            // peer's, and not one to retry: what is applied stays, and the sync ends here —
+            // `upgrade_refusal` has said why.
+            if upgrade_refusal(chain_state, h).is_some() {
+                store.save_chain_state(chain_state)?;
+                return Ok(total_applied);
             }
             let receipt = execute_block(chain_state, block);
             // Same stamp as the consensus path in `apply_finalized_block` — a node catching up
@@ -9337,6 +9451,39 @@ mod multiaddr_kind_tests {
     fn falls_back_to_dns4_for_hostnames() {
         assert_eq!(multiaddr_kind("localhost"), "dns4");
         assert_eq!(multiaddr_kind("node.silvra.net"), "dns4");
+    }
+}
+
+#[cfg(test)]
+mod upgrade_notice_tests {
+    use super::*;
+    use helix_executor::ScheduledUpgrade;
+
+    /// A build that runs the scheduled version has nothing to do; one that does not is told it
+    /// stops, at which block, how far away that is, and that nothing is reset.
+    #[test]
+    fn an_upgrade_this_build_does_not_run_is_a_warning_with_its_deadline() {
+        let upgrade = ScheduledUpgrade { version: 2, height: 5000 };
+        let ok = upgrade_notice(upgrade, 2, 4000).unwrap();
+        assert!(ok.contains("nothing to do"), "{ok}");
+        let stop = upgrade_notice(upgrade, 1, 4000).unwrap_err();
+        assert!(stop.contains("STOPS before that block"), "{stop}");
+        assert!(stop.contains("from block 5000") && stop.contains("1000 block(s) from now"), "{stop}");
+        assert!(stop.contains("nothing is reset"), "{stop}");
+    }
+
+    /// The refusal itself, through the node's one gate: blocks below the activation height go
+    /// through, the activation block and every one after it do not, and a build that runs the
+    /// version is let through everywhere.
+    #[test]
+    fn the_gate_stops_at_the_activation_height_and_not_before() {
+        let mut state = ChainState::new(0);
+        state.scheduled_upgrade = Some(ScheduledUpgrade { version: helix_executor::PROTOCOL_VERSION + 1, height: 50 });
+        assert!(upgrade_refusal(&state, 49).is_none(), "the block before runs the old rules");
+        assert!(upgrade_refusal(&state, 50).is_some());
+        assert!(upgrade_refusal(&state, 51).is_some());
+        state.scheduled_upgrade = Some(ScheduledUpgrade { version: helix_executor::PROTOCOL_VERSION, height: 50 });
+        assert!(upgrade_refusal(&state, 50).is_none(), "a version this build runs is no reason to stop");
     }
 }
 

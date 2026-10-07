@@ -179,6 +179,37 @@ Keep `validator-key.json` and `validator-key.signing-state.json` — the key car
 signing state starts over on the new chain by itself. In the desktop wallet: **Validate → Reset
 local chain**. Balances and stakes of the old chain do not carry over.
 
+### Protocol upgrades
+
+A change to the chain's rules no longer needs a reset. Stakers vote it in as a **protocol upgrade**
+(`helix governance propose-upgrade`, see [CLI](cli.md#governance)): the next protocol version, and
+the block from which it applies. Once that vote passes, every node is told, and what it does
+depends on its build:
+
+- **A release that runs the new version** goes on through that block under the new rules. Nothing
+  to do but install it — **before** the block. It runs the old version's blocks exactly as before,
+  so it can go in the moment it is published, long before the vote ends.
+- **A release that does not** stops *before* that block: it applies, proposes and votes on nothing
+  from there on, and says so in the log every minute. It keeps its data and its RPC — `/status`
+  still answers, at the last block it applied. Install the release that runs the version and start
+  it on the same data; it goes on from exactly that block. **Do not move or delete anything** —
+  this is not a reset.
+
+How you find out, in time:
+
+```bash
+helix governance params        # protocol_version, and a scheduled upgrade if there is one
+curl -s localhost:8545/status | jq '{protocol_version, supported_protocol_version, scheduled_upgrade}'
+```
+
+`scheduled_upgrade.supported: false` means the node answering stops at `scheduled_upgrade.height`.
+Its log says the same from the moment the upgrade passes, every minute, with the blocks left:
+`Protocol upgrade scheduled: protocol 2 from block … — this build … STOPS before that block`.
+
+An upgrade takes effect no sooner than the end of its own 1000-block vote and no later than
+30 days (at the 2-second block target) after it was proposed; only one can be scheduled at a time,
+and a scheduled one cannot be cancelled — it is avoided only by not voting it in.
+
 ### Joining fast from a checkpoint
 
 Replaying every block from genesis takes a while. A new node can instead start from a state

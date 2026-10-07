@@ -10,7 +10,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | Method | Path | Description |
 |---|---|---|
 | GET | `/` | Node info & endpoint list |
-| GET | `/status` | Height, hash, mempool size, supply stats |
+| GET | `/status` | Height, hash, mempool size, supply stats; `protocol_version` (the rules the chain runs), `supported_protocol_version` (the highest this build runs) and `scheduled_upgrade` (`{version, height, supported}` or `null`) — `supported: false` means this node stops before `height` until it is updated |
 | GET | `/genesis` | Everything needed to rebuild this chain's exact genesis state: the genesis block, governance params, the bootstrap validator's stake, the liquid genesis allocations, the personhood authorities and the genesis state hash a joining node recomputes and compares |
 | GET | `/blocks/latest` | Latest block with full transaction list |
 | GET | `/blocks/height/:n` | Block by height |
@@ -28,8 +28,8 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/accounts/:address/storage/:key_hex` | One hex-encoded key/value from a deployed contract's own storage |
 | GET | `/validators/:address/pool` | A validator's delegation pool — delegated stake, commission, effective stake, and `reward_address` (where the validator's own share is paid; `null` = to the validator itself) |
 | GET | `/names/:name` | Resolve name to address; a free name answers 404 with its `registration_price_nano` |
-| GET | `/governance/params` | Current runtime-adjustable protocol parameters |
-| GET | `/governance/proposals` | Proposals whose voting period is still running (`?limit=&offset=`); a closed one leaves the state |
+| GET | `/governance/params` | Current runtime-adjustable protocol parameters, `protocol_version` and `scheduled_upgrade` |
+| GET | `/governance/proposals` | Proposals whose voting period is still running (`?limit=&offset=`); a closed one leaves the state. A protocol upgrade carries `activation_height`, the first block under its version |
 | GET | `/governance/proposals/:id` | One proposal's status |
 | GET | `/mempool` | Pending transaction count |
 | GET | `/mempool/transactions` | The hash of every transaction waiting in this node's pool, sorted: `{"transactions": ["…"]}`. Each one's body is at `/transactions/:hash` |

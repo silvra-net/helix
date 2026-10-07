@@ -3,7 +3,7 @@ use std::path::Path;
 
 use helix_core::Block;
 use helix_crypto::{Address, Hash, PublicKey};
-use helix_executor::governance::{GovernanceParams, GovernanceProposal};
+use helix_executor::governance::{GovernanceParams, GovernanceProposal, ScheduledUpgrade, GENESIS_PROTOCOL_VERSION};
 use helix_executor::receipt::{BalanceChange, BalanceChangeKind, Receipt};
 use helix_executor::state::{AccountState, ChainState};
 
@@ -157,6 +157,13 @@ const META_ISSUED: &str = "total_issued";
 const META_MIN_VALIDATOR_STAKE: &str = "gov_min_validator_stake";
 const META_FUEL_PER_FEE_UNIT: &str = "gov_fuel_per_fee_unit";
 const META_NEXT_PROPOSAL_ID: &str = "gov_next_proposal_id";
+/// The protocol version blocks are executed under (`ChainState::protocol_version`). Absent: the
+/// genesis version.
+const META_PROTOCOL_VERSION: &str = "protocol_version";
+/// A scheduled upgrade, as two keys present together or not at all — removed when the upgrade takes
+/// effect, or a restart would schedule it again on this node alone.
+const META_UPGRADE_VERSION: &str = "scheduled_upgrade_version";
+const META_UPGRADE_HEIGHT: &str = "scheduled_upgrade_height";
 const META_GENESIS_VALIDATOR_STAKE: &str = "genesis_validator_stake";
 /// Height of the block whose execution produced the persisted state — see
 /// `ChainState::applied_height`. Written in the same transaction as the state itself.
@@ -709,6 +716,20 @@ impl HelixDb {
                 .map_err(|e| StorageError::Db(e.to_string()))?;
             meta.insert(META_NEXT_PROPOSAL_ID, &state.next_proposal_id.to_le_bytes()[..])
                 .map_err(|e| StorageError::Db(e.to_string()))?;
+            meta.insert(META_PROTOCOL_VERSION, &state.protocol_version.to_le_bytes()[..])
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            match state.scheduled_upgrade {
+                Some(upgrade) => {
+                    meta.insert(META_UPGRADE_VERSION, &upgrade.version.to_le_bytes()[..])
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                    meta.insert(META_UPGRADE_HEIGHT, &upgrade.height.to_le_bytes()[..])
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+                None => {
+                    meta.remove(META_UPGRADE_VERSION).map_err(|e| StorageError::Db(e.to_string()))?;
+                    meta.remove(META_UPGRADE_HEIGHT).map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
             for authority in &state.personhood_authorities {
                 personhood_authorities.insert(authority.as_bytes(), &[][..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1210,6 +1231,11 @@ impl HelixDb {
                 .unwrap_or(default_params.fuel_per_fee_unit),
         };
         let next_proposal_id = read_meta_u64(META_NEXT_PROPOSAL_ID).unwrap_or(0);
+        let protocol_version = read_meta_u64(META_PROTOCOL_VERSION).unwrap_or(GENESIS_PROTOCOL_VERSION);
+        let scheduled_upgrade = match (read_meta_u64(META_UPGRADE_VERSION), read_meta_u64(META_UPGRADE_HEIGHT)) {
+            (Some(version), Some(height)) => Some(ScheduledUpgrade { version, height }),
+            _ => None,
+        };
         // Absent only for a database written before this key existed. `META_HEIGHT` is the right
         // fallback rather than 0: `save_chain_state` and `put_block` run in the same write
         // transaction, so the state on disk is by construction the state of the tip on disk.
@@ -1255,6 +1281,8 @@ impl HelixDb {
             governance_params,
             proposals,
             next_proposal_id,
+            protocol_version,
+            scheduled_upgrade,
             used_personhood_commitments,
             slashed_double_sign_incidents,
             personhood_authorities,
@@ -3114,6 +3142,34 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// #267: the protocol version and a scheduled upgrade survive a restart, and a schedule cleared
+    /// when its upgrade took effect stays cleared. Without the keys the node would come back on the
+    /// genesis version; without the removal it would schedule the upgrade again — on this node
+    /// alone, and the reloaded state would hash differently from everyone else's.
+    #[test]
+    fn the_protocol_version_and_a_cleared_schedule_survive_reopening() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.scheduled_upgrade = Some(ScheduledUpgrade { version: 2, height: 500 });
+        db.save_chain_state(&state).unwrap();
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+        assert_eq!(loaded.scheduled_upgrade, Some(ScheduledUpgrade { version: 2, height: 500 }));
+        assert_eq!(loaded.protocol_version, GENESIS_PROTOCOL_VERSION);
+
+        // The upgrade takes effect.
+        state.activate_due_upgrade(500);
+        db.save_chain_state(&state).unwrap();
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+        assert_eq!(loaded.protocol_version, 2, "the version moved on survives");
+        assert_eq!(loaded.scheduled_upgrade, None, "a cleared schedule came back after reopening");
+        assert_eq!(loaded.state_hash(), state.state_hash(), "and the reloaded state is the same state");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// #249: a proposal pruned from the state stays pruned across a restart. Insert-only
     /// persistence would bring every closed proposal back on this node alone, and the reloaded
     /// state would hash differently from everyone else's.
@@ -3131,6 +3187,7 @@ mod tests {
                 voters: Default::default(),
                 yes_stake: 0,
                 quorum_denominator: 1,
+                activation_height: 0,
                 executed: false,
             });
         }

@@ -323,16 +323,26 @@ transaction directly against the REST API.
 ### Governance
 
 Stakers vote on two runtime-adjustable parameters, `min-validator-stake` and `fuel-per-fee-unit`
-(see [Staking](staking.md#staking)). Voting takes any stake; proposing takes the chain's minimum
-validator stake, as described below.
+(see [Staking](staking.md#staking)), and on **protocol upgrades** — changes to the chain's rules
+that take effect at a block height, without a reset. Voting takes any stake; proposing takes the
+chain's minimum validator stake, as described below.
 
 ```bash
-helix governance params                          # current values
+helix governance params                          # current values, protocol version, scheduled upgrade
 helix governance propose fuel-per-fee-unit 3 --key alice.json
+helix governance propose-upgrade 2 --at-height 520000 --key alice.json
 helix governance list                            # the proposals still open to a vote
 helix governance show 0                          # one proposal's vote tally
 helix governance vote 0 --key alice.json          # cast a stake-weighted yes-vote
 ```
+
+A protocol upgrade names the **next** version (the current one plus one) and the first block that
+runs it. That block has to come after the vote can end — at least 1000 blocks after the proposal —
+and no more than 30 days ahead (1,296,000 blocks); only one upgrade can be scheduled at a time, and a
+scheduled one cannot be cancelled. `propose-upgrade` checks all of it against the node before it
+asks for the passphrase. **Publish the release that runs the new version before proposing it:** from
+the activation height on, every node without it stops and waits until it is updated (see
+[Protocol upgrades](running-a-node.md#protocol-upgrades)).
 
 A proposal passes once yes-votes reach a 2/3-plus-one supermajority of the largest total stake
 the network held while it was open — never less than at creation, so a voter cannot shrink the
