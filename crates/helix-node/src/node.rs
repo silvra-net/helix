@@ -7859,13 +7859,7 @@ mod sync_blocks_from_peer_tests {
     }
 
     fn fresh_store() -> HelixDb {
-        let path = std::env::temp_dir().join(format!(
-            "helix-test-sync-store-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        let _ = std::fs::remove_file(&path);
-        HelixDb::open(&path).unwrap()
+        HelixDb::open_temporary("helix-test-sync-store").unwrap()
     }
 
     /// Registers `kp`'s address as a staked validator in `chain_state`, so blocks
@@ -10213,13 +10207,7 @@ mod handle_p2p_event_tests {
     use std::sync::atomic::AtomicUsize;
 
     fn fresh_store() -> HelixDb {
-        let path = std::env::temp_dir().join(format!(
-            "helix-test-p2p-event-store-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        let _ = std::fs::remove_file(&path);
-        HelixDb::open(&path).unwrap()
+        HelixDb::open_temporary("helix-test-p2p-event-store").unwrap()
     }
 
     fn signed_block(kp: &KeyPair, height: u64, prev_hash: Hash) -> Block {
@@ -13348,13 +13336,7 @@ mod round_sync_tests {
     use tokio::sync::{mpsc, Mutex, RwLock};
 
     fn fresh_store() -> HelixDb {
-        let path = std::env::temp_dir().join(format!(
-            "helix-test-roundsync-store-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        let _ = std::fs::remove_file(&path);
-        HelixDb::open(&path).unwrap()
+        HelixDb::open_temporary("helix-test-roundsync-store").unwrap()
     }
 
     /// Two equal validators, and the keypair whose turn it is to propose height 1 round 0 first.

@@ -236,6 +236,17 @@ pub struct HelixDb {
     /// the ten call sites are: ten. A hook added next to each of them is a duplicated invariant
     /// waiting to drift, and the one that gets missed is the one that matters (Lehre 12).
     snapshot_interval: u64,
+    /// Set by [`HelixDb::open_temporary`]: the file is removed when this handle is dropped.
+    delete_on_drop: Option<std::path::PathBuf>,
+}
+
+impl Drop for HelixDb {
+    fn drop(&mut self) {
+        // Runs before `db` closes; on Unix the space is freed once it has.
+        if let Some(path) = self.delete_on_drop.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Bytes available to this process on the disk that holds `path` — `None` where that cannot be
@@ -345,7 +356,30 @@ impl HelixDb {
             path: path.to_path_buf(),
             min_free_bytes: MIN_FREE_DISK_BYTES,
             snapshot_interval: configured_snapshot_interval(),
+            delete_on_drop: None,
         })
+    }
+
+    /// The file this database lives in.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A database in the system's temporary directory whose file is removed when it is dropped —
+    /// for tests. Their helpers opened one per test and left every file behind: 7,888 of them,
+    /// 14.6 GB, on the system partition by 2026-10-06 (#266). Not for a test that reopens the file
+    /// by its path after dropping it; that one names its own path and removes it itself.
+    pub fn open_temporary(label: &str) -> StorageResult<Self> {
+        static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "{label}-{}-{}.redb",
+            std::process::id(),
+            OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut db = Self::open(&path)?;
+        db.delete_on_drop = Some(path);
+        Ok(db)
     }
 
     // ── State snapshots ──────────────────────────────────────────────────────
@@ -2291,6 +2325,22 @@ mod tests {
         );
         drop(db);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A temporary database is a real file while it is open and none once it is dropped, and two
+    /// open at once never share a file (#266).
+    #[test]
+    fn a_temporary_database_removes_its_file_when_dropped() {
+        let a = HelixDb::open_temporary("helix-db-temporary-test").unwrap();
+        let b = HelixDb::open_temporary("helix-db-temporary-test").unwrap();
+        let (pa, pb) = (a.path.clone(), b.path.clone());
+        assert_ne!(pa, pb, "two open at once must not share a file");
+        assert!(pa.exists() && pb.exists());
+        drop(a);
+        assert!(!pa.exists(), "dropped, so removed");
+        assert!(pb.exists(), "the other one is untouched");
+        drop(b);
+        assert!(!pb.exists());
     }
 
     fn fresh_db() -> (HelixDb, std::path::PathBuf) {

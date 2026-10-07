@@ -3653,16 +3653,8 @@ mod tests {
     }
 
     pub(super) fn fresh_test_state() -> AppState {
-        let path = std::env::temp_dir().join(format!(
-            "helix-rpc-test-store-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let store = HelixDb::open(&path).unwrap();
+        let store = HelixDb::open_temporary("helix-rpc-test-store").unwrap();
+        let path = store.path().to_path_buf();
         let (p2p_command_tx, _p2p_command_rx) = mpsc::channel(8);
         AppState {
             keep_blocks: 0,
