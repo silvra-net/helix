@@ -173,6 +173,18 @@ pub struct Proposal {
     /// Last height at which a vote is accepted — what tells an expired proposal from an open one.
     /// Not defaulted either: zero would mark every proposal expired.
     pub expires_at_height: u64,
+    /// For a protocol upgrade: the first block under the new version, if it passes (#267).
+    #[serde(default)]
+    pub activation_height: Option<u64>,
+}
+
+/// A protocol upgrade governance has passed and the chain has not reached yet (#267).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledUpgrade {
+    pub version: u64,
+    pub height: u64,
+    /// Whether the node that answered runs `version`; `false` means it stops before `height`.
+    pub supported: bool,
 }
 
 /// The runtime-adjustable protocol parameters — mirrors `/governance/params`.
@@ -180,6 +192,11 @@ pub struct Proposal {
 pub struct GovParams {
     pub min_validator_stake_hlx: f64,
     pub fuel_per_fee_unit: u64,
+    /// Absent on nodes older than protocol upgrades (#267).
+    #[serde(default)]
+    pub protocol_version: Option<u64>,
+    #[serde(default)]
+    pub scheduled_upgrade: Option<ScheduledUpgrade>,
 }
 
 /// The guardian set registered for an address, or `None` when none is (a 404 = "not registered").

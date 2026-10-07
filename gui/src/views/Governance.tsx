@@ -18,6 +18,36 @@ function formatProposedValue(param: string, newValue: number): string {
   const isStake = param === "MinValidatorStake" || param === "min_validator_stake";
   return isStake ? `${hlx(newValue / 1e9)} HLX` : newValue.toLocaleString();
 }
+
+/// One proposal's title. A protocol upgrade is a version *and* a block — a voter who sees only
+/// "ProtocolUpgrade → 2" is voting without knowing when every node that has not updated stops.
+export function describeProposal(p: Pick<Proposal, "param" | "new_value" | "activation_height">): string {
+  if (p.param === "ProtocolUpgrade") {
+    const at = typeof p.activation_height === "number" ? ` from block ${p.activation_height.toLocaleString()}` : "";
+    return `Protocol upgrade → version ${p.new_value}${at}`;
+  }
+  return `${p.param} → ${formatProposedValue(p.param, p.new_value)}`;
+}
+
+/// What the wallet says about a scheduled protocol upgrade, or nothing when none is scheduled.
+///
+/// `supported` describes the node the wallet is talking to — its own when it runs one, which is
+/// the case that matters: that node stops before the activation block unless the app is updated.
+export function upgradeNotice(
+  params: Pick<GovParams, "scheduled_upgrade"> | null,
+  chainHeight: number,
+): { text: string; warn: boolean } | null {
+  const u = params?.scheduled_upgrade;
+  if (!u) return null;
+  const left = chainHeight > 0 && u.height > chainHeight ? ` (${(u.height - chainHeight).toLocaleString()} blocks from now)` : "";
+  const when = `Protocol ${u.version} takes effect at block ${u.height.toLocaleString()}${left}.`;
+  return u.supported
+    ? { text: `${when} The node this wallet talks to runs it — nothing to do.`, warn: false }
+    : {
+        text: `${when} The node this wallet talks to does not run it and stops before that block. Update the wallet (and any node you run) before then — nothing is reset, your data stays.`,
+        warn: true,
+      };
+}
 /// Where a proposal stands, in the only three states a voter can act on differently.
 ///
 /// "Open" is not the absence of the other two: a proposal whose voting period ran out still comes
@@ -90,6 +120,13 @@ export default function Governance({ node, chainHeight }: { node: string; chainH
             <div className="metric-value">{params ? params.fuel_per_fee_unit.toLocaleString() : "…"}</div>
           </div>
         </div>
+        {typeof params?.protocol_version === "number" && (
+          <p className="muted small">Protocol version {params.protocol_version}</p>
+        )}
+        {(() => {
+          const n = upgradeNotice(params, chainHeight);
+          return n ? <div className={n.warn ? "error" : "notice"}>{n.text}</div> : null;
+        })()}
         <p className="muted small">Only self-stakers can vote; delegation earns yield but carries no governance weight.</p>
       </div>
 
@@ -108,7 +145,7 @@ export default function Governance({ node, chainHeight }: { node: string; chainH
             {proposals.map((p) => (
               <div className="list-row" key={p.id}>
                 <div className="list-main">
-                  <div className="list-title">#{p.id} · {p.param} → {formatProposedValue(p.param, p.new_value)}</div>
+                  <div className="list-title">#{p.id} · {describeProposal(p)}</div>
                   <div className="muted small">
                     by {shortAddr(p.proposer)} · {hlx(p.yes_stake_hlx)} of {hlx(p.quorum_stake_hlx)} HLX
                     needed

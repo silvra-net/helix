@@ -145,11 +145,24 @@ export interface Proposal {
   /// Last height at which a vote is still accepted. Without it an expired proposal is
   /// indistinguishable from a live one and the wallet offers a button that can only fail.
   expires_at_height: number;
+  /// For a protocol upgrade: the first block under the new version, if it passes.
+  activation_height?: number | null;
+}
+
+/// A protocol upgrade governance has passed and the chain has not reached yet.
+export interface ScheduledUpgrade {
+  version: number;
+  height: number;
+  /// Whether the node that answered runs `version`; false means it stops before `height`.
+  supported: boolean;
 }
 
 export interface GovParams {
   min_validator_stake_hlx: number;
   fuel_per_fee_unit: number;
+  /// Absent on nodes older than protocol upgrades.
+  protocol_version?: number | null;
+  scheduled_upgrade?: ScheduledUpgrade | null;
 }
 
 export interface ValidatorStatus {
