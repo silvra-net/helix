@@ -278,7 +278,7 @@ Verified personhood matters for one thing: a validator's full stake counts towar
 power instead of half of it. The cap is the same for everyone — 1% of all stake — so
 personhood helps only a validator below it; one already at the cap gains nothing (see
 [Consensus](internals.md#consensus)).
-It is not required to hold, send, or stake HLX. **The public testnet configures no personhood
+It is not required to hold, send, or stake HLX. **The public network configures no personhood
 authority**, so personhood proofs are refused there.
 
 ### Social Recovery

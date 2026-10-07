@@ -73,8 +73,8 @@ moved. An account a contract paid finds that transaction in its history.
 
 **Finality.** A transaction in a block is final: consensus is BFT, a block is committed only with
 two thirds of the voting power behind it, and a committed block is never reverted. There is no
-confirmation count to wait for: `applied` in `/transactions/:hash` is final. (While Helix is a
-testnet, a reset replaces the whole chain — see the README.)
+confirmation count to wait for: `applied` in `/transactions/:hash` is final. (There are no
+resets since 1.0.0; a protocol change activates at a height scheduled on the chain.)
 
 ### Status response
 

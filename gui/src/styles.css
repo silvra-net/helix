@@ -134,13 +134,8 @@ nav { display: flex; flex-direction: column; gap: 2px; }
   border-radius: 8px; padding: 5px 8px; font-size: 12px; width: 240px; font-family: var(--mono);
 }
 .net-meta { font-size: 12px; color: var(--muted); white-space: nowrap; }
-.testnet-badge {
-  background: var(--warn-bg); color: var(--warn); border-radius: 99px;
-  padding: 4px 10px; font-size: 12px; white-space: nowrap;
-}
-
-/* Catch-up notice. Uses the same warning palette as the testnet badge: it reports that what is
-   on screen may be stale, which is a caution rather than an error — the node is working. */
+/* Catch-up notice. Uses the warning palette: it reports that what is on screen may be stale,
+   which is a caution rather than an error — the node is working. */
 .sync-banner {
   background: var(--warn-bg); color: var(--warn);
   padding: 8px 18px; font-size: 12px; line-height: 1.4;

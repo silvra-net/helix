@@ -23,8 +23,8 @@ use crate::node::Node;
 use crate::server::{router, Auth};
 
 /// The network this release serves: what `getblockchaininfo` calls the chain, and which section of
-/// `helix.conf` applies. The public chain is a testnet; this becomes `main` with the mainnet.
-pub const NETWORK: &str = "test";
+/// `helix.conf` applies. `main` since the mainnet (1.0.0).
+pub const NETWORK: &str = "main";
 
 /// The wallet RPC's port when nothing names one.
 pub const DEFAULT_PORT: u16 = 8547;

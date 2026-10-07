@@ -272,9 +272,6 @@ export default function App() {
               </span>
             )}
           </div>
-          <span className="testnet-badge" title="HLX on the public testnet is a valueless test token.">
-            ⚠ Testnet · test token, no value
-          </span>
         </header>
 
         {net?.is_syncing && (

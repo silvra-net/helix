@@ -46,7 +46,7 @@ export default function Setup({
         <div className="onboard-head">
           <span className="brand-mark big" aria-hidden>⛓</span>
           <h1>Helix Wallet</h1>
-          <p className="muted">A quantum-secure wallet for the Helix testnet.</p>
+          <p className="muted">A quantum-secure wallet for Helix.</p>
         </div>
 
         <div className="tabs">

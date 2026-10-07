@@ -19,7 +19,7 @@ export default function Receive({ address }: { address: string }) {
     <div className="stack">
       <div className="card receive-card">
         <div className="section-title">Receive HLX</div>
-        <p className="muted">Share this address to receive HLX on the Helix testnet.</p>
+        <p className="muted">Share this address to receive HLX.</p>
         {address && (
           // Rendered entirely client-side (qrcode.react is pure JS, no network fetch — CSP-safe).
           // Fixed white background with dark modules regardless of the app theme: a QR needs
@@ -33,8 +33,7 @@ export default function Receive({ address }: { address: string }) {
           {copied ? "Copied" : "Copy address"}
         </button>
         <p className="muted small">
-          Reminder: HLX on the testnet is a valueless test token — anything received here does not
-          survive a chain reset.
+          A transfer cannot be undone: have the sender check the address before they send.
         </p>
       </div>
     </div>

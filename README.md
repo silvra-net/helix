@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > A Layer-1 blockchain secured end-to-end by NIST-standardized post-quantum cryptography.
-> **Public testnet live, with independent validators. Mainnet launches once the validator set is proven — by milestone, not by calendar.**
+> **Mainnet live since 1.0.0, with independent validators. No more resets — the rules change through governance, at a height everyone can see coming.**
 
 Helix is built for the post-quantum era from the first line: every signature is ML-DSA-65
 (NIST FIPS 204), not a classical curve with a migration plan attached. On top of that sit
@@ -18,9 +18,11 @@ network, checks its genesis against the one compiled in, recomputes the genesis 
 trusting the peer that served it, syncs, and follows the chain — with no configuration. Every
 client command below talks to it out of the box.
 
-**What it is not yet.** The chain is a **testnet**: it is reset from genesis when its format
-changes, and **HLX on it is a valueless test token, not an investment.** The validator set is
-still small — see [Security](#security) for what that means for its fault tolerance.
+**What it is, and what it is not.** Since 1.0.0 the chain is the **mainnet**: it is not reset
+any more, and when the protocol changes, stakers schedule the upgrade on the chain itself and every
+node either follows or stops cleanly where its build ends. It is still a young network: the
+validator set is small — see [Security](#security) for what that means for its fault tolerance —
+and nothing here promises that HLX is worth anything. **HLX is not an investment.**
 
 **Pick your path:**
 
@@ -57,19 +59,19 @@ still small — see [Security](#security) for what that means for its fault tole
 | Phase | Status | What it means |
 |---|---|---|
 | **Core protocol** | ✅ Done | PoS with BFT finality, ML-DSA-65 signatures, WASM VM, ZK-STARK proofs, names, social recovery — implemented and running. |
-| **Public testnet** | ✅ Live | `node.silvra.net` finalizes blocks continuously; anyone can run a node or use the CLI against it. |
+| **Public network** | ✅ Live | `node.silvra.net` finalizes blocks continuously; anyone can run a node or use the CLI against it. |
 | **Validation from anywhere** | ✅ Verified | A validator behind a firewall, NAT or HTTPS proxy takes part over the WebSocket transport — the network's own hub runs behind a Cloudflare tunnel. |
 | **Independent validators** | 🔄 Growing | External operators co-sign the live chain from their own hardware. Four validators survive one failure, seven survive two. [Become one →](docs/running-a-node.md#bootstrapping-a-multi-validator-network) |
 | **Continuous adversarial review** | 🔄 Ongoing | See [Security](#security). |
-| **Mainnet** | 🎯 When it's earned | Fresh genesis, a freshly generated validator key, no more resets — launched once enough independent validators run stably to survive failures. |
+| **Mainnet** | ✅ 1.0.0 | Fresh genesis, a freshly generated validator key, no more resets. Protocol changes are scheduled by governance and activate at a set height ([how](docs/running-a-node.md#protocol-upgrades)). |
 
 ---
 
 ## Quick Start
 
-> **This is the public testnet.** It is reset from genesis when the chain format changes, and
-> HLX on it is a valueless test token that does not carry over to mainnet. Send transactions,
-> deploy contracts, break things — that is what it is for.
+> **This is the mainnet.** It is not reset; what you send stays sent. The network is young and its
+> validator set small, and nothing here promises that HLX is worth anything — it is not an
+> investment.
 
 **One binary does everything.** `helix start` runs a node; every other subcommand
 (`helix wallet`, `helix tx`, …) is a client. **You don't need a node to use Helix** — the client
@@ -91,7 +93,7 @@ helix tx send <address> 10 --key alice.json
 helix tx status <hash>
 ```
 
-Client commands use a node running on this machine if one answers, and the public testnet
+Client commands use a node running on this machine if one answers, and the public network
 (`https://node.silvra.net`) otherwise. Point them elsewhere with `--node <url>` or
 `HELIX_NODE=<url>`.
 
@@ -217,8 +219,8 @@ issues have been found and fixed this way; every one is described in the commit 
 
 **Known limitations:**
 
-- **The testnet is reset** whenever the chain format changes, until mainnet. Balances do not
-  survive a reset; nothing on this chain is money.
+- **A young network.** The chain started over at 1.0.0 and is not reset any more; balances of the
+  test chains before it did not carry over. Nothing here promises that HLX is worth anything.
 - **Fault tolerance is a property of the running set, not of the code.** `n` validators survive
   `⌊(n−1)/3⌋` failures: four survive one, seven survive two. The public set is still small, so
   the chain depends on its operators keeping their nodes up; when too many are missing it stops
@@ -229,7 +231,7 @@ issues have been found and fixed this way; every one is described in the commit 
   third of all messages lost, no fork in any run — and by multi-node tests with real processes.
   The live network is still small.
 - **Proof of personhood rests on trusted authorities**, any one of which can vouch for a human.
-  The public testnet configures none, so personhood is off there.
+  The public network configures none, so personhood is off there.
 - **The P2P transport is encrypted with classical cryptography** (libp2p Noise, X25519). What it
   carries is public ledger data, and every transaction, block and vote in it is ML-DSA-signed: a
   quantum attacker could read the traffic but not forge any of it. Details in

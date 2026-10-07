@@ -9,7 +9,7 @@ pub struct Args {
     #[arg(long, env = "HELIX_MESH_LISTEN", default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
     /// The network name in every network identifier (the blockchain is "Helix").
-    #[arg(long, env = "HELIX_MESH_NETWORK", default_value = "testnet")]
+    #[arg(long, env = "HELIX_MESH_NETWORK", default_value = "mainnet")]
     pub network: String,
     /// Serve only what needs no node — the construction steps around signing — for a machine
     /// that never talks to the network. The Data API, `/construction/metadata` and

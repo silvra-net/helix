@@ -3,17 +3,14 @@
 > Part of the [Helix documentation](../README.md). The endpoints and the transaction format are
 > in the [Reference](reference.md); this page is about using them to hold customer funds.
 
-**Helix is a testnet.** Its chain is reset when a release needs it, and HLX on it has no value.
-This page describes the interface an integration builds on, so that one can be written and
-tested now; it is not an invitation to list a testnet coin.
+**Helix is a young mainnet.** Since 1.0.0 the chain is not reset; when the protocol changes,
+stakers schedule the upgrade on the chain at a height everyone can see coming, and a node whose
+build does not know the new version stops cleanly there instead of running on under old rules —
+update your node before that height (`scheduled_upgrade` in `GET /status` names it). Whether to
+list HLX is your decision; nothing here promises that it is worth anything.
 
-**Use 0.20.4 or later.** `--memo`, `--offline`, `helix tx submit`, the chain id in `helix chain
-status`, the exact amount fields and a syncing node that keeps transaction outcomes arrived in
-0.20.1; every balance change of a block, recorded and served, and the Mesh Data API in 0.20.2;
-the Bitcoin-style wallet RPC (`helix.conf`, `helix-cli`), the Mesh Construction API and the
-container image in 0.20.3; the wallet RPC's fixes from an attack round in 0.20.4 — among them a
-withdrawal that paid but could show as given up, and a payment to another customer's deposit
-address listed without its receive.
+**Use 1.0.0 or later.** It is the first release of this chain; earlier releases belong to the test
+chains before it and cannot join.
 
 ## At a glance
 
@@ -30,7 +27,7 @@ address listed without its receive.
 | Fee | `base_fee_per_byte × size` burned, anything above it tips the proposer |
 | Ways to integrate | this page's REST API · a **Bitcoin-Core-style wallet RPC** served by the node (`server=1` in `helix.conf`, called with `helix-cli`) · the **Mesh (Rosetta)** Data and Construction API (`helix mesh`) |
 | Supply | `GET /supply/circulating`, `/supply/total`, `/supply/max` — a bare number in HLX |
-| Container | `ghcr.io/silvra-net/helix:<version>` (and `:latest`), from 0.20.3 on |
+| Container | `ghcr.io/silvra-net/helix:<version>` (and `:latest`) |
 
 ## Run your own node
 
@@ -47,9 +44,6 @@ have to trust someone else for, and it lifts the public rate limit. Setup is in
   `is_syncing` is false.
 - **Raise the rate limit on your own node** if you scan quickly: `HELIX_RPC_RATE_LIMIT=burst,refill`
   (default `500,100` per client IP).
-- **Start it with 0.20.1 or later.** 0.20.0 and earlier did not keep transaction outcomes for
-  blocks they took over sync, and answered `unknown` for them (#259); a node that synced under
-  0.20.0 keeps that gap for the blocks it synced then.
 
 ## Addresses
 
@@ -88,8 +82,8 @@ by its `hash` — the same transaction can never be applied twice.
 
 - `failed` — the transaction is in a block, its fee was charged, and it moved nothing (the reason
   is in `error`). Do not credit it.
-- `unknown` — this node has no record of the outcome (0.20.0 or earlier, catching up over sync;
-  or a checkpoint join). Do not credit it; ask a node that executed the block.
+- `unknown` — this node has no record of the outcome (it joined from a checkpoint after that
+  block). Do not credit it; ask a node that executed the block.
 
 **Or read an address's history:** `GET /accounts/<address>/transactions?limit=<n>&offset=<m>`,
 newest first, at most 200 per page, the same fields and statuses as above.
@@ -105,8 +99,8 @@ balance the block moved, with the transaction (`tx_index`, `tx_hash`; `null` for
 reward), the `account`, the `kind` (`transaction`, `reward`, `contract`) and a signed
 `delta_nano`. Summed per account they are exactly how much each balance moved, so a balance can be
 reconciled block by block. Every history row has `balance_change_nano` too: what that transaction
-did to the address, fee included. Both come from a node running 0.20.2 or later, and only for blocks
-it executed itself — absent means "this node has no record", never "nothing moved".
+did to the address, fee included. Both come only from blocks a node
+executed itself — absent means "this node has no record", never "nothing moved".
 
 ## Sending withdrawals
 
@@ -195,7 +189,7 @@ validator** — a hot wallet does not belong in the consensus process.
 
 Commands run through the shell, at most 16 at a time; one that fails is logged, not retried —
 `listsinceblock` is what catches up, as with Bitcoin Core. Sections `[main]` and `[test]` apply on
-their network (the public chain is `test`). **Bitcoin options that mean nothing for a Helix wallet**
+their network (the public chain is `main`). **Bitcoin options that mean nothing for a Helix wallet**
 (`txindex`, `dbcache`, `printtoconsole`, …) are accepted and named once in the log, so a copied
 `bitcoin.conf` works. **An unknown key stops the start with the reason**, and so does `zmqpub…`:
 Helix does not publish over ZMQ, and an exchange waiting for it would wait forever — use
@@ -249,7 +243,7 @@ applies.
 | `getrawtransaction txid true` | Any transaction in a block or in the pool, with `vin` and `vout` — see below. |
 | `validateaddress`, `getaddressinfo` | Address checks; `ismine` for the wallet's own. |
 | `walletpassphrase`, `walletlock`, `keypoolrefill`, `backupwallet` | As in Bitcoin Core. |
-| `getinfo`, `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getnetworkinfo`, `getwalletinfo`, `estimatesmartfee` | Chain and wallet state. `getinfo` is the old all-in-one call (removed from Bitcoin Core in 0.16), kept because many integrations still make it. Versions are numbers in Bitcoin Core's form: 0.20.2 is `200200`. |
+| `getinfo`, `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getnetworkinfo`, `getwalletinfo`, `estimatesmartfee` | Chain and wallet state. `getinfo` is the old all-in-one call (removed from Bitcoin Core in 0.16), kept because many integrations still make it. Versions are numbers in Bitcoin Core's form: 1.0.0 is `1000000`. |
 
 ### Where Helix differs
 
@@ -301,8 +295,8 @@ The service says so instead of pretending:
 - **Every transaction the wallet signs is recorded before it is submitted**, and submitted again
   if it expires unincluded — after a crash or a node restart nothing it signed is forgotten.
 
-The node must record balance changes for every block from the wallet's start on — any node
-running 0.20.2 or later does, for the blocks it executes. Back up the wallet directory, or call
+The node must record balance changes for every block from the wallet's start on — every node
+does, for the blocks it executes. Back up the wallet directory, or call
 `backupwallet` — keys are written once and never changed, so a backup stays valid for every address
 made before it.
 
@@ -316,10 +310,9 @@ process and reads the node's REST API — the same endpoints this page describes
 restarted without touching the node.
 
 ```bash
-helix --node http://127.0.0.1:8545 mesh --listen 127.0.0.1:8080 --network testnet
+helix --node http://127.0.0.1:8545 mesh --listen 127.0.0.1:8080
 ```
 
-(0.20.2 shipped it as a separate `helix-mesh` binary; since then it is part of `helix`.)
 
 **Raise the node's rate limit for it.** The node limits requests per client address (500 at once,
 100 a second by default), and `helix mesh` is one client asking for every block. Start the node
@@ -327,11 +320,11 @@ with, for example, `HELIX_RPC_RATE_LIMIT=5000,1000`; until then a throttled requ
 as error 10, retriable, and a sync crawls.
 
 (`HELIX_NODE`, `HELIX_MESH_LISTEN` and `HELIX_MESH_NETWORK` set the same.) The network
-identifier is `{"blockchain": "Helix", "network": "<--network>"}`; the currency is
+identifier is `{"blockchain": "Helix", "network": "mainnet"}` (`--network` changes the name); the currency is
 `{"symbol": "HLX", "decimals": 9}`, and every amount is in nano-HLX.
 
-**The node behind it must have executed every block itself** with a build that records balance
-changes (0.20.2 or later): synced from genesis, not joined from a checkpoint, not pruning.
+**The node behind it must have executed every block itself** — every 1.0.0 build records the
+balance changes this needs — synced from genesis, not joined from a checkpoint, not pruning.
 Blocks come from those records, so a block the node has no record of is refused (error 5), never
 shown with operations missing.
 
