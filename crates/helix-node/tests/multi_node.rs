@@ -260,6 +260,8 @@ fn start_node_in(
         // of self-signing its own genesis. Followers set HELIX_SYNC_PEER explicitly, which
         // overrides this anyway — but setting it on every node keeps the intent unambiguous.
         .env("HELIX_NEW_CHAIN", "1")
+        // The genesis validator funds the joiners; on the real chain the launch reserve is offline.
+        .env("HELIX_GENESIS_VALIDATOR_LIQUID_HLX", "90000")
         .env("RUST_LOG", std::env::var("HELIX_TEST_LOG").unwrap_or_else(|_| "error".into()));
 
     // Quiet by default — a green run should not litter the disk. Set `HELIX_TEST_LOG_DIR` (plus
@@ -677,7 +679,8 @@ async fn fund_and_stake(
 }
 
 /// A setting the node would otherwise drop without a word stops the start, before anything is
-/// created: a disk limit it cannot read (#240) and a seed peer that is not a multiaddr (#241).
+/// created: a disk limit it cannot read (#240), a seed peer that is not a multiaddr (#241), and a
+/// devnet genesis balance it cannot read (#270's launch split).
 ///
 /// `HELIX_KEEP_BYTES=120 gigs` used to read as "no byte budget" — the operator's explicit limit
 /// switched off, found out when the disk ran full — and `203.0.113.7:8546` as a seed was skipped,
@@ -694,6 +697,9 @@ async fn a_node_will_not_start_on_a_setting_it_would_ignore() {
     for (setting, value) in [
         ("HELIX_KEEP_BYTES", "120 gigs"),
         ("HELIX_P2P_SEED_PEERS", "203.0.113.7:8546"),
+        // A devnet genesis balance written the way people write money — it would otherwise launch
+        // a chain with the default instead.
+        ("HELIX_GENESIS_VALIDATOR_LIQUID_HLX", "90k"),
         // #245: the checkpoint a validator used on 2026-09-25, its hash one character short.
         (
             "HELIX_TRUSTED_CHECKPOINT",

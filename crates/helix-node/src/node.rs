@@ -11,7 +11,10 @@ use helix_core::{genesis_block, Block, CommitSig, Transaction, TxType};
 use helix_crypto::{Address, CryptoScheme, Hash, KeyFile, KeyPair, PublicKey, Signature};
 use helix_executor::{
     execute_block,
-    genesis::{GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX, VALIDATOR_GENESIS_STAKE_HLX},
+    genesis::{
+        GenesisConfig, NANO_PER_HLX, TOTAL_SUPPLY_HLX, VALIDATOR_GENESIS_LIQUID_HLX,
+        VALIDATOR_GENESIS_STAKE_HLX,
+    },
     state::ChainState,
     GovernanceParams,
 };
@@ -616,6 +619,31 @@ fn check_disk_budget_settings(keep_blocks: Option<&str>, keep_bytes: Option<&str
     Ok(())
 }
 
+/// `HELIX_GENESIS_VALIDATOR_LIQUID_HLX`: how much the bootstrap validator holds liquid on a chain
+/// this node launches, in nano-HLX — `None` when unset, which keeps
+/// `VALIDATOR_GENESIS_LIQUID_HLX`.
+///
+/// For devnets and the multi-node tests, which fund their other validators from the bootstrap
+/// validator. On the real chain the launch reserve sits on a key that never touches a server
+/// (`GENESIS_PREFUND`), and the validator keeps a working balance only. The value shapes only a
+/// genesis this node writes itself; a node joining a chain takes that chain's allocations from its
+/// peer. Unreadable is a refused start, not the default: a launch that quietly fell back would be
+/// a chain with other balances than its operator meant (#240).
+fn genesis_validator_liquid_setting(raw: Option<&str>) -> Result<Option<u64>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u64>().ok().filter(|hlx| *hlx <= TOTAL_SUPPLY_HLX / 2) {
+        Some(hlx) => Ok(Some(hlx * NANO_PER_HLX)),
+        None => bail!(
+            "HELIX_GENESIS_VALIDATOR_LIQUID_HLX={raw:?} is not a whole number of HLX up to {}. \
+             Write digits only, e.g. HELIX_GENESIS_VALIDATOR_LIQUID_HLX=90000. It sets a balance \
+             in the genesis of a chain this node launches, so the node does not start without \
+             understanding it. Unset it for the default ({VALIDATOR_GENESIS_LIQUID_HLX} HLX).",
+            TOTAL_SUPPLY_HLX / 2
+        ),
+    }
+}
 
 const RPC_BIND_DEFAULT: &str = "127.0.0.1:8545";
 /// Validator health heartbeat cadence and thresholds (see `validator_health_loop`).
@@ -771,6 +799,9 @@ impl HelixNode {
         check_seed_peers(&configured_seed_peers(&cfg))?;
         let wallet_rpc = wallet_rpc_settings(&cfg)?;
         check_trusted_checkpoint_setting(config::resolve("HELIX_TRUSTED_CHECKPOINT", &None).as_deref())?;
+        let genesis_validator_liquid = genesis_validator_liquid_setting(
+            std::env::var("HELIX_GENESIS_VALIDATOR_LIQUID_HLX").ok().as_deref(),
+        )?;
 
         let key_path = resolve_validator_key_path(&cfg);
         // Double-sign state lives beside the key it protects: validator-key.json ->
@@ -843,9 +874,12 @@ impl HelixNode {
         // `Stake` transaction — so the key registry that staking fills has to be seeded here, or
         // nothing could ever verify this validator's commit signatures (they no longer carry a
         // key of their own).
-        let genesis_cfg =
+        let mut genesis_cfg =
             GenesisConfig::devnet_with_personhood_authority(address.clone(), personhood_authorities)
                 .with_validator_key(keypair.public.clone());
+        if let Some(nano) = genesis_validator_liquid {
+            genesis_cfg = genesis_cfg.with_validator_liquid(nano);
+        }
 
         // `sync_peer = "http://seed:8545"` in helix.toml, or HELIX_SYNC_PEER — resolved here
         // (rather than after genesis, as before) because a node with no local chain yet needs
@@ -10189,6 +10223,23 @@ mod body_cap_tests {
                 "must show how to write it: {msg}"
             );
         }
+    }
+
+    /// A devnet's genesis balance for the bootstrap validator: unset keeps the default, digits set
+    /// it, anything else refuses the start and names the setting.
+    #[test]
+    fn a_genesis_validator_balance_the_node_cannot_read_stops_the_start() {
+        assert_eq!(genesis_validator_liquid_setting(None).unwrap(), None);
+        assert_eq!(genesis_validator_liquid_setting(Some(" 90000 ")).unwrap(), Some(90_000 * NANO_PER_HLX));
+        assert_eq!(genesis_validator_liquid_setting(Some("0")).unwrap(), Some(0));
+        for unreadable in ["90_000", "90k", "", "-1", "1.5", "99999999999999999999"] {
+            let msg = genesis_validator_liquid_setting(Some(unreadable))
+                .expect_err("an unreadable genesis balance must stop the start")
+                .to_string();
+            assert!(msg.starts_with("HELIX_GENESIS_VALIDATOR_LIQUID_HLX"), "{unreadable:?}: {msg}");
+        }
+        let too_much = (TOTAL_SUPPLY_HLX / 2 + 1).to_string();
+        assert!(genesis_validator_liquid_setting(Some(&too_much)).is_err(), "more than half the supply is not a devnet balance");
     }
 
     /// The sync cap is derived from the protocol, never guessed: whatever a batch may legitimately

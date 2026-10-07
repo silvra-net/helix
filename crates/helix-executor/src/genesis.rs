@@ -8,8 +8,8 @@ pub const NANO_PER_HLX: u64 = 1_000_000_000;
 /// (decision 2026-07-15): it is sized to sit just above what the emission schedule actually
 /// pays out, not at an aspirational round number the chain could never reach. The 1 HLX
 /// halving subsidy (`scheduled_block_reward`) emits a geometric series that converges to
-/// `2 × INITIAL_BLOCK_REWARD_HLX × HALVING_INTERVAL_BLOCKS ≈ 31.5 M HLX`; plus the 200 k genesis
-/// allocation that is the real asymptotic max supply ≈ 31.7 M. The cap is set to 33 M so
+/// `2 × INITIAL_BLOCK_REWARD_HLX × HALVING_INTERVAL_BLOCKS ≈ 31.5 M HLX`; plus the 100 k genesis
+/// allocation that is the real asymptotic max supply ≈ 31.6 M. The cap is set to 33 M so
 /// it clears that asymptote with a small (~4 %) margin and never binds prematurely — but it
 /// is a genuine ceiling, not the ~67 M of phantom headroom the old 100 M value carried (a
 /// cap 3× larger than anything the schedule could mint reads as dishonest to anyone who does
@@ -53,11 +53,28 @@ pub const MIN_VALIDATOR_STAKE: u64 = 10_000 * NANO_PER_HLX;
 /// `ChainState::genesis_validator_stake` and handed to joining nodes via `GET /genesis`, so
 /// retuning this constant does not retroactively rewrite the genesis of chains already
 /// running under the old value. It applies to new chains only.
-pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 10_000; // = MIN_VALIDATOR_STAKE
-
-/// Liquid balance the bootstrap validator holds at genesis, on top of its stake.
 ///
-/// Exists because `VALIDATOR_GENESIS_STAKE_HLX` sits exactly on `MIN_VALIDATOR_STAKE`: a single
+/// **15,000 since the last reset (2026-10-07)**, half again the minimum: at exactly
+/// `MIN_VALIDATOR_STAKE` a single 5 % slash (`SLASH_FRACTION_BPS`) dropped the bootstrap
+/// validator out of the set at the next rotation, and the liquid reserve that used to cover that
+/// moved off the hot key (`GENESIS_PREFUND`). 15,000 stays at or above the minimum through seven
+/// slashes in a row.
+pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 15_000;
+
+/// Liquid balance the bootstrap validator holds at genesis, on top of its stake — its working
+/// balance for fees.
+///
+/// **1,000 since the last reset (2026-10-07).** The launch reserve that used to sit here moved
+/// to `GENESIS_PREFUND`, onto a key that never touches a server: on the validator it was the
+/// largest balance on the chain, held by the one key that has to stay online. A transfer costs
+/// about 0.00001 HLX, so 1,000 covers fees for longer than anyone will need, and the slash margin
+/// it used to provide is now in the stake itself (`VALIDATOR_GENESIS_STAKE_HLX`). A devnet that
+/// funds its validators from the bootstrap validator raises it at launch with
+/// `HELIX_GENESIS_VALIDATOR_LIQUID_HLX` (the multi-node tests do).
+///
+/// The history below explains the earlier values; its reasons still hold for whoever retunes this.
+///
+/// It existed because `VALIDATOR_GENESIS_STAKE_HLX` sits exactly on `MIN_VALIDATOR_STAKE`: a single
 /// 5% slash (`SLASH_FRACTION_BPS`) leaves the validator below the bar and drops it out of the set
 /// at the next epoch, and it cannot stake its way back out of thin air. This reserve makes that
 /// recoverable in one transaction — staking takes effect immediately, only *unstaking* waits out
@@ -95,7 +112,7 @@ pub const VALIDATOR_GENESIS_STAKE_HLX: u64 = 10_000; // = MIN_VALIDATOR_STAKE
 /// validator starts with 100k in all — this plus its 10k stake. It still seeds the validators the
 /// network has (three at 15k apiece leave 45k), and the bootstrap validator's own block rewards
 /// refill it: ~0.5 HLX a block as one proposer of four is some ten thousand HLX a day.
-pub const VALIDATOR_GENESIS_LIQUID_HLX: u64 = 90_000;
+pub const VALIDATOR_GENESIS_LIQUID_HLX: u64 = 1_000;
 
 /// Pre-funded genesis wallets beyond the validator's bootstrap stake: (address, balance_HLX).
 /// Empty by design (decision 2026-07-15, superseding the 2026-07-05 decision to liquid-dump
@@ -112,7 +129,14 @@ pub const VALIDATOR_GENESIS_LIQUID_HLX: u64 = 90_000;
 /// joining nodes over `GET /genesis`. That is what makes filling this in safe at all — before
 /// it, a populated prefund would have been rebuilt by each joining node from *its own* binary,
 /// so any build skew became a genesis mismatch and a diverged chain.
-const GENESIS_PREFUND: &[(&str, u64)] = &[];
+///
+/// **Since the last reset (2026-10-07): the launch reserve, 84,000 HLX** — together with the
+/// validator's 15,000 staked and 1,000 liquid the 100,000 the chain starts with. The address was
+/// generated on Vistos' own machine; its key and recovery words never reach a server, and what it
+/// funds (validators, whatever else the network needs) is signed offline. Named here, in the
+/// public source, on purpose: every allocation of the chain can be read before it launches. A
+/// chain someone else launches from this source credits the same address — change it for yours.
+const GENESIS_PREFUND: &[(&str, u64)] = &[("hlxf2ToZiQrv2XFAVvRgXU8ygDiH9TarQTuc", 84_000)];
 
 /// Starting per-block issuance before any halving, in whole HLX. Minted on top of the
 /// validator's fee share for every block (including empty ones) via `scheduled_block_reward`
@@ -227,9 +251,10 @@ impl GenesisConfig {
     ) -> Self {
         let mut allocations = Vec::new();
         for (addr_str, hlx) in GENESIS_PREFUND {
-            if let Ok(addr) = Address::from_str(addr_str) {
-                allocations.push((addr, hlx * NANO_PER_HLX));
-            }
+            // Never skipped: an address that does not parse would quietly launch a chain without
+            // its allocation. `every_prefund_address_is_valid` keeps this from firing.
+            let addr = Address::from_str(addr_str).expect("GENESIS_PREFUND holds valid addresses");
+            allocations.push((addr, hlx * NANO_PER_HLX));
         }
         // Routed through `allocations` rather than credited directly in `build_state` so it lands
         // in `ChainState::genesis_allocations` like any other genesis balance — which is what
@@ -246,6 +271,18 @@ impl GenesisConfig {
             personhood_authorities,
             validator_stake: VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX,
         }
+    }
+
+    /// Give the bootstrap validator `nano` liquid instead of `VALIDATOR_GENESIS_LIQUID_HLX`: for a
+    /// devnet that funds its other validators from it (`HELIX_GENESIS_VALIDATOR_LIQUID_HLX`). Every
+    /// other allocation, the launch reserve included, stays as it is.
+    pub fn with_validator_liquid(mut self, nano: u64) -> Self {
+        let validator = self.validator.clone();
+        self.allocations.retain(|(address, _)| address != &validator);
+        if nano > 0 {
+            self.allocations.push((validator, nano));
+        }
+        self
     }
 
     /// Record the genesis validator's signing key, so the registry that every other validator
@@ -390,10 +427,11 @@ mod tests {
 
         assert_eq!(state.accounts[&validator.to_string()].staked, peer_stake);
         assert_eq!(state.genesis_validator_stake, peer_stake);
+        let allocated: u64 = cfg.allocations.iter().map(|(_, nano)| nano).sum();
         assert_eq!(
             state.total_issued,
-            peer_stake + VALIDATOR_GENESIS_LIQUID_HLX * NANO_PER_HLX,
-            "issuance must count what was really staked, plus the validator's liquid reserve"
+            peer_stake + allocated,
+            "issuance must count what was really staked, plus every liquid allocation"
         );
     }
 
@@ -601,14 +639,18 @@ mod tests {
         assert_eq!(scheduled_block_reward(u64::MAX), 0);
     }
 
-    /// Genesis hands the founder a bounded, deliberate allocation and nothing more. The 2026-07-15
-    /// version of this test asserted `balance == 0` — no liquid pre-mine at all. That is no longer
-    /// the rule: the validator now also gets `VALIDATOR_GENESIS_LIQUID_HLX` so a slash that drops
-    /// it under `MIN_VALIDATOR_STAKE` is recoverable (see that constant). The principle the old
-    /// assertion protected is unchanged and still enforced here — genesis must stay a rounding
-    /// error against total supply, with everything else earned block by block.
+    /// Genesis hands out exactly 100,000 HLX and nothing more (Vistos, 2026-09-30, kept on
+    /// 2026-10-07): the bootstrap validator's 15,000 staked and 1,000 liquid, and the 84,000 launch
+    /// reserve on a key that never touches a server (`GENESIS_PREFUND`). The total and the reserve
+    /// address are written out here rather than derived from the constants — derived, this test
+    /// would only check the constants against themselves.
+    ///
+    /// History: the 2026-07-15 version asserted `balance == 0`, no liquid pre-mine at all; the
+    /// validator then got a liquid reserve so a slash below `MIN_VALIDATOR_STAKE` was recoverable.
+    /// The principle the old assertion protected is unchanged and still enforced below — genesis
+    /// must stay a rounding error against total supply, with everything else earned block by block.
     #[test]
-    fn genesis_allocates_only_the_bootstrap_stake_and_its_reserve() {
+    fn genesis_allocates_the_bootstrap_stake_its_working_balance_and_the_launch_reserve() {
         let validator = Address::from_public_key(&helix_crypto::KeyPair::generate().public);
         let cfg = GenesisConfig::devnet(validator.clone());
         let state = cfg.build_state();
@@ -616,10 +658,13 @@ mod tests {
         let acc = state.get(&validator).expect("validator account must exist at genesis");
         assert_eq!(acc.staked, VALIDATOR_GENESIS_STAKE_HLX * NANO_PER_HLX);
         assert_eq!(acc.balance, VALIDATOR_GENESIS_LIQUID_HLX * NANO_PER_HLX);
+        let reserve = Address::from_str("hlxf2ToZiQrv2XFAVvRgXU8ygDiH9TarQTuc").unwrap();
+        assert_eq!(state.get(&reserve).expect("the launch reserve exists at genesis").balance, 84_000 * NANO_PER_HLX);
+        assert_eq!(state.get(&reserve).unwrap().staked, 0);
         assert_eq!(
             state.total_issued,
-            (VALIDATOR_GENESIS_STAKE_HLX + VALIDATOR_GENESIS_LIQUID_HLX) * NANO_PER_HLX,
-            "nothing may be issued at genesis beyond the stake and its reserve"
+            100_000 * NANO_PER_HLX,
+            "the chain starts with exactly 100,000 HLX — stake, working balance and launch reserve"
         );
         assert_eq!(state.total_supply, TOTAL_SUPPLY_HLX * NANO_PER_HLX);
 
@@ -643,5 +688,37 @@ mod tests {
              bootstrap allocation and becomes a pre-mine"
         );
         assert!(state.mintable_headroom() > 0, "the vast majority of supply must remain unminted");
+    }
+
+    /// A devnet's larger working balance replaces the validator's own allocation and touches no
+    /// other — the launch reserve stays where it is.
+    #[test]
+    fn a_devnet_validator_balance_replaces_only_the_validators_allocation() {
+        let validator = Address::from_public_key(&helix_crypto::KeyPair::generate().public);
+        let default = GenesisConfig::devnet(validator.clone()).build_state();
+        let devnet = GenesisConfig::devnet(validator.clone())
+            .with_validator_liquid(90_000 * NANO_PER_HLX)
+            .build_state();
+        assert_eq!(devnet.get(&validator).unwrap().balance, 90_000 * NANO_PER_HLX);
+        assert_eq!(devnet.get(&validator).unwrap().staked, default.get(&validator).unwrap().staked);
+        for (address, hlx) in GENESIS_PREFUND {
+            let address = Address::from_str(address).unwrap();
+            assert_eq!(devnet.get(&address).unwrap().balance, hlx * NANO_PER_HLX);
+        }
+        assert_eq!(
+            devnet.total_issued - default.total_issued,
+            (90_000 - VALIDATOR_GENESIS_LIQUID_HLX) * NANO_PER_HLX,
+            "only the validator's balance moved"
+        );
+    }
+
+    /// An address in `GENESIS_PREFUND` that did not parse would launch a chain without its
+    /// allocation; `devnet_with_personhood_authority` refuses to, and this keeps it from having to.
+    #[test]
+    fn every_prefund_address_is_valid() {
+        for (address, hlx) in GENESIS_PREFUND {
+            assert!(Address::from_str(address).is_ok(), "{address} is not a valid address");
+            assert!(*hlx > 0, "{address} is listed with nothing");
+        }
     }
 }

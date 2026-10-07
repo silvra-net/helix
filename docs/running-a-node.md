@@ -108,6 +108,7 @@ not start.
 | `HELIX_P2P_DISABLE_MDNS` | off | `1` turns off discovery on the local network — needed only when two separate Helix networks share a LAN. |
 | `HELIX_SYNC_PEER` | `https://node.silvra.net` | RPC endpoint of a node on the chain to join: the genesis and missing blocks come from it, and a follower polls it every 4 seconds for new blocks. |
 | `HELIX_NEW_CHAIN` | off | `1` starts a chain of your own: the node signs its own genesis. For private chains and a new network's first node. |
+| `HELIX_GENESIS_VALIDATOR_LIQUID_HLX` | 1000 | How much the bootstrap validator holds liquid in the genesis of a chain this node launches (`HELIX_NEW_CHAIN=1`), in whole HLX — for a devnet that funds its validators from it. A node that joins a chain takes that chain's allocations from its peer and does not use it. A value the node cannot read stops the start. |
 | `HELIX_GENESIS_HASH` | the public chain's, compiled in | The genesis hash of the chain this node must be on — checked before anything is written, and at every start against the chain already stored. Set it to join another network, or when a binary's compiled-in hash predates a reset. |
 | `HELIX_TRUSTED_CHECKPOINT` | (none) | `<height>:<block hash>:<state root>` — start a new node from a state snapshot instead of replaying the chain. See [Joining fast from a checkpoint](#joining-fast-from-a-checkpoint). |
 | `HELIX_SNAPSHOT_INTERVAL` | `10000` | How often, in heights, this node stores a state snapshot that other nodes can start from. `0` turns that off. |
@@ -147,7 +148,10 @@ HELIX_SYNC_PEER=https://node.other-network.example HELIX_GENESIS_HASH=<its genes
 ```
 
 To run a **chain of your own** — for development, or as the first node of a new network — set
-`HELIX_NEW_CHAIN=1`. Its validator key starts with 10,000 HLX staked and 90,000 liquid.
+`HELIX_NEW_CHAIN=1`. Its validator key starts with 15,000 HLX staked and 1,000 liquid, and the
+genesis credits the network's launch reserve (`GENESIS_PREFUND` in `crates/helix-executor/src/genesis.rs`
+— change it for a network of your own). A devnet that funds its validators from the bootstrap
+validator raises its balance at launch with `HELIX_GENESIS_VALIDATOR_LIQUID_HLX=<hlx>`.
 
 ### Verifying which chain you joined
 

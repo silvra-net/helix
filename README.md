@@ -113,10 +113,11 @@ one — settings, disk limits, running behind a proxy, becoming a validator — 
 
 `HELIX_NEW_CHAIN=1` starts a chain of your own instead: the node signs its own genesis and runs
 standalone. Its validator key (`./validator-key.json`, a regular CLI wallet file) starts with
-10,000 HLX staked and 90,000 liquid, so it can fund other wallets:
+15,000 HLX staked and 1,000 liquid; to fund other wallets from it, give it more at launch with
+`HELIX_GENESIS_VALIDATOR_LIQUID_HLX`:
 
 ```bash
-HELIX_NEW_CHAIN=1 helix start
+HELIX_NEW_CHAIN=1 HELIX_GENESIS_VALIDATOR_LIQUID_HLX=90000 helix start
 helix --node http://127.0.0.1:8545 tx send <address> 100 --key validator-key.json
 ```
 
