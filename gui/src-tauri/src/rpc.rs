@@ -25,6 +25,10 @@ pub struct NetworkStatus {
     pub best_hash: String,
     pub peer_count: usize,
     pub is_syncing: bool,
+    /// The tip this node is syncing towards, while it is; what the "catching up" banner measures
+    /// progress against. Absent when no peer has announced one.
+    #[serde(default)]
+    pub sync_target_height: Option<u64>,
     pub mempool_size: usize,
     pub circulating_supply_hlx: f64,
     /// What the next block charges per transaction byte. Absent on nodes older than the fee
@@ -163,6 +167,12 @@ pub struct Proposal {
     pub yes_stake_hlx: f64,
     #[serde(default)]
     pub executed: bool,
+    /// Yes-stake this proposal needs to pass. Not defaulted: every node on a chain this wallet can
+    /// join reports it, and a made-up zero would read as "already passed".
+    pub quorum_stake_hlx: f64,
+    /// Last height at which a vote is accepted — what tells an expired proposal from an open one.
+    /// Not defaulted either: zero would mark every proposal expired.
+    pub expires_at_height: u64,
 }
 
 /// The runtime-adjustable protocol parameters — mirrors `/governance/params`.

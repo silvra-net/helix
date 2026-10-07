@@ -151,3 +151,63 @@ mod command_names {
         assert!(unused.is_empty(), "registered commands api.ts never invokes: {unused:?}");
     }
 }
+
+#[cfg(test)]
+mod response_fields {
+    /// Every field the frontend reads must survive the Rust struct it passes through.
+    ///
+    /// The webview never sees a node's answer directly: a command deserializes it into a struct
+    /// here and serializes that struct again, so any field the struct does not name is dropped
+    /// without a word. On 2026-08-27 the node gained `quorum_stake_hlx` and `expires_at_height`,
+    /// `types.ts` and the governance view gained them too — and `rpc::Proposal` did not. The view
+    /// then called `.toLocaleString()` on a missing number. `sync_target_height` went the same
+    /// way, so the "catching up" banner could never appear. The TypeScript tests passed objects
+    /// built by hand and never went through this crate, which is how both stayed unseen.
+    ///
+    /// The rule: an interface in `types.ts` that shares its name with a struct here lists no field
+    /// the struct lacks. Fields only the struct has are fine.
+    #[test]
+    fn every_field_the_frontend_reads_passes_through_the_backend() {
+        let ts = include_str!("../../src/types.ts");
+        let sources = [
+            include_str!("rpc.rs"),
+            include_str!("commands.rs"),
+            include_str!("node_process.rs"),
+            include_str!("state.rs"),
+            include_str!("wallet.rs"),
+            include_str!("pricing.rs"),
+        ];
+        let mut compared = 0;
+        let mut gaps = Vec::new();
+        for block in ts.split("export interface ").skip(1) {
+            let name = block.split_whitespace().next().unwrap_or("");
+            let body = block.split_once('{').map(|(_, b)| b).unwrap_or("");
+            let body = body.split("\n}").next().unwrap_or("");
+            let fields: Vec<&str> = body
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//") && !l.starts_with('*') && !l.starts_with("/*"))
+                .filter_map(|l| l.split_once(':').map(|(f, _)| f.trim_end_matches('?')))
+                .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .collect();
+            let needle = format!("pub struct {name} {{");
+            let Some(src) = sources.iter().find(|s| s.contains(&needle)) else { continue };
+            let start = src.find(&needle).unwrap() + needle.len();
+            let end = start + src[start..].find("\n}").expect("struct end");
+            let rust = &src[start..end];
+            assert!(
+                !rust.contains("serde(rename"),
+                "{name} renames a field; this test compares names and would need to know"
+            );
+            compared += 1;
+            for field in fields {
+                if !rust.contains(&format!("pub {field}:")) {
+                    gaps.push(format!("{name}.{field}"));
+                }
+            }
+        }
+        // Positive control: the parsers found the pairs at all.
+        assert!(compared >= 15, "only {compared} interfaces matched a struct");
+        assert!(gaps.is_empty(), "types.ts reads fields the backend drops: {gaps:?}");
+    }
+}
