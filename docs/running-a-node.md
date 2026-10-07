@@ -434,14 +434,14 @@ Each release from 0.20.3 on is published as `ghcr.io/silvra-net/helix:<version>`
 `:latest`); `docker build -t helix-node .` in a checkout builds the same image.
 
 ```bash
-docker pull ghcr.io/silvra-net/helix:0.20.4
+docker pull ghcr.io/silvra-net/helix:1.0.0
 
 docker run -d --name helix \
   -p 8545:8545 -p 8546:8546 \
   -v helix-data:/data \
   -e HELIX_RPC_BIND=0.0.0.0:8545 \
   -e MALLOC_ARENA_MAX=2 -e HELIX_KEEP_BYTES=20G \
-  ghcr.io/silvra-net/helix:0.20.4
+  ghcr.io/silvra-net/helix:1.0.0
 ```
 
 - The image holds the `helix` binary (also as `helix-cli`, for the [wallet
