@@ -25,7 +25,7 @@ fn equal_set(n: usize, stake: u64) -> (Vec<KeyPair>, ValidatorSet) {
         .iter()
         .map(|kp| Validator::new(Address::from_public_key(&kp.public), stake, true))
         .collect();
-    (kps, ValidatorSet::new(validators, 0))
+    (kps, ValidatorSet::new(validators, 0, helix_crypto::Hash::ZERO))
 }
 
 /// How many validators may be absent before the remainder can no longer reach quorum.
@@ -99,7 +99,7 @@ fn the_one_percent_cap_equalises_everyone_above_it_and_nobody_below_it() {
         .zip(stakes)
         .map(|(kp, s)| Validator::new(Address::from_public_key(&kp.public), s * 1_000_000_000, true))
         .collect();
-    let set = ValidatorSet::new(validators, 0);
+    let set = ValidatorSet::new(validators, 0, helix_crypto::Hash::ZERO);
     let powers: Vec<u64> = set.full_members().map(|v| v.voting_power).collect();
 
     let cap = set.full_members().map(|v| v.stake).sum::<u64>() / 100;

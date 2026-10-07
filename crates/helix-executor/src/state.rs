@@ -1050,7 +1050,7 @@ impl ChainState {
                     )
                 })
                 .collect(),
-            0,
+            0, self.chain_id,
         );
         let signed_power: u64 = set
             .validators
@@ -1294,7 +1294,7 @@ impl ChainState {
                 helix_consensus::Validator { public_key, ..v }
             })
             .collect();
-        helix_consensus::ValidatorSet::new(validators, 0)
+        helix_consensus::ValidatorSet::new(validators, 0, self.chain_id)
     }
 
     /// The signing set from the rotation's own truth: `active_validators` as full members
@@ -2241,8 +2241,8 @@ mod tests {
 
         // Every call site installs the result this way, so compare what the engine actually gets.
         const EPOCH: u64 = 7;
-        let old = helix_consensus::ValidatorSet::new(the_old_way, EPOCH);
-        let new = helix_consensus::ValidatorSet::new(the_new_way, EPOCH);
+        let old = helix_consensus::ValidatorSet::new(the_old_way, EPOCH, helix_crypto::Hash::ZERO);
+        let new = helix_consensus::ValidatorSet::new(the_new_way, EPOCH, helix_crypto::Hash::ZERO);
 
         assert_eq!(
             old.validators.len(),

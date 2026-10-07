@@ -48,7 +48,9 @@ impl Vote {
     /// The bytes that get signed — deterministic canonical encoding. Includes
     /// `crypto_version` so a vote can't be replayed under a different scheme tag
     /// than the one it was actually signed with.
-    pub fn signing_bytes(&self) -> Vec<u8> {
+    /// Bound to `chain_id` (#271), like `helix_core::precommit_signing_bytes`: a vote for one chain
+    /// is not a vote for any other.
+    pub fn signing_bytes(&self, chain_id: &Hash) -> Vec<u8> {
         // Precommit delegates to `helix_core::precommit_signing_bytes` — the same function
         // `CommitSig::verify()` uses to check a precommit carried in a block's `last_commit`.
         // The two must never define "what a precommit signs" differently, or a genuine
@@ -56,6 +58,7 @@ impl Vote {
         // byte-layout drift, not an actual signature mismatch.
         if self.vote_type == VoteType::Precommit {
             return helix_core::precommit_signing_bytes(
+                chain_id,
                 self.height,
                 self.round,
                 &self.block_hash,
@@ -66,7 +69,8 @@ impl Vote {
         // Domain separation: a signature over a vote can never be reinterpreted as a
         // signature over a block header or transaction (which carry their own distinct
         // domain tags), even if the remaining bytes happened to line up.
-        bytes.extend_from_slice(b"helix-vote-v1:");
+        bytes.extend_from_slice(b"helix-vote-v2:");
+        bytes.extend_from_slice(chain_id.as_bytes());
         bytes.extend_from_slice(b"prevote:");
         bytes.extend_from_slice(&self.height.to_le_bytes());
         bytes.extend_from_slice(&self.round.to_le_bytes());
@@ -80,7 +84,7 @@ impl Vote {
     /// vote's contents. A forged vote (right address, no private key) fails here —
     /// this is what makes votes trustworthy once they start arriving over the
     /// network instead of only from `self`.
-    pub fn verify_signature(&self) -> ConsensusResult<()> {
+    pub fn verify_signature(&self, chain_id: &Hash) -> ConsensusResult<()> {
         if Address::from_public_key(&self.public_key) != self.validator {
             return Err(ConsensusError::InvalidVote {
                 reason: format!(
@@ -92,7 +96,7 @@ impl Vote {
         helix_crypto::verify_with_scheme(
             self.crypto_version,
             &self.public_key,
-            &self.signing_bytes(),
+            &self.signing_bytes(chain_id),
             &self.signature,
         )
         .map_err(ConsensusError::Crypto)

@@ -246,7 +246,7 @@ impl Sim {
                     true,
                 ))
                 .collect(),
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let genesis = Hash::digest(b"genesis");
         Sim {
@@ -442,7 +442,7 @@ impl Sim {
                             let mut tw = (**v).clone();
                             tw.block_hash = Hash::digest(b"the other branch");
                             tw.signature =
-                                kp.sign(&tw.signing_bytes()).expect("sign the twin vote");
+                                kp.sign(&tw.signing_bytes(&helix_crypto::Hash::ZERO)).expect("sign the twin vote");
                             Some(Msg::Vote(Box::new(tw)))
                         }
                         _ => None,
@@ -479,7 +479,7 @@ impl Sim {
                 // A different value for the same (height, round, type) — which is precisely what
                 // `VoteSet::add` is meant to catch and turn into double-sign evidence.
                 twin.block_hash = Hash::digest(b"the other branch");
-                twin.signature = kp.sign(&twin.signing_bytes()).expect("sign the twin vote");
+                twin.signature = kp.sign(&twin.signing_bytes(&helix_crypto::Hash::ZERO)).expect("sign the twin vote");
                 out.push(m);
                 out.push(Msg::Vote(Box::new(twin)));
                 continue;

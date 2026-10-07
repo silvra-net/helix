@@ -14,14 +14,23 @@ pub use helix_crypto::CryptoScheme as CryptoVersion;
 /// `helix-core` cannot depend back on `helix-consensus` (the dependency already runs the other
 /// way). `helix-consensus::Vote::signing_bytes()`'s `Precommit` arm calls this directly so the
 /// two can never drift apart into two different "what a precommit signs" definitions.
+///
+/// **Bound to the chain** (#271): `chain_id` — the genesis hash, as for transactions (#174) — is
+/// part of what is signed. Without it a precommit was valid on every chain its key had ever
+/// voted on, and a validator key carried its signatures from one chain into the next: testnet
+/// into mainnet, one reset into the next. A parameter rather than a field of the vote, so a vote
+/// for another chain simply does not verify here, and so the compiler asks every caller which
+/// chain it means.
 pub fn precommit_signing_bytes(
+    chain_id: &Hash,
     height: u64,
     round: u32,
     block_hash: &Hash,
     crypto_version: CryptoVersion,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"helix-vote-v1:");
+    bytes.extend_from_slice(b"helix-vote-v2:");
+    bytes.extend_from_slice(chain_id.as_bytes());
     bytes.extend_from_slice(b"precommit:");
     bytes.extend_from_slice(&height.to_le_bytes());
     bytes.extend_from_slice(&round.to_le_bytes());
@@ -89,6 +98,7 @@ impl CommitSig {
     /// signature against the wrong identity.
     pub fn verify(
         &self,
+        chain_id: &Hash,
         public_key: &PublicKey,
         height: u64,
         block_hash: &Hash,
@@ -98,7 +108,7 @@ impl CommitSig {
                 "commit sig public key does not derive declared validator address".into(),
             ));
         }
-        let bytes = precommit_signing_bytes(height, self.round, block_hash, self.crypto_version);
+        let bytes = precommit_signing_bytes(chain_id, height, self.round, block_hash, self.crypto_version);
         helix_crypto::verify_with_scheme(self.crypto_version, public_key, &bytes, &self.signature)
     }
 }
@@ -574,9 +584,14 @@ mod tests {
         assert_ne!(mk(0), mk(1_753_000_000_000), "the old hardcoded-0 genesis must not collide with a real-timestamp reset");
     }
 
+    /// The chain these tests sign for.
+    fn chain() -> Hash {
+        Hash::digest(b"test chain")
+    }
+
     fn signed_commit_sig(kp: &helix_crypto::KeyPair, height: u64, round: u32, block_hash: Hash) -> CommitSig {
         let addr = Address::from_public_key(&kp.public);
-        let bytes = precommit_signing_bytes(height, round, &block_hash, kp.scheme);
+        let bytes = precommit_signing_bytes(&chain(), height, round, &block_hash, kp.scheme);
         CommitSig {
             validator: addr,
             crypto_version: kp.scheme,
@@ -591,7 +606,7 @@ mod tests {
         let kp = KeyPair::generate();
         let block_hash = Hash::digest(b"parent block");
         let sig = signed_commit_sig(&kp, 41, 0, block_hash);
-        assert!(sig.verify(&kp.public, 41, &block_hash).is_ok());
+        assert!(sig.verify(&chain(), &kp.public, 41, &block_hash).is_ok());
     }
 
     /// A `CommitSig` can't be reused for a different height/round/block than it actually
@@ -604,7 +619,21 @@ mod tests {
         let kp = KeyPair::generate();
         let block_hash = Hash::digest(b"parent block");
         let sig = signed_commit_sig(&kp, 41, 0, block_hash);
-        assert!(sig.verify(&kp.public, 42, &block_hash).is_err());
+        assert!(sig.verify(&chain(), &kp.public, 42, &block_hash).is_err());
+    }
+
+    /// The signature binds the chain (#271): the same precommit — same key, height, round and
+    /// block hash — does not verify on any other chain. Without this, every signature a key ever
+    /// made on one chain was a valid signature on every other.
+    #[test]
+    fn commit_sig_verify_rejects_a_sig_made_for_another_chain() {
+        use helix_crypto::KeyPair;
+        let kp = KeyPair::generate();
+        let block_hash = Hash::digest(b"parent block");
+        let sig = signed_commit_sig(&kp, 41, 0, block_hash);
+        assert!(sig.verify(&chain(), &kp.public, 41, &block_hash).is_ok(), "positive control");
+        let other_chain = Hash::digest(b"another chain");
+        assert!(sig.verify(&other_chain, &kp.public, 41, &block_hash).is_err());
     }
 
     #[test]
@@ -619,10 +648,10 @@ mod tests {
         // The key now comes from the caller — the chain's registry — so the faithful version of
         // this forgery is: the registry answers with the *claimed* validator's key, and the
         // signature was made by somebody else. It must still fail.
-        assert!(sig.verify(&claimed.public, 41, &block_hash).is_err());
+        assert!(sig.verify(&chain(), &claimed.public, 41, &block_hash).is_err());
         // And supplying the real signer's key does not rescue it either: that key does not derive
         // the address the signature claims, which is the check that makes a lookup safe to trust.
-        assert!(sig.verify(&signer.public, 41, &block_hash).is_err());
+        assert!(sig.verify(&chain(), &signer.public, 41, &block_hash).is_err());
     }
 
     /// A block's `last_commit` doesn't change what it commits to sign — `signing_hash` folds

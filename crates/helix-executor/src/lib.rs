@@ -127,7 +127,7 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
             state
                 .validator_key(&sig.validator)
                 .is_some_and(|key| {
-                    sig.verify(key, height.saturating_sub(1), &block.header.prev_hash).is_ok()
+                    sig.verify(&state.chain_id, key, height.saturating_sub(1), &block.header.prev_hash).is_ok()
                 })
         })
         .map(|sig| sig.validator.clone())
@@ -1523,10 +1523,11 @@ fn execute_submit_double_sign_evidence(
             0,
         );
     }
-    if evidence.vote_a.verify_signature().is_err() {
+    // Against this chain (#271): a vote signed for another chain is no evidence about this one.
+    if evidence.vote_a.verify_signature(&state.chain_id).is_err() {
         return Receipt::failure(tx_hash, "vote_a signature verification failed", 0, 0);
     }
-    if evidence.vote_b.verify_signature().is_err() {
+    if evidence.vote_b.verify_signature(&state.chain_id).is_err() {
         return Receipt::failure(tx_hash, "vote_b signature verification failed", 0, 0);
     }
 
@@ -5693,7 +5694,7 @@ mod tests {
             crypto_version: kp.scheme,
             signature: Signature::from_bytes(vec![]),
         };
-        vote.signature = kp.sign(&vote.signing_bytes()).unwrap();
+        vote.signature = kp.sign(&vote.signing_bytes(&helix_crypto::Hash::ZERO)).unwrap();
         vote
     }
 
@@ -5764,6 +5765,58 @@ mod tests {
         let expected_slash = 1_000_000 * helix_consensus::SLASH_FRACTION_BPS / 10_000;
         assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000 - expected_slash);
         assert_eq!(state.total_burned, expected_slash);
+    }
+
+    /// Votes are evidence only on the chain they were signed for (#271). A key that validated on
+    /// another chain — a testnet, an earlier reset — signed votes there that differ from any vote
+    /// it signs here; none of them says anything about this chain, and none may slash. The test
+    /// above is the positive control: the same pair, both signed here, slashes.
+    #[test]
+    fn a_vote_signed_for_another_chain_is_no_evidence_here() {
+        let validator_kp = KeyPair::generate();
+        let validator_addr = Address::from_public_key(&validator_kp.public);
+        let reporter_kp = KeyPair::generate();
+        let reporter = Address::from_public_key(&reporter_kp.public);
+        let block_validator = Address::from_public_key(&KeyPair::generate().public);
+
+        // A real chain, not `Hash::ZERO`: evidence checked against the zero chain instead of this
+        // one would pass on a zero-chain state.
+        let this_chain = Hash::digest(b"this chain");
+        let report = |vote_b_chain: &Hash| {
+            let mut state = ChainState::new(0);
+            state.chain_id = this_chain;
+            state.update_account(&validator_addr, |acc| acc.staked = 1_000_000);
+            state.update_account(&reporter, |acc| acc.balance = 1_000_000);
+
+            let sign_for = |block: &[u8], chain: &Hash| {
+                let mut vote = signed_vote(&validator_kp, &validator_addr, helix_consensus::VoteType::Precommit, 10, 0, Hash::digest(block));
+                vote.signature = validator_kp.sign(&vote.signing_bytes(chain)).unwrap();
+                vote
+            };
+            let evidence = DoubleSignEvidence {
+                validator: validator_addr.clone(),
+                height: 10,
+                round: 0,
+                vote_a: sign_for(b"block-a", &this_chain),
+                vote_b: sign_for(b"block-b", vote_b_chain),
+            };
+            let mut tx = signed_evidence_tx(&reporter_kp, &reporter, &evidence, 0);
+            tx.chain_id = this_chain;
+            tx.signature = reporter_kp.sign(tx.signing_hash().as_bytes()).unwrap();
+            let receipt = execute_transaction(&mut state, &tx, &block_validator, 0, 0);
+            (receipt, state)
+        };
+
+        // Positive control: both votes signed for this chain are evidence here, and they slash.
+        let (receipt, state) = report(&this_chain);
+        assert!(receipt.success, "positive control: {:?}", receipt.error);
+        assert!(state.get(&validator_addr).unwrap().staked < 1_000_000);
+
+        let (receipt, state) = report(&Hash::digest(b"another chain"));
+        assert!(!receipt.success);
+        assert!(receipt.error.as_deref().unwrap_or("").contains("vote_b signature"), "{:?}", receipt.error);
+        assert_eq!(state.get(&validator_addr).unwrap().staked, 1_000_000, "nothing slashed");
+        assert_eq!(state.total_burned, 0);
     }
 
     /// **One incident, slashed as often as the reporter likes.**
@@ -6155,6 +6208,16 @@ mod tests {
     /// A block carrying a genuine quorum certificate — real precommit signatures from
     /// `signers`, the way a proposer that actually ran the round would attach them.
     fn block_with_commit(validator: &Address, height: u64, signers: &[&KeyPair]) -> Block {
+        block_with_commit_for(&helix_crypto::Hash::ZERO, validator, height, signers)
+    }
+
+    /// [`block_with_commit`], with the precommits signed for `chain`.
+    fn block_with_commit_for(
+        chain: &helix_crypto::Hash,
+        validator: &Address,
+        height: u64,
+        signers: &[&KeyPair],
+    ) -> Block {
         let mut block = empty_block(validator, height);
         block.header.last_commit = signers
             .iter()
@@ -6162,6 +6225,7 @@ mod tests {
                 // Must match what `execute_block` verifies against: the *parent* height and the
                 // block's own `prev_hash`.
                 let bytes = helix_core::precommit_signing_bytes(
+                    chain,
                     height.saturating_sub(1),
                     0,
                     &block.header.prev_hash,
@@ -6176,6 +6240,47 @@ mod tests {
             })
             .collect();
         block
+    }
+
+    /// A precommit signed for another chain is no participation on this one (#271). Three of four
+    /// validators sign; with the signatures made for this chain the certificate carries quorum and
+    /// the fourth is charged a miss (the positive control), with the same signatures made for
+    /// another chain nobody here has signed, the certificate proves nothing, and nobody is charged.
+    #[test]
+    fn a_commit_signed_for_another_chain_counts_as_no_participation() {
+        let this_chain = helix_crypto::Hash::digest(b"this chain");
+        let run = |signed_for: &helix_crypto::Hash| {
+            let proposer = Address::from_public_key(&KeyPair::generate().public);
+            let witnesses: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+            let silent = Address::from_public_key(&KeyPair::generate().public);
+            let mut state =
+                ChainState::new(crate::genesis::TOTAL_SUPPLY_HLX * crate::genesis::NANO_PER_HLX);
+            state.chain_id = this_chain;
+            state.governance_params.min_validator_stake = 100;
+            for kp in &witnesses {
+                let addr = Address::from_public_key(&kp.public);
+                state.update_account(&addr, |acc| acc.staked = 1_000);
+                state.set_validator_key(&addr, kp.public.clone());
+                state.active_validators.insert(addr);
+            }
+            state.update_account(&silent, |acc| acc.staked = 1_000);
+            state.active_validators.insert(silent.clone());
+
+            let signing: Vec<&KeyPair> = witnesses.iter().collect();
+            execute_block(&mut state, &block_with_commit_for(signed_for, &proposer, 1, &signing));
+            state.missed_blocks.get(&silent.to_string()).copied().unwrap_or(0)
+        };
+
+        assert!(
+            run(&this_chain) > 0,
+            "positive control: signed for this chain, the certificate convicts the silent one"
+        );
+        assert_eq!(
+            run(&helix_crypto::Hash::ZERO),
+            0,
+            "signed for another chain, the signatures must not count — the certificate proves \
+             nothing here and nobody may be charged on it"
+        );
     }
 
     /// The other half: once a validator really is in the active set, silence must still be

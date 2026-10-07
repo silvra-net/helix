@@ -125,7 +125,7 @@ fn run(latency: usize, skew: usize, ticks: usize) -> Outcome {
             Validator::with_key(Address::from_public_key(&kp_a.public), Some(kp_a.public.clone()), 1_000, true),
             Validator::with_key(Address::from_public_key(&kp_b.public), Some(kp_b.public.clone()), 1_000, true),
         ],
-        0,
+        0, helix_crypto::Hash::ZERO,
     );
     let genesis = Hash::digest(b"genesis");
     let mut a = Node::new(set.clone(), kp_a, genesis);

@@ -38,6 +38,11 @@ impl VoteSet {
 
     /// Add a vote. Returns the voting power now behind the vote's block hash.
     /// Errors on: unknown validator, duplicate vote, wrong height/round/type.
+    /// The chain whose votes this set counts (#271) — the one a vote for it must be signed for.
+    pub fn chain_id(&self) -> Hash {
+        self.validator_set.chain_id
+    }
+
     pub fn add(&mut self, vote: Vote) -> ConsensusResult<u64> {
         if vote.height != self.height || vote.round != self.round {
             return Err(ConsensusError::InvalidVote {
@@ -60,7 +65,7 @@ impl VoteSet {
             .get(&vote.validator)
             .ok_or_else(|| ConsensusError::UnknownValidator(vote.validator.clone()))?;
 
-        vote.verify_signature()?;
+        vote.verify_signature(&self.validator_set.chain_id)?;
 
         if let Some(existing) = self.votes.get(&addr_str) {
             if existing.block_hash != vote.block_hash {
@@ -164,7 +169,7 @@ mod tests {
 
     fn validator_set_of(keypair: &KeyPair) -> ValidatorSet {
         let address = Address::from_public_key(&keypair.public);
-        ValidatorSet::new(vec![crate::Validator::new(address, 1_000, true)], 0)
+        ValidatorSet::new(vec![crate::Validator::new(address, 1_000, true)], 0, helix_crypto::Hash::ZERO)
     }
 
     fn signed_vote(keypair: &KeyPair, height: u64, round: u32, block_hash: Hash) -> Vote {
@@ -178,8 +183,23 @@ mod tests {
             crypto_version: keypair.scheme,
             signature: Signature::from_bytes(vec![]),
         };
-        vote.signature = keypair.sign(&vote.signing_bytes()).unwrap();
+        vote.signature = keypair.sign(&vote.signing_bytes(&helix_crypto::Hash::ZERO)).unwrap();
         vote
+    }
+
+    /// A round counts no vote signed for another chain (#271) — the path every gossiped vote takes
+    /// into the engine.
+    #[test]
+    fn a_vote_signed_for_another_chain_is_refused() {
+        let kp = KeyPair::generate();
+        let mut vote_set = VoteSet::new(1, 0, VoteType::Prevote, validator_set_of(&kp));
+        let mut vote = signed_vote(&kp, 1, 0, Hash::digest(b"block"));
+        vote.signature = kp.sign(&vote.signing_bytes(&Hash::digest(b"another chain"))).unwrap();
+        assert!(vote_set.add(vote.clone()).is_err());
+        assert_eq!(vote_set.chain_id(), helix_crypto::Hash::ZERO);
+        // Positive control: the same vote signed for this round's chain is counted.
+        vote.signature = kp.sign(&vote.signing_bytes(&vote_set.chain_id())).unwrap();
+        assert!(vote_set.add(vote).is_ok());
     }
 
     /// Two nodes holding the same votes must hand out the same certificate. The committed block
@@ -192,7 +212,7 @@ mod tests {
             keys.iter()
                 .map(|k| crate::Validator::new(Address::from_public_key(&k.public), 1_000, true))
                 .collect(),
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let block_hash = Hash::digest(b"block");
         let votes: Vec<Vote> = keys.iter().map(|k| signed_vote(k, 1, 0, block_hash)).collect();

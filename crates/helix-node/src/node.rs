@@ -1541,6 +1541,17 @@ impl HelixNode {
         // set every live node rotated to — including honouring the one-epoch activation
         // delay for a staker that has not been rotated in yet. See backlog #129.
         let genesis_height = self.store.read().await.latest_height();
+        // Which chain this node's votes are for (#271). Every path that sets a state up stamps it
+        // (`with_chain_id`, or the stored genesis on load), so the unset value here is a defect —
+        // and signing with it would make every vote this validator casts count on no chain at all.
+        let chain_id = self.chain_state.read().await.chain_id;
+        if chain_id == Hash::ZERO {
+            anyhow::bail!(
+                "refusing to start consensus: this node does not know which chain it is on (its \
+                 chain id is unset). Its votes would be valid on no chain. This is a bug — please \
+                 report it with the start of this log."
+            );
+        }
         let validator_set = {
             let state_guard = self.chain_state.read().await;
             let validators = validators_from_state(&state_guard);
@@ -1550,9 +1561,9 @@ impl HelixNode {
                 // No qualifying stakers recorded yet — fall back to self as sole
                 // validator so the chain can still produce blocks.
                 let total_stake = 1_000_000_000_000_000u64;
-                ValidatorSet::new(vec![Validator::new(self.address.clone(), total_stake, true)], epoch)
+                ValidatorSet::new(vec![Validator::new(self.address.clone(), total_stake, true)], epoch, chain_id)
             } else {
-                ValidatorSet::new(validators, epoch)
+                ValidatorSet::new(validators, epoch, chain_id)
             }
         };
         let engine = Arc::new(RwLock::new(BftEngine::new(
@@ -2614,6 +2625,7 @@ async fn apply_synced_batch(
         ValidatorSet::new(
             validators_from_state(&cs),
             base / helix_consensus::EPOCH_LENGTH,
+            cs.chain_id,
         )
     };
 
@@ -3568,7 +3580,7 @@ async fn reconcile_engine_validator_set(
 /// window an attacker would aim at.
 fn last_quorum_certified_index(blocks: &[Block], chain_state: &ChainState) -> Option<usize> {
     let first = blocks.first()?;
-    let set = ValidatorSet::new(validators_from_state(chain_state), first.height());
+    let set = ValidatorSet::new(validators_from_state(chain_state), first.height(), chain_state.chain_id);
     if set.total_voting_power() == 0 {
         return None;
     }
@@ -7047,7 +7059,7 @@ async fn sync_blocks_from_peer(
                     // validator set stops the chain outright; that has happened and cost 14.5
                     // hours, while the failure avoided by refusing is hypothetical and needs the
                     // operator's own configured sync peer to be hostile.
-                    let set = ValidatorSet::new(validators_from_state(chain_state), h);
+                    let set = ValidatorSet::new(validators_from_state(chain_state), h, chain_state.chain_id);
                     let keys = chain_state.validator_keys.clone();
                     let certificate = fetch_tip_certificate(
                         peer_url,
@@ -7317,7 +7329,7 @@ mod sync_blocks_from_peer_tests {
     /// the parent. The test helpers below build them too, because since #136 the sync path checks
     /// them — a block whose successor carries no quorum is exactly what an attacker serves.
     fn commit_sig_for(kp: &KeyPair, height: u64, block_hash: &Hash) -> CommitSig {
-        let bytes = helix_core::block::precommit_signing_bytes(
+        let bytes = helix_core::block::precommit_signing_bytes(&helix_crypto::Hash::ZERO,
             height,
             0,
             block_hash,
@@ -7941,7 +7953,7 @@ mod sync_blocks_from_peer_tests {
         let store = Arc::new(RwLock::new(fresh_store()));
         let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
         let addr = Address::from_public_key(&KeyPair::generate().public);
-        let vset = ValidatorSet::new(vec![Validator::new(addr.clone(), 1, true)], 0);
+        let vset = ValidatorSet::new(vec![Validator::new(addr.clone(), 1, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr, 0)));
         // Held, as a failed startup sync with no chain would leave it.
         let syncing = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -8161,7 +8173,7 @@ mod sync_blocks_from_peer_tests {
         let addr = Address::from_public_key(&kp.public);
         let store = Arc::new(RwLock::new(fresh_store()));
         let chain_state = Arc::new(RwLock::new(base));
-        let validator_set = ValidatorSet::new(validators_from_state(&*chain_state.read().await), 0);
+        let validator_set = ValidatorSet::new(validators_from_state(&*chain_state.read().await), 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr, 0)));
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
@@ -8232,7 +8244,7 @@ mod sync_blocks_from_peer_tests {
         // The engine the joiner built at startup, before it was ever active: the bootstrap
         // fallback set (just the genesis validator it syncs behind), with itself as its identity.
         let stale =
-            ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0);
+            ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(stale, joiner_addr.clone(), 0)));
         assert!(
             engine.read().await.validator_set().get(&joiner_addr).is_none(),
@@ -8351,7 +8363,7 @@ mod sync_blocks_from_peer_tests {
         let chain_state = Arc::new(RwLock::new(base));
         // C's engine at startup: the bootstrap fallback set (just the validator it syncs behind),
         // with its own identity. C is a plain follower so far, in nobody's set.
-        let stale = ValidatorSet::new(vec![Validator::new(addr_a.clone(), 1_000_000, false)], 0);
+        let stale = ValidatorSet::new(vec![Validator::new(addr_a.clone(), 1_000_000, false)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(stale, joiner_addr.clone(), 0)));
 
         // Phase 1: C follows the chain across A and B's activation at height 200 — a rotation it is
@@ -8493,7 +8505,7 @@ mod sync_blocks_from_peer_tests {
         }
         let validator_set = ValidatorSet::new(
             vec![Validator::with_key(addr.clone(), Some(kp.public.clone()), 1_000_000, true)],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr.clone(), 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
@@ -8877,7 +8889,7 @@ mod sync_blocks_from_peer_tests {
         let mut chain_state = ChainState::new(0);
         stake_validator(&mut chain_state, &a);
         stake_validator(&mut chain_state, &b);
-        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0, helix_crypto::Hash::ZERO);
 
         // Built on the state this node actually holds — a batch that claims another one is
         // refused before anything else is looked at (#194), which is the point of that check.
@@ -8920,7 +8932,7 @@ mod sync_blocks_from_peer_tests {
         let mut chain_state = ChainState::new(0);
         stake_validator(&mut chain_state, &a);
         stake_validator(&mut chain_state, &b);
-        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0, helix_crypto::Hash::ZERO);
 
         // Positive control: the same blocks on the right state are accepted. Without it, the
         // refusal below could just as well mean the batch was malformed some other way.
@@ -8959,7 +8971,7 @@ mod sync_blocks_from_peer_tests {
         // This node has executed up to height 7; the batch below starts at 1, so its parent is a
         // height whose state this node no longer holds.
         chain_state.applied_height = 7;
-        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0, helix_crypto::Hash::ZERO);
 
         let blocks = chained_blocks_on_state(
             &a,
@@ -8979,7 +8991,7 @@ mod sync_blocks_from_peer_tests {
         let mut chain_state = ChainState::new(0);
         stake_validator(&mut chain_state, &attacker);
         stake_validator(&mut chain_state, &honest);
-        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0, helix_crypto::Hash::ZERO);
 
         // On the right state, so what is refused below is the missing quorum and nothing else.
         let blocks = chained_blocks_on_state(
@@ -9285,7 +9297,7 @@ mod sync_blocks_from_peer_tests {
             chain_state.stakers().is_empty(),
             "precondition: a genesis state has no stakers, which is what opens the window"
         );
-        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0, helix_crypto::Hash::ZERO);
         assert_eq!(
             set.total_voting_power(),
             0,
@@ -9320,7 +9332,7 @@ mod sync_blocks_from_peer_tests {
         let anchor_kp = KeyPair::generate();
         let anchor = Address::from_public_key(&anchor_kp.public);
         let chain_state = ChainState::new(0);
-        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0, helix_crypto::Hash::ZERO);
 
         let blocks =
             chained_blocks_on_state(&anchor_kp, &[], &[1, 2, 3, 4, 5], chain_state.state_hash());
@@ -9346,7 +9358,7 @@ mod sync_blocks_from_peer_tests {
     fn a_node_that_cannot_name_its_genesis_validator_waives_nothing() {
         let anyone = KeyPair::generate();
         let chain_state = ChainState::new(0);
-        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0, helix_crypto::Hash::ZERO);
         let blocks =
             chained_blocks_on_state(&anyone, &[], &[1, 2, 3], chain_state.state_hash());
 
@@ -9368,7 +9380,7 @@ mod sync_blocks_from_peer_tests {
         let honest = KeyPair::generate();
         let mut chain_state = ChainState::new(0);
         stake_validator(&mut chain_state, &honest);
-        let set = ValidatorSet::new(validators_from_state(&chain_state), 0);
+        let set = ValidatorSet::new(validators_from_state(&chain_state), 0, helix_crypto::Hash::ZERO);
         assert!(set.total_voting_power() > 0, "precondition: the window is closed");
 
         let blocks = chained_blocks_on_state(
@@ -10385,7 +10397,7 @@ mod handle_p2p_event_tests {
         block.header.last_commit = signers
             .iter()
             .map(|s| {
-                let bytes = helix_core::precommit_signing_bytes(
+                let bytes = helix_core::precommit_signing_bytes(&helix_crypto::Hash::ZERO,
                     height.saturating_sub(1),
                     0,
                     &block.header.prev_hash,
@@ -10410,7 +10422,7 @@ mod handle_p2p_event_tests {
         signers
             .iter()
             .map(|s| {
-                let bytes = helix_core::precommit_signing_bytes(
+                let bytes = helix_core::precommit_signing_bytes(&helix_crypto::Hash::ZERO,
                     height,
                     0,
                     &block_hash,
@@ -10459,7 +10471,7 @@ mod handle_p2p_event_tests {
                 Validator::new(Address::from_public_key(&a.public), 1_000_000, true),
                 Validator::new(Address::from_public_key(&b.public), 1_000_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
 
         // The follower converts the CommitSigs back to precommit votes for the tip it just synced
@@ -10597,7 +10609,7 @@ mod handle_p2p_event_tests {
         // Validator set contains only a legitimate, unrelated validator — not the attacker.
         let real_kp = KeyPair::generate();
         let real_addr = Address::from_public_key(&real_kp.public);
-        let validator_set = ValidatorSet::new(vec![Validator::new(real_addr.clone(), 1_000_000, true)], 0);
+        let validator_set = ValidatorSet::new(vec![Validator::new(real_addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, real_addr, 0)));
 
         let own_kp = KeyPair::generate();
@@ -10650,7 +10662,7 @@ mod handle_p2p_event_tests {
         let store = Arc::new(RwLock::new(fresh_store()));
         let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
 
-        let validator_set = ValidatorSet::new(vec![Validator::new(validator_addr.clone(), 1_000_000, true)], 0);
+        let validator_set = ValidatorSet::new(vec![Validator::new(validator_addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, validator_addr.clone(), 0)));
 
         let own_kp = KeyPair::generate();
@@ -10721,7 +10733,7 @@ mod handle_p2p_event_tests {
             }
             let store = Arc::new(RwLock::new(fresh_store()));
             let validator_set =
-                ValidatorSet::new(vec![Validator::new(validator_addr.clone(), 1_000_000, true)], 0);
+                ValidatorSet::new(vec![Validator::new(validator_addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
             let engine =
                 Arc::new(RwLock::new(BftEngine::new(validator_set, validator_addr.clone(), 0)));
             let (p2p_tx, _p2p_rx) = mpsc::channel(8);
@@ -10788,7 +10800,7 @@ mod handle_p2p_event_tests {
                 Validator::new(proposer_addr.clone(), 1_000_000, true),
                 Validator::new(other_addr, 1_000_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, proposer_addr.clone(), 0)));
         let own_kp = KeyPair::generate();
@@ -10887,7 +10899,7 @@ mod handle_p2p_event_tests {
         let kp = KeyPair::generate();
         let addr = Address::from_public_key(&kp.public);
         let engine = Arc::new(RwLock::new(BftEngine::new(
-            ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0),
+            ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO),
             addr,
             0,
         )));
@@ -11073,7 +11085,7 @@ mod handle_p2p_event_tests {
         stake_in_state(&mut cs, kp);
         let addr = Address::from_public_key(&kp.public);
         let engine = Arc::new(RwLock::new(BftEngine::new(
-            ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0),
+            ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO),
             addr,
             0,
         )));
@@ -11382,7 +11394,7 @@ mod handle_p2p_event_tests {
         let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
         let addr = Address::from_public_key(&kp.public);
         let engine = Arc::new(RwLock::new(BftEngine::new(
-            ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0),
+            ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO),
             addr,
             0,
         )));
@@ -11619,7 +11631,7 @@ mod handle_p2p_event_tests {
         let store = Arc::new(RwLock::new(fresh_store()));
         let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
 
-        let validator_set = ValidatorSet::new(vec![Validator::new(validator_addr.clone(), 1_000_000, true)], 0);
+        let validator_set = ValidatorSet::new(vec![Validator::new(validator_addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, validator_addr, 0)));
 
         let own_kp = KeyPair::generate();
@@ -11663,7 +11675,7 @@ mod handle_p2p_event_tests {
             crypto_version: kp.scheme,
             signature: Sig::from_bytes(vec![]),
         };
-        vote.signature = kp.sign(&vote.signing_bytes()).unwrap();
+        vote.signature = kp.sign(&vote.signing_bytes(&helix_crypto::Hash::ZERO)).unwrap();
         vote
     }
 
@@ -11828,7 +11840,7 @@ mod handle_p2p_event_tests {
         }
 
         let validator_set =
-            ValidatorSet::new(vec![Validator::new(bad_validator_addr.clone(), 1_000_000, true)], 0);
+            ValidatorSet::new(vec![Validator::new(bad_validator_addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine =
             Arc::new(RwLock::new(BftEngine::new(validator_set, bad_validator_addr.clone(), 0)));
 
@@ -11929,7 +11941,7 @@ mod handle_p2p_event_tests {
             let mut state = chain_state.write().await;
             state.update_account(&sender, |acc| acc.balance = 1_000_000);
         }
-        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr, 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
@@ -11976,7 +11988,7 @@ mod handle_p2p_event_tests {
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let store = Arc::new(RwLock::new(fresh_store()));
         let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
-        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr, 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0));
@@ -12010,7 +12022,7 @@ mod handle_p2p_event_tests {
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let store = Arc::new(RwLock::new(fresh_store()));
         let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
-        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let validator_set = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, addr, 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0u64));
@@ -12065,7 +12077,7 @@ mod handle_p2p_event_tests {
         let store = Arc::new(RwLock::new(fresh_store()));
         let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
         let engine = Arc::new(RwLock::new(BftEngine::new(
-            ValidatorSet::new(vec![], 0),
+            ValidatorSet::new(vec![], 0, helix_crypto::Hash::ZERO),
             Address::from_public_key(&kp.public),
             0,
         )));
@@ -12191,7 +12203,7 @@ mod handle_p2p_event_tests {
         let chain_state = Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX)));
         // Empty validator set — mirrors the same bootstrap window `sync_blocks_from_peer` relies
         // on, which since 2026-09-22 admits the genesis validator rather than anyone at all.
-        let validator_set = ValidatorSet::new(vec![], 0);
+        let validator_set = ValidatorSet::new(vec![], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, Address::from_public_key(&kp.public), 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0u64));
@@ -12294,7 +12306,7 @@ mod handle_p2p_event_tests {
             // `stakers()` fallback and probation offers no gate — covered separately in executor).
             cs.active_validators.insert(genesis_addr.clone());
         }
-        let validator_set = ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0);
+        let validator_set = ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, genesis_addr.clone(), 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0u64));
@@ -12393,7 +12405,7 @@ mod handle_p2p_event_tests {
             cs.update_account(&phantom_addr, |acc| acc.staked = 1_000_000);
             cs.active_validators.insert(genesis_addr.clone());
         }
-        let validator_set = ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0);
+        let validator_set = ValidatorSet::new(vec![Validator::new(genesis_addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, genesis_addr.clone(), 0)));
         let (p2p_tx, _p2p_rx) = mpsc::channel(8);
         let last_applied_height = Arc::new(Mutex::new(0u64));
@@ -12600,7 +12612,7 @@ mod handle_p2p_event_tests {
             cs.governance_params.min_validator_stake = 1;
             cs.update_account(&addr, |acc| acc.staked = 1_000_000);
         }
-        let vset = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let vset = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr.clone(), 0)));
         let (p2p_tx, _rx) = mpsc::channel(64);
         let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -12653,7 +12665,7 @@ mod handle_p2p_event_tests {
             cs.governance_params.min_validator_stake = 1;
             cs.update_account(&addr, |acc| acc.staked = 1_000_000);
         }
-        let vset = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0);
+        let vset = ValidatorSet::new(vec![Validator::new(addr.clone(), 1_000_000, true)], 0, helix_crypto::Hash::ZERO);
         let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr.clone(), 0)));
         let (p2p_tx, _rx) = mpsc::channel(64);
         let last_applied = Arc::new(Mutex::new(0u64));
@@ -12732,7 +12744,7 @@ mod handle_p2p_event_tests {
                 Validator::new(addr.clone(), 10_000_000, true),
                 Validator::new(absent.clone(), 10_000_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr.clone(), 0)));
 
@@ -12833,7 +12845,7 @@ mod handle_p2p_event_tests {
                 Validator::new(addr.clone(), 10_000_000, true),
                 Validator::new(absent.clone(), 100, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr.clone(), 0)));
         {
@@ -12915,7 +12927,7 @@ mod handle_p2p_event_tests {
                 Validator::new(addr.clone(), 10_000_000, true),
                 Validator::new(b.clone(), 10_000_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let engine = Arc::new(RwLock::new(BftEngine::new(vset, addr.clone(), 0)));
         {
@@ -13495,7 +13507,7 @@ mod round_sync_tests {
                 Validator::new(Address::from_public_key(&one.public), 1_000, true),
                 Validator::new(Address::from_public_key(&two.public), 1_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let proposer = set.proposer_for_round(1, 0).expect("a set of two has a proposer").address.clone();
         if proposer == Address::from_public_key(&one.public) {

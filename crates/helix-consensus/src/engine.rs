@@ -522,7 +522,7 @@ impl BftEngine {
             // many votes it sends. The threshold measured in *power* is what actually enforces
             // "a probationer cannot pull the set to its round"; this is the cheap short-circuit,
             // not the rule — removing it changes performance, not behaviour.
-            if validator.voting_power == 0 || vote.verify_signature().is_err() {
+            if validator.voting_power == 0 || vote.verify_signature(&self.validator_set.chain_id).is_err() {
                 continue;
             }
             voters.insert(vote.validator.clone(), validator.voting_power);
@@ -847,6 +847,7 @@ impl BftEngine {
         // are already tracking it. Self-healing via the backstop timeout, but only after
         // throwing away a round for no reason.
         let Ok(vote) = cast_vote(
+            &self.validator_set.chain_id,
             &self.address,
             keypair,
             VoteType::Prevote,
@@ -1001,7 +1002,7 @@ impl BftEngine {
         round.set_proposal(block.clone(), valid_round, pol)?;
 
         // Cast own prevote for our proposal.
-        let prevote = cast_vote(&self.address, keypair, VoteType::Prevote, height, round_num, block_hash.clone())?;
+        let prevote = cast_vote(&self.validator_set.chain_id, &self.address, keypair, VoteType::Prevote, height, round_num, block_hash)?;
         round.add_prevote(prevote.clone())?;
         self.outbound_votes.push(prevote);
 
@@ -1114,7 +1115,7 @@ impl BftEngine {
                 .last_commit
                 .iter()
                 .any(|v| v.validator == vote.validator);
-            if in_set && !already_known && vote.verify_signature().is_ok() {
+            if in_set && !already_known && vote.verify_signature(&self.validator_set.chain_id).is_ok() {
                 debug!(
                     height = vote.height,
                     validator = %vote.validator,
@@ -1262,7 +1263,7 @@ impl BftEngine {
         // withholding is exactly what stops a value conflicting with a 2/3 lock from ever
         // reaching a prevote-quorum.
         if self.should_prevote(&block_hash, valid_round) {
-            let prevote = cast_vote(&self.address, keypair, VoteType::Prevote, height, round_num, block_hash)?;
+            let prevote = cast_vote(&self.validator_set.chain_id, &self.address, keypair, VoteType::Prevote, height, round_num, block_hash)?;
             round.add_prevote(prevote.clone())?;
             self.outbound_votes.push(prevote);
 
@@ -1464,7 +1465,7 @@ impl BftEngine {
                 .validator_set
                 .get(&vote.validator)
                 .ok_or_else(|| ConsensusError::UnknownValidator(vote.validator.clone()))?;
-            vote.verify_signature()?;
+            vote.verify_signature(&self.validator_set.chain_id)?;
             if counted.insert(vote.validator.to_string()) {
                 power += validator.voting_power;
             }
@@ -1517,7 +1518,7 @@ impl BftEngine {
             else {
                 continue;
             };
-            sig.verify(key, height - 1, parent_hash)
+            sig.verify(&self.validator_set.chain_id, key, height - 1, parent_hash)
                 .map_err(|e| ConsensusError::InvalidBlock {
                     height,
                     reason: format!("invalid last_commit signature from {}: {e}", sig.validator),
@@ -1749,7 +1750,7 @@ impl BftEngine {
             return;
         }
         let next_epoch = self.validator_set.epoch + 1;
-        self.validator_set = ValidatorSet::new(validators, next_epoch);
+        self.validator_set = ValidatorSet::new(validators, next_epoch, self.validator_set.chain_id);
     }
 
     /// Install the validator set a synced node computed from chain state, at an explicit
@@ -1783,7 +1784,7 @@ impl BftEngine {
             self.validator_set.validators.iter().map(|v| v.address.clone()).collect();
         let after: HashSet<Address> = validators.iter().map(|v| v.address.clone()).collect();
         let changed = before != after;
-        self.validator_set = ValidatorSet::new(validators, epoch);
+        self.validator_set = ValidatorSet::new(validators, epoch, self.validator_set.chain_id);
         changed
     }
 
@@ -2155,6 +2156,7 @@ impl BftEngine {
             return;
         };
         if let Ok(vote) = cast_vote(
+            &self.validator_set.chain_id,
             &self.address,
             keypair,
             VoteType::Precommit,
@@ -2189,7 +2191,7 @@ impl BftEngine {
                 vote.vote_type == VoteType::Precommit
                     && vote.height == height
                     && &vote.block_hash == block_hash
-                    && vote.verify_signature().is_ok()
+                    && vote.verify_signature(&self.validator_set.chain_id).is_ok()
                     && seen.insert(vote.validator.clone())
             })
             .collect()
@@ -2317,7 +2319,7 @@ fn lock_and_precommit(
     // Cast our own precommit for the agreed value if we haven't already.
     if !round.precommits.has_voted(address) {
         if let Ok(precommit) =
-            cast_vote(address, keypair, VoteType::Precommit, round.height, round.round, hash)
+            cast_vote(&round.precommits.chain_id(), address, keypair, VoteType::Precommit, round.height, round.round, hash)
         {
             outbound.push(precommit.clone());
             let _ = round.add_precommit(precommit);
@@ -2328,6 +2330,7 @@ fn lock_and_precommit(
 /// Build and sign a vote. Free function (not a method) so it can be called
 /// while a `&mut RoundState` borrowed from `BftEngine::round` is still live.
 fn cast_vote(
+    chain_id: &Hash,
     address: &Address,
     keypair: &KeyPair,
     vote_type: VoteType,
@@ -2345,7 +2348,7 @@ fn cast_vote(
         crypto_version: keypair.scheme,
         signature: Signature::from_bytes(vec![]),
     };
-    let signing_bytes = vote.signing_bytes();
+    let signing_bytes = vote.signing_bytes(chain_id);
     vote.signature = keypair
         .sign(&signing_bytes)
         .map_err(ConsensusError::Crypto)?;
@@ -2388,7 +2391,7 @@ mod tests {
                 Validator::new(b_addr.clone(), 1_000, true),
                 Validator::new(c_addr.clone(), 1_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
 
         FourValidators { self_kp, self_addr, a_kp, b_kp, c_kp, c_addr, validator_set }
@@ -2472,7 +2475,7 @@ mod tests {
 
     fn peer_vote(kp: &KeyPair, vote_type: VoteType, height: u64, round: u32, hash: Hash) -> Vote {
         let addr = Address::from_public_key(&kp.public);
-        cast_vote(&addr, kp, vote_type, height, round, hash).unwrap()
+        cast_vote(&helix_crypto::Hash::ZERO, &addr, kp, vote_type, height, round, hash).unwrap()
     }
 
     /// Sets up one full-power validator that finalizes alone, plus a zero-power #132 probationer.
@@ -2486,7 +2489,7 @@ mod tests {
                 Validator::new(full_addr.clone(), 100_000, true),
                 Validator::new_probationary(probationer_addr.clone(), 100_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         (full_kp, full_addr, probationer_kp, probationer_addr, set)
     }
@@ -2575,7 +2578,7 @@ mod tests {
 
         // The certificate the finalizer gossips alongside the block, cast in round 3 — the round
         // this node must agree with rather than inventing one.
-        let finalizers_precommit = cast_vote(
+        let finalizers_precommit = cast_vote(&helix_crypto::Hash::ZERO, 
             &full_addr,
             &full_kp,
             VoteType::Precommit,
@@ -2606,7 +2609,7 @@ mod tests {
             "the round must come from the adopted certificate — inventing round 0 would sign a \
              second value for a round this node may already have voted in, i.e. equivocate"
         );
-        assert!(vote.verify_signature().is_ok(), "and it must be a genuine signature");
+        assert!(vote.verify_signature(&helix_crypto::Hash::ZERO).is_ok(), "and it must be a genuine signature");
     }
 
     /// Nothing is cast when there is no certificate to agree with: with no round the vote could
@@ -2647,6 +2650,60 @@ mod tests {
             engine.take_outbound_votes().is_empty(),
             "already attested by having voted — no second signature for {}",
             block.height()
+        );
+    }
+
+    /// Every vote the engine signs itself is bound to the chain its validator set belongs to
+    /// (#271) — the proposer's own prevote and precommit, the certificate it commits with, and the
+    /// attestation a node casts for a block it adopted. The other consensus tests run on
+    /// `Hash::ZERO`, where an engine that signed for the zero chain instead of its own would pass
+    /// unnoticed; here the chain is a real one, so such a signature fails.
+    #[test]
+    fn every_vote_the_engine_signs_is_bound_to_its_chain() {
+        let chain = Hash::digest(b"this chain");
+        let (full_kp, full_addr, probationer_kp, probationer_addr, mut set) =
+            full_power_plus_probationer();
+        set.chain_id = chain;
+
+        let mut engine = engine_at_off_slot(set.clone(), full_addr.clone());
+        let block = engine
+            .produce_block(&full_kp, Hash::digest(b"parent"), engine.current_height(), Hash::ZERO, vec![])
+            .expect("finalizes alone");
+        let outbound = engine.take_outbound_votes();
+        assert!(
+            outbound.iter().any(|v| v.vote_type == VoteType::Prevote)
+                && outbound.iter().any(|v| v.vote_type == VoteType::Precommit),
+            "positive control: the proposer cast both its votes, got {outbound:?}"
+        );
+        for vote in outbound.iter().chain(engine.commit_certificate().iter()) {
+            assert!(
+                vote.verify_signature(&chain).is_ok(),
+                "{:?} by the proposer must verify on its own chain",
+                vote.vote_type
+            );
+            assert!(
+                vote.verify_signature(&Hash::ZERO).is_err(),
+                "{:?} by the proposer must not verify on any other chain",
+                vote.vote_type
+            );
+        }
+
+        // The fast path: a node adopting the block casts its attestation for the same chain.
+        let certificate = engine.commit_certificate();
+        let mut adopter = BftEngine::new(set, probationer_addr.clone(), 0);
+        adopter.sync_to_externally_finalized_block(block.height(), block.hash(), certificate);
+        adopter.attest_adopted_block(&probationer_kp);
+        let attestation = adopter.take_outbound_votes();
+        assert_eq!(attestation.len(), 1, "positive control: the adopter attested");
+        assert!(attestation[0].verify_signature(&chain).is_ok());
+        assert!(attestation[0].verify_signature(&Hash::ZERO).is_err());
+
+        // And a precommit signed for another chain does not join this chain's certificate.
+        let foreign = peer_vote(&probationer_kp, VoteType::Precommit, block.height(), 0, block.hash());
+        let _ = engine.add_vote(&full_kp, foreign);
+        assert!(
+            !engine.commit_certificate().iter().any(|v| v.validator == probationer_addr),
+            "a vote signed for the zero chain must not be counted on this one"
         );
     }
 
@@ -4061,7 +4118,7 @@ mod tests {
                 Validator::with_key(peer_addr, Some(peer_kp.public.clone()), 1_000, true),
                 Validator::with_key(self_addr.clone(), Some(self_kp.public.clone()), 1_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         TwoValidators { self_kp, self_addr, peer_kp, validator_set }
     }
@@ -4179,7 +4236,7 @@ mod tests {
         // Start from a stale, self-only set at epoch 1 — what a joiner built at startup, behind
         // the genesis validator, before its own activation rotation ever landed.
         let mut engine = BftEngine::new(
-            ValidatorSet::new(vec![Validator::new(v.self_addr.clone(), 1_000, true)], 1),
+            ValidatorSet::new(vec![Validator::new(v.self_addr.clone(), 1_000, true)], 1, helix_crypto::Hash::ZERO),
             v.self_addr.clone(),
             250,
         );
@@ -4293,7 +4350,7 @@ mod tests {
         let probationer = Address::from_public_key(&KeyPair::generate().public);
         let mut validators = v.validator_set.validators.clone();
         validators.push(Validator::new_probationary(probationer.clone(), 1_000, true));
-        let set = ValidatorSet::new(validators, 0);
+        let set = ValidatorSet::new(validators, 0, helix_crypto::Hash::ZERO);
         assert_eq!(
             set.get(&probationer).unwrap().voting_power,
             0,
@@ -4448,7 +4505,7 @@ mod tests {
                     )
                 })
                 .collect(),
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         (self_kp, self_addr, a_kp, b_kp, set)
     }
@@ -4502,7 +4559,7 @@ mod tests {
         let addr = Address::from_public_key(&kp.public);
         let set = ValidatorSet::new(
             vec![Validator::with_key(addr.clone(), Some(kp.public.clone()), 1_000, true)],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let engine = BftEngine::new(set, addr, 0);
         assert!(!engine.hears_no_other_validator());

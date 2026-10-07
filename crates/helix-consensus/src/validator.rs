@@ -99,10 +99,14 @@ impl Validator {
 pub struct ValidatorSet {
     pub validators: Vec<Validator>,
     pub epoch: u64,
+    /// The chain these validators sign for (#271) — its genesis hash, as in transactions (#174).
+    /// Every vote and every commit signature this set counts is checked against it, so a
+    /// certificate "from this set" is one from this chain and no other.
+    pub chain_id: Hash,
 }
 
 impl ValidatorSet {
-    pub fn new(mut validators: Vec<Validator>, epoch: u64) -> Self {
+    pub fn new(mut validators: Vec<Validator>, epoch: u64, chain_id: Hash) -> Self {
         // Probationary validators (backlog #132) carry no voting power and don't count toward the
         // total that sets the 1% cap: they are in the set only so their signatures are gathered
         // into `last_commit`. Basing the cap on their stake too would let a large-stake phantom
@@ -120,7 +124,7 @@ impl ValidatorSet {
             v.voting_power = raw_power.min(cap_per_validator);
         }
 
-        ValidatorSet { validators, epoch }
+        ValidatorSet { validators, epoch, chain_id }
     }
 
     /// The validators that count toward quorum and take proposer turns — everyone except those
@@ -160,7 +164,7 @@ impl ValidatorSet {
                 v.vote_type == VoteType::Precommit
                     && v.height == height
                     && &v.block_hash == block_hash
-                    && v.verify_signature().is_ok()
+                    && v.verify_signature(&self.chain_id).is_ok()
                     && seen.insert(v.validator.clone())
             })
             .filter_map(|v| self.get(&v.validator))
@@ -261,7 +265,7 @@ mod tests {
             crypto_version: CryptoVersion::MlDsa,
             signature: Signature::from_bytes(vec![]),
         };
-        v.signature = kp.sign(&v.signing_bytes()).unwrap();
+        v.signature = kp.sign(&v.signing_bytes(&helix_crypto::Hash::ZERO)).unwrap();
         v
     }
 
@@ -272,7 +276,7 @@ mod tests {
                 Validator::new(Address::from_public_key(&a.public), 100_000, true),
                 Validator::new(Address::from_public_key(&b.public), 100_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         )
     }
 
@@ -285,6 +289,54 @@ mod tests {
         let hash = Hash::digest(b"block-5");
         let cert = vec![precommit(&a, 5, hash), precommit(&b, 5, hash)];
         assert!(set.precommits_reach_quorum(&cert, 5, &hash));
+    }
+
+    /// The same precommit signed for another chain (#271).
+    fn precommit_for_chain(kp: &KeyPair, height: u64, block_hash: Hash, chain_id: &Hash) -> Vote {
+        let mut v = precommit(kp, height, block_hash);
+        v.signature = kp.sign(&v.signing_bytes(chain_id)).unwrap();
+        v
+    }
+
+    /// A certificate signed by every member of this set, for the right height and block — but on
+    /// another chain — proves nothing here (#271). Before, a vote carried no chain, so a key's
+    /// signatures from one chain counted on every other one that key validated on.
+    #[test]
+    fn a_full_certificate_signed_for_another_chain_does_not_reach_quorum() {
+        let (a, b) = (KeyPair::generate(), KeyPair::generate());
+        // A real chain, not `Hash::ZERO`: a set that checked against the zero chain instead of its
+        // own would pass the positive control below on a zero-chain set.
+        let mut set = two_validator_set(&a, &b);
+        set.chain_id = Hash::digest(b"this chain");
+        let hash = Hash::digest(b"block-5");
+        let elsewhere = Hash::ZERO;
+        let cert = vec![
+            precommit_for_chain(&a, 5, hash, &elsewhere),
+            precommit_for_chain(&b, 5, hash, &elsewhere),
+        ];
+        assert_eq!(set.precommit_power(&cert, 5, &hash), 0);
+        assert!(!set.precommits_reach_quorum(&cert, 5, &hash));
+        // Positive control: the same votes signed for this set's chain do reach it.
+        let here = vec![
+            precommit_for_chain(&a, 5, hash, &set.chain_id),
+            precommit_for_chain(&b, 5, hash, &set.chain_id),
+        ];
+        assert!(set.precommits_reach_quorum(&here, 5, &hash));
+    }
+
+    /// Prevotes and precommits alike: a vote verifies under the chain it was signed for and under
+    /// no other.
+    #[test]
+    fn a_vote_verifies_only_for_the_chain_it_was_signed_for() {
+        let kp = KeyPair::generate();
+        let (one, two) = (Hash::digest(b"chain one"), Hash::digest(b"chain two"));
+        for vote_type in [VoteType::Prevote, VoteType::Precommit] {
+            let mut v = precommit(&kp, 7, Hash::digest(b"block-7"));
+            v.vote_type = vote_type;
+            v.signature = kp.sign(&v.signing_bytes(&one)).unwrap();
+            assert!(v.verify_signature(&one).is_ok(), "{:?} on its own chain", v.vote_type);
+            assert!(v.verify_signature(&two).is_err(), "{:?} on another chain", v.vote_type);
+        }
     }
 
     /// A1, the attack: a single Byzantine validator gossips a block it alone signed. Its lone
@@ -332,8 +384,8 @@ mod tests {
         for v in &mut prevotes {
             v.vote_type = VoteType::Prevote;
             v.signature = match v.validator == Address::from_public_key(&a.public) {
-                true => a.sign(&v.signing_bytes()).unwrap(),
-                false => b.sign(&v.signing_bytes()).unwrap(),
+                true => a.sign(&v.signing_bytes(&helix_crypto::Hash::ZERO)).unwrap(),
+                false => b.sign(&v.signing_bytes(&helix_crypto::Hash::ZERO)).unwrap(),
             };
         }
         assert!(!set.precommits_reach_quorum(&prevotes, 5, &hash), "prevotes are not precommits");
@@ -377,7 +429,7 @@ mod tests {
         let v = Validator::new(rand_address(), 100_000, true);
         assert_eq!(v.voting_power, 0, "power is unknown until the set applies its cap");
 
-        let set = ValidatorSet::new(vec![v.clone()], 0);
+        let set = ValidatorSet::new(vec![v.clone()], 0, helix_crypto::Hash::ZERO);
         assert!(set.get(&v.address).unwrap().voting_power > 0, "the set computes real power");
     }
 
@@ -385,7 +437,7 @@ mod tests {
     /// a vacuous certificate is rejected rather than trivially accepted.
     #[test]
     fn an_empty_set_never_reaches_quorum() {
-        let set = ValidatorSet::new(vec![], 0);
+        let set = ValidatorSet::new(vec![], 0, helix_crypto::Hash::ZERO);
         let hash = Hash::digest(b"block-5");
         assert!(!set.precommits_reach_quorum(&[], 5, &hash));
     }
@@ -400,7 +452,7 @@ mod tests {
         let b = rand_address();
         let mut set = ValidatorSet::new(
             vec![Validator::new(a.clone(), 100, true), Validator::new(b.clone(), 100, true)],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
 
         assert!(set.remove(&a));
@@ -413,7 +465,7 @@ mod tests {
     fn remove_reports_false_for_an_address_not_in_the_set() {
         let a = rand_address();
         let stranger = rand_address();
-        let mut set = ValidatorSet::new(vec![Validator::new(a, 100, true)], 0);
+        let mut set = ValidatorSet::new(vec![Validator::new(a, 100, true)], 0, helix_crypto::Hash::ZERO);
 
         assert!(!set.remove(&stranger));
         assert_eq!(set.len(), 1);
@@ -424,13 +476,13 @@ mod tests {
         let a = rand_address();
         let b = rand_address();
         // One full validator plus a probationer with a far larger stake.
-        let full_only = ValidatorSet::new(vec![Validator::new(a.clone(), 100_000, true)], 0);
+        let full_only = ValidatorSet::new(vec![Validator::new(a.clone(), 100_000, true)], 0, helix_crypto::Hash::ZERO);
         let with_prob = ValidatorSet::new(
             vec![
                 Validator::new(a.clone(), 100_000, true),
                 Validator::new_probationary(b.clone(), 900_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
 
         // The probationer carries no power...
@@ -472,7 +524,7 @@ mod tests {
                 Validator::new(verified.clone(), 50_000, true),
                 Validator::new(whale.clone(), 9_900_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         assert_eq!(below.get(&unverified).unwrap().voting_power, 25_000, "stake / 2");
         assert_eq!(below.get(&verified).unwrap().voting_power, 50_000, "stake");
@@ -485,7 +537,7 @@ mod tests {
                 Validator::new(verified.clone(), 400_000, true),
                 Validator::new(whale.clone(), 9_200_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         let ceiling = 10_000_000u64 / 100;
         assert_eq!(above.get(&unverified).unwrap().voting_power, ceiling);
@@ -511,7 +563,7 @@ mod tests {
         let b = rand_address();
         let tiny = ValidatorSet::new(
             vec![Validator::new(a.clone(), 40, true), Validator::new(b.clone(), 50, true)],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         assert_eq!(tiny.total_voting_power(), 0, "90 / 100 = 0: nobody has any power");
         assert!(
@@ -523,7 +575,7 @@ mod tests {
         // The reachable floor, one crate over: a lone validator at governance's minimum keeps the
         // ceiling far away from zero.
         let floor = helix_executor_min_validator_stake_floor();
-        let real = ValidatorSet::new(vec![Validator::new(a, floor, true)], 0);
+        let real = ValidatorSet::new(vec![Validator::new(a, floor, true)], 0, helix_crypto::Hash::ZERO);
         assert!(
             real.total_voting_power() > 0,
             "a validator at the governance floor must carry power, or the chain cannot start"
@@ -556,7 +608,7 @@ mod tests {
                 Validator::new(a.clone(), 100_000, true),
                 Validator::new_probationary(b.clone(), 100_000, true),
             ],
-            0,
+            0, helix_crypto::Hash::ZERO,
         );
         // Every height/round must land on the one full member, never the probationer.
         for h in 0..crate::EPOCH_LENGTH {
@@ -571,7 +623,7 @@ mod tests {
     fn a_set_of_only_probationers_has_no_proposer_and_no_quorum_power() {
         // Can't happen in practice (a probationer only ever joins an existing active set), but the
         // math must not divide by zero or hand out a turn nobody can take.
-        let set = ValidatorSet::new(vec![Validator::new_probationary(rand_address(), 100_000, true)], 0);
+        let set = ValidatorSet::new(vec![Validator::new_probationary(rand_address(), 100_000, true)], 0, helix_crypto::Hash::ZERO);
         assert!(set.proposer_for_round(0, 0).is_none());
         assert_eq!(set.total_voting_power(), 0);
     }
@@ -582,7 +634,7 @@ mod tests {
         let b = rand_address();
         let mut set = ValidatorSet::new(
             vec![Validator::new(a.clone(), 100, true), Validator::new(b, 100, true)],
-            7,
+            7, helix_crypto::Hash::ZERO,
         );
 
         set.remove(&a);
