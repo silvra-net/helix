@@ -620,6 +620,13 @@ impl P2PService {
         let mut blocksync_progress_tip: u64 = 0;
         let mut blocksync_stall_ticks: u32 = 0;
         let mut blocksync_stall_reported = false;
+        // Whether this node hears the block, vote, committed-block and transaction topics — see
+        // `listen_to_consensus_gossip`. For that rule: the tip last seen to rise, and the ticks since.
+        // `None` until it has risen in this process, because a restart is not progress (the counter
+        // above starts at 0 and would read the first tick after a restart as one).
+        let mut consensus_gossip_on = true;
+        let mut catch_up_seen_tip = tip_height.load(Ordering::Relaxed);
+        let mut catch_up_still_ticks: Option<u32> = None;
         // The height this node executes nothing from — see `P2PCommand::StopCatchingUpAt`.
         let mut blocksync_halt: Option<u64> = None;
         if let Some(addr) = &config.public_addr {
@@ -1328,6 +1335,16 @@ impl P2PService {
                     // below would name a cause that is not the one (#267).
                     if blocksync_halted(our_tip, blocksync_halt) {
                         blocksync_stall_ticks = 0;
+                        // Not catching up any more, so no reason to be deaf.
+                        if !consensus_gossip_on {
+                            set_consensus_gossip(
+                                &mut swarm,
+                                &[&block_topic, &vote_topic, &committed_topic],
+                                &tx_topic,
+                                true,
+                            );
+                            consensus_gossip_on = true;
+                        }
                         continue;
                     }
                     request_blocks_if_behind(
@@ -1338,6 +1355,53 @@ impl P2PService {
                         blocksync_batch,
                         &mut blocksync_in_flight,
                     );
+
+                    // Far behind and catching up: stop hearing what this node cannot use yet, so
+                    // the blocks it can use get the link (`listen_to_consensus_gossip`).
+                    if our_tip > catch_up_seen_tip {
+                        catch_up_seen_tip = our_tip;
+                        catch_up_still_ticks = Some(0);
+                    } else if let Some(ticks) = catch_up_still_ticks.as_mut() {
+                        *ticks = ticks.saturating_add(1);
+                    }
+                    {
+                        let best_claimed = peer_tips
+                            .iter()
+                            .filter(|(peer, _)| swarm.is_connected(peer))
+                            .map(|(_, range)| range.tip)
+                            .max();
+                        let listen = listen_to_consensus_gossip(
+                            consensus_gossip_on,
+                            our_tip,
+                            best_claimed,
+                            catch_up_still_ticks,
+                        );
+                        if listen != consensus_gossip_on {
+                            set_consensus_gossip(
+                                &mut swarm,
+                                &[&block_topic, &vote_topic, &committed_topic],
+                                &tx_topic,
+                                listen,
+                            );
+                            consensus_gossip_on = listen;
+                            let behind = best_claimed.map(|b| b.saturating_sub(our_tip));
+                            if listen {
+                                info!(
+                                    height = our_tip,
+                                    behind = ?behind,
+                                    "Listening to block, vote and transaction gossip again"
+                                );
+                            } else {
+                                info!(
+                                    height = our_tip,
+                                    behind = ?behind,
+                                    "Far behind and catching up — not listening to block, vote and \
+                                     transaction gossip until close to the tip: this node cannot use \
+                                     it yet, and it takes the download the missing blocks need"
+                                );
+                            }
+                        }
+                    }
 
                     // Report a catch-up that is not happening (backlog #190). Read *after* the
                     // request above, so `blocksync_in_flight` answers the question the line is for:
@@ -2951,6 +3015,83 @@ fn next_blocksync_batch(current: u32, outcome: BatchOutcome) -> u32 {
     }
 }
 
+/// How far behind the best claimed tip a node must be before it stops listening to the consensus
+/// topics while it catches up.
+const CATCH_UP_DEAF_GAP: u64 = 1_000;
+
+/// How close to the best claimed tip a node that stopped listening starts again. Far below
+/// [`CATCH_UP_DEAF_GAP`], so a node near the threshold does not toggle its subscriptions with every
+/// batch.
+const CATCH_UP_LISTEN_GAP: u64 = 100;
+
+/// Driver ticks without a single new block after which a node that stopped listening starts again —
+/// 90 s, three request timeouts. Catching up is the only reason to be deaf; when it stalls, listening
+/// is the safe state.
+const CATCH_UP_STALL_TICKS: u32 = 45;
+
+/// Whether a node should be subscribed to the block, vote, committed-block and transaction topics.
+///
+/// A node far behind cannot use any of them: proposals and votes are for heights it will not reach
+/// for hours, and a committed block only counts at the height right above its tip. But every
+/// connected peer sends it all of them — on 2026-10-13 that filled a home validator's whole
+/// download (~3 MB/s of a ~25 Mbit line, a speed test beside it got 1 MB/s and the total did not
+/// move), and the block-sync answers it needed to catch up arrived at ~50 kB/s. Unsubscribed, a peer
+/// sends it none of that (gossipsub delivers to a peer only on topics it subscribed to, explicit
+/// peers included), and the link is free for the blocks. The peer-exchange topic stays: it carries
+/// the tips this rule reads, and a peer with no subscription at all is disconnected by #232's watch.
+///
+/// **What keeps a liar from making a validator deaf:** the claimed tip is unauthenticated, so a gap
+/// alone never decides. A node stops listening only while its own height is actually rising
+/// (`ticks_without_progress`, `None` until it first has — a restart is not progress), and every
+/// block that raises it passed a quorum check. Behind for real and catching up is the only state in
+/// which the rule turns the topics off; at the true tip progress stops, and within
+/// [`CATCH_UP_STALL_TICKS`] the node listens again, however high anyone claims the chain is.
+fn listen_to_consensus_gossip(
+    listening: bool,
+    our_tip: u64,
+    best_claimed: Option<u64>,
+    ticks_without_progress: Option<u32>,
+) -> bool {
+    let Some(best) = best_claimed else {
+        return true;
+    };
+    let gap = best.saturating_sub(our_tip);
+    let progressing = ticks_without_progress.is_some_and(|t| t < CATCH_UP_STALL_TICKS);
+    if listening {
+        !(gap > CATCH_UP_DEAF_GAP && progressing)
+    } else {
+        gap <= CATCH_UP_LISTEN_GAP || !progressing
+    }
+}
+
+/// Subscribe to, or unsubscribe from, the topics [`listen_to_consensus_gossip`] decides about. The
+/// peer-exchange topic is never touched.
+fn set_consensus_gossip(
+    swarm: &mut libp2p::Swarm<HelixBehaviour>,
+    consensus_topics: &[&gossipsub::IdentTopic],
+    tx_topic: &gossipsub::IdentTopic,
+    listen: bool,
+) {
+    for topic in consensus_topics {
+        let lane = Lane::Consensus.of(swarm);
+        if listen {
+            if let Err(e) = lane.subscribe(topic) {
+                warn!(topic = %topic, err = %e, "Could not subscribe to a topic again");
+            }
+        } else {
+            lane.unsubscribe(topic);
+        }
+    }
+    let lane = Lane::of_topic(TOPIC_TRANSACTIONS).of(swarm);
+    if listen {
+        if let Err(e) = lane.subscribe(tx_topic) {
+            warn!(topic = %tx_topic, err = %e, "Could not subscribe to a topic again");
+        }
+    } else {
+        lane.unsubscribe(tx_topic);
+    }
+}
+
 /// Publishes our full current `known_addrs` set on the peer-exchange topic, stamped with our
 /// version. Sent even when we know no addresses yet: the message still carries our version, which
 /// is worth propagating on its own so peers can notice a running-version mismatch (#109) — the
@@ -4104,6 +4245,51 @@ mod peer_exchange_tests {
             next_blocksync_batch(MAX_BLOCKSYNC_BATCH, BatchOutcome::Delivered),
             MAX_BLOCKSYNC_BATCH,
             "and never past it"
+        );
+    }
+
+    /// Far behind and actually catching up is the one state in which a node stops listening.
+    #[test]
+    fn a_node_stops_listening_only_while_it_is_far_behind_and_catching_up() {
+        use super::{listen_to_consensus_gossip as listen, CATCH_UP_DEAF_GAP, CATCH_UP_STALL_TICKS};
+        let tip = 300_000;
+        let far = Some(tip + CATCH_UP_DEAF_GAP + 1);
+        // Positive control: behind, and the last block arrived a tick ago.
+        assert!(!listen(true, tip, far, Some(1)), "far behind and catching up: stop listening");
+        // A restart is not progress — the rule must not take the first tick after one as such.
+        assert!(listen(true, tip, far, None), "no rise seen yet in this process: keep listening");
+        // Behind, but not moving: deafness would not be paid for by anything.
+        assert!(listen(true, tip, far, Some(CATCH_UP_STALL_TICKS)), "stalled: keep listening");
+        // Close to the tip: the gossip is what keeps a node there.
+        assert!(listen(true, tip, Some(tip + CATCH_UP_DEAF_GAP), Some(1)), "at the threshold: keep listening");
+        // Nobody claims anything.
+        assert!(listen(true, tip, None, Some(1)), "no claim: keep listening");
+    }
+
+    /// A node that stopped listening starts again near the tip, or as soon as catching up stalls —
+    /// whatever anyone claims. That second half is what keeps a lying peer from making a validator
+    /// deaf: at the true tip no block arrives, and the stall brings the topics back.
+    #[test]
+    fn a_deaf_node_listens_again_near_the_tip_or_when_catching_up_stalls() {
+        use super::{
+            listen_to_consensus_gossip as listen, CATCH_UP_DEAF_GAP, CATCH_UP_LISTEN_GAP,
+            CATCH_UP_STALL_TICKS,
+        };
+        let tip = 300_000;
+        assert!(listen(false, tip, Some(tip + CATCH_UP_LISTEN_GAP), Some(1)), "close to the tip: listen");
+        assert!(
+            listen(false, tip, Some(tip + 1_000_000), Some(CATCH_UP_STALL_TICKS)),
+            "stalled, however high the claim: listen"
+        );
+        assert!(listen(false, tip, None, Some(1)), "no claim: listen");
+        // Hysteresis: between the two gaps a node keeps what it has, so it does not flip with every
+        // batch.
+        let between = Some(tip + (CATCH_UP_LISTEN_GAP + CATCH_UP_DEAF_GAP) / 2);
+        assert!(!listen(false, tip, between, Some(1)), "deaf and still well behind: stay deaf");
+        assert!(listen(true, tip, between, Some(1)), "listening and only somewhat behind: stay listening");
+        assert!(
+            !listen(false, tip, Some(tip + CATCH_UP_DEAF_GAP + 1), Some(CATCH_UP_STALL_TICKS - 1)),
+            "a stall shorter than the limit does not end it"
         );
     }
 

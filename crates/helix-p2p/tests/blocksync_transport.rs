@@ -613,3 +613,119 @@ async fn a_node_whose_full_batches_time_out_asks_for_fewer_and_catches_up() {
     );
     assert_eq!(batch.blocks[0].height(), 1, "and it starts where the node is: {asked:?}");
 }
+
+/// A prevote that decodes — the service forwards it as `NewVote`; whether it is valid is the node
+/// layer's business. A fresh round every call, so gossipsub does not drop it as a duplicate.
+fn a_prevote(kp: &KeyPair, round: u32) -> Vote {
+    Vote {
+        vote_type: helix_consensus::VoteType::Prevote,
+        height: 7,
+        round,
+        block_hash: helix_crypto::Hash::ZERO,
+        validator: Address::from_public_key(&kp.public),
+        public_key: kp.public.clone(),
+        crypto_version: kp.scheme,
+        signature: Signature::from_bytes(vec![1; 32]),
+    }
+}
+
+/// A node far behind that is catching up stops hearing consensus gossip, and hears it again near
+/// the tip — over a real connection, measured by whether the peer's votes still arrive.
+///
+/// The home validator of 2026-10-13 had its whole download (~3 MB/s) filled with gossip it could
+/// not use, from every peer, while the block-sync answers it needed came in at ~50 kB/s. The three
+/// phases here are the rule's three states: listening at first (no rise seen yet — the control that
+/// the votes arrive at all), deaf while far behind and rising, listening again once close.
+#[tokio::test]
+async fn a_node_far_behind_and_catching_up_stops_hearing_votes_and_hears_them_again_near_the_tip() {
+    let kp = KeyPair::generate();
+    let ahead_tip = Arc::new(AtomicU64::new(5_000));
+    let (ahead, ahead_cmd, mut ahead_events) = P2PService::new(
+        config(19_803, None),
+        ahead_tip,
+        Arc::new(FixedBlocks {
+            blocks: chained_blocks(&kp, 3),
+            certificate: stand_in_certificate(&kp),
+        }),
+    );
+    tokio::spawn(async move { ahead.run().await });
+    tokio::spawn(async move { while ahead_events.recv().await.is_some() {} });
+
+    let behind_tip = Arc::new(AtomicU64::new(0));
+    let (behind, _behind_cmd, mut behind_events) =
+        P2PService::new(config(19_804, Some(19_803)), behind_tip.clone(), Arc::new(NoBlocks));
+    tokio::spawn(async move { behind.run().await });
+
+    let mut round = 0u32;
+    // Sends a fresh vote from the peer that is ahead and reports whether one arrived within `wait`.
+    // Every other event is drained; a disconnect fails the test, since "no votes" must mean deaf,
+    // not gone.
+    macro_rules! a_vote_arrives_within {
+        ($wait:expr) => {{
+            let deadline = tokio::time::Instant::now() + $wait;
+            let mut arrived = false;
+            let mut next_send = tokio::time::Instant::now();
+            while tokio::time::Instant::now() < deadline && !arrived {
+                if tokio::time::Instant::now() >= next_send {
+                    round += 1;
+                    ahead_cmd
+                        .send(P2PCommand::BroadcastVote(a_prevote(&kp, round)))
+                        .await
+                        .unwrap();
+                    next_send = tokio::time::Instant::now() + Duration::from_secs(1);
+                }
+                match tokio::time::timeout(Duration::from_millis(200), behind_events.recv()).await {
+                    Ok(Some(P2PEvent::NewVote(_))) => arrived = true,
+                    Ok(Some(P2PEvent::PeerDisconnected(p))) => {
+                        panic!("the peer disconnected ({p}) — silence would prove nothing")
+                    }
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => panic!("the service under test stopped"),
+                }
+            }
+            arrived
+        }};
+    }
+
+    // Phase 1, the control: connected and listening — votes arrive. No rise seen yet, so the gap of
+    // 5000 alone must not make the node deaf.
+    assert!(
+        a_vote_arrives_within!(Duration::from_secs(60)),
+        "the peer's votes never arrived — the connection or the subscription is broken, and the \
+         rest of this test would prove nothing"
+    );
+
+    // Phase 2: catching up — the tip rises while the peer still claims to be far ahead. Peer
+    // exchange brings that claim within 30 s; give it the time, then the votes must stop.
+    let climbing = behind_tip.clone();
+    let climber = tokio::spawn(async move {
+        loop {
+            climbing.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    let deaf_by = tokio::time::Instant::now() + Duration::from_secs(70);
+    let mut went_deaf = false;
+    while tokio::time::Instant::now() < deaf_by {
+        // Ten seconds of fresh votes, none heard: deaf (subscriptions take a moment to reach the
+        // peer, so one quiet second would not be enough).
+        if !a_vote_arrives_within!(Duration::from_secs(10)) {
+            went_deaf = true;
+            break;
+        }
+    }
+    assert!(
+        went_deaf,
+        "far behind and catching up, the node kept receiving the peer's votes — it did not stop \
+         listening (tip now {})",
+        behind_tip.load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    // Phase 3: close to the tip — listening again.
+    climber.abort();
+    behind_tip.store(4_960, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        a_vote_arrives_within!(Duration::from_secs(30)),
+        "close to the tip, the node did not start listening again"
+    );
+}
