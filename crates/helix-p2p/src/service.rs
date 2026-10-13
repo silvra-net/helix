@@ -591,6 +591,8 @@ impl P2PService {
         // a flood. Cleared on a response and on any failure, so a peer that never answers costs one
         // request and one timeout, not a wedged sync.
         let mut blocksync_in_flight = false;
+        // How many blocks the next request asks for — see `next_blocksync_batch`.
+        let mut blocksync_batch = MAX_BLOCKSYNC_BATCH;
         // The block-sync answers this node is building or sending — see `BlockSyncServing`.
         let mut blocksync_serving = BlockSyncServing::default();
         let (blocksync_answer_tx, mut blocksync_answers) =
@@ -991,6 +993,10 @@ impl P2PService {
                                             .insert(peer, BLOCKSYNC_PEER_COOLDOWN_TICKS);
                                         debug!(peer = %peer, "Block-sync peer claimed to be ahead but served nothing — trying another peer");
                                     } else {
+                                        blocksync_batch = next_blocksync_batch(
+                                            blocksync_batch,
+                                            BatchOutcome::Delivered,
+                                        );
                                         info!(
                                             peer = %peer,
                                             blocks = response.blocks.len(),
@@ -1014,6 +1020,17 @@ impl P2PService {
                             blocksync_in_flight = false;
                             blocksync_cooldown.insert(peer, BLOCKSYNC_PEER_COOLDOWN_TICKS);
                             debug!(peer = %peer, err = %error, "Block-sync request failed — trying another peer");
+                            if let Some(outcome) = batch_outcome_of_failure(&error) {
+                                let smaller = next_blocksync_batch(blocksync_batch, outcome);
+                                if smaller < blocksync_batch {
+                                    info!(
+                                        blocks = smaller,
+                                        was = blocksync_batch,
+                                        "Block-sync answers are not arriving in time — asking for fewer blocks at once"
+                                    );
+                                }
+                                blocksync_batch = smaller;
+                            }
                         }
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
                             request_response::Event::InboundFailure { peer, request_id, error, .. }
@@ -1318,6 +1335,7 @@ impl P2PService {
                         &peer_tips,
                         &blocksync_cooldown,
                         our_tip,
+                        blocksync_batch,
                         &mut blocksync_in_flight,
                     );
 
@@ -1771,6 +1789,7 @@ impl P2PService {
                                 &peer_tips,
                                 &blocksync_cooldown,
                                 our_tip,
+                                blocksync_batch,
                                 &mut blocksync_in_flight,
                             );
                         }
@@ -2829,6 +2848,7 @@ fn request_blocks_if_behind(
     peer_tips: &HashMap<PeerId, PeerRange>,
     cooldown: &HashMap<PeerId, u32>,
     our_tip: u64,
+    batch: u32,
     in_flight: &mut bool,
 ) -> bool {
     if *in_flight {
@@ -2841,7 +2861,7 @@ fn request_blocks_if_behind(
     let Some((peer, peer_tip)) = candidate else {
         return false;
     };
-    let count = blocksync_request_count(our_tip, peer_tip);
+    let count = blocksync_request_count(our_tip, peer_tip).min(batch);
     if count == 0 {
         return false;
     }
@@ -2888,6 +2908,47 @@ fn blocksync_request_count(our_tip: u64, peer_tip: u64) -> u32 {
     let last_of_signing_group = ((from - 1) / epoch_len + 1) * epoch_len;
     let last = peer_tip.min(last_of_signing_group);
     (last - our_tip).min(u64::from(MAX_BLOCKSYNC_BATCH)) as u32
+}
+
+/// The smallest batch the catch-up driver shrinks to. A handful of blocks is a few hundred
+/// kilobytes at today's block size, which any link that carries consensus at all can deliver within
+/// the request timeout; below that, the per-request overhead outweighs what a smaller answer saves.
+const MIN_BLOCKSYNC_BATCH: u32 = 5;
+
+/// What became of a block-sync request, as far as the size of the next one is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchOutcome {
+    /// Blocks arrived.
+    Delivered,
+    /// The answer did not arrive within the timeout, or its stream broke off on the way.
+    TooSlow,
+}
+
+/// Which failures say "ask for less next time". A timeout and a stream that broke off are what an
+/// answer too large for the link looks like from here: it shares the connection with the peer's
+/// gossip, and on 2026-10-13 a home validator three hours behind saw every one of 147 requests for
+/// 100 blocks (~4.6 MB) end exactly so, while 75–240 kB/s arrived per connection. A refused dial, a
+/// closed connection or an unsupported protocol says nothing about size.
+fn batch_outcome_of_failure(error: &request_response::OutboundFailure) -> Option<BatchOutcome> {
+    match error {
+        request_response::OutboundFailure::Timeout | request_response::OutboundFailure::Io(_) => {
+            Some(BatchOutcome::TooSlow)
+        }
+        _ => None,
+    }
+}
+
+/// The batch size to ask for next. Halved when an answer was too slow, grown by a quarter when one
+/// arrived — so a link that cannot carry a full batch settles near what it can, and one that
+/// recovers is back at the full batch within sixteen answers, even from the floor. A request for fewer blocks than the
+/// gap is never a weaker one: every batch is proven by its own tip certificate, however short.
+fn next_blocksync_batch(current: u32, outcome: BatchOutcome) -> u32 {
+    match outcome {
+        BatchOutcome::TooSlow => (current / 2).max(MIN_BLOCKSYNC_BATCH),
+        BatchOutcome::Delivered => current
+            .saturating_add((current / 4).max(1))
+            .min(MAX_BLOCKSYNC_BATCH),
+    }
 }
 
 /// Publishes our full current `known_addrs` set on the peer-exchange topic, stamped with our
@@ -4009,6 +4070,66 @@ mod peer_exchange_tests {
         assert_eq!(super::blocksync_request_count(100, 100), 0);
         assert_eq!(super::blocksync_request_count(100, 90), 0);
     }
+
+    /// An answer too slow for the link halves the next request, down to a floor and not past it;
+    /// one that arrives grows it again, up to the full batch and not past that. The home validator
+    /// of 2026-10-13 asked for 100 blocks 147 times in a row and got none of them — always the full
+    /// batch, because nothing remembered that the last one never came.
+    #[test]
+    fn the_batch_shrinks_on_slow_answers_and_grows_back_on_delivered_ones() {
+        use super::{next_blocksync_batch, BatchOutcome, MAX_BLOCKSYNC_BATCH, MIN_BLOCKSYNC_BATCH};
+        let mut batch = MAX_BLOCKSYNC_BATCH;
+        let mut seen = vec![batch];
+        for _ in 0..10 {
+            batch = next_blocksync_batch(batch, BatchOutcome::TooSlow);
+            seen.push(batch);
+        }
+        assert_eq!(seen[1], MAX_BLOCKSYNC_BATCH / 2, "one slow answer halves the request");
+        assert!(
+            seen.windows(2).all(|w| w[1] <= w[0]),
+            "slow answers never grow the request: {seen:?}"
+        );
+        assert_eq!(batch, MIN_BLOCKSYNC_BATCH, "and it stops at the floor: {seen:?}");
+
+        let mut grown = 0;
+        while batch < MAX_BLOCKSYNC_BATCH {
+            let next = next_blocksync_batch(batch, BatchOutcome::Delivered);
+            assert!(next > batch, "a delivered answer must grow the request ({batch} → {next})");
+            batch = next;
+            grown += 1;
+        }
+        assert_eq!(batch, MAX_BLOCKSYNC_BATCH);
+        assert_eq!(grown, 16, "back at the full batch from the floor in sixteen answers, as documented");
+        assert_eq!(
+            next_blocksync_batch(MAX_BLOCKSYNC_BATCH, BatchOutcome::Delivered),
+            MAX_BLOCKSYNC_BATCH,
+            "and never past it"
+        );
+    }
+
+    /// Only the failures that look like an answer too big for the link shrink the request. A dial
+    /// that failed or a peer that does not speak the protocol says nothing about size — shrinking
+    /// on those would leave a node asking for five blocks at a time because one peer was offline.
+    #[test]
+    fn only_a_timeout_or_a_broken_stream_counts_as_too_slow() {
+        use libp2p::request_response::OutboundFailure;
+        use super::{batch_outcome_of_failure, BatchOutcome};
+        assert_eq!(
+            batch_outcome_of_failure(&OutboundFailure::Timeout),
+            Some(BatchOutcome::TooSlow)
+        );
+        assert_eq!(
+            batch_outcome_of_failure(&OutboundFailure::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected end of file"
+            ))),
+            Some(BatchOutcome::TooSlow)
+        );
+        assert_eq!(batch_outcome_of_failure(&OutboundFailure::DialFailure), None);
+        assert_eq!(batch_outcome_of_failure(&OutboundFailure::ConnectionClosed), None);
+        assert_eq!(batch_outcome_of_failure(&OutboundFailure::UnsupportedProtocols), None);
+    }
+
 
     /// A peer on a different chain has to be named as such.
     ///

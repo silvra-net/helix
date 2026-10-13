@@ -515,3 +515,101 @@ async fn the_highest_peer_claim_is_published_and_retracted_with_its_peer() {
         "a departed peer's claim must not linger — it would hold production indefinitely"
     );
 }
+
+/// Answers a request for more than `limit` blocks only after the asker has given up waiting, and a
+/// smaller one at once — the shape of a link that carries a short answer in time and a full batch
+/// not at all. Records every count it was asked for.
+struct SlowForLargeBatches {
+    blocks: Vec<Block>,
+    certificate: Vec<Vote>,
+    limit: u32,
+    asked: std::sync::Mutex<Vec<u32>>,
+}
+
+impl BlockProvider for SlowForLargeBatches {
+    fn blocks<'a>(
+        &'a self,
+        from_height: u64,
+        count: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BlockSyncResponse> + Send + 'a>> {
+        Box::pin(async move {
+            self.asked.lock().unwrap().push(count);
+            if count > self.limit {
+                // Past the 30 s request timeout: the asker has stopped waiting by now.
+                tokio::time::sleep(Duration::from_secs(32)).await;
+            }
+            let served: Vec<Block> = self
+                .blocks
+                .iter()
+                .filter(|b| b.height() >= from_height)
+                .take(count as usize)
+                .cloned()
+                .collect();
+            BlockSyncResponse { blocks: served, tip_certificate: self.certificate.clone() }
+        })
+    }
+}
+
+/// A node whose full-size requests never arrive in time asks for fewer blocks, and catches up.
+///
+/// On 2026-10-13 a validator on a home line, three hours behind, asked its peers for 100 blocks 147
+/// times in a row. Every answer was ~4.6 MB on a connection already carrying the peer's gossip, and
+/// every one timed out — so the next request was for 100 blocks again, and the node never moved.
+/// Here the peer answers 50 blocks at once and 100 only after the timeout: the first request must be
+/// a full batch (otherwise the test proves nothing about shrinking), and a batch must still arrive.
+#[tokio::test]
+async fn a_node_whose_full_batches_time_out_asks_for_fewer_and_catches_up() {
+    let kp = KeyPair::generate();
+    let blocks = chained_blocks(&kp, 200);
+    let provider = Arc::new(SlowForLargeBatches {
+        blocks,
+        certificate: stand_in_certificate(&kp),
+        limit: 50,
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+
+    let ahead_tip = Arc::new(AtomicU64::new(200));
+    let (ahead, _ahead_cmd, mut ahead_events) =
+        P2PService::new(config(19_801, None), ahead_tip, provider.clone());
+    tokio::spawn(async move { ahead.run().await });
+    tokio::spawn(async move { while ahead_events.recv().await.is_some() {} });
+
+    let behind_tip = Arc::new(AtomicU64::new(0));
+    let (behind, _behind_cmd, mut behind_events) =
+        P2PService::new(config(19_802, Some(19_801)), behind_tip, Arc::new(NoBlocks));
+    tokio::spawn(async move { behind.run().await });
+
+    // One timeout (30 s), one cooldown (10 s), one prompt answer — plus connecting.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
+    let mut received: Option<BlockSyncResponse> = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), behind_events.recv()).await {
+            Ok(Some(P2PEvent::BlocksSynced(batch, _peer))) => {
+                received = Some(batch);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
+    let asked = provider.asked.lock().unwrap().clone();
+    assert_eq!(
+        asked.first().copied(),
+        Some(helix_p2p::MAX_BLOCKSYNC_BATCH),
+        "the first request must be a full batch, or this test proves nothing about shrinking: {asked:?}"
+    );
+    let batch = received.unwrap_or_else(|| {
+        panic!(
+            "no batch arrived in 100 s — the node kept asking for what the link cannot carry in \
+             time. Requests seen by the peer: {asked:?}"
+        )
+    });
+    assert!(
+        !batch.blocks.is_empty() && batch.blocks.len() <= 50,
+        "the batch that arrived must be one the link could carry: {} blocks, requests {asked:?}",
+        batch.blocks.len()
+    );
+    assert_eq!(batch.blocks[0].height(), 1, "and it starts where the node is: {asked:?}");
+}
