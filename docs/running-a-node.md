@@ -106,7 +106,7 @@ not start.
 | `HELIX_P2P_PUBLIC_ADDR` | (discovered) | The address this node announces to peers: a host (`helix.example.com`, the P2P port is appended) or a multiaddr (`/dns4/host/tcp/443/tls/ws`). Usually discovered by itself — set it behind a proxy or tunnel. |
 | `HELIX_P2P_SEED_PEERS` | (none) | Comma-separated multiaddrs to dial in addition to the sync peer, e.g. `/ip4/203.0.113.7/tcp/8546,/dns4/peer.example/tcp/8546`. |
 | `HELIX_P2P_DISABLE_MDNS` | off | `1` turns off discovery on the local network — needed only when two separate Helix networks share a LAN. |
-| `HELIX_RPC_SYNC_RATE` | (none) | Upload the block batches other nodes fetch from this node's RPC (`/sync/blocks`) may use, e.g. `700K` (bytes per second, units K/M/G, binary). Set, batches go out one at a time at that rate, only in the compact form (`encoding=bincode`; the JSON form is refused with 503, and current clients ask for the compact form again on their next round): on a thin uplink, several joining nodes at once otherwise share the line so thinly that none of their batches finishes before the client gives up, and they retry forever. Unset serves at full speed. Zero or an unreadable value stops the start. |
+| `HELIX_RPC_SYNC_RATE` | (none) | Upload the block batches other nodes fetch from this node's RPC (`/sync/blocks`) may use, e.g. `400K` (bytes per second, units K/M/G, binary; leave room below the line's upload rate — see [On a home connection](#on-a-home-connection)). Set, batches go out one at a time at that rate, only in the compact form (`encoding=bincode`; the JSON form is refused with 503). A batch that would wait longer than its client can still receive it is answered 503 with `Retry-After` at once: on a thin uplink, several joining nodes at once otherwise share the line so thinly that none of their batches finishes before the client gives up, and they retry forever. Unset serves at full speed. Zero or an unreadable value stops the start. |
 | `HELIX_P2P_RELAY` | on | `off` stops this node passing other nodes' gossip on. It still receives and acts on everything and still sends its own votes, proposals and transactions. For a validator on a home connection whose upload fills up: a relay sends every message it receives to every other peer. Leave it on if other nodes reach the network only through yours. A value that is not yes/no stops the start. |
 | `HELIX_SYNC_PEER` | `https://node.silvra.net` | RPC endpoint of a node on the chain to join: the genesis and missing blocks come from it, and a follower polls it every 4 seconds for new blocks. |
 | `HELIX_NEW_CHAIN` | off | `1` starts a chain of your own: the node signs its own genesis. For private chains and a new network's first node. |
@@ -311,6 +311,32 @@ This costs nothing in authenticity: libp2p's Noise handshake runs inside the Web
 proxy carries the traffic but cannot pose as a peer. Nodes on WebSocket and on TCP interoperate
 freely. A node that syncs from yours finds the WebSocket address by itself (your `/status` names
 it); no seed configuration is needed on its side.
+
+### On a home connection
+
+Every connected peer sends a node every block, vote and proposal — on a network of fifteen
+validators that is a few MB/s, and on a home line it can take the whole download. A node does three
+things about that by itself:
+
+- **Far behind and catching up** (more than 1,000 blocks behind the best tip its peers announce,
+  and its own height rising), it stops listening to blocks, votes, proposals and transactions until
+  it is within 100 blocks, so the link is free for the blocks it is fetching. The log says *"Far
+  behind and catching up — not listening …"* and later *"Listening to block, vote and transaction
+  gossip again"*. If catching up stalls for 90 seconds, it listens again regardless — a peer
+  announcing a false tip cannot keep a node deaf.
+- **Not in the validator set** (no stake, pending or jailed), it follows the chain by block sync
+  even at the tip and does not take votes, proposals or gossiped copies of blocks at all: each block
+  arrives once. *"Not in the validator set — following the chain by block sync …"*. Once its key is
+  in the set — probation included, where its signatures are already collected — it hears everything
+  again on the next tick.
+- **When block-sync answers do not arrive in time**, it asks for fewer blocks at once and for more
+  again as answers come in: *"Block-sync answers are not arriving in time — asking for fewer
+  blocks at once"*.
+
+For the upload, `HELIX_P2P_RELAY=off` stops this node passing others' gossip on, and
+`HELIX_RPC_SYNC_RATE` paces the block batches it serves over RPC — set it below the line's upload
+rate with room to spare: a tunnel adds its own overhead (measured on 2026-10-13: at `700K` on a
+~10 Mbit/s line the tunnel sent about 60 % more than the node gave it, and the line was full).
 
 ---
 
