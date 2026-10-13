@@ -6648,18 +6648,29 @@ fn multiaddr_kind(host: &str) -> &'static str {
 /// stop being something a compressor has to discover.
 ///
 /// The decoded value is identical either way, so nothing downstream knows which was used.
+///
+/// **Only a peer that refuses the parameter (a 4xx) is moved to JSON** (2026-10-13). Until then
+/// any failure was — a timeout, a broken stream, and the 503 a paced sync peer answers while its
+/// upload is taken (`HELIX_RPC_SYNC_RATE`). That peer refuses JSON too, so the switch bought
+/// nothing there; elsewhere it turned one slow answer into every later batch arriving 4.5× larger.
+/// A 503 now comes back as [`PeerBusy`], for a caller that can afford to wait.
 async fn fetch_sync_blocks(
     client: &reqwest::Client,
     peer_url: &str,
     from: u64,
+    count: u32,
     binary: &mut bool,
 ) -> Result<Vec<Block>> {
-    let base = format!("{}/sync/blocks?from={}&count=200", peer_url.trim_end_matches('/'), from);
+    let base =
+        format!("{}/sync/blocks?from={}&count={}", peer_url.trim_end_matches('/'), from, count);
     if *binary {
         let url = format!("{base}&encoding=bincode");
-        let resp = client.get(&url).send().await;
+        let resp = client.get(&url).send().await.with_context(|| format!("could not reach {url}"))?;
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Err(PeerBusy::from_response(&resp).into());
+        }
         match resp {
-            Ok(r) if r.status().is_success() => {
+            r if r.status().is_success() => {
                 let is_binary = r
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
@@ -6677,12 +6688,78 @@ async fn fetch_sync_blocks(
                 return serde_json::from_slice(&bytes)
                     .with_context(|| format!("{url} did not answer with valid JSON"));
             }
-            // Refused or unreachable — fall through to plain JSON. An unreachable peer fails
-            // there too, with the diagnosis `fetch_json` already produces.
-            _ => *binary = false,
+            // The parameter refused — a node from before it. Plain JSON, for the rest of the sync.
+            r if r.status().is_client_error() => *binary = false,
+            r => bail!("{url} answered HTTP {}", r.status()),
         }
     }
     fetch_json(client, &base).await
+}
+
+/// A sync peer that answered "busy, ask again later": HTTP 503, with how long to wait.
+///
+/// V1 answers so while its paced upload is taken by another batch (`HELIX_RPC_SYNC_RATE`), and
+/// every node while all of its heavy-response places are (#237). It is neither a refusal nor a
+/// failure of the peer, so it is a type of its own: a caller that can wait — a joining node that
+/// has nothing else to do yet — asks again; one that holds a lock others need fails fast instead.
+#[derive(Debug)]
+struct PeerBusy {
+    retry_after: Duration,
+}
+
+impl PeerBusy {
+    /// Longest wait honoured. A peer naming more is still busy, and a joiner asking again sooner
+    /// costs it one short request.
+    const LONGEST_WAIT: Duration = Duration::from_secs(30);
+
+    fn from_response(resp: &reqwest::Response) -> Self {
+        let named = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        PeerBusy {
+            retry_after: named
+                .unwrap_or(Duration::from_secs(5))
+                .clamp(Duration::from_secs(1), Self::LONGEST_WAIT),
+        }
+    }
+}
+
+impl std::fmt::Display for PeerBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the sync peer is busy and asked to come back in {} s", self.retry_after.as_secs())
+    }
+}
+
+impl std::error::Error for PeerBusy {}
+
+/// How often a joining node asks a busy sync peer again before it gives the request up. With the
+/// longest honoured wait that is ten minutes; with a paced peer's usual five seconds, under two.
+const BUSY_PEER_ATTEMPTS: u32 = 20;
+
+/// Run `fetch` again for as long as the peer answers [`PeerBusy`], up to [`BUSY_PEER_ATTEMPTS`].
+/// Any other outcome is returned as it is. Only for callers that hold no lock another path needs.
+async fn patiently<T, F, Fut>(mut fetch: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        match fetch().await {
+            Err(e) if attempt < BUSY_PEER_ATTEMPTS => match e.downcast_ref::<PeerBusy>() {
+                Some(busy) => {
+                    debug!(attempt, wait_secs = busy.retry_after.as_secs(), "Sync peer busy — asking again");
+                    tokio::time::sleep(busy.retry_after).await;
+                    attempt += 1;
+                }
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
 }
 
 /// A height and the hash of the block at it, supplied by the operator from outside the network.
@@ -6840,13 +6917,24 @@ async fn snapshot_sync_from_peer(
         peer_url.trim_end_matches('/'),
         checkpoint.height
     );
-    let resp = client.get(&url).send().await.with_context(|| format!("{url} is unreachable"))?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "{url} answered HTTP {} — this peer has no stored snapshot at that height",
-        resp.status()
-    );
-    let bytes = read_body_capped(resp, MAX_SNAPSHOT_BYTES, &url).await?;
+    // Asked again while the peer is busy (a 503 while its heavy-response places or its paced
+    // upload are taken): one busy answer used to send a joining node into replaying the whole chain,
+    // which is the slow path for it and the expensive one for the peer (2026-10-13).
+    let (http, snapshot_url) = (&client, &url);
+    let bytes = patiently(move || async move {
+        let url = snapshot_url;
+        let resp = http.get(url).send().await.with_context(|| format!("{url} is unreachable"))?;
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Err(PeerBusy::from_response(&resp).into());
+        }
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "{url} answered HTTP {} — this peer has no stored snapshot at that height",
+            resp.status()
+        );
+        read_body_capped(resp, MAX_SNAPSHOT_BYTES, url).await
+    })
+    .await?;
     let mut snapshot: helix_executor::state::StateSnapshot = bincode::deserialize(&bytes)
         .with_context(|| format!("{url} did not answer with a state snapshot"))?;
 
@@ -6906,8 +6994,16 @@ async fn snapshot_sync_from_peer(
         expected_root.to_hex()
     );
 
-    let mut binary = true;
-    let blocks = fetch_sync_blocks(&client, peer_url, checkpoint.height, &mut binary).await?;
+    // The anchor is one block, so one block is what is asked for. This asked for a full batch of
+    // 200 until 2026-10-13 — ~9 MB through the sync peer's upload to read the first of them, which
+    // on a paced home line did not arrive within the client's timeout, and the joiner fell back to
+    // replaying the chain from genesis.
+    let anchor_height = checkpoint.height;
+    let blocks = patiently(move || async move {
+        let mut binary = true;
+        fetch_sync_blocks(http, peer_url, anchor_height, 1, &mut binary).await
+    })
+    .await?;
     anyhow::ensure!(
         !blocks.is_empty(),
         "the peer served no block at height {}, so there is no anchor to store",
@@ -6996,7 +7092,7 @@ async fn sync_blocks_from_peer(
         // against ~0.4 s of local work — so holding a lock across it buys nothing and costs
         // everything.
         let blocks: Vec<Block> =
-            fetch_sync_blocks(&client, peer_url, from, &mut binary_encoding).await?;
+            fetch_sync_blocks(&client, peer_url, from, 200, &mut binary_encoding).await?;
         if blocks.is_empty() {
             break; // caught up
         }
@@ -7752,6 +7848,106 @@ mod sync_blocks_from_peer_tests {
              startup guard reads"
         );
         drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A joining node asks a busy sync peer again instead of giving up the snapshot, and asks for the
+    /// one block it needs rather than a batch.
+    ///
+    /// On 2026-10-13 a joining operator with a correct checkpoint never got in: the anchor fetch
+    /// asked for 200 blocks (~9 MB) through V1's paced upload, did not get them within the client's
+    /// timeout, and the node fell back to replaying the chain from genesis — the slow path for it and
+    /// the expensive one for V1. Here the peer answers "busy" (503) to the first snapshot request and
+    /// to the first block request; the snapshot must still be adopted, every block request must be
+    /// for one block, and none may fall back to JSON.
+    #[tokio::test]
+    async fn a_busy_sync_peer_is_asked_again_and_the_anchor_is_one_block() {
+        let kp = KeyPair::generate();
+        let chain_id = Hash::from_bytes([3u8; 32]);
+        let (snapshot, blocks, cp) = snapshot_fixture(&kp, 10_000, chain_id);
+        let snapshot = Arc::new(snapshot);
+        let blocks = Arc::new(blocks);
+        let snapshot_asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let block_counts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (sa, bc) = (snapshot_asks.clone(), block_counts.clone());
+        let app = Router::new()
+            .route(
+                "/sync/snapshot",
+                get(move || {
+                    let (snapshot, sa) = (snapshot.clone(), sa.clone());
+                    async move {
+                        if sa.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            return (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                [(axum::http::header::RETRY_AFTER, "1")],
+                                Vec::new(),
+                            )
+                                .into_response();
+                        }
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            bincode::serialize(&*snapshot).unwrap(),
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/sync/blocks",
+                get(move |Query(params): Query<HashMap<String, String>>| {
+                    let (blocks, bc) = (blocks.clone(), bc.clone());
+                    async move {
+                        let from: u64 = params.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let count: usize =
+                            params.get("count").and_then(|s| s.parse().ok()).unwrap_or(200);
+                        let encoding = params.get("encoding").cloned().unwrap_or_else(|| "json".into());
+                        let first = {
+                            let mut seen = bc.lock().unwrap();
+                            seen.push(format!("{encoding}:{count}"));
+                            seen.len() == 1
+                        };
+                        if first {
+                            return (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                [(axum::http::header::RETRY_AFTER, "1")],
+                                Vec::new(),
+                            )
+                                .into_response();
+                        }
+                        let page: Vec<Block> =
+                            blocks.iter().filter(|b| b.height() >= from).take(count).cloned().collect();
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            bincode::serialize(&page).unwrap(),
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let peer = format!("http://{addr}");
+        let (store, state, path) = fresh_store_and_state().await;
+
+        let height = snapshot_sync_from_peer(&peer, &cp, chain_id, &store, &state)
+            .await
+            .expect("a peer that was busy for a moment must still deliver the snapshot");
+
+        assert_eq!(height, 10_000);
+        assert_eq!(state.read().await.applied_height, 10_000, "the state is the peer's");
+        assert_eq!(
+            snapshot_asks.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the snapshot was asked for again after the busy answer, once"
+        );
+        assert_eq!(
+            *block_counts.lock().unwrap(),
+            vec!["bincode:1".to_string(), "bincode:1".to_string()],
+            "the anchor is asked for as one block, again after the busy answer, and never as JSON"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -9262,6 +9458,53 @@ mod sync_blocks_from_peer_tests {
             asked.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "asked once, then never again — one wasted request per sync, not one per batch"
+        );
+    }
+
+    /// A busy sync peer is not a peer that refuses the compact encoding. Until 2026-10-13 a 503 —
+    /// what a paced sync peer answers while its upload is taken — moved the rest of the sync to
+    /// JSON, 4.5× the bytes, from a peer that refuses JSON too. Now it ends this sync with
+    /// [`PeerBusy`] (the live paths hold a lock others need, so they do not wait) and asks nothing in
+    /// JSON.
+    #[tokio::test]
+    async fn a_busy_sync_peer_is_not_taken_for_one_that_refuses_the_compact_encoding() {
+        let json_asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ja = json_asks.clone();
+        let app = Router::new().route(
+            "/sync/blocks",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let ja = ja.clone();
+                async move {
+                    if params.get("encoding").map(String::as_str) != Some("bincode") {
+                        ja.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [(axum::http::header::RETRY_AFTER, "5")],
+                        "busy",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+
+        let err = sync_blocks_from_peer(&format!("http://{addr}"), 0, &store, &chain_state)
+            .await
+            .expect_err("a peer that only ever answers busy cannot be synced from");
+
+        let busy = err.downcast_ref::<PeerBusy>().unwrap_or_else(|| {
+            panic!("the error must say the peer is busy, not something else: {err:#}")
+        });
+        assert_eq!(busy.retry_after, Duration::from_secs(5), "with the wait the peer named");
+        assert_eq!(
+            json_asks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and nothing was asked in JSON"
         );
     }
 
