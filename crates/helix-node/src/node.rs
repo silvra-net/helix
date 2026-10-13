@@ -4047,12 +4047,9 @@ async fn apply_finalized_block(
         // it belongs to as a pair — see `ChainState::applied_height`. Any reader taking the read
         // lock now sees both or neither; there is no moment where they disagree.
         state.applied_height = height;
-        // Not a protocol-level state root (not in BlockHeader, not signed, doesn't gate
-        // consensus) — a diagnostic escape hatch. If two nodes' logs ever show different
-        // state_hash values at the same height, something has silently diverged; grep for
-        // it. Also served live via GET /status (NodeStatus::state_hash) for tooling that
-        // wants to compare running nodes without trawling logs. See ChainState::state_hash's
-        // doc comment for exactly what this is and isn't.
+        // The root the next block's proposer signs as its `prev_state_root` (#194), so two nodes
+        // that disagree here will refuse each other's next block. Logged at debug for comparing
+        // nodes by hand; also served live via GET /status (NodeStatus::state_hash).
         debug!(height, state_hash = %state.state_hash().to_hex(), "Block applied");
         (
             receipt.tx_receipts,
@@ -4211,12 +4208,28 @@ async fn apply_finalized_block(
         // cannot finalize before this one is persisted below, so no later certificate can race in
         // here) — send it with the block so a fast-path receiver can adopt it as its own
         // `last_commit` instead of an empty one (#114).
-        let (round, certificate) = {
+        let (round, certificate, we_proposed_it) = {
             let eng = engine.read().await;
-            (eng.last_committed_round().unwrap_or(0), eng.commit_certificate())
+            (
+                eng.last_committed_round().unwrap_or(0),
+                eng.commit_certificate(),
+                block.header.validator == eng.address,
+            )
         };
         let _ = p2p_tx.try_send(P2PCommand::BroadcastProposal(Proposal::fresh(round, block.clone())));
-        let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone(), certificate));
+        // The committed block itself goes out from its proposer only (2026-10-13). Every validator
+        // that finalized it used to publish it, each with the precommits *it* happened to collect —
+        // so the copies differ in bytes, gossipsub cannot merge them, and with fourteen validators
+        // every node received and relayed up to fourteen ~100 KB messages per block. That was the
+        // largest share of what filled a home validator's uplink. The validators that finalized the
+        // block do not need it; the nodes that do — followers, and anyone who missed the precommits
+        // — need one copy, which the proposer's provides. If that copy never comes (a proposer gone
+        // right after its block), they fall back on what they always had: the gap is noticed at the
+        // next block and filled by block sync. (The proposal just above is the same bytes the
+        // proposer already sent, so gossipsub drops it as a duplicate and it costs nothing.)
+        if we_proposed_it {
+            let _ = p2p_tx.try_send(P2PCommand::BroadcastBlock(block.clone(), certificate));
+        }
     }
 
     // Persist block + chain state to the same redb file, under one write lock.
@@ -8642,6 +8655,60 @@ mod sync_blocks_from_peer_tests {
             "block 1 was already applied by the aborted sync — executing it again mints its reward \
              twice and puts this node on a different state than its peers",
         );
+    }
+
+    /// Who republishes a block that finalized here (2026-10-13): its proposer, and nobody else.
+    ///
+    /// Each validator that finalized a block used to publish it with the precommits it had
+    /// collected; the copies differed in bytes, and with fourteen validators every node received and
+    /// relayed up to fourteen of them per block — the largest share of what filled a home
+    /// validator's uplink. The two halves are each a positive control for the other: the proposer
+    /// still publishes (otherwise followers would lose their copy and this test would pass on a node
+    /// that publishes nothing), and a validator that merely took part does not.
+    #[tokio::test]
+    async fn only_its_proposer_republishes_a_block_that_finalized_here() {
+        let proposer = KeyPair::generate();
+        let bystander = KeyPair::generate();
+        for (we_are, should_publish) in [(&proposer, true), (&bystander, false)] {
+            let base = ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX);
+            let mut built = base.clone();
+            let mut tip = (Hash::ZERO, None);
+            let blocks = extend_chain(&proposer, &[&proposer], &[0, 1], &[], &mut built, &mut tip);
+
+            let store = Arc::new(RwLock::new(fresh_store()));
+            let chain_state = Arc::new(RwLock::new(base));
+            store.write().await.put_block(blocks[0].clone()).unwrap();
+            execute_block(&mut *chain_state.write().await, &blocks[0]);
+
+            let our_address = Address::from_public_key(&we_are.public);
+            let validator_set = ValidatorSet::new(
+                vec![Validator::with_key(our_address.clone(), Some(we_are.public.clone()), 1_000_000, true)],
+                0,
+                Hash::ZERO,
+            );
+            let engine = Arc::new(RwLock::new(BftEngine::new(validator_set, our_address, 0)));
+            let mempool = Arc::new(RwLock::new(Mempool::new()));
+            let (p2p_tx, mut p2p_rx) = mpsc::channel(16);
+            let last_applied_height = Arc::new(Mutex::new(0u64));
+
+            apply_finalized_block(
+                blocks[1].clone(), true, vec![], &store, &mempool, &chain_state, &engine, &p2p_tx, &last_applied_height, &Arc::new(RwLock::new(TipCertificate::default())),
+            )
+            .await;
+            assert_eq!(store.read().await.latest_height(), 1, "precondition: block 1 was applied");
+
+            let mut published_block = false;
+            while let Ok(cmd) = p2p_rx.try_recv() {
+                if matches!(cmd, P2PCommand::BroadcastBlock(..)) {
+                    published_block = true;
+                }
+            }
+            assert_eq!(
+                published_block, should_publish,
+                "{}: a finalized block is republished by its proposer and by nobody else",
+                if should_publish { "the proposer" } else { "a validator that only took part" }
+            );
+        }
     }
 
     /// Like `serve_blocks`, but also serves `/sync/tip-certificate` for the last block — what a
