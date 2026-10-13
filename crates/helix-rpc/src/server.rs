@@ -71,6 +71,9 @@ pub struct AppState {
     /// live engine, never on disk), and served at `GET /sync/tip-certificate` so an RPC-only
     /// follower can obtain the one certificate `/sync/blocks` cannot carry (#133).
     pub tip_certificate: Arc<RwLock<crate::TipCertificate>>,
+    /// `HELIX_RPC_SYNC_RATE`: block batches go out one at a time at this rate (`SyncPacer`).
+    /// `None` serves them as fast as the line allows, as every node always has.
+    pub sync_pacer: Option<Arc<SyncPacer>>,
     /// Diagnostics the node publishes for `GET /diagnostics` — see [`crate::NodeDiagnostics`].
     ///
     /// Atomics and a snapshot rather than asking consensus: this endpoint is most useful exactly
@@ -517,6 +520,80 @@ async fn heavy_response_permit(
     permit_or_busy(&HEAVY_RESPONSES, HEAVY_RESPONSE_WAIT).await
 }
 
+/// The upload `/sync/blocks` answers may use, when this node's operator has set one
+/// (`HELIX_RPC_SYNC_RATE`, `AppState::sync_pacer`).
+///
+/// Why it exists (2026-10-13): on a home uplink of ~1.2 MB/s, the production node served
+/// `/sync/blocks` to five or more joining nodes at once. A batch had grown to ~9 MB (fourteen
+/// signatures a block), the joiners' clients give a batch 30 s, and eight answers sharing the line
+/// got ~150 kB/s each — none finished, every client retried the same batch, and 623 aborted
+/// answers in an hour kept the line full while nobody, the node itself included, made progress.
+/// So with a rate set, batches go out **one at a time** and **at that rate**: a waiting request
+/// costs no bytes, the one being sent finishes inside its client's window, and the rest of the line
+/// stays free for the node's own consensus and catch-up.
+/// One transmission at a time, at a fixed rate.
+pub struct SyncPacer {
+    sending: std::sync::Arc<tokio::sync::Semaphore>,
+    bytes_per_sec: u64,
+}
+
+impl SyncPacer {
+    /// `bytes_per_sec` is clamped to at least 1; the node refuses a zero before it gets here.
+    pub fn new(bytes_per_sec: u64) -> Self {
+        let bytes_per_sec = bytes_per_sec.max(1);
+        SyncPacer { sending: std::sync::Arc::new(tokio::sync::Semaphore::new(1)), bytes_per_sec }
+    }
+
+    /// The right to send, waiting up to `wait` for whoever is sending now — or the answer that says
+    /// to come back.
+    async fn turn(
+        &self,
+        wait: std::time::Duration,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
+        match tokio::time::timeout(wait, self.sending.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "5")],
+                Json(json!({ "error": "busy serving block batches — retry in a few seconds" })),
+            )
+                .into_response()),
+        }
+    }
+}
+
+/// How much of a paced answer goes out between two pauses.
+const PACED_CHUNK: usize = 64 * 1024;
+
+/// `bytes`, as a stream that takes `bytes.len() / bytes_per_sec` seconds to drain and holds `turn`
+/// until it ends — or until it is dropped, which is what happens when the client goes away: the
+/// next waiting request gets its turn at once instead of after a transmission nobody reads.
+///
+/// Fused: the compression layer polls a body once more after its end, and an unfused stream panics
+/// there (#244).
+fn paced(
+    bytes: Vec<u8>,
+    bytes_per_sec: u64,
+    turn: tokio::sync::OwnedSemaphorePermit,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::convert::Infallible>> {
+    use futures_util::StreamExt;
+    let bytes = axum::body::Bytes::from(bytes);
+    futures_util::stream::unfold((bytes, 0usize, turn), move |(bytes, at, turn)| async move {
+        if at >= bytes.len() {
+            drop(turn);
+            return None;
+        }
+        let end = (at + PACED_CHUNK).min(bytes.len());
+        let chunk = bytes.slice(at..end);
+        // Pause before the chunk, not after: the first one waits too, so the rate holds from the
+        // first byte, and the last pause is not spent after everything has already gone out.
+        let pause = std::time::Duration::from_secs_f64(chunk.len() as f64 / bytes_per_sec as f64);
+        tokio::time::sleep(pause).await;
+        Some((Ok(chunk), (bytes, end, turn)))
+    })
+    .fuse()
+}
+
 /// A place in `places`, waiting up to `wait` for one — or the answer that says to come back.
 async fn permit_or_busy(
     places: &tokio::sync::Semaphore,
@@ -789,6 +866,15 @@ async fn get_sync_blocks(
         params.get("count").and_then(|v| v.parse().ok()).unwrap_or(200).min(200);
     let binary = params.get("encoding").map(String::as_str) == Some("bincode");
     if binary {
+        // With an upload limit, wait for this answer's turn to be sent before building it: a
+        // request that waits costs nothing, and one that is built goes out at once (`SyncPacer`).
+        let turn = match state.sync_pacer.as_deref() {
+            Some(pacer) => match pacer.turn(HEAVY_RESPONSE_WAIT).await {
+                Ok(turn) => Some((turn, pacer.bytes_per_sec)),
+                Err(busy) => return busy,
+            },
+            None => None,
+        };
         // Bincode opens with the number of blocks, so this answer is built whole — at about the
         // blocks' own size, and one of a bounded number at a time.
         let _permit = match heavy_response_permit().await {
@@ -806,6 +892,14 @@ async fn get_sync_blocks(
         // A serialization failure here is not worth failing the request over: answering JSON is
         // always correct, just larger, and the caller handles both.
         if let Ok(bytes) = bincode::serialize(&blocks) {
+            if let Some((turn, bytes_per_sec)) = turn {
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                    axum::body::Body::from_stream(paced(bytes, bytes_per_sec, turn)),
+                )
+                    .into_response();
+            }
             return (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -2218,6 +2312,72 @@ async fn get_transaction_status(
 }
 
 #[cfg(test)]
+mod paced_sync_tests {
+    use super::{paced, SyncPacer};
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    async fn drain(
+        stream: impl futures_util::Stream<Item = Result<axum::body::Bytes, std::convert::Infallible>>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        out
+    }
+
+    /// A paced batch carries every byte, in order, and takes as long as its rate says — the 9 MB
+    /// that a home uplink could not finish for anyone in 30 s go out in a bounded, known time.
+    #[tokio::test(start_paused = true)]
+    async fn a_paced_answer_carries_every_byte_and_takes_as_long_as_its_rate_says() {
+        let pacer = SyncPacer::new(100_000);
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let turn = pacer.turn(Duration::from_secs(1)).await.expect("nobody else is sending");
+        let started = tokio::time::Instant::now();
+        let sent = drain(paced(bytes.clone(), pacer.bytes_per_sec, turn)).await;
+        let took = started.elapsed();
+        assert_eq!(sent, bytes, "every byte, in order");
+        assert!(
+            took >= Duration::from_millis(2_950) && took <= Duration::from_millis(3_050),
+            "300 kB at 100 kB/s takes 3 s, took {took:?}"
+        );
+    }
+
+    /// One batch at a time: the next waits for the one being sent, and gets its turn the moment that
+    /// one ends — or is dropped, which is what a client hanging up does; a transmission nobody reads
+    /// must not hold the line for the rest of its length. And the stream is fused: polled again
+    /// after its end, as the compression layer does, it says `None` instead of panicking (#244).
+    #[tokio::test(start_paused = true)]
+    async fn the_next_batch_waits_for_the_one_being_sent_and_gets_its_turn_when_that_ends() {
+        let pacer = SyncPacer::new(100_000);
+        let first = pacer.turn(Duration::from_secs(1)).await.expect("first turn");
+        assert!(
+            pacer.turn(Duration::from_millis(100)).await.is_err(),
+            "a second batch must not go out while the first is being sent"
+        );
+
+        // The first client hangs up after one chunk.
+        let mut stream = Box::pin(paced(vec![7u8; 1_000_000], pacer.bytes_per_sec, first));
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        let second = pacer
+            .turn(Duration::from_millis(100))
+            .await
+            .expect("a dropped transmission hands its turn on at once");
+
+        let mut done = Box::pin(paced(vec![1u8; 10], pacer.bytes_per_sec, second));
+        while done.next().await.is_some() {}
+        assert!(done.next().await.is_none(), "fused: no panic when polled after its end");
+        assert!(
+            pacer.turn(Duration::from_millis(100)).await.is_ok(),
+            "a finished transmission hands its turn on"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use helix_core::{Block, BlockHeader, CryptoVersion, TxType};
@@ -2329,6 +2489,7 @@ mod tests {
             p2p_public_addr: None,
             p2p_command_tx,
             tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
+            sync_pacer: None,
             started_at_unix: 0,
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3674,6 +3835,7 @@ mod tests {
             p2p_public_addr: None,
             p2p_command_tx,
             tip_certificate: Arc::new(RwLock::new(crate::TipCertificate::default())),
+            sync_pacer: None,
             started_at_unix: 0,
             silent_peer_validators: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             highest_peer_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4283,6 +4445,49 @@ mod tests {
         flate2::read::GzDecoder::new(&body[..]).read_to_string(&mut json).unwrap();
         let blocks: Vec<Block> = serde_json::from_str(&json).unwrap();
         assert_eq!(blocks.len(), 3);
+    }
+
+    /// A paced bincode batch (`HELIX_RPC_SYNC_RATE`) through the production stack — rate limit,
+    /// connect info, compression — arrives whole and decodes to the blocks asked for. A streamed
+    /// body is what broke behind the compression layer once (#244); this one streams too.
+    #[tokio::test]
+    async fn a_paced_block_batch_survives_the_production_stack() {
+        use std::io::Read;
+        use tower::ServiceExt;
+
+        let state = AppState {
+            sync_pacer: Some(Arc::new(SyncPacer::new(50 * 1024 * 1024))),
+            ..fresh_test_state_with_blocks(5).await
+        };
+        let limiter = Arc::new(RateLimiter::new(1_000.0, 1_000.0));
+        let mut request = axum::http::Request::builder()
+            .uri("/sync/blocks?from=1&count=3&encoding=bincode")
+            .header(axum::http::header::ACCEPT_ENCODING, "gzip")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_001))));
+
+        let response = router(state, limiter).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let gzipped = response
+            .headers()
+            .get(axum::http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            == Some("gzip");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the whole answer arrives");
+        let raw = if gzipped {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(&body[..]).read_to_end(&mut out).unwrap();
+            out
+        } else {
+            body.to_vec()
+        };
+        let blocks: Vec<Block> = bincode::deserialize(&raw).expect("a bincode block batch");
+        assert_eq!(blocks.iter().map(|b| b.height()).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     /// The streamed answer is the array a client has always parsed, for every length — empty,

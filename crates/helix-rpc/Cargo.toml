@@ -27,6 +27,8 @@ bincode.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Virtual time, so the paced block batches (`SYNC_PACER`) are tested at their real rates in no time.
+tokio = { workspace = true, features = ["test-util"] }
 # Already in the tree through reqwest's gzip; here to read a compressed answer back in a test.
 flate2 = "1"
 

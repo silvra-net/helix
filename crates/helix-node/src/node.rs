@@ -587,6 +587,27 @@ fn parse_byte_budget(raw: &str) -> Option<u64> {
     n.checked_mul(scale)
 }
 
+/// The upload `/sync/blocks` answers may use (`HELIX_RPC_SYNC_RATE`, `helix_rpc::server::SyncPacer`),
+/// in bytes per second — written like a disk budget (`700K`, `1M`), every unit binary.
+///
+/// Unset or empty: no limit, as every node always has. Zero or a value this node cannot read
+/// refuses the start: zero would serve nothing at all, and a typo read as "no limit" would leave a
+/// thin uplink as full as the operator set this to stop (2026-10-13).
+fn sync_rate_setting(raw: Option<&str>) -> Result<Option<u64>> {
+    let Some(raw) = raw else { return Ok(None) };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    match parse_byte_budget(raw) {
+        Some(0) | None => bail!(
+            "HELIX_RPC_SYNC_RATE={raw:?} is not an upload rate this node can use. Write the bytes \
+             per second block batches may take, e.g. HELIX_RPC_SYNC_RATE=700K (units K/M/G, binary), \
+             or unset it to serve them as fast as the line allows."
+        ),
+        Some(rate) => Ok(Some(rate)),
+    }
+}
+
 /// Whether this node relays other nodes' gossip (`HELIX_P2P_RELAY`, `P2PConfig::relay`).
 ///
 /// Unset or empty: it relays, as every node always has. A value that is neither yes nor no refuses
@@ -793,6 +814,8 @@ pub struct HelixNode {
     /// nothing else — and only while the RPC catch-up, the independent second release path, is
     /// also unavailable.
     highest_peer_tip: Arc<std::sync::atomic::AtomicU64>,
+    /// `HELIX_RPC_SYNC_RATE`, read and checked at startup (`sync_rate_setting`).
+    sync_rate: Option<u64>,
     /// Live commit certificate for the current tip — served at `/sync/tip-certificate` (#133) and
     /// used to certify a block handed to a peer over block sync (#138). Created in the constructor
     /// rather than in `run()` because [`StoreBlockProvider`] needs to share the very same cell.
@@ -824,6 +847,10 @@ impl HelixNode {
             std::env::var("HELIX_GENESIS_VALIDATOR_LIQUID_HLX").ok().as_deref(),
         )?;
         let relay = relay_setting(config::resolve("HELIX_P2P_RELAY", &cfg.p2p_relay).as_deref())?;
+        let sync_rate = sync_rate_setting(std::env::var("HELIX_RPC_SYNC_RATE").ok().as_deref())?;
+        if let Some(rate) = sync_rate {
+            info!(bytes_per_sec = rate, "Block batches over RPC go out one at a time at this rate (HELIX_RPC_SYNC_RATE)");
+        }
 
         let key_path = resolve_validator_key_path(&cfg);
         // Double-sign state lives beside the key it protects: validator-key.json ->
@@ -1298,6 +1325,7 @@ impl HelixNode {
             announced_tip_height,
             announced_earliest_block,
             highest_peer_tip,
+            sync_rate,
             tip_certificate: shared_tip_certificate,
             signing_state_path,
             previous_run: previous_run_for_rpc,
@@ -1342,6 +1370,7 @@ impl HelixNode {
             p2p_public_addr: self.p2p_public_addr.clone(),
             p2p_command_tx: self.p2p_command_tx.clone(),
             tip_certificate: tip_certificate.clone(),
+            sync_pacer: self.sync_rate.map(|rate| Arc::new(helix_rpc::server::SyncPacer::new(rate))),
             started_at_unix: crate::run_record::now_unix(),
             silent_peer_validators: silent_peer_validators.clone(),
             rounds_lost_with_quorum_power: rounds_lost_with_quorum_power.clone(),
@@ -10322,6 +10351,21 @@ mod body_cap_tests {
     fn a_byte_budget_that_cannot_be_read_is_not_taken_for_none() {
         for unreadable in ["lots", "12X", "", "G", "1.5G", "120 GiBs", "-5G", "99999999999T"] {
             assert_eq!(parse_byte_budget(unreadable), None, "{unreadable:?}");
+        }
+    }
+
+    /// `HELIX_RPC_SYNC_RATE`: unset or empty means no limit; a rate in bytes or with a binary unit
+    /// is taken; zero and anything unreadable stop the start, naming the setting.
+    #[test]
+    fn the_sync_rate_setting_reads_a_rate_and_refuses_zero_or_nonsense() {
+        assert_eq!(sync_rate_setting(None).unwrap(), None);
+        assert_eq!(sync_rate_setting(Some(" ")).unwrap(), None);
+        assert_eq!(sync_rate_setting(Some("700K")).unwrap(), Some(700 * 1024));
+        assert_eq!(sync_rate_setting(Some("1M")).unwrap(), Some(1 << 20));
+        assert_eq!(sync_rate_setting(Some("500000")).unwrap(), Some(500_000));
+        for unreadable in ["0", "0K", "fast", "700 kbit", "-1"] {
+            let msg = sync_rate_setting(Some(unreadable)).unwrap_err().to_string();
+            assert!(msg.contains("HELIX_RPC_SYNC_RATE"), "{unreadable:?}: {msg}");
         }
     }
 
