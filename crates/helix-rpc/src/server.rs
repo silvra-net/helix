@@ -565,11 +565,20 @@ impl SyncPacer {
 /// How much of a paced answer goes out between two pauses.
 const PACED_CHUNK: usize = 64 * 1024;
 
-/// How long a block batch waits for its turn, with a rate set. Half the 30 s today's client gives
-/// a whole batch: a request that gets its turn still has the other half to be sent in (~13 s for a
-/// 9 MB batch at 700 KiB/s), and one that does not is told to come back before it has cost a byte.
-/// Waiting the full 30 s instead meant the client had given up by the time its turn came.
-const SYNC_TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// The part of today's client's 30 s per batch that a paced answer may use, waiting and sending
+/// together — the rest is for the request to arrive and the tunnel in between.
+const SYNC_CLIENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// How long a built batch of `len` bytes may wait for its turn at `bytes_per_sec`: whatever the
+/// client's window leaves after sending it. A request that waits longer would have its client give
+/// up while it is being sent — bytes for nobody — so it is told to come back instead, before it has
+/// cost a byte. Zero when the batch alone takes the whole window: then it is sent only if the line
+/// is free this instant. (A fixed 15 s, the first version, was right for 700 KiB/s and wrong for
+/// 400: a 9 MB batch takes 23 s there.)
+fn sync_turn_wait(len: usize, bytes_per_sec: u64) -> std::time::Duration {
+    let sending = std::time::Duration::from_secs_f64(len as f64 / bytes_per_sec.max(1) as f64);
+    SYNC_CLIENT_WINDOW.saturating_sub(sending)
+}
 
 /// `bytes`, as a stream that takes `bytes.len() / bytes_per_sec` seconds to drain and holds `turn`
 /// until it ends — or until it is dropped, which is what happens when the client goes away: the
@@ -887,15 +896,6 @@ async fn get_sync_blocks(
             .into_response();
     }
     if binary {
-        // With an upload limit, wait for this answer's turn to be sent before building it: a
-        // request that waits costs nothing, and one that is built goes out at once (`SyncPacer`).
-        let turn = match state.sync_pacer.as_deref() {
-            Some(pacer) => match pacer.turn(SYNC_TURN_WAIT).await {
-                Ok(turn) => Some((turn, pacer.bytes_per_sec)),
-                Err(busy) => return busy,
-            },
-            None => None,
-        };
         // Bincode opens with the number of blocks, so this answer is built whole — at about the
         // blocks' own size, and one of a bounded number at a time.
         let _permit = match heavy_response_permit().await {
@@ -913,11 +913,20 @@ async fn get_sync_blocks(
         // A serialization failure here is not worth failing the request over: answering JSON is
         // always correct, just larger, and the caller handles both.
         if let Ok(bytes) = bincode::serialize(&blocks) {
-            if let Some((turn, bytes_per_sec)) = turn {
+            // With an upload limit (`SyncPacer`): built first — milliseconds — so the wait for a
+            // turn can be fitted to this batch's size; and built under the place taken above,
+            // which is held until the turn comes, so waiting batches stay as bounded in memory as
+            // building ones always were.
+            if let Some(pacer) = state.sync_pacer.as_deref() {
+                drop(store);
+                let turn = match pacer.turn(sync_turn_wait(bytes.len(), pacer.bytes_per_sec)).await {
+                    Ok(turn) => turn,
+                    Err(busy) => return busy,
+                };
                 return (
                     StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                    axum::body::Body::from_stream(paced(bytes, bytes_per_sec, turn)),
+                    axum::body::Body::from_stream(paced(bytes, pacer.bytes_per_sec, turn)),
                 )
                     .into_response();
             }
@@ -2334,7 +2343,7 @@ async fn get_transaction_status(
 
 #[cfg(test)]
 mod paced_sync_tests {
-    use super::{paced, SyncPacer};
+    use super::{paced, sync_turn_wait, SyncPacer};
     use futures_util::StreamExt;
     use std::time::Duration;
 
@@ -2364,6 +2373,19 @@ mod paced_sync_tests {
             took >= Duration::from_millis(2_950) && took <= Duration::from_millis(3_050),
             "300 kB at 100 kB/s takes 3 s, took {took:?}"
         );
+    }
+
+    /// The wait for a turn is what the client's window leaves after sending the batch: the 9 MB
+    /// batches of 2026-10-13 may wait ~12 s at 700 KiB/s, ~2 s at 400 KiB/s, and a batch that alone
+    /// takes longer than the window may not wait at all.
+    #[test]
+    fn a_batch_waits_only_as_long_as_its_client_can_still_receive_it() {
+        let nine_mb = 9_100_000;
+        let at = |kib: u64| sync_turn_wait(nine_mb, kib * 1024).as_secs_f64();
+        assert!((at(700) - 12.3).abs() < 0.3, "700 KiB/s: {}", at(700));
+        assert!((at(400) - 2.8).abs() < 0.3, "400 KiB/s: {}", at(400));
+        assert_eq!(at(300), 0.0, "longer than the window alone: no waiting");
+        assert!(sync_turn_wait(1_000, 1024 * 1024).as_secs_f64() > 24.9, "a small batch may wait");
     }
 
     /// One batch at a time: the next waits for the one being sent, and gets its turn the moment that
@@ -4541,6 +4563,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(compact.status(), StatusCode::OK, "the compact form is still served");
+    }
+
+    /// A built batch waiting for its turn does not hold the block store: the node applies blocks
+    /// under its write lock, and a batch waiting up to 25 s with a read lock open would stop this
+    /// node's own catch-up for exactly as long — on the node that most needs it.
+    #[tokio::test]
+    async fn a_batch_waiting_for_its_turn_does_not_hold_the_block_store() {
+        use tower::ServiceExt;
+        let pacer = Arc::new(SyncPacer::new(1024));
+        let state = AppState {
+            sync_pacer: Some(pacer.clone()),
+            ..fresh_test_state_with_blocks(5).await
+        };
+        // Someone else is sending.
+        let _sending = pacer.turn(std::time::Duration::from_secs(1)).await.unwrap();
+        let mut request = axum::http::Request::builder()
+            .uri("/sync/blocks?from=1&count=3&encoding=bincode")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_003))));
+        let limiter = Arc::new(RateLimiter::new(1_000.0, 1_000.0));
+        let waiting = tokio::spawn(router(state.clone(), limiter).oneshot(request));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "premise: the batch is waiting for its turn");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), state.store.write()).await.is_ok(),
+            "a waiting batch kept the store locked"
+        );
+        waiting.abort();
     }
 
     /// The streamed answer is the array a client has always parsed, for every length — empty,
