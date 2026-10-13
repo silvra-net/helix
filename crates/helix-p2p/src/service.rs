@@ -269,6 +269,16 @@ pub enum P2PCommand {
     /// node's `self_addr` in the same moment — the filter that stops it dialing its own
     /// announcement when a peer echoes it back.
     AnnounceSelfAddress(String),
+    /// Whether this node only follows the chain: `true` while its key is not in the validator set.
+    ///
+    /// A follower applies committed blocks, each with its certificate, and nothing else of the
+    /// consensus traffic: proposals and votes are for the validators deciding a height. But every
+    /// connected peer sends it all of them, and on 2026-10-13 the votes alone — thirty a block at
+    /// ~5.4 KB, from each of up to fifteen peers — were the largest part of what filled a home
+    /// node's ~25 Mbit download, so that at the tip it could not keep up and fell behind block by
+    /// block. While this is `true` the service is not subscribed to votes or proposals; committed
+    /// blocks, transactions and peer exchange stay.
+    FollowOnly(bool),
 }
 
 #[derive(NetworkBehaviour)]
@@ -474,6 +484,12 @@ impl P2PService {
             .gossipsub
             .subscribe(&peer_exchange_topic)
             .map_err(|e| P2PError::Gossipsub(e.to_string()))?;
+        let consensus_topics = ConsensusTopics {
+            proposals: &block_topic,
+            votes: &vote_topic,
+            committed: &committed_topic,
+            transactions: &tx_topic,
+        };
 
         let listen_addr: Multiaddr = format!(
             "/ip4/{}/tcp/{}",
@@ -625,6 +641,8 @@ impl P2PService {
         // `None` until it has risen in this process, because a restart is not progress (the counter
         // above starts at 0 and would read the first tick after a restart as one).
         let mut consensus_gossip_on = true;
+        // A follower does not hear votes or proposals — see `P2PCommand::FollowOnly`.
+        let mut follow_only = false;
         let mut catch_up_seen_tip = tip_height.load(Ordering::Relaxed);
         let mut catch_up_still_ticks: Option<u32> = None;
         // The height this node executes nothing from — see `P2PCommand::StopCatchingUpAt`.
@@ -1337,13 +1355,13 @@ impl P2PService {
                         blocksync_stall_ticks = 0;
                         // Not catching up any more, so no reason to be deaf.
                         if !consensus_gossip_on {
+                            consensus_gossip_on = true;
                             set_consensus_gossip(
                                 &mut swarm,
-                                &[&block_topic, &vote_topic, &committed_topic],
-                                &tx_topic,
-                                true,
+                                &consensus_topics,
+                                !consensus_gossip_on,
+                                follow_only,
                             );
-                            consensus_gossip_on = true;
                         }
                         continue;
                     }
@@ -1377,13 +1395,13 @@ impl P2PService {
                             catch_up_still_ticks,
                         );
                         if listen != consensus_gossip_on {
+                            consensus_gossip_on = listen;
                             set_consensus_gossip(
                                 &mut swarm,
-                                &[&block_topic, &vote_topic, &committed_topic],
-                                &tx_topic,
-                                listen,
+                                &consensus_topics,
+                                !consensus_gossip_on,
+                                follow_only,
                             );
-                            consensus_gossip_on = listen;
                             let behind = best_claimed.map(|b| b.saturating_sub(our_tip));
                             if listen {
                                 info!(
@@ -1809,6 +1827,25 @@ impl P2PService {
                                     publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
                                 }
                                 Err(_) => warn!(peer = %peer, "Unparseable peer id in block-sync report"),
+                            }
+                        }
+                        P2PCommand::FollowOnly(follow) => {
+                            if follow != follow_only {
+                                follow_only = follow;
+                                set_consensus_gossip(
+                                    &mut swarm,
+                                    &consensus_topics,
+                                    !consensus_gossip_on,
+                                    follow_only,
+                                );
+                                if follow {
+                                    info!(
+                                        "Not in the validator set — following committed blocks only, \
+                                         without the votes and proposals the validators exchange"
+                                    );
+                                } else {
+                                    info!("In the validator set — hearing votes and proposals again");
+                                }
                             }
                         }
                         P2PCommand::StopCatchingUpAt(height) => {
@@ -3064,31 +3101,41 @@ fn listen_to_consensus_gossip(
     }
 }
 
-/// Subscribe to, or unsubscribe from, the topics [`listen_to_consensus_gossip`] decides about. The
-/// peer-exchange topic is never touched.
+/// The gossip topics a node may stop hearing, in the two groups the rules decide about.
+struct ConsensusTopics<'a> {
+    proposals: &'a gossipsub::IdentTopic,
+    votes: &'a gossipsub::IdentTopic,
+    committed: &'a gossipsub::IdentTopic,
+    transactions: &'a gossipsub::IdentTopic,
+}
+
+/// Subscribe to, or unsubscribe from, each topic as the two rules say: a node catching up from
+/// far behind hears none of them ([`listen_to_consensus_gossip`]), a follower hears committed
+/// blocks and transactions but no votes or proposals (`P2PCommand::FollowOnly`). Idempotent —
+/// gossipsub answers a repeated subscribe or unsubscribe with "no change". The peer-exchange topic
+/// is never touched.
 fn set_consensus_gossip(
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
-    consensus_topics: &[&gossipsub::IdentTopic],
-    tx_topic: &gossipsub::IdentTopic,
-    listen: bool,
+    topics: &ConsensusTopics,
+    catching_up_deaf: bool,
+    follow_only: bool,
 ) {
-    for topic in consensus_topics {
-        let lane = Lane::Consensus.of(swarm);
-        if listen {
+    let hear_blocks = !catching_up_deaf;
+    let hear_votes = !catching_up_deaf && !follow_only;
+    for (topic, hear) in [
+        (topics.proposals, hear_votes),
+        (topics.votes, hear_votes),
+        (topics.committed, hear_blocks),
+        (topics.transactions, hear_blocks),
+    ] {
+        let lane = Lane::of_topic(&topic.to_string()).of(swarm);
+        if hear {
             if let Err(e) = lane.subscribe(topic) {
                 warn!(topic = %topic, err = %e, "Could not subscribe to a topic again");
             }
         } else {
             lane.unsubscribe(topic);
         }
-    }
-    let lane = Lane::of_topic(TOPIC_TRANSACTIONS).of(swarm);
-    if listen {
-        if let Err(e) = lane.subscribe(tx_topic) {
-            warn!(topic = %tx_topic, err = %e, "Could not subscribe to a topic again");
-        }
-    } else {
-        lane.unsubscribe(tx_topic);
     }
 }
 

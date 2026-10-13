@@ -729,3 +729,87 @@ async fn a_node_far_behind_and_catching_up_stops_hearing_votes_and_hears_them_ag
         "close to the tip, the node did not start listening again"
     );
 }
+
+/// A follower stops hearing votes and proposals and keeps hearing committed blocks — over a real
+/// connection — and hears votes again once it is told it is in the validator set.
+///
+/// Thirty votes a block at ~5.4 KB, from each of up to fifteen peers, were the largest part of
+/// what filled a home node's download on 2026-10-13, so that at the tip it fell behind block by
+/// block. A node that only follows needs none of them: it applies committed blocks, which carry
+/// their certificate. The committed blocks arriving while the votes do not is the half that makes
+/// this safe — a follower that went deaf to everything would simply stop following.
+#[tokio::test]
+async fn a_follower_hears_committed_blocks_but_not_votes_and_votes_again_once_it_validates() {
+    let kp = KeyPair::generate();
+    let (sender, sender_cmd, mut sender_events) =
+        P2PService::new(config(19_805, None), Arc::new(AtomicU64::new(0)), Arc::new(NoBlocks));
+    tokio::spawn(async move { sender.run().await });
+    tokio::spawn(async move { while sender_events.recv().await.is_some() {} });
+    let (follower, follower_cmd, mut follower_events) = P2PService::new(
+        config(19_806, Some(19_805)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(NoBlocks),
+    );
+    tokio::spawn(async move { follower.run().await });
+
+    let blocks = chained_blocks(&kp, 40);
+    let mut next_block = 0usize;
+    let mut round = 0u32;
+    // For `window`, send a fresh vote and a fresh committed block every second, and count what the
+    // follower receives of each. A disconnect fails the test: silence must mean "not subscribed".
+    macro_rules! received_within {
+        ($window:expr) => {{
+            let deadline = tokio::time::Instant::now() + $window;
+            let (mut votes, mut committed) = (0u32, 0u32);
+            let mut next_send = tokio::time::Instant::now();
+            while tokio::time::Instant::now() < deadline {
+                if tokio::time::Instant::now() >= next_send {
+                    round += 1;
+                    sender_cmd.send(P2PCommand::BroadcastVote(a_prevote(&kp, round))).await.unwrap();
+                    let block = blocks[next_block % blocks.len()].clone();
+                    next_block += 1;
+                    sender_cmd
+                        .send(P2PCommand::BroadcastBlock(block, stand_in_certificate(&kp)))
+                        .await
+                        .unwrap();
+                    next_send = tokio::time::Instant::now() + Duration::from_secs(1);
+                }
+                match tokio::time::timeout(Duration::from_millis(200), follower_events.recv()).await {
+                    Ok(Some(P2PEvent::NewVote(_))) => votes += 1,
+                    Ok(Some(P2PEvent::NewCommittedBlock(..))) => committed += 1,
+                    Ok(Some(P2PEvent::PeerDisconnected(p))) => {
+                        panic!("the peer disconnected ({p}) — silence would prove nothing")
+                    }
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => panic!("the service under test stopped"),
+                }
+            }
+            (votes, committed)
+        }};
+    }
+
+    // Control: connected, subscribed to everything — wait until votes arrive at all.
+    let connect_by = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut heard = false;
+    while tokio::time::Instant::now() < connect_by && !heard {
+        heard = received_within!(Duration::from_secs(2)).0 > 0;
+    }
+    assert!(heard, "the votes never arrived — the connection is broken and this test proves nothing");
+
+    // Following only: after the unsubscribe has had time to reach the peer, no vote — and
+    // committed blocks still.
+    follower_cmd.send(P2PCommand::FollowOnly(true)).await.unwrap();
+    let _ = received_within!(Duration::from_secs(4));
+    let (votes, committed) = received_within!(Duration::from_secs(10));
+    assert_eq!(votes, 0, "a follower must not be sent the validators' votes");
+    assert!(committed >= 3, "and must still be sent committed blocks: got {committed} in 10 s");
+
+    // In the validator set again: votes arrive.
+    follower_cmd.send(P2PCommand::FollowOnly(false)).await.unwrap();
+    let mut back = false;
+    let back_by = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < back_by && !back {
+        back = received_within!(Duration::from_secs(2)).0 > 0;
+    }
+    assert!(back, "told it validates again, the node did not hear votes again");
+}

@@ -5102,9 +5102,26 @@ async fn block_production_loop(
     // Whether "not in the active set" has been said for the current stretch — see
     // `follower_notice_due`.
     let mut follower_announced = false;
+    // What the P2P service was last told about following only — see `P2PCommand::FollowOnly`.
+    // `None` until it has been told once.
+    let mut follow_only_told: Option<bool> = None;
 
     loop {
         interval.tick().await;
+
+        // A node whose key is not in the validator set does not need the votes and proposals the
+        // validators exchange — they were most of what filled a home node's download on 2026-10-13.
+        // Told on the first tick and on every change; a full command queue means "tell it next
+        // tick", never "assume it heard".
+        let follow_only = {
+            let eng = engine.read().await;
+            eng.validator_set().get(&eng.address).is_none()
+        };
+        if follow_only_told != Some(follow_only)
+            && p2p_tx.try_send(P2PCommand::FollowOnly(follow_only)).is_ok()
+        {
+            follow_only_told = Some(follow_only);
+        }
 
         // Proof of life for the health heartbeat (backlog #151). Deliberately the very first thing
         // after the tick, ahead of every gate and every `continue` below: this counter answers
