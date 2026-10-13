@@ -565,6 +565,12 @@ impl SyncPacer {
 /// How much of a paced answer goes out between two pauses.
 const PACED_CHUNK: usize = 64 * 1024;
 
+/// How long a block batch waits for its turn, with a rate set. Half the 30 s today's client gives
+/// a whole batch: a request that gets its turn still has the other half to be sent in (~13 s for a
+/// 9 MB batch at 700 KiB/s), and one that does not is told to come back before it has cost a byte.
+/// Waiting the full 30 s instead meant the client had given up by the time its turn came.
+const SYNC_TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// `bytes`, as a stream that takes `bytes.len() / bytes_per_sec` seconds to drain and holds `turn`
 /// until it ends — or until it is dropped, which is what happens when the client goes away: the
 /// next waiting request gets its turn at once instead of after a transmission nobody reads.
@@ -865,11 +871,26 @@ async fn get_sync_blocks(
     let count: u64 =
         params.get("count").and_then(|v| v.parse().ok()).unwrap_or(200).min(200);
     let binary = params.get("encoding").map(String::as_str) == Some("bincode");
+    // With an upload limit, the JSON form is not served at all: it is 4.5 times the size, cannot be
+    // paced (the stream is the uncompressed text), and today's client only asks for it after the
+    // compact form failed — which with a limit means it waited for a turn and got none. Refusing it
+    // ends that client's attempt for this round, and its next one asks for the compact form again
+    // (2026-10-13: unpaced JSON fallbacks were filling the line the limit had just freed).
+    if !binary && state.sync_pacer.is_some() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "30")],
+            Json(json!({
+                "error": "this node serves block batches only as encoding=bincode, one at a time — retry"
+            })),
+        )
+            .into_response();
+    }
     if binary {
         // With an upload limit, wait for this answer's turn to be sent before building it: a
         // request that waits costs nothing, and one that is built goes out at once (`SyncPacer`).
         let turn = match state.sync_pacer.as_deref() {
-            Some(pacer) => match pacer.turn(HEAVY_RESPONSE_WAIT).await {
+            Some(pacer) => match pacer.turn(SYNC_TURN_WAIT).await {
                 Ok(turn) => Some((turn, pacer.bytes_per_sec)),
                 Err(busy) => return busy,
             },
@@ -4488,6 +4509,38 @@ mod tests {
         };
         let blocks: Vec<Block> = bincode::deserialize(&raw).expect("a bincode block batch");
         assert_eq!(blocks.iter().map(|b| b.height()).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    /// With an upload limit the JSON form of a block batch is refused at once — four and a half
+    /// times the bytes, unpaceable, and only ever asked for after the compact form failed. The
+    /// compact form is still served (the positive control: the refusal is about the form).
+    #[tokio::test]
+    async fn with_an_upload_limit_the_json_form_of_a_block_batch_is_refused() {
+        use tower::ServiceExt;
+        let state = AppState {
+            sync_pacer: Some(Arc::new(SyncPacer::new(50 * 1024 * 1024))),
+            ..fresh_test_state_with_blocks(5).await
+        };
+        let limiter = Arc::new(RateLimiter::new(1_000.0, 1_000.0));
+        let ask = |uri: &str| {
+            let mut request =
+                axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_002))));
+            request
+        };
+        let json = router(state.clone(), limiter.clone())
+            .oneshot(ask("/sync/blocks?from=1&count=3"))
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(json.headers().get(axum::http::header::RETRY_AFTER).is_some());
+        let compact = router(state, limiter)
+            .oneshot(ask("/sync/blocks?from=1&count=3&encoding=bincode"))
+            .await
+            .unwrap();
+        assert_eq!(compact.status(), StatusCode::OK, "the compact form is still served");
     }
 
     /// The streamed answer is the array a client has always parsed, for every length — empty,
