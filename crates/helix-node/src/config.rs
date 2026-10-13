@@ -77,6 +77,11 @@ pub struct NodeConfig {
     /// networks share a LAN (mDNS would otherwise cross-wire them) — see
     /// `helix_p2p::P2PConfig::enable_mdns`. Absent/false keeps mDNS on (the default).
     pub p2p_disable_mdns: Option<String>,
+    /// `off` (or `0`/`false`/`no`) to stop relaying other nodes' gossip — this node still reads
+    /// and acts on everything and still publishes its own messages. For a node with a thin uplink
+    /// in a meshed network; see `helix_p2p::P2PConfig::relay` for what it costs. Absent: relays,
+    /// as every node always has.
+    pub p2p_relay: Option<String>,
     /// Comma-separated list of additional P2P peers to dial directly, as libp2p
     /// multiaddrs (e.g. `/ip4/1.2.3.4/tcp/8546,/dns4/peer.example/tcp/8546`). Unlike
     /// `sync_peer` (one HTTP peer for history + its single derived P2P seed), this hard-wires

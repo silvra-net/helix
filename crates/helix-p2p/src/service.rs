@@ -704,7 +704,9 @@ impl P2PService {
                             // before anything else touches the message and before the node is
                             // involved (#228). A transaction waits for the node's signature check;
                             // its ticket carries that obligation.
-                            if let Forwarding::Now(acceptance) = forwarding_of(gossiped.as_ref()) {
+                            if let Forwarding::Now(acceptance) =
+                                forwarding_of(gossiped.as_ref(), config.relay)
+                            {
                                 report_forwarding(
                                     &mut swarm,
                                     lane,
@@ -1503,11 +1505,7 @@ impl P2PService {
                 }
 
                 Some(checked) = transaction_verdicts.recv() => {
-                    let acceptance = match checked.verdict {
-                        TransactionVerdict::Valid => gossipsub::MessageAcceptance::Accept,
-                        TransactionVerdict::Forged => gossipsub::MessageAcceptance::Reject,
-                        TransactionVerdict::Unjudged => gossipsub::MessageAcceptance::Ignore,
-                    };
+                    let acceptance = relayed(checked.verdict, config.relay);
                     // A ticket is only ever issued for a transaction, and transactions only
                     // travel on their own lane.
                     report_forwarding(
@@ -3056,17 +3054,37 @@ enum Forwarding {
 /// - A transaction: after the node's signature check, which is what stops a forged one from
 ///   crossing every honest node (a transaction is cheap to hold back; a vote is not).
 /// - A banned peer's message, or a topic this node does not speak: `Ignore`.
-fn forwarding_of(message: Option<&Gossiped>) -> Forwarding {
+///
+/// `relay` is `P2PConfig::relay`. Off, everything that would have been accepted is `Ignore`d
+/// instead — still read and acted on here, no longer passed on — while `Reject` stays `Reject`:
+/// not relaying is a choice about this node's uplink, not a pardon for the peer that sent junk.
+/// A transaction still waits for the node's check, so a forged one is still charged to its author
+/// (`relayed`).
+fn forwarding_of(message: Option<&Gossiped>, relay: bool) -> Forwarding {
     use gossipsub::MessageAcceptance::{Accept, Ignore, Reject};
+    let pass_on = if relay { Accept } else { Ignore };
     match message {
         None => Forwarding::Now(Ignore),
         Some(Gossiped::Proposal(_))
         | Some(Gossiped::Vote(_))
         | Some(Gossiped::CommittedBlock(..))
-        | Some(Gossiped::PeerExchange(_)) => Forwarding::Now(Accept),
+        | Some(Gossiped::PeerExchange(_)) => Forwarding::Now(pass_on),
         Some(Gossiped::Transaction(_)) => Forwarding::AfterTheNodeHasChecked,
         Some(Gossiped::Unreadable) => Forwarding::Now(Reject),
         Some(Gossiped::UnknownTopic) => Forwarding::Now(Ignore),
+    }
+}
+
+/// What a checked transaction's verdict means for forwarding — the counterpart of `forwarding_of`
+/// for the one kind of message whose verdict comes later. A valid one is passed on only by a node
+/// that relays (`P2PConfig::relay`); a forged one is rejected either way.
+fn relayed(verdict: TransactionVerdict, relay: bool) -> gossipsub::MessageAcceptance {
+    use gossipsub::MessageAcceptance::{Accept, Ignore, Reject};
+    match verdict {
+        TransactionVerdict::Valid if relay => Accept,
+        TransactionVerdict::Valid => Ignore,
+        TransactionVerdict::Forged => Reject,
+        TransactionVerdict::Unjudged => Ignore,
     }
 }
 
@@ -4598,7 +4616,7 @@ mod blocksync_selection_tests {
 #[cfg(test)]
 mod observed_height_tests {
     use super::{
-        decode_gossip, forwarding_of, hand_over_transaction, observed_height, Forwarding,
+        decode_gossip, forwarding_of, hand_over_transaction, observed_height, relayed, Forwarding,
         GossipTicket, Gossiped, P2PEvent, TransactionVerdict, TOPIC_BLOCKS, TOPIC_COMMITTED_BLOCKS,
         TOPIC_PEER_EXCHANGE, TOPIC_TRANSACTIONS, TOPIC_VOTES,
     };
@@ -4722,55 +4740,97 @@ mod observed_height_tests {
         })
         .unwrap();
 
-        let cases: Vec<(&str, Option<Gossiped>, Forwarding)> = vec![
+        // Each case: what a relaying node does, then what a node with `relay` off does.
+        let cases: Vec<(&str, Option<Gossiped>, Forwarding, Forwarding)> = vec![
             (
                 "proposal",
                 Some(decode_gossip(TOPIC_BLOCKS, &proposal)),
                 Forwarding::Now(Accept),
+                Forwarding::Now(Ignore),
             ),
             (
                 "vote",
                 Some(decode_gossip(TOPIC_VOTES, &vote)),
                 Forwarding::Now(Accept),
+                Forwarding::Now(Ignore),
             ),
             (
                 "committed block",
                 Some(decode_gossip(TOPIC_COMMITTED_BLOCKS, &committed)),
                 Forwarding::Now(Accept),
+                Forwarding::Now(Ignore),
             ),
             (
                 "peer exchange",
                 Some(decode_gossip(TOPIC_PEER_EXCHANGE, &peer_exchange)),
                 Forwarding::Now(Accept),
+                Forwarding::Now(Ignore),
             ),
             (
                 "transaction",
                 Some(decode_gossip(TOPIC_TRANSACTIONS, &transaction)),
+                Forwarding::AfterTheNodeHasChecked,
                 Forwarding::AfterTheNodeHasChecked,
             ),
             (
                 "garbage on a vote topic",
                 Some(decode_gossip(TOPIC_VOTES, b"x")),
                 Forwarding::Now(Reject),
+                Forwarding::Now(Reject),
             ),
             (
                 "garbage on the transaction topic",
                 Some(decode_gossip(TOPIC_TRANSACTIONS, b"x")),
+                Forwarding::Now(Reject),
                 Forwarding::Now(Reject),
             ),
             (
                 "a topic this node does not speak",
                 Some(decode_gossip("/helix/some-future-topic", &proposal)),
                 Forwarding::Now(Ignore),
+                Forwarding::Now(Ignore),
             ),
-            ("anything from a banned peer", None, Forwarding::Now(Ignore)),
+            (
+                "anything from a banned peer",
+                None,
+                Forwarding::Now(Ignore),
+                Forwarding::Now(Ignore),
+            ),
         ];
         // `MessageAcceptance` has no `PartialEq`; its `Debug` names the variant.
-        for (what, message, expected) in cases {
+        for (what, message, relaying, not_relaying) in cases {
             assert_eq!(
-                format!("{:?}", forwarding_of(message.as_ref())),
+                format!("{:?}", forwarding_of(message.as_ref(), true)),
+                format!("{relaying:?}"),
+                "{what}, relaying"
+            );
+            assert_eq!(
+                format!("{:?}", forwarding_of(message.as_ref(), false)),
+                format!("{not_relaying:?}"),
+                "{what}, with relay off"
+            );
+        }
+    }
+
+    /// A checked transaction: passed on only by a node that relays, and a forged one is refused —
+    /// and so charged to its author — whether this node relays or not. Not relaying is about this
+    /// node's uplink; it must not turn into a pass for whoever sends forgeries.
+    #[test]
+    fn a_checked_transaction_is_passed_on_only_by_a_relay_and_a_forgery_is_refused_either_way() {
+        use MessageAcceptance::{Accept, Ignore, Reject};
+        let cases = [
+            (TransactionVerdict::Valid, true, Accept),
+            (TransactionVerdict::Valid, false, Ignore),
+            (TransactionVerdict::Forged, true, Reject),
+            (TransactionVerdict::Forged, false, Reject),
+            (TransactionVerdict::Unjudged, true, Ignore),
+            (TransactionVerdict::Unjudged, false, Ignore),
+        ];
+        for (verdict, relay, expected) in cases {
+            assert_eq!(
+                format!("{:?}", relayed(verdict, relay)),
                 format!("{expected:?}"),
-                "{what}"
+                "{verdict:?} with relay {relay}"
             );
         }
     }

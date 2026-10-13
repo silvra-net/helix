@@ -107,6 +107,23 @@ pub struct P2PConfig {
     /// mistake is closed on both sides, so it costs one redial, not a half-dead link.
     pub ping_interval: Duration,
     pub ping_timeout: Duration,
+    /// Whether this node passes on gossip it received from others — proposals, votes, committed
+    /// blocks, peer exchange and transactions. On by default. Off, the node still reads and acts
+    /// on everything it receives, and still publishes its own votes, proposals and transactions;
+    /// it only stops being a relay for everybody else's.
+    ///
+    /// Why it exists (2026-10-13): every peer here is an explicit gossipsub peer, so a relay sends
+    /// each message it receives to *every* other connection. On a home uplink that is the whole
+    /// line — the production validator sat at its ~1.2 MB/s ceiling for three days, forwarding
+    /// four copies of every committed block to six peers, dropped consensus messages, fell
+    /// behind and could not catch up, while what it had to send for itself was well under a
+    /// tenth of that. A node whose peers reach each other directly loses nothing by not relaying.
+    ///
+    /// What it costs: a node that reaches the network *only* through this one stops hearing
+    /// everybody else (its own messages still go out). In a hub-and-spoke network that is the
+    /// chain (`forwarding_of`), so this is an operator's switch for a node with a thin uplink in
+    /// a meshed network, never a default.
+    pub relay: bool,
 }
 
 impl Default for P2PConfig {
@@ -126,6 +143,7 @@ impl Default for P2PConfig {
             peer_store_path: None,
             ping_interval: Duration::from_secs(15),
             ping_timeout: Duration::from_secs(60),
+            relay: true,
         }
     }
 }

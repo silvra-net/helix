@@ -587,6 +587,27 @@ fn parse_byte_budget(raw: &str) -> Option<u64> {
     n.checked_mul(scale)
 }
 
+/// Whether this node relays other nodes' gossip (`HELIX_P2P_RELAY`, `P2PConfig::relay`).
+///
+/// Unset or empty: it relays, as every node always has. A value that is neither yes nor no refuses
+/// the start instead of being read either way: the one operator who sets this has a reason — an
+/// uplink that relaying fills (2026-10-13) — and a typo read as "on" would leave that line full
+/// without a word, while one read as "off" could cut off a node that reaches the network only
+/// through this one.
+fn relay_setting(raw: Option<&str>) -> Result<bool> {
+    let Some(raw) = raw else { return Ok(true) };
+    if raw.trim().is_empty() {
+        return Ok(true);
+    }
+    flag_value(raw).ok_or_else(|| {
+        anyhow::anyhow!(
+            "HELIX_P2P_RELAY={raw:?} is not yes or no. Write HELIX_P2P_RELAY=off to stop this node \
+             relaying other nodes' gossip (it still reads everything and sends its own), or unset \
+             it to keep relaying."
+        )
+    })
+}
+
 /// Refuses a disk limit this node cannot read, before anything is created or opened.
 ///
 /// `HELIX_KEEP_BLOCKS` and `HELIX_KEEP_BYTES` exist to keep the disk from filling, and a full disk
@@ -802,6 +823,7 @@ impl HelixNode {
         let genesis_validator_liquid = genesis_validator_liquid_setting(
             std::env::var("HELIX_GENESIS_VALIDATOR_LIQUID_HLX").ok().as_deref(),
         )?;
+        let relay = relay_setting(config::resolve("HELIX_P2P_RELAY", &cfg.p2p_relay).as_deref())?;
 
         let key_path = resolve_validator_key_path(&cfg);
         // Double-sign state lives beside the key it protects: validator-key.json ->
@@ -1177,6 +1199,15 @@ impl HelixNode {
                 info!("mDNS LAN discovery disabled — relying on seed peers + peer exchange only");
                 p2p_config.enable_mdns = false;
             }
+        }
+
+        // Relaying other nodes' gossip: on unless the operator turned it off (`relay_setting`).
+        p2p_config.relay = relay;
+        if !relay {
+            info!(
+                "Not relaying other nodes' gossip (HELIX_P2P_RELAY=off) — this node reads everything \
+                 and publishes its own votes, proposals and transactions, and passes nothing else on"
+            );
         }
 
         let p2p_port = p2p_config.listen_addr.port();
@@ -1963,6 +1994,20 @@ async fn rebuild_compact_block(
     rebuilt
 }
 
+/// Whether the "block gap" warning may be written now: at most once a minute, for every path
+/// that asks. Separate from `upgrade_refusal`'s clock, so one of them cannot silence the other.
+fn gap_notice_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_LOGGED: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_LOGGED.load(Ordering::Relaxed);
+    now >= last.saturating_add(60)
+        && LAST_LOGGED.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+}
+
 /// Whether this build may apply, propose or vote on block `height` (#267): `Some(reason)` when the
 /// chain has moved, or moves at `height`, to a protocol this build does not execute
 /// (`ChainState::refuses_block`). One rule for every path that takes a block — the consensus commit,
@@ -2347,7 +2392,23 @@ async fn handle_p2p_event(
                 // helix.toml's `sync_peer` via `config::resolve`, same source as the startup
                 // sync in `HelixNode::new`). If unset, we can't fill the gap and will stay
                 // behind until the next block arrives.
-                warn!(our_height, block_height, "Block gap detected — attempting catch-up sync");
+                // At most once a minute: a node that is behind hears every new block and was
+                // writing this line for each of them — 16,000 times an hour on 2026-10-13, which
+                // rotated its log away in fifteen hours. And it said "attempting catch-up sync"
+                // on a node with no sync peer, where nothing here attempts anything: the P2P
+                // block-sync driver is what fills the gap there.
+                if gap_notice_due() {
+                    if sync_peer.is_some() {
+                        warn!(our_height, block_height, "Block gap detected — catching up from the sync peer");
+                    } else {
+                        warn!(
+                            our_height,
+                            block_height,
+                            "Block gap detected — P2P block sync fills it (no sync peer is set here). \
+                             Repeated at most once a minute while this node is behind"
+                        );
+                    }
+                }
                 if let Some(peer_url) = sync_peer {
                     // Hold `last_applied_height` for the whole sync, exactly like
                     // `rpc_sync_loop` does — without it, this path calls `execute_block`
@@ -10194,6 +10255,29 @@ mod body_cap_tests {
     fn a_byte_budget_that_cannot_be_read_is_not_taken_for_none() {
         for unreadable in ["lots", "12X", "", "G", "1.5G", "120 GiBs", "-5G", "99999999999T"] {
             assert_eq!(parse_byte_budget(unreadable), None, "{unreadable:?}");
+        }
+    }
+
+    /// `HELIX_P2P_RELAY`: unset or empty relays, as every node always has; yes/no in any of the
+    /// usual spellings sets it; anything else stops the start and says how to write it — read
+    /// either way, a typo would do the opposite of what one operator meant.
+    #[test]
+    fn the_relay_setting_relays_by_default_and_refuses_a_value_it_cannot_read() {
+        assert!(relay_setting(None).unwrap(), "unset relays");
+        assert!(relay_setting(Some("")).unwrap(), "empty relays");
+        assert!(relay_setting(Some("  ")).unwrap(), "blank relays");
+        for on in ["on", "1", "true", "YES", " On "] {
+            assert!(relay_setting(Some(on)).unwrap(), "{on:?}");
+        }
+        for off in ["off", "0", "false", "no", "OFF"] {
+            assert!(!relay_setting(Some(off)).unwrap(), "{off:?}");
+        }
+        for unreadable in ["of", "disabled", "nein", "2"] {
+            let msg = relay_setting(Some(unreadable)).unwrap_err().to_string();
+            assert!(
+                msg.contains("HELIX_P2P_RELAY") && msg.contains("HELIX_P2P_RELAY=off"),
+                "{unreadable:?}: {msg}"
+            );
         }
     }
 

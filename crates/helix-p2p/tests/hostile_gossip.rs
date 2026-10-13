@@ -751,3 +751,87 @@ async fn an_upgraded_relay_forwards_every_consensus_topic_at_once_and_garbage_ne
         );
     }
 }
+
+/// `P2PConfig::relay` off (2026-10-13): a node that does not relay still hears every consensus
+/// message and still sends its own — it only stops passing everybody else's on.
+///
+/// The production validator sits on a home uplink, and relaying filled it: as an explicit gossipsub
+/// peer to every connection, it sent each message it received on to every other one. Turning that
+/// off must cost nothing this node needs. So, with the not-relaying node R between an author and an
+/// observer: R's own node receives the author's vote (it hears everything); the observer receives
+/// R's own vote (what R publishes still goes out — and the positive control that the observer's
+/// link carries anything at all); and none of the author's vote, proposal or committed block
+/// reaches the observer (R passes nothing on). `an_upgraded_relay_forwards_every_consensus_topic…`
+/// above is the same layout with relaying on, where all three cross.
+#[tokio::test]
+async fn a_node_that_does_not_relay_hears_everything_sends_its_own_and_passes_nothing_on() {
+    let (relay_cmd, mut relay_events) =
+        spawn(P2PConfig { relay: false, ..config(19_775, vec![]) });
+    let (author_cmd, mut author_events) = spawn(config(19_776, vec![19_775]));
+    let (_observer, mut seen) = observe_through(19_775).await;
+
+    let Some(P2PEvent::PeerConnected(relay_id)) =
+        next_matching(&mut author_events, Duration::from_secs(15), |e| {
+            matches!(e, P2PEvent::PeerConnected(_))
+        })
+        .await
+    else {
+        panic!("the author never connected to the node that does not relay");
+    };
+    // Mesh formation on every node before anything is published.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    author_cmd
+        .send(P2PCommand::BroadcastVote(a_vote(10)))
+        .await
+        .unwrap();
+    author_cmd
+        .send(P2PCommand::BroadcastProposal(
+            helix_consensus::Proposal::fresh(0, a_block(11)),
+        ))
+        .await
+        .unwrap();
+    author_cmd
+        .send(P2PCommand::BroadcastBlock(a_block(10), vec![a_vote(10)]))
+        .await
+        .unwrap();
+    relay_cmd
+        .send(P2PCommand::BroadcastVote(a_vote(20)))
+        .await
+        .unwrap();
+
+    let heard = next_matching(&mut relay_events, Duration::from_secs(15), |e| {
+        matches!(e, P2PEvent::NewVote(vote) if vote.height == 10)
+    })
+    .await;
+    assert!(
+        heard.is_some(),
+        "the node that does not relay never received the author's vote — not relaying must not \
+         mean not listening"
+    );
+
+    let mut own_vote_arrived = false;
+    let mut passed_on = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some((topic, source)) = seen.recv().await {
+            if source.to_string() == relay_id {
+                if topic == helix_p2p::TOPIC_VOTES {
+                    own_vote_arrived = true;
+                }
+            } else {
+                passed_on.push(topic);
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        own_vote_arrived,
+        "the observer never received the vote the not-relaying node published itself — its own \
+         messages must still go out (and without them this test proves nothing about the link)"
+    );
+    assert!(
+        passed_on.is_empty(),
+        "a node with relay off passed other nodes' gossip on: {passed_on:?}"
+    );
+}
