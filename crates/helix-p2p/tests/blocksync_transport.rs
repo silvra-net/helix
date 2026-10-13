@@ -730,16 +730,16 @@ async fn a_node_far_behind_and_catching_up_stops_hearing_votes_and_hears_them_ag
     );
 }
 
-/// A follower stops hearing votes and proposals and keeps hearing committed blocks — over a real
-/// connection — and hears votes again once it is told it is in the validator set.
+/// A follower hears neither votes nor gossiped committed blocks — over a real connection — and
+/// hears votes again once it is told it is in the validator set.
 ///
-/// Thirty votes a block at ~5.4 KB, from each of up to fifteen peers, were the largest part of
-/// what filled a home node's download on 2026-10-13, so that at the tip it fell behind block by
-/// block. A node that only follows needs none of them: it applies committed blocks, which carry
-/// their certificate. The committed blocks arriving while the votes do not is the half that makes
-/// this safe — a follower that went deaf to everything would simply stop following.
+/// On 2026-10-13 a home node back at the tip received ~2.5 MB/s per connection-sum of gossip it
+/// could not keep up with; measured, most of it was committed blocks arriving in several copies
+/// from every peer, and the votes after them. A follower follows by block sync instead, where each
+/// block arrives once. (The fallback to gossip when block sync stalls is the rule's own test; here
+/// the peer claims no tip above ours, so it must not engage.)
 #[tokio::test]
-async fn a_follower_hears_committed_blocks_but_not_votes_and_votes_again_once_it_validates() {
+async fn a_follower_hears_neither_votes_nor_gossiped_blocks_and_votes_again_once_it_validates() {
     let kp = KeyPair::generate();
     let (sender, sender_cmd, mut sender_events) =
         P2PService::new(config(19_805, None), Arc::new(AtomicU64::new(0)), Arc::new(NoBlocks));
@@ -796,13 +796,21 @@ async fn a_follower_hears_committed_blocks_but_not_votes_and_votes_again_once_it
     }
     assert!(heard, "the votes never arrived — the connection is broken and this test proves nothing");
 
-    // Following only: after the unsubscribe has had time to reach the peer, no vote — and
-    // committed blocks still.
+    // The control for the committed half: before following only, committed blocks arrive too.
+    let (_, committed_before) = received_within!(Duration::from_secs(5));
+    assert!(
+        committed_before >= 2,
+        "committed blocks must arrive while subscribed, or their absence below proves nothing: \
+         {committed_before} in 5 s"
+    );
+
+    // Following only: after the unsubscribe has had time to reach the peer, no vote and no
+    // gossiped committed block.
     follower_cmd.send(P2PCommand::FollowOnly(true)).await.unwrap();
     let _ = received_within!(Duration::from_secs(4));
     let (votes, committed) = received_within!(Duration::from_secs(10));
     assert_eq!(votes, 0, "a follower must not be sent the validators' votes");
-    assert!(committed >= 3, "and must still be sent committed blocks: got {committed} in 10 s");
+    assert_eq!(committed, 0, "nor gossiped committed blocks — it follows by block sync");
 
     // In the validator set again: votes arrive.
     follower_cmd.send(P2PCommand::FollowOnly(false)).await.unwrap();

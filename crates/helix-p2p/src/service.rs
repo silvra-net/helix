@@ -276,8 +276,10 @@ pub enum P2PCommand {
     /// connected peer sends it all of them, and on 2026-10-13 the votes alone — thirty a block at
     /// ~5.4 KB, from each of up to fifteen peers — were the largest part of what filled a home
     /// node's ~25 Mbit download, so that at the tip it could not keep up and fell behind block by
-    /// block. While this is `true` the service is not subscribed to votes or proposals; committed
-    /// blocks, transactions and peer exchange stay.
+    /// block. While this is `true` the service is not subscribed to votes or proposals, nor —
+    /// unless block sync stalls — to committed blocks: a follower follows by block sync, and each
+    /// block reaches it once instead of once per peer and finalizer (`follower_needs_committed_gossip`).
+    /// Transactions and peer exchange stay.
     FollowOnly(bool),
 }
 
@@ -641,8 +643,12 @@ impl P2PService {
         // `None` until it has risen in this process, because a restart is not progress (the counter
         // above starts at 0 and would read the first tick after a restart as one).
         let mut consensus_gossip_on = true;
-        // A follower does not hear votes or proposals — see `P2PCommand::FollowOnly`.
+        // A follower does not hear votes or proposals — see `P2PCommand::FollowOnly` — and hears
+        // committed blocks only when block sync has stalled (`follower_needs_committed_gossip`),
+        // for which it counts the ticks since its tip last rose, from the start.
         let mut follow_only = false;
+        let mut follower_fallback = false;
+        let mut ticks_since_rise: u32 = 0;
         let mut catch_up_seen_tip = tip_height.load(Ordering::Relaxed);
         let mut catch_up_still_ticks: Option<u32> = None;
         // The height this node executes nothing from — see `P2PCommand::StopCatchingUpAt`.
@@ -1361,6 +1367,7 @@ impl P2PService {
                                 &consensus_topics,
                                 !consensus_gossip_on,
                                 follow_only,
+                                follower_fallback,
                             );
                         }
                         continue;
@@ -1379,8 +1386,12 @@ impl P2PService {
                     if our_tip > catch_up_seen_tip {
                         catch_up_seen_tip = our_tip;
                         catch_up_still_ticks = Some(0);
-                    } else if let Some(ticks) = catch_up_still_ticks.as_mut() {
-                        *ticks = ticks.saturating_add(1);
+                        ticks_since_rise = 0;
+                    } else {
+                        if let Some(ticks) = catch_up_still_ticks.as_mut() {
+                            *ticks = ticks.saturating_add(1);
+                        }
+                        ticks_since_rise = ticks_since_rise.saturating_add(1);
                     }
                     {
                         let best_claimed = peer_tips
@@ -1394,6 +1405,34 @@ impl P2PService {
                             best_claimed,
                             catch_up_still_ticks,
                         );
+                        let fallback = follow_only
+                            && follower_needs_committed_gossip(
+                                follower_fallback,
+                                our_tip,
+                                best_claimed,
+                                ticks_since_rise,
+                            );
+                        if fallback != follower_fallback {
+                            follower_fallback = fallback;
+                            set_consensus_gossip(
+                                &mut swarm,
+                                &consensus_topics,
+                                !consensus_gossip_on,
+                                follow_only,
+                                follower_fallback,
+                            );
+                            let behind = best_claimed.map(|b| b.saturating_sub(our_tip));
+                            if fallback {
+                                warn!(
+                                    height = our_tip,
+                                    behind = ?behind,
+                                    "Block sync has not moved this follower for 90 s — hearing \
+                                     committed blocks over gossip again until it is close"
+                                );
+                            } else {
+                                info!(height = our_tip, "Following by block sync again");
+                            }
+                        }
                         if listen != consensus_gossip_on {
                             consensus_gossip_on = listen;
                             set_consensus_gossip(
@@ -1401,6 +1440,7 @@ impl P2PService {
                                 &consensus_topics,
                                 !consensus_gossip_on,
                                 follow_only,
+                                follower_fallback,
                             );
                             let behind = best_claimed.map(|b| b.saturating_sub(our_tip));
                             if listen {
@@ -1832,16 +1872,19 @@ impl P2PService {
                         P2PCommand::FollowOnly(follow) => {
                             if follow != follow_only {
                                 follow_only = follow;
+                                follower_fallback = false;
                                 set_consensus_gossip(
                                     &mut swarm,
                                     &consensus_topics,
                                     !consensus_gossip_on,
                                     follow_only,
+                                    follower_fallback,
                                 );
                                 if follow {
                                     info!(
-                                        "Not in the validator set — following committed blocks only, \
-                                         without the votes and proposals the validators exchange"
+                                        "Not in the validator set — following the chain by block \
+                                         sync, without the votes, proposals and gossiped copies of \
+                                         blocks the validators exchange"
                                     );
                                 } else {
                                     info!("In the validator set — hearing votes and proposals again");
@@ -3101,6 +3144,33 @@ fn listen_to_consensus_gossip(
     }
 }
 
+/// How far behind the best claimed tip a follower must be, with block sync stalled, before it
+/// hears committed blocks over gossip again.
+const FOLLOWER_FALLBACK_GAP: u64 = 10;
+
+/// Whether a follower should hear committed blocks over gossip after all, given whether it does.
+///
+/// A follower follows by block sync, even at the tip: it asks for what its peers announce, and each
+/// block reaches it once. Over gossip each block reached it many times — every validator that
+/// finalized it published its own copy until `7ab6c82`, and every peer forwards every copy — and on
+/// 2026-10-13 that was ~2.5 MB/s of a home node's ~25 Mbit download, measured per connection after
+/// votes and proposals were already off, so that it could not keep up at the tip. Gossip comes back
+/// only if block sync has not raised the tip for [`CATCH_UP_STALL_TICKS`] while peers claim to be
+/// more than [`FOLLOWER_FALLBACK_GAP`] ahead — the old behaviour, for when the new one fails — and
+/// goes again once the node is within that gap.
+fn follower_needs_committed_gossip(
+    hearing: bool,
+    our_tip: u64,
+    best_claimed: Option<u64>,
+    ticks_since_rise: u32,
+) -> bool {
+    let gap = best_claimed.map_or(0, |best| best.saturating_sub(our_tip));
+    if gap <= FOLLOWER_FALLBACK_GAP {
+        return false;
+    }
+    hearing || ticks_since_rise >= CATCH_UP_STALL_TICKS
+}
+
 /// The gossip topics a node may stop hearing, in the two groups the rules decide about.
 struct ConsensusTopics<'a> {
     proposals: &'a gossipsub::IdentTopic,
@@ -3109,9 +3179,10 @@ struct ConsensusTopics<'a> {
     transactions: &'a gossipsub::IdentTopic,
 }
 
-/// Subscribe to, or unsubscribe from, each topic as the two rules say: a node catching up from
-/// far behind hears none of them ([`listen_to_consensus_gossip`]), a follower hears committed
-/// blocks and transactions but no votes or proposals (`P2PCommand::FollowOnly`). Idempotent —
+/// Subscribe to, or unsubscribe from, each topic as the rules say: a node catching up from far
+/// behind hears none of them ([`listen_to_consensus_gossip`]); a follower hears transactions only
+/// (`P2PCommand::FollowOnly`) and follows by block sync, unless that has stalled
+/// ([`follower_needs_committed_gossip`]). Idempotent —
 /// gossipsub answers a repeated subscribe or unsubscribe with "no change". The peer-exchange topic
 /// is never touched.
 fn set_consensus_gossip(
@@ -3119,14 +3190,16 @@ fn set_consensus_gossip(
     topics: &ConsensusTopics,
     catching_up_deaf: bool,
     follow_only: bool,
+    follower_fallback: bool,
 ) {
-    let hear_blocks = !catching_up_deaf;
     let hear_votes = !catching_up_deaf && !follow_only;
+    let hear_committed = !catching_up_deaf && (!follow_only || follower_fallback);
+    let hear_transactions = !catching_up_deaf;
     for (topic, hear) in [
         (topics.proposals, hear_votes),
         (topics.votes, hear_votes),
-        (topics.committed, hear_blocks),
-        (topics.transactions, hear_blocks),
+        (topics.committed, hear_committed),
+        (topics.transactions, hear_transactions),
     ] {
         let lane = Lane::of_topic(&topic.to_string()).of(swarm);
         if hear {
@@ -4338,6 +4411,28 @@ mod peer_exchange_tests {
             !listen(false, tip, Some(tip + CATCH_UP_DEAF_GAP + 1), Some(CATCH_UP_STALL_TICKS - 1)),
             "a stall shorter than the limit does not end it"
         );
+    }
+
+    /// A follower hears committed blocks over gossip only when block sync has stalled while it is
+    /// well behind, and stops again once it is close — whatever happened in between.
+    #[test]
+    fn a_follower_falls_back_to_gossiped_blocks_only_while_block_sync_is_stalled() {
+        use super::{follower_needs_committed_gossip as needs, CATCH_UP_STALL_TICKS, FOLLOWER_FALLBACK_GAP};
+        let tip = 300_000;
+        let behind = Some(tip + FOLLOWER_FALLBACK_GAP + 1);
+        let close = Some(tip + FOLLOWER_FALLBACK_GAP);
+        // Positive control: well behind and block sync has not moved for the limit.
+        assert!(needs(false, tip, behind, CATCH_UP_STALL_TICKS), "stalled and behind: hear gossip");
+        // Block sync moving: no gossip, however far behind.
+        assert!(!needs(false, tip, behind, CATCH_UP_STALL_TICKS - 1), "still moving: block sync");
+        // Close to the tip: block sync keeps up, and a stopped chain is not a stall of ours.
+        assert!(!needs(false, tip, close, CATCH_UP_STALL_TICKS * 10), "close: block sync");
+        assert!(!needs(false, tip, None, CATCH_UP_STALL_TICKS * 10), "no claim: block sync");
+        // Once on, it stays on while behind even though the tip rises — gossip only ever applies the
+        // block right above the tip, so this is the old behaviour for as long as block sync is out —
+        // and goes off once close.
+        assert!(needs(true, tip, behind, 0), "on and still behind: stays on");
+        assert!(!needs(true, tip, close, 0), "on and close again: off");
     }
 
     /// Only the failures that look like an answer too big for the link shrink the request. A dial
