@@ -600,11 +600,15 @@ pub struct ChainState {
     /// disagreeing about everything it labels.
     #[serde(default)]
     pub applied_height: u64,
-    /// Consecutive blocks (address string -> count) a validator's precommit has been absent
-    /// from `BlockHeader::last_commit`, as counted by `record_block_participation`. Reset to
-    /// absent the instant a signature from that validator is seen again — a handful of missed
-    /// blocks proves nothing (a proposer momentarily behind on gossip, a validator mid-restart),
-    /// only sustained absence does. Not the same thing as `helix-consensus`'s local, RAM-only
+    /// A validator's downtime debt (address string -> debt), as counted by
+    /// `record_block_participation` from `BlockHeader::last_commit`: each block it should have
+    /// signed and did not adds [`MISS_WEIGHT`], each it signed takes [`PARTICIPATION_CREDIT`] off,
+    /// and the entry is removed at zero. At [`DOWNTIME_JAIL_THRESHOLD_BLOCKS`] it is jailed —
+    /// after 1800 blocks of complete silence, or over a longer stretch below two thirds. A handful
+    /// of missed blocks proves nothing (a proposer momentarily behind on gossip, a validator
+    /// mid-restart) and is paid back by signing. (Until 2026-09-18 this was a streak, reset by any
+    /// signature, and this comment still said so until 2026-10-14.) Not the same thing as
+    /// `helix-consensus`'s local, RAM-only
     /// `missed_rounds`, which since 2026-07-22 is purely a diagnostic (it decides what a
     /// stalled node *logs*, nothing else) — this is the persisted, on-chain layer that survives
     /// node restarts and has an actual consequence (`jailed_until`).
