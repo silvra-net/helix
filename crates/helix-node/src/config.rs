@@ -82,6 +82,9 @@ pub struct NodeConfig {
     /// in a meshed network; see `helix_p2p::P2PConfig::relay` for what it costs. Absent: relays,
     /// as every node always has.
     pub p2p_relay: Option<String>,
+    /// At most this many peers this node dials itself (at least 3); peers that dial in are not
+    /// limited. Absent: no limit. See `helix_p2p::P2PConfig::outbound_peers`.
+    pub p2p_outbound_peers: Option<String>,
     /// Comma-separated list of additional P2P peers to dial directly, as libp2p
     /// multiaddrs (e.g. `/ip4/1.2.3.4/tcp/8546,/dns4/peer.example/tcp/8546`). Unlike
     /// `sync_peer` (one HTTP peer for history + its single derived P2P seed), this hard-wires

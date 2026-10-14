@@ -107,6 +107,7 @@ not start.
 | `HELIX_P2P_SEED_PEERS` | (none) | Comma-separated multiaddrs to dial in addition to the sync peer, e.g. `/ip4/203.0.113.7/tcp/8546,/dns4/peer.example/tcp/8546`. |
 | `HELIX_P2P_DISABLE_MDNS` | off | `1` turns off discovery on the local network — needed only when two separate Helix networks share a LAN. |
 | `HELIX_RPC_SYNC_RATE` | (none) | Upload the block batches other nodes fetch from this node's RPC (`/sync/blocks`) may use, e.g. `400K` (bytes per second, units K/M/G, binary; leave room below the line's upload rate — see [On a home connection](#on-a-home-connection)). Set, batches go out one at a time at that rate, only in the compact form (`encoding=bincode`; the JSON form is refused with 503). A batch that would wait longer than its client can still receive it is answered 503 with `Retry-After` at once: on a thin uplink, several joining nodes at once otherwise share the line so thinly that none of their batches finishes before the client gives up, and they retry forever. Unset serves at full speed. Zero or an unreadable value stops the start. |
+| `HELIX_P2P_OUTBOUND_PEERS` | (none) | At most this many peers this node dials itself, e.g. `4`; at least 3. Peers that dial in are still accepted. Every peer passes every message on to every other, so a node hears each vote once per peer — on a home line, a few peers are enough and each one more is another copy of everything (see [On a home connection](#on-a-home-connection)). Unset dials every address it learns. A value below 3 or not a number stops the start. |
 | `HELIX_P2P_RELAY` | on | `off` stops this node passing other nodes' gossip on. It still receives and acts on everything and still sends its own votes, proposals and transactions. For a validator on a home connection whose upload fills up: a relay sends every message it receives to every other peer. Leave it on if other nodes reach the network only through yours. A value that is not yes/no stops the start. |
 | `HELIX_SYNC_PEER` | `https://node.silvra.net` | RPC endpoint of a node on the chain to join: the genesis and missing blocks come from it, and a follower polls it every 4 seconds for new blocks. |
 | `HELIX_NEW_CHAIN` | off | `1` starts a chain of your own: the node signs its own genesis. For private chains and a new network's first node. |
@@ -347,6 +348,13 @@ misses arrives by block sync, as it does for a follower. *"Relay is off — this
 committed blocks by block sync …"* at the start says so. If block sync does not move the node for
 90 seconds while it is more than ten blocks behind, it hears the gossiped blocks again until it is
 close.
+
+What is left for a validator are the proposals and votes, and it hears each of them once from every
+peer, because every peer passes every message on. On 2026-10-14 the production validator, back in
+the set with twelve peers it had dialed, received about 2 MB/s that way and sent each of its own
+votes twelve times; a third of its precommits reached the next proposer too late to be counted.
+`HELIX_P2P_OUTBOUND_PEERS=4` keeps it to four peers of its own. Peers that dial in are not limited
+— the node may be someone's way into the network — so the count can drift above four over time.
 
 ---
 

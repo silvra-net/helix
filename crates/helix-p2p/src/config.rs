@@ -124,6 +124,22 @@ pub struct P2PConfig {
     /// chain (`forwarding_of`), so this is an operator's switch for a node with a thin uplink in
     /// a meshed network, never a default.
     pub relay: bool,
+    /// At most this many peers this node *dials* itself; `None` (the default) dials every address
+    /// it learns, as always. Peers that dial in are never refused on its account — the public seed
+    /// must keep admitting every node that joins through it.
+    ///
+    /// Why it exists (2026-10-14): every peer here is an explicit gossipsub peer and passes every
+    /// message on to every other, so a node hears each vote once *per peer*. The production
+    /// validator on its home line, back in the set, received ~170 kB/s from each of twelve peers it
+    /// had dialed — 2 MB/s, nearly all of it copies — and sent each of its own votes twelve times
+    /// up a ~10 Mbit line. Its precommits reached the next proposer too late for a third of the
+    /// certificates. A few peers that relay are enough to hear everything once.
+    ///
+    /// When a dial completes with the target already met, the new peer is closed again before it
+    /// is announced, and new addresses from peer exchange are learned but not dialed. Below the
+    /// target, the redial tick dials known addresses to make up the difference. Never below
+    /// `MIN_HEALTHY_PEERS`: the node checks that when it reads the setting.
+    pub outbound_peers: Option<usize>,
 }
 
 impl Default for P2PConfig {
@@ -144,6 +160,7 @@ impl Default for P2PConfig {
             ping_interval: Duration::from_secs(15),
             ping_timeout: Duration::from_secs(60),
             relay: true,
+            outbound_peers: None,
         }
     }
 }

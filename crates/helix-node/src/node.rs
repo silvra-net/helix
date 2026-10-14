@@ -629,6 +629,30 @@ fn relay_setting(raw: Option<&str>) -> Result<bool> {
     })
 }
 
+/// Reads `HELIX_P2P_OUTBOUND_PEERS`: unset or blank is no limit; otherwise a whole number of at
+/// least `MIN_HEALTHY_PEERS`. Below that floor the node would keep dialing to reach it and closing
+/// what it dialed; and a typo must not quietly become "no limit", the setting it was meant to
+/// change — so anything else stops the start.
+fn outbound_peers_setting(raw: Option<&str>) -> Result<Option<usize>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let floor = helix_p2p::service::MIN_HEALTHY_PEERS;
+    match raw.parse::<usize>() {
+        Ok(n) if n >= floor => Ok(Some(n)),
+        Ok(n) => bail!(
+            "HELIX_P2P_OUTBOUND_PEERS={n} is below {floor}: a node that dials fewer peers than that \
+             keeps redialing for them. Write a number of at least {floor}, or unset it for no limit."
+        ),
+        Err(_) => bail!(
+            "HELIX_P2P_OUTBOUND_PEERS={raw:?} is not a whole number. Write, for example, \
+             HELIX_P2P_OUTBOUND_PEERS=4, or unset it for no limit."
+        ),
+    }
+}
+
 /// Refuses a disk limit this node cannot read, before anything is created or opened.
 ///
 /// `HELIX_KEEP_BLOCKS` and `HELIX_KEEP_BYTES` exist to keep the disk from filling, and a full disk
@@ -847,6 +871,9 @@ impl HelixNode {
             std::env::var("HELIX_GENESIS_VALIDATOR_LIQUID_HLX").ok().as_deref(),
         )?;
         let relay = relay_setting(config::resolve("HELIX_P2P_RELAY", &cfg.p2p_relay).as_deref())?;
+        let outbound_peers = outbound_peers_setting(
+            config::resolve("HELIX_P2P_OUTBOUND_PEERS", &cfg.p2p_outbound_peers).as_deref(),
+        )?;
         let sync_rate = sync_rate_setting(std::env::var("HELIX_RPC_SYNC_RATE").ok().as_deref())?;
         if let Some(rate) = sync_rate {
             info!(bytes_per_sec = rate, "Block batches over RPC go out one at a time at this rate (HELIX_RPC_SYNC_RATE)");
@@ -1226,6 +1253,16 @@ impl HelixNode {
                 info!("mDNS LAN discovery disabled — relying on seed peers + peer exchange only");
                 p2p_config.enable_mdns = false;
             }
+        }
+
+        p2p_config.outbound_peers = outbound_peers;
+        if let Some(target) = outbound_peers {
+            info!(
+                target,
+                "Dialing at most this many peers (HELIX_P2P_OUTBOUND_PEERS) — every peer passes on \
+                 every message, so each one more is one more copy of every vote; peers that dial in \
+                 are still accepted"
+            );
         }
 
         // Relaying other nodes' gossip: on unless the operator turned it off (`relay_setting`).
@@ -10626,6 +10663,25 @@ mod body_cap_tests {
         for unreadable in ["0", "0K", "fast", "700 kbit", "-1"] {
             let msg = sync_rate_setting(Some(unreadable)).unwrap_err().to_string();
             assert!(msg.contains("HELIX_RPC_SYNC_RATE"), "{unreadable:?}: {msg}");
+        }
+    }
+
+    /// The outbound target (`HELIX_P2P_OUTBOUND_PEERS`): unset is no limit, a number at or above
+    /// the redial floor is taken, and anything else stops the start rather than becoming no limit.
+    #[test]
+    fn the_outbound_peer_target_is_unset_by_default_and_never_below_the_floor() {
+        assert_eq!(outbound_peers_setting(None).unwrap(), None, "unset is no limit");
+        assert_eq!(outbound_peers_setting(Some("")).unwrap(), None, "empty is no limit");
+        assert_eq!(outbound_peers_setting(Some(" 4 ")).unwrap(), Some(4));
+        let floor = helix_p2p::service::MIN_HEALTHY_PEERS;
+        assert_eq!(outbound_peers_setting(Some(&floor.to_string())).unwrap(), Some(floor));
+        for below in 0..floor {
+            let msg = outbound_peers_setting(Some(&below.to_string())).unwrap_err().to_string();
+            assert!(msg.contains("below"), "{below}: {msg}");
+        }
+        for unreadable in ["four", "4.5", "-1", "4 peers"] {
+            let msg = outbound_peers_setting(Some(unreadable)).unwrap_err().to_string();
+            assert!(msg.contains("not a whole number"), "{unreadable}: {msg}");
         }
     }
 

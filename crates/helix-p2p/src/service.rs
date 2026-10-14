@@ -604,6 +604,9 @@ impl P2PService {
         // node's `peer_count` (`AtomicUsize`) to `usize::MAX` and make every quorum-peer check
         // trivially pass.
         let mut connected_peers: HashSet<PeerId> = HashSet::new();
+        // The peers in `connected_peers` whose first connection this node dialed — what
+        // `outbound_peers` counts. A peer that dialed in is never in it.
+        let mut outbound_peers: HashSet<PeerId> = HashSet::new();
         // The address behind every connection this node dialed itself, while that connection is
         // up — what `redial_targets` needs to leave alone (#233). Keyed by connection and emptied
         // as each closes, so an address is only ever skipped while a link through it really
@@ -802,6 +805,12 @@ impl P2PService {
                                         &mut peer_warnings,
                                         tip_height.load(Ordering::Relaxed),
                                         &our_genesis,
+                                        // Dials still in flight count: at startup every remembered
+                                        // address is being dialed at once.
+                                        !outbound_peer_refused(
+                                            config.outbound_peers,
+                                            outbound_peers.len() + pending_dials.len(),
+                                        ),
                                     );
                                     if let Some(range) = outcome.announced_range {
                                         // Credit the tip to whoever *wrote* the announcement, not to
@@ -1249,6 +1258,24 @@ impl P2PService {
                                 continue;
                             }
 
+                            // A dial that completes with the outbound target already met is one
+                            // peer too many (`P2PConfig::outbound_peers`). Closed before it is
+                            // announced, so the node never counts it and `ConnectionClosed` finds
+                            // nothing to tear down. Only a *new* peer: a further connection to one
+                            // this node already has costs no extra copies of anything.
+                            if endpoint.is_dialer()
+                                && !connected_peers.contains(&peer_id)
+                                && outbound_peer_refused(config.outbound_peers, outbound_peers.len())
+                            {
+                                debug!(
+                                    peer = %peer_id,
+                                    outbound = outbound_peers.len(),
+                                    "Dialed one peer more than HELIX_P2P_OUTBOUND_PEERS — closing it"
+                                );
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                continue;
+                            }
+
                             // Only the first connection to a peer makes it a *new* peer. Further
                             // ones are routine (both sides dialing, a redial racing the existing
                             // link) and must not be announced again — see `connected_peers`.
@@ -1260,6 +1287,9 @@ impl P2PService {
                                 continue;
                             }
 
+                            if endpoint.is_dialer() {
+                                outbound_peers.insert(peer_id);
+                            }
                             info!(peer = %peer_id, "Peer connected");
 
                             // Counted here, in the branch that treats this as a *new* peer, so
@@ -1329,6 +1359,7 @@ impl P2PService {
                                 continue;
                             }
                             connected_peers.remove(&peer_id);
+                            outbound_peers.remove(&peer_id);
                             // `info!`, matching "Peer connected" above — the asymmetry this
                             // replaces (connect at `info!`, disconnect at `debug!`) is not
                             // cosmetic. On 2026-07-29 a dropped link to one validator cost 14.5
@@ -1566,24 +1597,48 @@ impl P2PService {
                     if !verdict.dial {
                         redial_logged_for = None;
                     }
+                    // Both of this node's own addresses: the configured one stays in the
+                    // remembered file even after a probe replaced it, and dialing either would
+                    // only reach this node again (through the proxy, for a tunnel address).
+                    let own: Vec<&str> = config
+                        .public_addr
+                        .as_deref()
+                        .into_iter()
+                        .chain(announced_self.as_deref())
+                        .collect();
+                    // A dial still in flight counts as a link: at startup the first tick comes
+                    // before the seed dial has become a connection, and dialed the seed a
+                    // second time — every operator held two links to the hub (#236).
+                    let linked: HashSet<Multiaddr> = dialed_links
+                        .values()
+                        .chain(pending_dials.values())
+                        .cloned()
+                        .collect();
+                    // With an outbound target, a node that has the floor but not its target makes
+                    // up the difference here — otherwise every peer that leaves lowers the count
+                    // for good, down to the floor. Unset, this is always zero and nothing changes.
+                    let top_up = if verdict.dial {
+                        0
+                    } else {
+                        outbound_top_up(config.outbound_peers, outbound_peers.len(), pending_dials.len())
+                    };
+                    if top_up > 0 {
+                        let targets: Vec<Multiaddr> =
+                            redial_targets(&[], &known_addrs, &own, &linked, redial_rotation)
+                                .into_iter()
+                                .take(top_up)
+                                .collect();
+                        redial_rotation = redial_rotation.wrapping_add(1);
+                        debug!(
+                            outbound = outbound_peers.len(),
+                            dialing = targets.len(),
+                            "Below HELIX_P2P_OUTBOUND_PEERS — dialing known addresses"
+                        );
+                        for addr in targets {
+                            dial_tracked(&mut swarm, addr, &mut pending_dials);
+                        }
+                    }
                     if verdict.dial {
-                        // Both of this node's own addresses: the configured one stays in the
-                        // remembered file even after a probe replaced it, and dialing either would
-                        // only reach this node again (through the proxy, for a tunnel address).
-                        let own: Vec<&str> = config
-                            .public_addr
-                            .as_deref()
-                            .into_iter()
-                            .chain(announced_self.as_deref())
-                            .collect();
-                        // A dial still in flight counts as a link: at startup the first tick comes
-                        // before the seed dial has become a connection, and dialed the seed a
-                        // second time — every operator held two links to the hub (#236).
-                        let linked: HashSet<Multiaddr> = dialed_links
-                            .values()
-                            .chain(pending_dials.values())
-                            .cloned()
-                            .collect();
                         let targets = redial_targets(
                             &seed_addrs,
                             &known_addrs,
@@ -2113,6 +2168,20 @@ const MAX_KNOWN_REDIALS_PER_TICK: usize = 16;
 /// are the norm here — six validators — so this is deliberately a floor, not a fan-out target.
 pub const MIN_HEALTHY_PEERS: usize = 3;
 
+/// Whether a peer this node has just dialed is one more than `P2PConfig::outbound_peers` allows.
+///
+/// `outbound_now` counts the peers this node dialed and still holds (plus, where a dial is about to
+/// be started, the dials in flight). Unset is no limit — every node before 1.0.1 behaved so.
+fn outbound_peer_refused(target: Option<usize>, outbound_now: usize) -> bool {
+    target.is_some_and(|target| outbound_now >= target)
+}
+
+/// How many known addresses the redial tick dials to bring this node's own peers up to
+/// `P2PConfig::outbound_peers`, counting the dials already in flight. Zero when unset.
+fn outbound_top_up(target: Option<usize>, outbound_now: usize, dials_in_flight: usize) -> usize {
+    target.map_or(0, |target| target.saturating_sub(outbound_now + dials_in_flight))
+}
+
 /// Whether to dial for more peers this tick, and whether to say so.
 ///
 /// Pure so the *when* is testable: a mechanism that fires at the wrong moment is green in any
@@ -2519,6 +2588,7 @@ fn unreadable_peer_exchange(peer: &str, seen: u32) -> (Option<String>, bool) {
 /// Returns what the caller must act on: the range of chain the sender claims, and whether it is
 /// behind us and should be served the blocks it is missing. Takes the message already decoded —
 /// a payload that does not decode never gets here (`decode_gossip`, #228).
+#[allow(clippy::too_many_arguments)]
 fn handle_peer_exchange_message(
     msg: PeerExchangeMsg,
     known_addrs: &mut HashSet<String>,
@@ -2527,6 +2597,9 @@ fn handle_peer_exchange_message(
     warnings: &mut PeerWarnings,
     our_tip: u64,
     our_genesis: &str,
+    // False once this node has dialed as many peers as `P2PConfig::outbound_peers` allows: the
+    // addresses are still learned — the redial tick may need them — only not dialed now.
+    dial_new: bool,
 ) -> PeerExchangeOutcome {
     // Catch a peer that upgraded (or downgraded) while we keep running — the gap join-time
     // `peer_version_warning` cannot see (#109).
@@ -2544,6 +2617,9 @@ fn handle_peer_exchange_message(
     }
 
     for addr in select_new_addrs(known_addrs, &msg.peers, self_addr) {
+        if !dial_new {
+            continue;
+        }
         match addr.parse::<Multiaddr>() {
             Ok(multiaddr) => {
                 debug!(addr = %addr, "Dialing newly learned peer address");
@@ -5581,7 +5657,28 @@ mod peer_tip_gate_tests {
 mod redial_target_tests {
     use super::{redial_targets, MAX_KNOWN_REDIALS_PER_TICK};
 
-    use super::{redial_verdict, MIN_HEALTHY_PEERS};
+    use super::{outbound_peer_refused, outbound_top_up, redial_verdict, MIN_HEALTHY_PEERS};
+
+    /// Unset is the behaviour of every node before 1.0.1: no dial is ever refused and the redial
+    /// tick never tops anything up. A target closes the peer that would exceed it, and the tick
+    /// dials the shortfall — counting the dials in flight, or a slow handshake would be dialed
+    /// again every 30 s until it completed and then had to be closed.
+    #[test]
+    fn an_outbound_target_refuses_the_peer_past_it_and_tops_up_to_it() {
+        for outbound in [0, 3, 12, 500] {
+            assert!(!outbound_peer_refused(None, outbound), "unset never refuses ({outbound})");
+            assert_eq!(outbound_top_up(None, outbound, 0), 0, "unset never tops up ({outbound})");
+        }
+
+        assert!(!outbound_peer_refused(Some(4), 3), "the fourth of four is welcome");
+        assert!(outbound_peer_refused(Some(4), 4), "the fifth of four is one too many");
+        assert!(outbound_peer_refused(Some(4), 9), "and so is any after it");
+
+        assert_eq!(outbound_top_up(Some(4), 1, 0), 3);
+        assert_eq!(outbound_top_up(Some(4), 1, 2), 1, "dials in flight count");
+        assert_eq!(outbound_top_up(Some(4), 4, 0), 0);
+        assert_eq!(outbound_top_up(Some(4), 6, 3), 0, "over the target is not negative");
+    }
 
     /// The production failure of 2026-09-17/18 in one assertion: a node holding a single peer is
     /// one disconnect from being alone, and the old rule (`connected_peers().next().is_none()`)
