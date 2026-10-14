@@ -56,6 +56,7 @@ pub(crate) mod domain {
     pub const PROBATION_SEEN: u8 = 20;
     pub const MISSED_BLOCKS: u8 = 21;
     pub const JAILED_UNTIL: u8 = 22;
+    pub const DOWNTIME_JAILS: u8 = 23;
 }
 
 /// The lattice hash of one encoded entry.
@@ -246,6 +247,7 @@ impl ChainState {
             probation_seen,
             missed_blocks,
             jailed_until,
+            downtime_jails,
         } = self;
         vec![
             Box::new(MapPart { map: accounts, contribution: keyed(domain::ACCOUNTS) }),
@@ -270,6 +272,9 @@ impl ChainState {
             Box::new(SetPart { set: probation_seen, domain: domain::PROBATION_SEEN }),
             Box::new(MapPart { map: missed_blocks, contribution: keyed(domain::MISSED_BLOCKS) }),
             Box::new(MapPart { map: jailed_until, contribution: keyed(domain::JAILED_UNTIL) }),
+            // Empty under protocol 1, where it contributes nothing — the root of a protocol-1
+            // state is the one it always was.
+            Box::new(MapPart { map: downtime_jails, contribution: keyed(domain::DOWNTIME_JAILS) }),
         ]
     }
 
@@ -380,6 +385,7 @@ impl ChainState {
             probation_seen,
             missed_blocks,
             jailed_until,
+            downtime_jails,
         } = self;
         accounts.settled();
         names.settled();
@@ -403,6 +409,7 @@ impl ChainState {
         probation_seen.settled();
         missed_blocks.settled();
         jailed_until.settled();
+        downtime_jails.settled();
     }
 
     /// Debug builds: the commitment kept from writes equals the one recomputed from every entry.
@@ -461,7 +468,7 @@ mod tests {
             VALIDATOR_KEYS, ACCOUNT_KEYS, PROPOSALS, USED_PERSONHOOD_COMMITMENTS,
             SLASHED_DOUBLE_SIGN_INCIDENTS, VALIDATOR_POOLS, DELEGATOR_SHARES, REWARD_ADDRESSES,
             REDELEGATIONS, CONTRACT_STORAGE, PENDING_VALIDATORS, ACTIVE_VALIDATORS,
-            PROBATIONARY_VALIDATORS, PROBATION_SEEN, MISSED_BLOCKS, JAILED_UNTIL,
+            PROBATIONARY_VALIDATORS, PROBATION_SEEN, MISSED_BLOCKS, JAILED_UNTIL, DOWNTIME_JAILS,
         ];
         let distinct: std::collections::BTreeSet<u8> = tags.iter().copied().collect();
         assert_eq!(distinct.len(), tags.len(), "two collections share a domain tag");
@@ -507,7 +514,10 @@ mod tests {
 
     /// What a node that just started would compute for the same state: everything from scratch.
     fn recomputed(state: &ChainState) -> Hash {
-        let copy: ChainState = bincode::deserialize(&bincode::serialize(state).unwrap()).unwrap();
+        // The way a state really arrives as bytes: a snapshot, with the appendix that carries what
+        // is not in the struct's bincode layout (`ChainState::downtime_jails`). Plain bincode would
+        // drop it and report a mismatch that no node can meet.
+        let copy = crate::state::state_from_snapshot_bytes(&crate::state::snapshot_bytes(state).unwrap()).unwrap();
         assert!(copy.commitment.0.is_none(), "a state received as bytes carries no commitment");
         copy.state_hash()
     }
@@ -602,6 +612,7 @@ mod tests {
             ("probation_seen", |s| { s.probation_seen.insert(address(8)); }),
             ("missed_blocks", |s| { s.missed_blocks.insert("x".into(), 1); }),
             ("jailed_until", |s| { s.jailed_until.insert("x".into(), 1); }),
+            ("downtime_jails", |s| { s.downtime_jails.insert("x".into(), vec![7]); }),
             ("personhood", |s| { s.personhood.insert(address(1).to_string(), helix_identity::PersonhoodStatus::Verified { verified_at_height: 3 }); }),
             ("guardians", |s| { s.guardians.insert(address(1).to_string(), helix_identity::GuardianSet { guardians: vec![address(2)] }); }),
             ("recovery_requests", |s| { s.recovery_requests.insert(address(1).to_string(), helix_identity::RecoveryRequest { votes: vec![] }); }),
@@ -642,7 +653,7 @@ mod tests {
         ];
         assert_eq!(
             changes.len(),
-            22 + 10,
+            23 + 10,
             "every committed collection and every global, once each — see `parts` and `globals_entry`"
         );
         let base = populated();

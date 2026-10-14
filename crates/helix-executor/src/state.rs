@@ -100,12 +100,55 @@ pub const BLOCKS_OF_SILENCE_TO_JAIL: u32 = DOWNTIME_JAIL_THRESHOLD_BLOCKS / MISS
 
 /// Minimum blocks a downtime-jailed validator must wait before `TxType::Unjail` is accepted —
 /// see its doc comment for why unjailing isn't automatic. 300 blocks ≈ 10 minutes at the 2s
-/// block time, matching Cosmos SDK's own default downtime-jail duration (600s). Deliberately
-/// carries **no slash**: downtime alone isn't proof of malice (a validator's node crashing
-/// and restarting is the common case, not the adversarial one) — slashing stays reserved for
-/// provable misbehavior (`SLASH_FRACTION_BPS`, double-signing). Jailing alone is real
-/// friction: while jailed, that stake earns nothing and casts no vote.
+/// block time, matching Cosmos SDK's own default downtime-jail duration (600s). Under protocol 1
+/// it carries **no slash**; from protocol 2 a downtime jail costs stake and the wait grows with
+/// repeat jails — see [`DOWNTIME_PENALTIES_PROTOCOL`]. Under protocol 2 this is the wait of a
+/// first jail.
 pub const MIN_JAIL_BLOCKS: u64 = 300;
+
+/// The protocol version from which downtime costs stake (Vistos, 2026-10-14).
+///
+/// Until then jailing was the only consequence, and on mainnet it taught nothing: on 2026-10-14
+/// three validators sat silent for over an hour between them, the rest of the set took over
+/// their proposer turns at 12 s each, and the chain ran at a third of its pace. Three rules,
+/// together, from this version on:
+///
+/// - **A jail costs stake**, burned, and more each time within [`DOWNTIME_HISTORY_BLOCKS`]:
+///   [`DOWNTIME_SLASH_BPS`], with a longer wait before `Unjail` ([`DOWNTIME_MIN_JAIL_BLOCKS`]).
+///   It reaches the delegators' pool as a double-sign slash does (`ChainState::slash`), so
+///   delegating to an unreliable validator is a risk worth weighing. Burned rather than paid to
+///   the rest of the set: a proposer chooses which precommits its certificate carries, and paying
+///   the set for another validator's misses would pay it to leave that validator's signatures out.
+/// - **A validator that has just been promoted starts owing** ([`NEW_VALIDATOR_DOWNTIME_DEBT`]):
+///   one that never signs is jailed after 600 blocks instead of 1800. A probationer is promoted on
+///   a heartbeat transaction, which proves the key is used, not that its node takes part — on
+///   2026-10-14 a validator was promoted that way and never signed a block. Requiring signatures
+///   *during* probation instead was the original design and failed under measurement (see
+///   `rotate_active_validators`); as an active validator its precommits are awaited and counted.
+/// - **A validator that stays jailed is unbonded** ([`AUTO_UNBOND_AFTER_JAIL_BLOCKS`]): its own
+///   stake moves to the unbonding queue, still slashable, and is its owner's again a week later.
+///   An abandoned validator stops counting in the governance denominator (`total_staked`).
+pub const DOWNTIME_PENALTIES_PROTOCOL: u64 = 2;
+
+/// What a downtime jail costs, in basis points of the validator's stake and its delegators'
+/// pool: the first within [`DOWNTIME_HISTORY_BLOCKS`], the second, and every one after that.
+pub const DOWNTIME_SLASH_BPS: [u64; 3] = [100, 300, 500];
+
+/// How long a downtime jail lasts at least, by the same count: 300 blocks, about a day, about a
+/// week (at the 2-second target).
+pub const DOWNTIME_MIN_JAIL_BLOCKS: [u64; 3] = [MIN_JAIL_BLOCKS, 43_200, 302_400];
+
+/// How far back a validator's earlier downtime jails count: about 30 days at the 2-second target —
+/// the same span `MAX_UPGRADE_LEAD_BLOCKS` names.
+pub const DOWNTIME_HISTORY_BLOCKS: u64 = 1_296_000;
+
+/// The downtime debt a validator starts with when it is promoted: 600 silent blocks from the jail
+/// threshold. Signing pays it off like any debt — at the two thirds the quorum asks, it shrinks.
+pub const NEW_VALIDATOR_DOWNTIME_DEBT: u32 = DOWNTIME_JAIL_THRESHOLD_BLOCKS - 600 * MISS_WEIGHT;
+
+/// How long after a jail could have been lifted the validator's own stake is unbonded: about a
+/// week at the 2-second target.
+pub const AUTO_UNBOND_AFTER_JAIL_BLOCKS: u64 = 302_400;
 
 /// Per-account ledger state
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +350,79 @@ pub struct StateSnapshot {
     /// taken. Read together with the state under one lock, because the pair is the claim.
     pub height: u64,
     pub state: ChainState,
+}
+
+/// What a snapshot carries after the bincode of `ChainState` (or of a `StateSnapshot`): the state
+/// that is not in its layout — see `ChainState::downtime_jails` for why. `version` names this
+/// shape; a decoder refuses one it does not know rather than guess at a state root.
+#[derive(Serialize, Deserialize)]
+struct SnapshotAppendix {
+    version: u8,
+    downtime_jails: std::collections::BTreeMap<String, Vec<u64>>,
+}
+
+const SNAPSHOT_APPENDIX_VERSION: u8 = 1;
+
+impl SnapshotAppendix {
+    fn of(state: &ChainState) -> Self {
+        SnapshotAppendix {
+            version: SNAPSHOT_APPENDIX_VERSION,
+            downtime_jails: state.downtime_jails.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+
+    /// Read what follows a decoded value of `used` bytes. Nothing there is a snapshot written
+    /// before the appendix existed (1.0.x), whose state has none of it.
+    fn read_after(bytes: &[u8], used: u64, state: &mut ChainState) -> bincode::Result<()> {
+        let tail = bytes.get(used as usize..).unwrap_or_default();
+        if tail.is_empty() {
+            return Ok(());
+        }
+        let appendix: SnapshotAppendix = bincode::deserialize(tail)?;
+        if appendix.version != SNAPSHOT_APPENDIX_VERSION {
+            return Err(Box::new(bincode::ErrorKind::Custom(format!(
+                "a snapshot appendix of version {} — this build reads version {SNAPSHOT_APPENDIX_VERSION}",
+                appendix.version
+            ))));
+        }
+        state.downtime_jails = appendix.downtime_jails.into_iter().collect::<HashMap<_, _>>().into();
+        Ok(())
+    }
+}
+
+/// A state as snapshot bytes: its bincode, then the appendix. A 1.0.x decoder reads the first part
+/// and skips the rest as trailing bytes (`bincode::deserialize` allows them).
+pub fn snapshot_bytes(state: &ChainState) -> bincode::Result<Vec<u8>> {
+    let mut bytes = bincode::serialize(state)?;
+    bytes.extend(bincode::serialize(&SnapshotAppendix::of(state))?);
+    Ok(bytes)
+}
+
+/// The inverse of [`snapshot_bytes`]. The length of the first part is measured by encoding what was
+/// decoded (`serialized_size`) — the same bytes, so the same length — instead of decoding through a
+/// reader, which reserves memory from lengths read off the wire (#246's class).
+pub fn state_from_snapshot_bytes(bytes: &[u8]) -> bincode::Result<ChainState> {
+    let mut state: ChainState = bincode::deserialize(bytes)?;
+    let used = bincode::serialized_size(&state)?;
+    SnapshotAppendix::read_after(bytes, used, &mut state)?;
+    Ok(state)
+}
+
+impl StateSnapshot {
+    /// This snapshot as served by `GET /sync/snapshot`: its bincode, then the appendix of its state.
+    pub fn to_bytes(&self) -> bincode::Result<Vec<u8>> {
+        let mut bytes = bincode::serialize(self)?;
+        bytes.extend(bincode::serialize(&SnapshotAppendix::of(&self.state))?);
+        Ok(bytes)
+    }
+
+    /// The inverse of [`StateSnapshot::to_bytes`]; also reads a 1.0.x snapshot, which has no appendix.
+    pub fn from_bytes(bytes: &[u8]) -> bincode::Result<StateSnapshot> {
+        let mut snapshot: StateSnapshot = bincode::deserialize(bytes)?;
+        let used = bincode::serialized_size(&snapshot)?;
+        SnapshotAppendix::read_after(bytes, used, &mut snapshot.state)?;
+        Ok(snapshot)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -621,6 +737,17 @@ pub struct ChainState {
     /// auto-rejoining the instant a validator reappears would defeat the point.
     #[serde(default)]
     pub jailed_until: TrackedMap<String, u64>,
+    /// Address string -> the heights of its downtime jails within the last
+    /// [`DOWNTIME_HISTORY_BLOCKS`], oldest first — what makes a repeat jail cost more (protocol 2,
+    /// see [`DOWNTIME_PENALTIES_PROTOCOL`]). Empty under protocol 1.
+    ///
+    /// **Not in `ChainState`'s bincode layout** (`serde(skip)`): a state snapshot is this struct
+    /// as bincode, and a field in the layout would make every snapshot written by 1.0.x unreadable
+    /// here and every one written here unreadable there. It travels as an appendix after the
+    /// struct instead (`snapshot_bytes` / `state_from_snapshot_bytes`), which a 1.0.x decoder
+    /// skips as trailing bytes, and has a storage table of its own.
+    #[serde(skip)]
+    pub downtime_jails: TrackedMap<String, Vec<u64>>,
     /// The state commitment as of the last settlement (#270, see `crate::commitment`). Never
     /// serialized: a state that arrives as bytes has its commitment recomputed, not trusted.
     /// Public so a state can be built from parts; outside this crate the only value there is to
@@ -701,6 +828,7 @@ impl ChainState {
             applied_height: 0,
             missed_blocks: Default::default(),
             jailed_until: Default::default(),
+            downtime_jails: Default::default(),
             commitment: Commitment::default(),
         }
     }
@@ -998,7 +1126,12 @@ impl ChainState {
             let count = self.missed_blocks.entry(key.clone()).or_insert(0);
             *count = count.saturating_add(MISS_WEIGHT);
             if *count >= DOWNTIME_JAIL_THRESHOLD_BLOCKS && !self.jailed_until.contains_key(&key) {
-                self.jailed_until.insert(key, height + MIN_JAIL_BLOCKS);
+                let wait = if self.protocol_version >= DOWNTIME_PENALTIES_PROTOCOL {
+                    self.penalize_downtime(addr, height)
+                } else {
+                    MIN_JAIL_BLOCKS
+                };
+                self.jailed_until.insert(key, height + wait);
                 // Out of the quorum from this block on, not merely at the next rotation — the
                 // node fast-jails it out of the live `BftEngine` for the same reason. Leaving
                 // it here would keep charging a validator that no longer counts.
@@ -1007,6 +1140,80 @@ impl ChainState {
             }
         }
         newly_jailed
+    }
+
+    /// The protocol-2 cost of a downtime jail at `height`: slashes `validator` by the share its
+    /// recent jails call for, records this jail, and returns how long it lasts at least.
+    ///
+    /// Counts the jails within [`DOWNTIME_HISTORY_BLOCKS`] *before* this one; older ones are
+    /// dropped here, and by `prune_downtime_history` for validators that are never jailed again.
+    fn penalize_downtime(&mut self, validator: &Address, height: u64) -> u64 {
+        let key = validator.to_string();
+        let since = height.saturating_sub(DOWNTIME_HISTORY_BLOCKS);
+        let mut recent: Vec<u64> = self
+            .downtime_jails
+            .get(&key)
+            .map(|jails| jails.iter().copied().filter(|h| *h > since).collect())
+            .unwrap_or_default();
+        let step = recent.len().min(DOWNTIME_SLASH_BPS.len() - 1);
+        self.slash(validator, DOWNTIME_SLASH_BPS[step]);
+        recent.push(height);
+        self.downtime_jails.insert(key, recent);
+        DOWNTIME_MIN_JAIL_BLOCKS[step]
+    }
+
+    /// Drop downtime jails older than [`DOWNTIME_HISTORY_BLOCKS`], and validators with none left —
+    /// so the record stays the size of the recent past. Run at every epoch boundary under
+    /// protocol 2; deterministic like everything in `execute_block`.
+    pub fn prune_downtime_history(&mut self, height: u64) {
+        let since = height.saturating_sub(DOWNTIME_HISTORY_BLOCKS);
+        let stale: Vec<String> = self
+            .downtime_jails
+            .iter()
+            .filter(|(_, jails)| jails.iter().any(|h| *h <= since))
+            .map(|(validator, _)| validator.clone())
+            .collect();
+        for validator in stale {
+            let kept: Vec<u64> =
+                self.downtime_jails[&validator].iter().copied().filter(|h| *h > since).collect();
+            if kept.is_empty() {
+                self.downtime_jails.remove(&validator);
+            } else {
+                self.downtime_jails.insert(validator, kept);
+            }
+        }
+    }
+
+    /// Protocol 2: move the own stake of every validator jailed for
+    /// [`AUTO_UNBOND_AFTER_JAIL_BLOCKS`] past the height it could have unjailed from into the
+    /// unbonding queue — as an `Unstake` of everything would, still slashable for its whole
+    /// unbonding period. Delegations stay where they are; their owners undelegate as always.
+    ///
+    /// An account already unbonding *from another validator's pool* (`unbonding_source` set) is
+    /// left until that ends: there is one unbonding slot per account, and merging two sources
+    /// would let one validator's slash reach the other's capital. Its own earlier unstake is
+    /// merged in, and the later of the two unlock heights applies. The jail entry stays, so the
+    /// validator cannot come back on delegated stake alone; with stake again it unjails as usual.
+    pub fn unbond_long_jailed(&mut self, height: u64) {
+        let due: Vec<String> = self
+            .jailed_until
+            .iter()
+            .filter(|(_, until)| height >= until.saturating_add(AUTO_UNBOND_AFTER_JAIL_BLOCKS))
+            .map(|(validator, _)| validator.clone())
+            .collect();
+        for key in due {
+            let Some(acc) = self.accounts.get(&key) else { continue };
+            if acc.staked == 0 || acc.unbonding_source.is_some() {
+                continue;
+            }
+            let Ok(validator) = Address::from_str(&key) else { continue };
+            let unlock = height + UNBONDING_PERIOD;
+            self.update_account(&validator, |acc| {
+                acc.unbonding_stake = acc.unbonding_stake.saturating_add(acc.staked);
+                acc.unbonding_unlock_height = acc.unbonding_unlock_height.max(unlock);
+                acc.staked = 0;
+            });
+        }
     }
 
     /// Does `last_commit` prove that a real 2/3+1 majority signed the parent block?
@@ -1413,6 +1620,14 @@ impl ChainState {
             .collect();
         for a in &promoted {
             self.active_validators.insert(a.clone());
+            // Protocol 2: a promoted validator starts owing — see `NEW_VALIDATOR_DOWNTIME_DEBT`.
+            // Never lowered: one promoted again soon after a jail keeps the larger debt.
+            if self.protocol_version >= DOWNTIME_PENALTIES_PROTOCOL {
+                let debt = self.missed_blocks.get(&a.to_string()).copied().unwrap_or(0);
+                if debt < NEW_VALIDATOR_DOWNTIME_DEBT {
+                    self.missed_blocks.insert(a.to_string(), NEW_VALIDATOR_DOWNTIME_DEBT);
+                }
+            }
         }
 
         // Pending stakers that have served their one-epoch delay enter probation: in the signing
@@ -2639,5 +2854,240 @@ mod tests {
             Some(1_799),
             "the 1800th missed block must jail — the height is zero-based, so that is height 1799"
         );
+    }
+
+    // ── Protocol 2: downtime costs stake (`DOWNTIME_PENALTIES_PROTOCOL`) ─────────────────────
+
+    /// Four validators of `per_validator` each; `addr(2)` is the one that goes silent.
+    fn downtime_set(protocol: u64, per_validator: u64) -> ChainState {
+        let mut state = ChainState::new(0);
+        state.protocol_version = protocol;
+        state.governance_params.min_validator_stake = 100;
+        for n in 1..=4 {
+            stake(&mut state, n, per_validator);
+        }
+        state
+    }
+
+    /// Run blocks from `from` with `addr(2)` absent from every certificate until it is jailed;
+    /// the height it was jailed at.
+    fn silent_until_jailed(state: &mut ChainState, from: u64) -> u64 {
+        let validators = vec![addr(1), addr(2), addr(3), addr(4)];
+        let without_2: std::collections::HashSet<Address> =
+            [addr(1), addr(3), addr(4)].into_iter().collect();
+        for height in from..from + 10_000 {
+            if !state.record_block_participation(&validators, &without_2, height).is_empty() {
+                return height;
+            }
+        }
+        panic!("addr(2) was never jailed");
+    }
+
+    /// What `Unjail` does to the two maps, so the next silence starts from a clean debt.
+    fn lift_jail(state: &mut ChainState) {
+        state.jailed_until.remove(&addr(2).to_string());
+        state.missed_blocks.remove(&addr(2).to_string());
+    }
+
+    /// Under protocol 1 nothing changes: the jail costs nothing, lasts 300 blocks, and leaves no
+    /// record. A chain that has not voted for protocol 2 must compute exactly what it always has.
+    #[test]
+    fn under_protocol_1_a_downtime_jail_costs_nothing_and_leaves_no_record() {
+        let mut state = downtime_set(1, 1_000_000);
+        let burned = state.total_burned;
+        let at = silent_until_jailed(&mut state, 0);
+        assert_eq!(state.get(&addr(2)).unwrap().staked, 1_000_000);
+        assert_eq!(state.total_burned, burned);
+        assert_eq!(state.jailed_until.get(&addr(2).to_string()), Some(&(at + MIN_JAIL_BLOCKS)));
+        assert!(state.downtime_jails.is_empty());
+    }
+
+    /// The escalation, step by step: 1 %, 3 %, then 5 % for every further jail within the window,
+    /// each burned, and a wait of 300 blocks, about a day, about a week.
+    #[test]
+    fn under_protocol_2_each_downtime_jail_costs_more_and_lasts_longer() {
+        let mut state = downtime_set(2, 1_000_000);
+        let mut expected_stake = 1_000_000u64;
+        let mut from = 0;
+        for (step, (bps, wait)) in [(100, 300), (300, 43_200), (500, 302_400), (500, 302_400)]
+            .into_iter()
+            .enumerate()
+        {
+            let burned = state.total_burned;
+            let at = silent_until_jailed(&mut state, from);
+            let slash = expected_stake * bps / 10_000;
+            expected_stake -= slash;
+            assert_eq!(
+                state.get(&addr(2)).unwrap().staked,
+                expected_stake,
+                "jail {} must cost {bps} bps",
+                step + 1
+            );
+            assert_eq!(state.total_burned, burned + slash, "and the slash is burned");
+            assert_eq!(
+                state.jailed_until.get(&addr(2).to_string()),
+                Some(&(at + wait)),
+                "jail {} must last {wait} blocks",
+                step + 1
+            );
+            assert_eq!(state.downtime_jails[&addr(2).to_string()].len(), step + 1);
+            lift_jail(&mut state);
+            from = at + 1;
+        }
+        // The others were never charged.
+        assert_eq!(state.get(&addr(1)).unwrap().staked, 1_000_000);
+    }
+
+    /// A jail older than the window does not count: a validator that was jailed once, long ago,
+    /// pays the first-jail price again. And the epoch pruning drops the old record.
+    #[test]
+    fn a_downtime_jail_older_than_the_window_does_not_count() {
+        let mut state = downtime_set(2, 1_000_000);
+        let first = silent_until_jailed(&mut state, 0);
+        lift_jail(&mut state);
+        let after_first = state.get(&addr(2)).unwrap().staked;
+
+        let later = first + DOWNTIME_HISTORY_BLOCKS + 1;
+        let second = silent_until_jailed(&mut state, later);
+        assert_eq!(
+            state.get(&addr(2)).unwrap().staked,
+            after_first - after_first / 100,
+            "outside the window the next jail is a first one again — 1 %"
+        );
+        assert_eq!(state.jailed_until.get(&addr(2).to_string()), Some(&(second + MIN_JAIL_BLOCKS)));
+        assert_eq!(state.downtime_jails[&addr(2).to_string()], vec![second], "the old one was dropped");
+
+        state.prune_downtime_history(second + DOWNTIME_HISTORY_BLOCKS);
+        assert!(state.downtime_jails.is_empty(), "and once it ages out too, nothing is kept");
+    }
+
+    /// The pool behind the validator pays the same share, as for double-signing: delegating to an
+    /// unreliable validator is a risk, which is the point.
+    #[test]
+    fn a_downtime_slash_reaches_the_delegators_pool() {
+        let mut state = downtime_set(2, 1_000_000);
+        state.validator_pools.insert(
+            addr(2).to_string(),
+            DelegationPool { total_shares: 500_000, total_delegated_stake: 500_000, commission_bps: 1000 },
+        );
+        silent_until_jailed(&mut state, 0);
+        assert_eq!(state.validator_pools[&addr(2).to_string()].total_delegated_stake, 495_000);
+        assert_eq!(state.get(&addr(2)).unwrap().staked, 990_000);
+    }
+
+    /// Promotion under protocol 2 starts the validator at a debt of 2400: silent from the start,
+    /// it is jailed after 600 blocks instead of 1800. Under protocol 1 it starts at nothing.
+    #[test]
+    fn a_promoted_validator_that_never_signs_is_jailed_after_600_blocks() {
+        for (protocol, expected_jail) in [(2u64, 599u64), (1, 1_799)] {
+            let mut state = downtime_set(protocol, 1_000_000);
+            for n in [1, 3, 4] {
+                state.active_validators.insert(addr(n));
+            }
+            state.probationary_validators.insert(addr(2));
+            state.probation_seen.insert(addr(2));
+            state.rotate_active_validators();
+            assert!(state.active_validators.contains(&addr(2)), "precondition: promoted");
+            let debt = state.missed_blocks.get(&addr(2).to_string()).copied();
+            if protocol >= DOWNTIME_PENALTIES_PROTOCOL {
+                assert_eq!(debt, Some(NEW_VALIDATOR_DOWNTIME_DEBT));
+            } else {
+                assert_eq!(debt, None);
+            }
+            assert_eq!(silent_until_jailed(&mut state, 0), expected_jail, "protocol {protocol}");
+        }
+    }
+
+    /// The debt is paid off by signing: a newly promoted validator signing three blocks in four —
+    /// above the two thirds the quorum asks — owes less and less and is never jailed.
+    #[test]
+    fn a_promoted_validator_that_signs_pays_its_debt_down() {
+        let mut state = downtime_set(2, 1_000_000);
+        for n in [1, 3, 4] {
+            state.active_validators.insert(addr(n));
+        }
+        state.probationary_validators.insert(addr(2));
+        state.probation_seen.insert(addr(2));
+        state.rotate_active_validators();
+
+        let validators = vec![addr(1), addr(2), addr(3), addr(4)];
+        let all: std::collections::HashSet<Address> = validators.iter().cloned().collect();
+        let without_2: std::collections::HashSet<Address> =
+            [addr(1), addr(3), addr(4)].into_iter().collect();
+        for height in 0..4_000u64 {
+            let signers = if height % 4 == 0 { &without_2 } else { &all };
+            assert!(state.record_block_participation(&validators, signers, height).is_empty());
+        }
+        // Per four blocks one miss (+2) and three signatures (-3): one off every four blocks.
+        let debt = state.missed_blocks.get(&addr(2).to_string()).copied().unwrap_or(0);
+        assert_eq!(debt, NEW_VALIDATOR_DOWNTIME_DEBT - 1_000, "after 4000 blocks at 75 %");
+    }
+
+    /// A validator jailed and not back a week after it could have been is unbonded: its own stake
+    /// moves to the unbonding queue, still slashable, its own again after the unbonding period.
+    /// Not a block sooner, not under protocol 1, and not while its one slot holds another
+    /// validator's unbonding.
+    #[test]
+    fn a_validator_jailed_for_a_week_past_its_unjail_height_is_unbonded() {
+        let until = 1_000;
+        let due = until + AUTO_UNBOND_AFTER_JAIL_BLOCKS;
+        for protocol in [1u64, 2] {
+            let mut state = downtime_set(protocol, 1_000_000);
+            state.jailed_until.insert(addr(2).to_string(), until);
+            if protocol >= DOWNTIME_PENALTIES_PROTOCOL {
+                state.unbond_long_jailed(due - 1);
+                assert_eq!(state.get(&addr(2)).unwrap().staked, 1_000_000, "a block too soon");
+                state.unbond_long_jailed(due);
+                let acc = state.get(&addr(2)).unwrap();
+                assert_eq!((acc.staked, acc.unbonding_stake), (0, 1_000_000));
+                assert_eq!(acc.unbonding_unlock_height, due + UNBONDING_PERIOD);
+                assert_eq!(acc.unbonding_source, None, "its own self-bond, slashable as such");
+                assert!(state.jailed_until.contains_key(&addr(2).to_string()), "still jailed");
+                assert!(state.stakers().iter().all(|(a, _)| a != &addr(2)));
+            }
+        }
+
+        // An account whose one slot already holds an undelegation from another pool waits.
+        let mut state = downtime_set(2, 1_000_000);
+        state.jailed_until.insert(addr(2).to_string(), until);
+        state.update_account(&addr(2), |acc| {
+            acc.unbonding_stake = 5;
+            acc.unbonding_unlock_height = due + 10;
+            acc.unbonding_source = Some(addr(3).to_string());
+        });
+        state.unbond_long_jailed(due);
+        assert_eq!(state.get(&addr(2)).unwrap().staked, 1_000_000, "the slot is taken, so it waits");
+    }
+
+    /// The downtime record is not in `ChainState`'s bincode layout — it travels after it. Written
+    /// and read back it is all there, and the state root is the same; a 1.0.x snapshot (no
+    /// appendix) reads as a state without a record; a 1.0.x reader skips the appendix; an
+    /// appendix version this build does not know is refused rather than guessed at.
+    #[test]
+    fn a_snapshot_carries_the_downtime_record_after_the_state() {
+        let mut state = downtime_set(2, 1_000_000);
+        silent_until_jailed(&mut state, 0);
+        assert!(!state.downtime_jails.is_empty(), "precondition: a record to carry");
+        let root = state.state_hash();
+
+        let bytes = snapshot_bytes(&state).unwrap();
+        let back = state_from_snapshot_bytes(&bytes).unwrap();
+        assert_eq!(back.downtime_jails.get(&addr(2).to_string()), state.downtime_jails.get(&addr(2).to_string()));
+        assert_eq!(back.state_hash(), root);
+
+        let old: ChainState = bincode::deserialize(&bytes).unwrap();
+        assert!(old.downtime_jails.is_empty(), "a 1.0.x reader takes the state and skips the rest");
+
+        let without = bincode::serialize(&state).unwrap();
+        assert!(state_from_snapshot_bytes(&without).unwrap().downtime_jails.is_empty());
+
+        let snapshot = StateSnapshot { height: 7, state: state.clone() };
+        let snap_back = StateSnapshot::from_bytes(&snapshot.to_bytes().unwrap()).unwrap();
+        assert_eq!(snap_back.height, 7);
+        assert_eq!(snap_back.state.state_hash(), root);
+
+        let mut future = bincode::serialize(&state).unwrap();
+        future.extend(bincode::serialize(&(9u8, std::collections::BTreeMap::<String, Vec<u64>>::new())).unwrap());
+        assert!(state_from_snapshot_bytes(&future).is_err(), "an unknown appendix is refused");
     }
 }

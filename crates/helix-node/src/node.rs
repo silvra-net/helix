@@ -6989,7 +6989,9 @@ async fn snapshot_sync_from_peer(
         read_body_capped(resp, MAX_SNAPSHOT_BYTES, url).await
     })
     .await?;
-    let mut snapshot: helix_executor::state::StateSnapshot = bincode::deserialize(&bytes)
+    // `from_bytes` also reads the appendix after the state (protocol 2's downtime record), and a
+    // 1.0.x snapshot, which has none.
+    let mut snapshot = helix_executor::state::StateSnapshot::from_bytes(&bytes)
         .with_context(|| format!("{url} did not answer with a state snapshot"))?;
 
     // The peer serves the newest snapshot at or below what was asked. Anything below the

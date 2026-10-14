@@ -216,7 +216,16 @@ Its log says the same from the moment the upgrade passes, every minute, with the
 
 An upgrade takes effect no sooner than the end of its own 1000-block vote and no later than
 30 days (at the 2-second block target) after it was proposed; only one can be scheduled at a time,
-and a scheduled one cannot be cancelled — it is avoided only by not voting it in.
+and a scheduled one cannot be cancelled — it is avoided only by not voting it in. It passes with
+yes-votes from two thirds of all staked HLX — jailed validators' stake included, until it is
+unbonded.
+
+The protocol versions so far:
+
+| Version | Rules | Runs on |
+|---|---|---|
+| 1 | the mainnet's rules from genesis | every release since 1.0.0 |
+| 2 | **downtime costs stake**: a jail is slashed 1 %, 3 %, then 5 % within about 30 days and lasts longer each time; a newly active validator starts with a downtime debt; a validator left jailed for a week is unbonded — see [Slashing and jailing](staking.md#slashing-and-jailing) | the first release after 1.0.1 |
 
 ### Joining fast from a checkpoint
 

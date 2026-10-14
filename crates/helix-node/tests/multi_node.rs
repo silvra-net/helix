@@ -2538,18 +2538,20 @@ const UP_A_P2P: u16 = 29_792;
 const UP_B_RPC: u16 = 29_801;
 const UP_B_P2P: u16 = 29_802;
 
-/// A protocol upgrade passed by governance stops every node whose build does not run it, at the
-/// same block, without a fork — and a stopped node keeps serving its RPC and stays stopped across
-/// a restart (#267). Over the real binary: the upgrade is proposed and voted with the real CLI.
+/// Protocol upgrades over the real binary (#267), both ways, with the real CLI proposing and
+/// voting: one this build runs, and one it does not.
 ///
-/// This build runs protocol 1 only, so the upgrade to 2 is one *it* does not run — exactly the
-/// position of an operator who has not updated. What the test can tell apart: without the node's
-/// own refusal, the sole validator would reach the executor's last-line assert in its production
-/// loop, and the process would end (`Block loop panicked`). It must instead stand at the block
-/// before, answering.
+/// **1 → 2**, the upgrade this build was made for (downtime penalties): both nodes go on through
+/// the activation block, report protocol 2 and agree on the state after it — the validator that
+/// produced the blocks and the follower that only executed them computed the new rules alike.
+///
+/// **2 → 3**, which no build runs yet — the position of an operator who has not updated: both stop
+/// at the same block, keep answering on RPC, and a restart does not carry either past it. Without
+/// the node's own refusal the sole validator would reach the executor's last-line assert in its
+/// production loop and the process would end (`Block loop panicked`).
 #[tokio::test]
-#[ignore = "spawns 2 real node processes and runs a chain past a 1000-block voting period (~5 min at an accelerated block time) — run explicitly with --ignored"]
-async fn a_protocol_upgrade_this_build_does_not_run_stops_every_node_at_the_same_block() {
+#[ignore = "spawns 2 real node processes and runs a chain through two 1000-block voting periods (~10 min at an accelerated block time) — run explicitly with --ignored"]
+async fn a_protocol_upgrade_runs_where_the_build_supports_it_and_stops_every_node_where_it_does_not() {
     let _serialized = NODE_TEST_LOCK.lock().await;
     let fast = [("HELIX_BLOCK_TIME_MS", "20")];
     let kp = KeyPair::generate();
@@ -2565,7 +2567,7 @@ async fn a_protocol_upgrade_this_build_does_not_run_stops_every_node_at_the_same
 
     let s = status(UP_A_RPC).await.expect("A answers");
     assert_eq!(s["protocol_version"], 1, "{s}");
-    assert_eq!(s["supported_protocol_version"], 1, "{s}");
+    assert_eq!(s["supported_protocol_version"], 2, "{s}");
     assert!(s["scheduled_upgrade"].is_null(), "{s}");
 
     // Refused before signing: a version that skips one, and a height inside the vote. Neither
@@ -2576,24 +2578,46 @@ async fn a_protocol_upgrade_this_build_does_not_run_stops_every_node_at_the_same
     assert!(!run_cli(&url, &["governance", "propose-upgrade", "2", "--at-height", &soon, "--key", &key]));
     assert_eq!(account(UP_A_RPC, &me).await.expect("genesis account")["nonce"], 0, "nothing was sent");
 
-    // Proposed and voted with the real CLI. A holds all the stake, so its vote passes it.
+    // ── 1 → 2: proposed and voted with the real CLI; A holds all the stake, so its vote passes it.
     assert!(run_cli(&url, &["governance", "propose-upgrade", "2", "--at-height", &at.to_string(), "--key", &key]));
     let proposed = wait_for_account(UP_A_RPC, &me, |acc| acc["nonce"].as_u64().unwrap_or(0) >= 1, Duration::from_secs(60)).await;
-    assert!(proposed, "the proposal never landed");
+    assert!(proposed, "the first proposal never landed");
     assert!(run_cli(&url, &["governance", "vote", "0", "--key", &key]));
+    wait_for_scheduled(&[UP_A_RPC, UP_B_RPC], serde_json::json!({ "version": 2, "height": at, "supported": true })).await;
 
-    let expected = serde_json::json!({ "version": 2, "height": at, "supported": false });
+    // Through the activation block, on both, and the same state after it.
+    wait_for_height(UP_A_RPC, at + 5, Duration::from_secs(900)).await;
+    wait_for_height(UP_B_RPC, at + 5, Duration::from_secs(120)).await;
     for port in [UP_A_RPC, UP_B_RPC] {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            let s = status(port).await;
-            if s.as_ref().is_some_and(|s| s["scheduled_upgrade"] == expected) {
+        let s = status(port).await.unwrap_or_else(|| panic!("port {port} stopped answering after the upgrade"));
+        assert_eq!(s["protocol_version"], 2, "port {port} did not move to protocol 2: {s}");
+        assert!(s["scheduled_upgrade"].is_null(), "{s}");
+    }
+    // The same state at the same height, read from both — a follower that executed the new rules
+    // differently from the validator that produced the blocks would disagree here.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (sa, sb) = (status(UP_A_RPC).await, status(UP_B_RPC).await);
+        if let (Some(sa), Some(sb)) = (&sa, &sb) {
+            if sa["state_height"] == sb["state_height"] && sa["state_height"].as_u64() >= Some(at) {
+                assert_eq!(sa["state_hash"], sb["state_hash"], "different state after protocol 2: {sa} / {sb}");
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "port {port} never reported the upgrade: {s:?}");
-            tokio::time::sleep(Duration::from_millis(300)).await;
         }
+        assert!(std::time::Instant::now() < deadline, "no common state height after the upgrade: {sa:?} / {sb:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // ── 2 → 3: one this build does not run.
+    let s = status(UP_A_RPC).await.expect("A answers");
+    let at = s["height"].as_u64().unwrap() + 1100;
+    assert!(!run_cli(&url, &["governance", "propose-upgrade", "4", "--at-height", &at.to_string(), "--key", &key]));
+    assert!(run_cli(&url, &["governance", "propose-upgrade", "3", "--at-height", &at.to_string(), "--key", &key]));
+    let proposed = wait_for_account(UP_A_RPC, &me, |acc| acc["nonce"].as_u64().unwrap_or(0) >= 3, Duration::from_secs(60)).await;
+    assert!(proposed, "the second proposal never landed");
+    assert!(run_cli(&url, &["governance", "vote", "1", "--key", &key]));
+    let expected = serde_json::json!({ "version": 3, "height": at, "supported": false });
+    wait_for_scheduled(&[UP_A_RPC, UP_B_RPC], expected.clone()).await;
 
     // Up to the block before, and no further — on both.
     wait_for_height(UP_A_RPC, at - 1, Duration::from_secs(900)).await;
@@ -2602,7 +2626,7 @@ async fn a_protocol_upgrade_this_build_does_not_run_stops_every_node_at_the_same
     for port in [UP_A_RPC, UP_B_RPC] {
         let s = status(port).await.unwrap_or_else(|| panic!("port {port} stopped answering at the halt"));
         assert_eq!(s["height"], at - 1, "port {port} went past the activation block or fell back: {s}");
-        assert_eq!(s["protocol_version"], 1, "{s}");
+        assert_eq!(s["protocol_version"], 2, "{s}");
         assert_eq!(s["scheduled_upgrade"], expected, "{s}");
     }
     let (ha, hb) = (block_header(UP_A_RPC, at - 1).await, block_header(UP_B_RPC, at - 1).await);
@@ -2619,4 +2643,19 @@ async fn a_protocol_upgrade_this_build_does_not_run_stops_every_node_at_the_same
     assert_eq!(s["height"], at - 1, "{s}");
     assert_eq!(s["scheduled_upgrade"], expected, "{s}");
     drop(a);
+}
+
+/// Wait until every node in `ports` reports `expected` as its scheduled upgrade.
+async fn wait_for_scheduled(ports: &[u16], expected: serde_json::Value) {
+    for &port in ports {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let s = status(port).await;
+            if s.as_ref().is_some_and(|s| s["scheduled_upgrade"] == expected) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "port {port} never reported {expected}: {s:?}");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
 }

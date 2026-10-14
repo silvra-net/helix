@@ -92,6 +92,11 @@ const MISSED_BLOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("missed
 /// stale-key pruning as `MISSED_BLOCKS` — without it, a validator that legitimately unjailed
 /// would come back jailed on the next node restart.
 const JAILED_UNTIL: TableDefinition<&str, &[u8]> = TableDefinition::new("jailed_until");
+/// address string → bincode `Vec<u64>` of its recent downtime jail heights (protocol 2) — see
+/// `ChainState::downtime_jails`. Entries leave as they age out (`prune_downtime_history`), so the
+/// same stale-key pruning as `JAILED_UNTIL`: insert-only persistence would bring an aged-out jail
+/// back on this node's next start, and its next jail would cost more here than everywhere else.
+const DOWNTIME_JAILS: TableDefinition<&str, &[u8]> = TableDefinition::new("downtime_jails");
 /// validator address string → payout address string (#229) — see `ChainState::reward_addresses`.
 /// Removed when a validator clears its payout, so needs the same stale-key pruning as
 /// `JAILED_UNTIL`: insert-only persistence would bring a cleared payout back on this node's next
@@ -363,6 +368,7 @@ impl HelixDb {
         tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
+        tx.open_table(DOWNTIME_JAILS).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(REWARD_ADDRESSES).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
         tx.open_multimap_table(ADDRESS_TX_INDEX).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -413,7 +419,7 @@ impl HelixDb {
     /// names a `prev_state_root` that will never match, and the joiner rejects it — loudly, which
     /// is the right failure, but it makes the node useless to anyone bootstrapping.
     pub fn put_state_snapshot(&self, height: u64, state: &ChainState) -> StorageResult<()> {
-        let bytes = bincode::serialize(state)
+        let bytes = helix_executor::state::snapshot_bytes(state)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let tx = self.db.begin_write().map_err(|e| StorageError::Db(e.to_string()))?;
         {
@@ -444,7 +450,7 @@ impl HelixDb {
         match range.next_back() {
             Some(entry) => {
                 let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
-                let state: ChainState = bincode::deserialize(v.value())
+                let state = helix_executor::state::state_from_snapshot_bytes(v.value())
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 Ok(Some((k.value(), state)))
             }
@@ -505,7 +511,7 @@ impl HelixDb {
             && state.applied_height % self.snapshot_interval == 0;
         let snapshot_bytes = if snapshot_now {
             Some(
-                bincode::serialize(state)
+                helix_executor::state::snapshot_bytes(state)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?,
             )
         } else {
@@ -552,6 +558,7 @@ impl HelixDb {
             let mut probation_seen = tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut missed_blocks = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut jailed_until = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
+            let mut downtime_jails = tx.open_table(DOWNTIME_JAILS).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut reward_addresses = tx.open_table(REWARD_ADDRESSES).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut contract_storage = tx.open_table(CONTRACT_STORAGE).map_err(|e| StorageError::Db(e.to_string()))?;
             let mut genesis_allocations = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -920,6 +927,31 @@ impl HelixDb {
                 jailed_until.insert(addr.as_str(), &height.to_le_bytes()[..])
                     .map_err(|e| StorageError::Db(e.to_string()))?;
             }
+            // Same stale-key pruning again — see DOWNTIME_JAILS' doc comment.
+            {
+                let current: std::collections::HashSet<&str> =
+                    state.downtime_jails.keys().map(|s| s.as_str()).collect();
+                let stale: Vec<String> = downtime_jails
+                    .iter()
+                    .map_err(|e| StorageError::Db(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (k, _) = entry.ok()?;
+                        let key = k.value().to_string();
+                        (!current.contains(key.as_str())).then_some(key)
+                    })
+                    .collect();
+                for key in stale {
+                    downtime_jails
+                        .remove(key.as_str())
+                        .map_err(|e| StorageError::Db(e.to_string()))?;
+                }
+            }
+            for (addr, heights) in &state.downtime_jails {
+                let encoded = bincode::serialize(heights)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                downtime_jails.insert(addr.as_str(), encoded.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
             // Same stale-key pruning again — see REWARD_ADDRESSES' doc comment.
             {
                 let current: std::collections::HashSet<&str> =
@@ -984,6 +1016,7 @@ impl HelixDb {
         let probation_seen_table = tx.open_table(PROBATION_SEEN).map_err(|e| StorageError::Db(e.to_string()))?;
         let missed_blocks_table = tx.open_table(MISSED_BLOCKS).map_err(|e| StorageError::Db(e.to_string()))?;
         let jailed_until_table = tx.open_table(JAILED_UNTIL).map_err(|e| StorageError::Db(e.to_string()))?;
+        let downtime_jails_table = tx.open_table(DOWNTIME_JAILS).map_err(|e| StorageError::Db(e.to_string()))?;
         let reward_addresses_table = tx.open_table(REWARD_ADDRESSES).map_err(|e| StorageError::Db(e.to_string()))?;
         let genesis_allocations_table = tx.open_table(GENESIS_ALLOCATIONS).map_err(|e| StorageError::Db(e.to_string()))?;
         let meta_table = tx.open_table(META).map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1203,6 +1236,14 @@ impl HelixDb {
             jailed_until.insert(k.value().to_string(), u64::from_le_bytes(height_bytes));
         }
 
+        let mut downtime_jails = std::collections::HashMap::new();
+        for entry in downtime_jails_table.iter().map_err(|e| StorageError::Db(e.to_string()))? {
+            let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
+            let heights: Vec<u64> = bincode::deserialize(v.value())
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            downtime_jails.insert(k.value().to_string(), heights);
+        }
+
         let mut reward_addresses = std::collections::HashMap::new();
         for entry in reward_addresses_table.iter().map_err(|e| StorageError::Db(e.to_string()))? {
             let (k, v) = entry.map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1300,6 +1341,7 @@ impl HelixDb {
             probation_seen: probation_seen.into(),
             missed_blocks: missed_blocks.into(),
             jailed_until: jailed_until.into(),
+            downtime_jails: downtime_jails.into(),
         };
         // The one full computation of the commitment a loaded state needs; every block after it
         // is folded in from what it wrote (#270).
@@ -3081,6 +3123,65 @@ mod tests {
 
         assert_eq!(loaded.missed_blocks.get(&addr(1).to_string()), Some(&42));
         assert_eq!(loaded.jailed_until.get(&addr(2).to_string()), Some(&9_999));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Protocol 2's downtime record (`ChainState::downtime_jails`) survives a restart, an aged-out
+    /// entry stays out, and the state root after reopening is the one before — the record is not
+    /// in `ChainState`'s bincode layout, so without its own table a restart would forget it, and
+    /// this node alone would then charge a repeat jail as a first one.
+    #[test]
+    fn the_downtime_record_survives_reopening_and_an_aged_out_one_stays_out() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.downtime_jails.insert(addr(1).to_string(), vec![10, 20]);
+        state.downtime_jails.insert(addr(2).to_string(), vec![30]);
+        db.save_chain_state(&state).unwrap();
+
+        state.downtime_jails.remove(&addr(2).to_string());
+        db.save_chain_state(&state).unwrap();
+        let root = state.state_hash();
+
+        drop(db);
+        let db = HelixDb::open(&path).unwrap();
+        let loaded = db.load_chain_state(1_000_000).unwrap();
+
+        assert_eq!(loaded.downtime_jails.get(&addr(1).to_string()), Some(&vec![10, 20]));
+        assert!(
+            !loaded.downtime_jails.contains_key(&addr(2).to_string()),
+            "an aged-out downtime record came back after reopening"
+        );
+        assert_eq!(loaded.state_hash(), root, "the root after reopening is the root before");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stored snapshot carries the downtime record too, and reading one written before it
+    /// existed (plain bincode, as 1.0.x wrote them) still works.
+    #[test]
+    fn a_stored_snapshot_carries_the_downtime_record() {
+        let (db, path) = fresh_db();
+        let mut state = ChainState::new(1_000_000);
+        state.downtime_jails.insert(addr(1).to_string(), vec![42]);
+        db.put_state_snapshot(100, &state).unwrap();
+        let (_, back) = db.state_snapshot_at_or_before(100).unwrap().unwrap();
+        assert_eq!(back.downtime_jails.get(&addr(1).to_string()), Some(&vec![42]));
+        assert_eq!(back.state_hash(), state.state_hash());
+
+        // A snapshot as 1.0.x stored it: the struct alone.
+        {
+            let tx = db.db.begin_write().unwrap();
+            {
+                let mut table = tx.open_table(STATE_SNAPSHOTS).unwrap();
+                let old = bincode::serialize(&ChainState::new(1_000_000)).unwrap();
+                table.insert(200u64, old.as_slice()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let (h, old) = db.state_snapshot_at_or_before(200).unwrap().unwrap();
+        assert_eq!(h, 200);
+        assert!(old.downtime_jails.is_empty());
 
         let _ = std::fs::remove_file(&path);
     }

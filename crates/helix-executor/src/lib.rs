@@ -68,7 +68,7 @@ pub const MAX_BLOCK_FUEL: u64 = 400_000_000;
 /// version's rules — and only there: a build that claimed a version it does not implement would
 /// execute that version's blocks under the wrong rules. A chain that schedules a version above it
 /// stops this build at the activation height (`ChainState::refuses_block`) instead.
-pub const PROTOCOL_VERSION: u64 = governance::GENESIS_PROTOCOL_VERSION;
+pub const PROTOCOL_VERSION: u64 = state::DOWNTIME_PENALTIES_PROTOCOL;
 
 /// Execute all transactions in a block, updating chain state in place, distribute fees, and mint
 /// this block's scheduled issuance (see `genesis::scheduled_block_reward`). Skips invalid
@@ -165,6 +165,14 @@ pub fn execute_block(state: &mut ChainState, block: &Block) -> BlockReceipt {
     // Proposals whose vote is over, likewise — see `prune_closed_proposals`. A vote in this block
     // was checked against the same `is_expired`, so nothing pruned here could still have counted.
     state.prune_closed_proposals(height);
+    // Protocol 2: a validator jailed and not back for a week is unbonded, and downtime jails older
+    // than the history window stop counting (see `DOWNTIME_PENALTIES_PROTOCOL`).
+    if state.protocol_version >= state::DOWNTIME_PENALTIES_PROTOCOL {
+        state.unbond_long_jailed(height);
+        if height.is_multiple_of(helix_consensus::EPOCH_LENGTH) {
+            state.prune_downtime_history(height);
+        }
+    }
 
     // Epoch boundary: rebuild the active validator set from current stake. After this block's
     // transactions, so a `Stake` in this very block is considered, and after
@@ -4885,16 +4893,46 @@ mod tests {
     #[should_panic(expected = "the node must refuse the block before executing it")]
     fn a_passed_upgrade_is_scheduled_and_a_build_without_it_stops_at_its_height() {
         let mut state = ChainState::new(0);
+        // A chain already at the highest version this build runs, voting for the next one.
+        state.protocol_version = PROTOCOL_VERSION;
         let (kp, me) = sole_staker(&mut state);
+        let next = PROTOCOL_VERSION + 1;
         let at = 10 + governance::VOTING_PERIOD_BLOCKS + 1;
-        assert!(propose_upgrade(&mut state, &kp, &me, 0, 2, at, 10).success);
+        assert!(propose_upgrade(&mut state, &kp, &me, 0, next, at, 10).success);
         assert!(vote(&mut state, &kp, &me, 1, 0, 11).success);
-        assert_eq!(state.scheduled_upgrade, Some(governance::ScheduledUpgrade { version: 2, height: at }));
+        assert_eq!(state.scheduled_upgrade, Some(governance::ScheduledUpgrade { version: next, height: at }));
         let validator = Address::from_public_key(&KeyPair::generate().public);
         execute_block(&mut state, &empty_block(&validator, at - 1));
-        assert_eq!(state.protocol_version, 1, "the block before the activation height runs the old rules");
+        assert_eq!(state.protocol_version, PROTOCOL_VERSION, "the block before the activation height runs the old rules");
         assert!(state.scheduled_upgrade.is_some());
         execute_block(&mut state, &empty_block(&validator, at));
+    }
+
+    /// The upgrade this build was made for: protocol 1 votes for 2, and from the activation block
+    /// on the chain runs it — downtime penalties included (`state::DOWNTIME_PENALTIES_PROTOCOL`).
+    /// A validator jailed long ago is left alone the block before and unbonded in the block itself.
+    #[test]
+    fn the_upgrade_to_protocol_2_takes_effect_in_its_activation_block() {
+        assert_eq!(PROTOCOL_VERSION, 2, "this build runs protocol 2");
+        let mut state = ChainState::new(0);
+        let (kp, me) = sole_staker(&mut state);
+        let at = 10 + governance::VOTING_PERIOD_BLOCKS + 1 + state::AUTO_UNBOND_AFTER_JAIL_BLOCKS;
+        assert!(propose_upgrade(&mut state, &kp, &me, 0, 2, at, 10).success);
+        assert!(vote(&mut state, &kp, &me, 1, 0, 11).success);
+
+        // Someone jailed and never back, long enough ago to be unbonded the moment the rule holds.
+        let gone = Address::from_public_key(&KeyPair::generate().public);
+        state.update_account(&gone, |acc| acc.staked = 50_000);
+        state.jailed_until.insert(gone.to_string(), 1);
+
+        let validator = Address::from_public_key(&KeyPair::generate().public);
+        execute_block(&mut state, &empty_block(&validator, at - 1));
+        assert_eq!(state.protocol_version, 1);
+        assert_eq!(state.get(&gone).unwrap().staked, 50_000, "protocol 1 leaves it staked");
+        execute_block(&mut state, &empty_block(&validator, at));
+        assert_eq!(state.protocol_version, 2);
+        assert_eq!(state.get(&gone).unwrap().staked, 0, "protocol 2 holds from its own block");
+        assert_eq!(state.get(&gone).unwrap().unbonding_stake, 50_000);
     }
 
     /// One upgrade at a time, checked again when a proposal passes: a second proposal for the same

@@ -1091,7 +1091,9 @@ async fn get_state_snapshot(
             Ok(Some((height, chain_state))) => {
                 let snapshot =
                     helix_executor::state::StateSnapshot { height, state: chain_state };
-                match bincode::serialize(&snapshot) {
+                // With the appendix (`StateSnapshot::to_bytes`): what is not in the state's
+                // bincode layout travels after it, and a 1.0.x joiner skips it.
+                match snapshot.to_bytes() {
                     Ok(bytes) => (
                         StatusCode::OK,
                         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -1128,7 +1130,7 @@ async fn get_state_snapshot(
         let cs = state.chain_state.read().await;
         helix_executor::state::StateSnapshot { height: cs.applied_height, state: cs.clone() }
     };
-    match bincode::serialize(&snapshot) {
+    match snapshot.to_bytes() {
         Ok(bytes) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -1510,6 +1512,18 @@ async fn get_validator_pool(
     )
 }
 
+/// How many downtime jails `validator` has had within `DOWNTIME_HISTORY_BLOCKS` — where it stands
+/// in protocol 2's escalation: the next one costs `DOWNTIME_SLASH_BPS[min(n, 2)]`. Counted at the
+/// state's own height, so an entry the epoch pruning has not reached yet is not counted.
+fn recent_downtime_jails(chain: &ChainState, validator: &str) -> usize {
+    let since = chain.applied_height.saturating_sub(helix_executor::state::DOWNTIME_HISTORY_BLOCKS);
+    chain
+        .downtime_jails
+        .get(validator)
+        .map(|jails| jails.iter().filter(|h| **h > since).count())
+        .unwrap_or(0)
+}
+
 /// `GET /validators` — everyone currently eligible to validate, with what a delegator needs in
 /// order to choose between them.
 ///
@@ -1599,6 +1613,7 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                 "voting_power": power.get(&key),
                 "jailed_until": chain.jailed_until.get(&key),
                 "missed_blocks": chain.missed_blocks.get(&key),
+                "recent_downtime_jails": recent_downtime_jails(&chain, &key),
             })
         })
         .collect();
@@ -1623,6 +1638,7 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                 "voting_power": power.get(key),
                 "jailed_until": Some(until),
                 "missed_blocks": chain.missed_blocks.get(key),
+                "recent_downtime_jails": recent_downtime_jails(&chain, key),
             }));
         }
     }

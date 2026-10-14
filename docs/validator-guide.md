@@ -13,9 +13,10 @@ first, stake from the node's own key, then watch one line in the log.
 
 A validator is expected to sign **every block, around the clock**. Each block it should have signed
 and did not adds to a downtime debt, and after about **1,800 blocks of silence — 45 to 50 minutes**
-at the chain's current pace — it is jailed (no HLX lost, but out of the set until it unjails; see
-[Slashing and jailing](staking.md#slashing-and-jailing)). Restarts and updates cost a few blocks and
-are absorbed. A laptop that sleeps is not.
+at the chain's current pace — it is jailed: out of the set until it unjails, and from protocol 2 on
+also slashed — 1 %, 3 %, then 5 % of its stake and its delegators' pool, burned, for each jail
+within about 30 days (see [Slashing and jailing](staking.md#slashing-and-jailing)). Restarts and
+updates cost a few blocks and are absorbed. A laptop that sleeps is not.
 
 What one validator used on mainnet in its first week (measured 2026-10-14; the chain then made
 about 55,000 blocks a day, one every 1.6 s on average, with 16 active validators):
@@ -180,6 +181,10 @@ different key than the one you staked — compare with step 4.
 
 ## 7. Confirm it signs
 
+Under protocol 2 a validator starts its first epochs owing a downtime debt of 2,400 (of the 3,600
+that jail): one whose node does not sign is jailed after 600 blocks. A validator that signs pays it
+off within hours — `helix account` shows the debt going down.
+
 Once a minute the node writes a health line. A validator doing its job:
 
 ```
@@ -213,7 +218,9 @@ See [Running a validator](staking.md#running-a-validator), steps 5–6.
 - **Restarts** cost a few blocks of downtime debt and are paid back by signing; a nightly restart
   is fine.
 - **Jailed anyway?** Bring the node back, let it sync, then `helix tx unjail --key validator-key.json`
-  (allowed from the height `helix account <address>` names).
+  (allowed from the height `helix account <address>` names). Under protocol 2 the jail has cost
+  stake; below 10,000 HLX, stake more first. A validator left jailed for a week after that height
+  is unbonded.
 - **Never** delete `helix-data.redb` — rename it if you want it gone; the chain can always be fetched
   again.
 

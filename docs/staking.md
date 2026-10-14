@@ -80,16 +80,32 @@ locks its data directory so a second node on the same directory refuses to start
 against a copy of the key running on another machine — that one keeps its own memory and can sign
 against the first.
 
-**Downtime** costs no HLX, but removes you from the set until you come back deliberately. Each
-missed block you should have signed adds 2 to a counter, each signed one takes 1 off, so the
-counter grows while you sign less than two thirds of your blocks. At the threshold you are jailed:
+**Downtime** removes you from the set until you come back deliberately. Each missed block you
+should have signed adds 2 to a counter (`missed_blocks`, a downtime debt), each signed one takes 1
+off, so the debt grows while you sign less than two thirds of your blocks. At 3,600 you are jailed:
 
 - after **1,800 blocks** of complete silence (45–50 minutes at the chain's pace in its first week);
 - and also, over a longer stretch, if you keep signing less than two thirds — what the quorum needs
   from each validator.
 
-Reboots, upgrades and short outages stay far below that. To return, once your node is back and
-synced — at least 300 blocks after the jailing, with your stake still at the minimum:
+From **protocol 2** (once stakers have voted it in — `helix governance params` shows the chain's
+protocol), downtime also costs stake:
+
+- **Each jail is slashed and burned:** 1 % of your stake and of your delegators' pool for the first
+  jail within about 30 days, 3 % for the second, 5 % for every one after that. The wait before you
+  may unjail grows the same way: 300 blocks, about a day, about a week. `GET /validators` shows
+  `recent_downtime_jails`. A validator staked at exactly the minimum falls below it with the first
+  slash and has to stake more before it can unjail — keep a margin.
+- **A validator that has just become active starts with a debt of 2,400:** one that never signs is
+  jailed after 600 blocks instead of 1,800. Signing pays it off — at three blocks in four it is gone
+  within a few hours. `helix account` shows it right after promotion; that is expected.
+- **A validator that stays jailed is unbonded:** a week after it could have unjailed, its own stake
+  moves to the unbonding queue (7 days, still slashable) and is its owner's again after that.
+  Delegations stay where they are. To return: stake again, then unjail.
+
+Under protocol 1 downtime costs no HLX. Reboots, upgrades and short outages stay far below the
+threshold either way. To return, once your node is back and synced — after the wait above, with
+your stake still at the minimum:
 
 ```bash
 helix tx unjail --key validator-key.json
