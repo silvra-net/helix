@@ -167,15 +167,16 @@ is wrong. So the genesis is pinned:
 - **Another network:** set `HELIX_GENESIS_HASH`, taken from its release notes or a node you trust —
   not from the peer you are about to sync from, which would be circular. Without it the node
   trusts the peer and warns.
-- **After a reset** a release published before it cannot know the new genesis; it refuses to join
-  and names its own version. Upgrade, or set the new hash by hand.
+- **A release from before the mainnet** (before 1.0.0) knows only the test network's genesis; it
+  refuses to join and names its own version. Install a current release.
 
 The current value is on any node: `curl -s https://node.silvra.net/blocks/height/0 | jq -r .hash`.
 
-### After a chain reset
+### A database from another chain
 
-A reset starts a new chain; the release that comes with it says so. A node still holding the old
-chain refuses to start, names both genesis hashes and the files to move aside:
+The mainnet is not reset — its rules change through [protocol upgrades](#protocol-upgrades). A
+node whose data directory still holds another chain — the test network that ran until 1.0.0, or a
+chain of your own — refuses to start, names both genesis hashes and the files to move aside:
 
 ```bash
 mv helix-data.redb helix-data.redb.pre-reset.bak    # never delete it
@@ -184,7 +185,7 @@ mv helix-peers.txt helix-peers.txt.pre-reset.bak
 
 Keep `validator-key.json` and `validator-key.signing-state.json` — the key carries over, and the
 signing state starts over on the new chain by itself. In the desktop wallet: **Validate → Reset
-local chain**. Balances and stakes of the old chain do not carry over.
+local chain**. Balances and stakes of the other chain do not carry over.
 
 ### Protocol upgrades
 
@@ -247,14 +248,15 @@ whichever peer replies first.
 
 ## Disk usage
 
-The chain database grows with every block — about 17 KB for an empty block, about 47 KB per block
-on the previous testnet chain (4–6 validators, light traffic), roughly 2 GB a day. Unset, a node
+The chain database grows with every block — about 17 KB for an empty block, about 50 KB per block
+on mainnet with 16 validators (measured 2026-10-14), and about 55,000 blocks a day: roughly 2.8 GB a
+day. Unset, a node
 keeps everything, which is what an archive node is for. Everyone else should set a limit:
 
 - **`HELIX_KEEP_BYTES=20G`** keeps as many recent blocks as fit in that much disk, whatever size
   blocks turn out to be. The database file grows in doubling steps and never shrinks, so ask for a
   little less than the power of two you mean: `120G` keeps it at 128 GB, `128G` can take it to 256.
-- **`HELIX_KEEP_BLOCKS=100000`** keeps a fixed number of blocks (a little over two days).
+- **`HELIX_KEEP_BLOCKS=100000`** keeps a fixed number of blocks (a little under two days at that pace).
 
 Set both and the tighter one applies; at least 1000 blocks are always kept, and the genesis block
 is never dropped. Pruning also runs while a new node catches up. Old blocks are deleted in batches
@@ -360,8 +362,8 @@ votes twelve times; a third of its precommits reached the next proposer too late
 
 ## Becoming a validator
 
-The steps, the stake and delegation are in [Staking](staking.md#staking). What matters for the
-node:
+From an empty machine to a signing validator, step by step: the [Validator guide](validator-guide.md).
+The stake and delegation are in [Staking](staking.md#staking). What matters for the node:
 
 - **Sync first, stake last.** Start the node, wait until `helix chain status` shows peers and a
   moving height, and only then send the stake. A validator is expected to sign as soon as it is

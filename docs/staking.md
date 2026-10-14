@@ -14,6 +14,9 @@ Three ways to put HLX to work — they combine freely:
 
 ### Running a validator
 
+> Setting up the machine and the node first? The [Validator guide](validator-guide.md) goes from an
+> empty machine to a signing validator; this section is the staking part of it.
+
 > **Stake the address your node signs with — no other.** The node's identity is its
 > `validator-key.json`. Stake a different wallet and that wallet's address becomes a validator
 > nothing signs for; it will never be promoted and earns nothing. Step 1 checks this.
@@ -81,7 +84,7 @@ against the first.
 missed block you should have signed adds 2 to a counter, each signed one takes 1 off, so the
 counter grows while you sign less than two thirds of your blocks. At the threshold you are jailed:
 
-- after **1,800 blocks** of complete silence (about an hour);
+- after **1,800 blocks** of complete silence (45–50 minutes at the chain's pace in its first week);
 - and also, over a longer stretch, if you keep signing less than two thirds — what the quorum needs
   from each validator.
 

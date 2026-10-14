@@ -12,7 +12,7 @@ Helix is built for the post-quantum era from the first line: every signature is 
 Tendermint-style BFT finality, a fuel-metered WASM contract VM, ZK-STARK proofs (hash-based, no
 elliptic curves), human-readable `.hlx` names and social wallet recovery.
 
-**It runs.** The public network finalizes a block every two seconds, co-signed by validators
+**It runs.** The public network finalizes a block every one to two seconds, co-signed by validators
 that independent operators run on their own hardware. A freshly downloaded binary finds the
 network, checks its genesis against the one compiled in, recomputes the genesis state instead of
 trusting the peer that served it, syncs, and follows the chain — with no configuration. Every
@@ -32,9 +32,9 @@ and nothing here promises that HLX is worth anything. **HLX is not an investment
   chain in three commands.
 - 💰 **Holding HLX, or want to earn rewards?** → [Using the CLI](docs/cli.md#using-the-cli-helix)
   and [Staking](docs/staking.md#staking) — you can delegate without running a node.
-- 🖥️ **Running a validator?** → [Installation](docs/installation.md#installation) →
-  [Running a Node](docs/running-a-node.md#running-a-node), or the desktop wallet's **Node** tab —
-  both run the same `helix` binary.
+- 🖥️ **Running a validator?** → the [Validator guide](docs/validator-guide.md) — machine, settings,
+  staking and day-to-day in one place — or the desktop wallet's **Validate** tab. Both run the same
+  `helix` binary.
 - 🔬 **Here for the internals?** → [Consensus](docs/internals.md#consensus),
   [Cryptography](docs/internals.md#cryptography--determinism) and the
   [Reference](docs/reference.md#reference).
@@ -175,6 +175,7 @@ it is co-signing — compiled into the binary.
 ## Documentation
 
 - **[Installation](docs/installation.md)** — system requirements, downloads, building from source
+- **[Validator guide](docs/validator-guide.md)** — from an empty machine to a validator that signs every block: profiles for a data center, a home line and a small machine
 - **[Running a node](docs/running-a-node.md)** — settings, disk limits, joining the network, proxies and tunnels, validators, Docker
 - **[Using the CLI](docs/cli.md)** — wallets, sending, fees, names, contracts, personhood, recovery, governance
 - **[Staking and delegation](docs/staking.md)** — run a validator, or delegate to one
@@ -206,7 +207,7 @@ issues have been found and fixed this way; every one is described in the commit 
   (at most ±12.5% per block). Wallets cap a fee they price themselves at 1 HLX.
 - **Validators.** Signing two different votes for the same height and round is provable on-chain
   and costs 5% of stake, once per offence. A validator that stops signing is jailed: one that is
-  completely silent after 1,800 blocks (about an hour), and one that signs less than two thirds
+  completely silent after 1,800 blocks (45–50 minutes), and one that signs less than two thirds
   of its blocks over time as well. It returns with an explicit `Unjail` transaction.
 - **Network.** A node forwards only messages it has decoded and accepted, holds the author —
   never the relaying node — responsible for bad data, bounds every message and response it
