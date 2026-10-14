@@ -107,7 +107,7 @@ pub async fn show_account(address: &str, node: &str) -> Result<()> {
     if let Some(unlock_height) = res["jailed_until"].as_u64() {
         println!("  Jailed   : downtime-jailed, can submit `tx unjail` at block #{unlock_height}");
     } else if let Some(missed) = res["missed_blocks"].as_u64() {
-        println!("  Missed   : {missed} consecutive blocks without a signature seen (resets on the next one)");
+        println!("  Missed   : {}", downtime_debt_line(missed));
     }
     println!("  Nonce    : {}", res["nonce"]);
 
@@ -151,5 +151,31 @@ mod tests {
     #[test]
     fn a_hash_of_exactly_the_display_width_is_not_marked_as_truncated() {
         assert_eq!(short_hash(Some("0123456789abcdef")), "0123456789abcdef");
+    }
+}
+
+/// What `missed_blocks` means since the downtime rule became a rate (#198): a debt, not a run of
+/// misses — each block not signed adds `MISS_WEIGHT`, each signed one takes `PARTICIPATION_CREDIT`
+/// off, and the validator is jailed at `DOWNTIME_JAIL_THRESHOLD_BLOCKS`. The line said
+/// "consecutive blocks … (resets on the next one)" until 2026-10-14, which an operator would read
+/// as harmless right after any signature.
+fn downtime_debt_line(missed: u64) -> String {
+    use helix_executor::state::{DOWNTIME_JAIL_THRESHOLD_BLOCKS, MISS_WEIGHT, PARTICIPATION_CREDIT};
+    format!(
+        "downtime debt {missed} of {DOWNTIME_JAIL_THRESHOLD_BLOCKS} — +{MISS_WEIGHT} per block not \
+         signed, -{PARTICIPATION_CREDIT} per block signed; jailed at {DOWNTIME_JAIL_THRESHOLD_BLOCKS}"
+    )
+}
+
+#[cfg(test)]
+mod downtime_debt_line_tests {
+    use super::downtime_debt_line;
+
+    #[test]
+    fn the_downtime_line_reads_as_a_debt_with_its_threshold() {
+        let line = downtime_debt_line(42);
+        assert!(line.contains("downtime debt 42 of 3600"), "{line}");
+        assert!(line.contains("jailed at 3600"), "{line}");
+        assert!(!line.contains("consecutive"), "the old reading: {line}");
     }
 }

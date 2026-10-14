@@ -502,8 +502,8 @@ async fn get_blocks_range(
     (StatusCode::OK, Json(blocks)).into_response()
 }
 
-/// How many large answers — a bincode block batch, a state snapshot, a checkpoint — this node
-/// builds at once. Block ranges have their own places, `VIEW_RESPONSES`.
+/// How many bincode block batches this node builds at once. Block ranges (`VIEW_RESPONSES`) and
+/// state answers (`STATE_RESPONSES`) have places of their own.
 ///
 /// Each one holds its blocks in memory while it is being built, and these endpoints need no
 /// account and cost the asker nothing: without a bound, memory was whatever the number of
@@ -536,6 +536,21 @@ static VIEW_RESPONSES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_ne
 async fn view_response_permit(
 ) -> Result<tokio::sync::SemaphorePermit<'static>, axum::response::Response> {
     permit_or_busy(&VIEW_RESPONSES, HEAVY_RESPONSE_WAIT).await
+}
+
+/// The same for `/sync/checkpoint` and `/sync/snapshot`, which copy a whole stored state — kept
+/// apart from the block batches for the same reason as block ranges, and with more at stake.
+///
+/// They are how a node joins fast from a checkpoint, the path the docs recommend for a small
+/// machine. Shared with the batches, the places were all held by other joiners' batches waiting
+/// for their paced turn, and the checkpoint answered 503 after its 30 s wait — measured on
+/// node.silvra.net on 2026-10-14, while the batches themselves were doing what the limit asks.
+/// Two places: a joiner asks for each once, and a state is the largest single thing a node copies.
+static STATE_RESPONSES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+async fn state_response_permit(
+) -> Result<tokio::sync::SemaphorePermit<'static>, axum::response::Response> {
+    permit_or_busy(&STATE_RESPONSES, HEAVY_RESPONSE_WAIT).await
 }
 
 /// The upload `/sync/blocks` answers may use, when this node's operator has set one
@@ -987,8 +1002,8 @@ async fn get_sync_blocks(
 /// collects it — from several nodes, and only when they agree.
 async fn get_sync_checkpoint(State(state): State<AppState>) -> axum::response::Response {
     // Reads a whole stored state per request — cheap at today's size, but it grows with every
-    // account, and every other answer that copies a state or a batch takes one of the same places.
-    let _permit = match heavy_response_permit().await {
+    // account, so it takes one of the places for state answers (`STATE_RESPONSES`).
+    let _permit = match state_response_permit().await {
         Ok(permit) => permit,
         Err(busy) => return busy,
     };
@@ -1066,7 +1081,7 @@ async fn get_state_snapshot(
     // the joiner is checking it, so it can never be named by a checkpoint.
     let asked: Option<u64> = params.get("height").and_then(|v| v.trim().parse().ok());
     // A copy of the whole state per request, and the state grows with every account anyone opens.
-    let _permit = match heavy_response_permit().await {
+    let _permit = match state_response_permit().await {
         Ok(permit) => permit,
         Err(busy) => return busy,
     };
@@ -4716,20 +4731,33 @@ mod tests {
         drop(every_view_place);
     }
 
-    /// `/sync/checkpoint` reads a whole stored state per request, so it takes one of the heavy
-    /// places like every other answer that copies a state or a batch. Held only briefly here:
-    /// the places are shared by every test in this binary, and one that needs a place waits.
+    /// `/sync/checkpoint` reads a whole stored state per request, so it takes one of the places for
+    /// state answers — never one a block batch holds. Held only briefly here: the places are shared
+    /// by every test in this binary, and one that needs a place waits.
     #[tokio::test]
-    async fn the_checkpoint_waits_for_a_heavy_place() {
+    async fn a_checkpoint_does_not_wait_behind_block_batches_but_keeps_a_bound_of_its_own() {
         let state = fresh_test_state_with_blocks(1).await;
-        let every_place = HEAVY_RESPONSES.acquire_many(4).await.unwrap();
+
+        // Every place a block batch can hold is taken — by other joiners' batches waiting for their
+        // paced turn. The checkpoint answers anyway (2026-10-14: 503 after a 30 s wait here).
+        let every_batch_place = HEAVY_RESPONSES.acquire_many(4).await.unwrap();
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            get_sync_checkpoint(State(state.clone())),
+        )
+        .await;
+        assert!(answered.is_ok(), "the checkpoint waited for a place a block batch holds");
+        drop(every_batch_place);
+
+        // Its own places are still a bound: taken, it waits, and answers once one is free.
+        let every_state_place = STATE_RESPONSES.acquire_many(2).await.unwrap();
         let while_taken = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             get_sync_checkpoint(State(state.clone())),
         )
         .await;
-        assert!(while_taken.is_err(), "answered while every heavy place was taken");
-        drop(every_place);
+        assert!(while_taken.is_err(), "answered while every place for state answers was taken");
+        drop(every_state_place);
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             get_sync_checkpoint(State(state)),
