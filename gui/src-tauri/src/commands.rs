@@ -142,6 +142,27 @@ pub fn lock_wallet(state: State<'_, WalletState>) {
     *state.inner.lock().unwrap() = None;
 }
 
+/// Use a different wallet: lock this one and move its file aside (renamed, never deleted — see
+/// `wallet::set_aside_at`), so the app opens on its start screen. Returns where the file went.
+///
+/// Refused while the app's own node runs: it runs as this wallet's key by default, and started
+/// again without the file it would create a fresh key in its place — which the app would then
+/// take for the wallet.
+#[tauri::command]
+pub fn set_aside_wallet(
+    app: AppHandle,
+    state: State<'_, WalletState>,
+    node: State<'_, crate::node_process::NodeProcessState>,
+) -> Result<String, String> {
+    if node.is_running() {
+        return Err("Stop the node in Validate first — it runs as this wallet's key.".into());
+    }
+    *state.inner.lock().unwrap() = None;
+    let backup = wallet::set_aside_at(&wallet_path(&app)?)?;
+    log::info!("wallet set aside to {}", backup.display());
+    Ok(backup.to_string_lossy().into_owned())
+}
+
 /// The person is using the wallet — restart the idle lock's count (`state::IDLE_LOCK_AFTER`).
 /// The frontend calls this on input, at most every half minute. It cannot keep a locked wallet
 /// open or reopen one: on a locked wallet it does nothing.

@@ -37,6 +37,9 @@ export const api = {
 
   lockWallet: () => invoke<void>("lock_wallet"),
 
+  // Use a different wallet: this one's file is moved aside (kept, never deleted). Returns where.
+  setAsideWallet: () => invoke<string>("set_aside_wallet"),
+
   // Set or change the wallet's passphrase. `current` is empty for a wallet that has none.
   changePassphrase: (current: string, next: string) =>
     invoke<void>("change_passphrase", { current: current || null, next }),
@@ -174,6 +177,24 @@ export const api = {
 /// transaction you send passes through someone else's machine, which can misreport the former
 /// and observe the latter.
 export const DEFAULT_NODE = "https://node.silvra.net";
+
+/// Endpoints that no longer exist. `helix.silvra.net` stopped resolving on 2026-08-26, when the
+/// public node moved to `node.silvra.net` — and a wallet that ever had it typed into its node field
+/// kept it across every update, failing every request with "error sending request".
+const RETIRED_NODES = ["helix.silvra.net"];
+
+/// The node a wallet should read from, given what it stored: the stored one, unless it names a
+/// retired endpoint — then nothing, and the caller falls back to `DEFAULT_NODE` and forgets it.
+export function usableStoredNode(stored: string | null): string | null {
+  if (!stored) return null;
+  let host: string;
+  try {
+    host = new URL(stored.trim()).hostname;
+  } catch {
+    return stored;
+  }
+  return RETIRED_NODES.includes(host) ? null : stored;
+}
 
 /// Where the bundled node's RPC lands. `node_process.rs` starts it without `HELIX_RPC_BIND`, so
 /// it takes the compiled-in default.

@@ -211,7 +211,14 @@ pub fn node_stop(state: State<'_, NodeProcessState>) -> Result<(), String> {
 
 #[tauri::command]
 pub fn node_process_status(state: State<'_, NodeProcessState>) -> NodeProcessStatus {
-    NodeProcessStatus { running: state.child.lock().unwrap().is_some() }
+    NodeProcessStatus { running: state.is_running() }
+}
+
+impl NodeProcessState {
+    /// Whether the app's own node is running.
+    pub(crate) fn is_running(&self) -> bool {
+        self.child.lock().unwrap().is_some()
+    }
 }
 
 /// Move this node's local chain database aside so the next start re-syncs from scratch.

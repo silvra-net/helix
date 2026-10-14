@@ -11,10 +11,13 @@ export default function Settings({
   address,
   encrypted,
   onPassphraseChanged,
+  onWalletSetAside,
 }: {
   address: string;
   encrypted: boolean;
   onPassphraseChanged: () => void;
+  /** Called once this wallet's file has been moved aside — the app goes back to its start screen. */
+  onWalletSetAside: () => void;
 }) {
   const [passphrase, setPassphrase] = useState("");
   // The passphrase form (#226) — separate from the reveal field above, which asks for the
@@ -33,6 +36,10 @@ export default function Settings({
   const [logDir, setLogDir] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [theme, setTheme] = useState<ThemePref>(getThemePref());
+  // "Use a different wallet": a first click asks, a second does it — the file is only moved, but
+  // whoever has not written its 24 words down should get one more look at that line.
+  const [asideAsked, setAsideAsked] = useState(false);
+  const [asideError, setAsideError] = useState<string | null>(null);
 
   const chooseTheme = (pref: ThemePref) => {
     setThemePref(pref);
@@ -246,6 +253,40 @@ export default function Settings({
             <button onClick={showPubkey}>Show public key</button>
           </div>
         )}
+      </div>
+
+      <div className="card">
+        <div className="section-title">Use a different wallet</div>
+        <p className="muted small" style={{ marginTop: -4 }}>
+          Opens the start screen, where you restore another wallet from its 24 words or create a new
+          one. This wallet's file is moved aside and kept as a backup next to it — nothing is
+          deleted — but make sure you have its 24 words before you do this.
+        </p>
+        {asideError && <p className="text-warn small">{asideError}</p>}
+        <div className="row-actions end">
+          {asideAsked ? (
+            <>
+              <button onClick={() => setAsideAsked(false)}>Cancel</button>
+              <button
+                className="primary"
+                onClick={async () => {
+                  setAsideError(null);
+                  try {
+                    await api.setAsideWallet();
+                    onWalletSetAside();
+                  } catch (err) {
+                    setAsideError(String(err));
+                    setAsideAsked(false);
+                  }
+                }}
+              >
+                Yes, set this wallet aside
+              </button>
+            </>
+          ) : (
+            <button onClick={() => setAsideAsked(true)}>Use a different wallet…</button>
+          )}
+        </div>
       </div>
 
       <div className="card">

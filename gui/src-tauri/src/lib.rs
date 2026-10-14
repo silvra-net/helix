@@ -67,6 +67,7 @@ pub fn run() {
             commands::restore_wallet,
             commands::unlock_wallet,
             commands::lock_wallet,
+            commands::set_aside_wallet,
             commands::change_passphrase,
             commands::touch_wallet,
             commands::get_network,

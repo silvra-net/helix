@@ -127,10 +127,79 @@ fn encode(kp: &KeyPair, passphrase: Option<&str>) -> Result<KeyFile, String> {
     }
 }
 
+/// Move the wallet at `path` aside so the app starts over — for using a different wallet. Returns
+/// where it went.
+///
+/// **Renamed, never deleted**, like the chain database (`node_reset_chain`): the file may be the
+/// only copy of a key someone did not write the 24 words down for. Its signing state
+/// (`<name>.signing-state.json`, written beside it by a local node that runs as this wallet) goes
+/// with it under the same suffix — it records what *this* key last signed, and left behind it would
+/// guard the next wallet's key with another key's history.
+pub fn set_aside_at(path: &Path) -> Result<std::path::PathBuf, String> {
+    if !path.exists() {
+        return Err("No wallet to set aside.".into());
+    }
+    // Unix seconds, and a counter should two land in the same second.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(e)?
+        .as_secs();
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("wallet.json");
+    let backup_of = |p: &Path, n: u32| {
+        let base = p.file_name().and_then(|n| n.to_str()).unwrap_or(name).to_string();
+        let suffix = if n == 0 { format!("{stamp}") } else { format!("{stamp}-{n}") };
+        p.with_file_name(format!("{base}.set-aside.{suffix}.bak"))
+    };
+    let mut n = 0;
+    while backup_of(path, n).exists() {
+        n += 1;
+    }
+    let backup = backup_of(path, n);
+    let signing_state = path.with_extension("signing-state.json");
+    std::fs::rename(path, &backup).map_err(|err| format!("could not move the wallet aside: {err}"))?;
+    if signing_state.exists() {
+        std::fs::rename(&signing_state, backup_of(&signing_state, n))
+            .map_err(|err| format!("could not move the wallet's signing state aside: {err}"))?;
+    }
+    Ok(backup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use helix_crypto::Address;
+
+    /// Setting a wallet aside moves it — and its signing state — under a backup name, intact; the
+    /// place is then free for another wallet, and a second set-aside never overwrites the first.
+    #[test]
+    fn setting_a_wallet_aside_keeps_it_and_its_signing_state_and_frees_the_place() {
+        let dir = std::env::temp_dir().join(format!("helix-gui-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.json");
+        let first = create_at(&path, None).unwrap();
+        std::fs::write(dir.join("wallet.signing-state.json"), b"{\"h\":1}").unwrap();
+
+        let backup = set_aside_at(&path).unwrap();
+        assert!(!exists_at(&path), "the place is free");
+        assert!(!dir.join("wallet.signing-state.json").exists(), "the signing state went too");
+        let kept = KeyFile::load(&backup).unwrap().to_keypair(None).unwrap();
+        assert_eq!(Address::from_public_key(&kept.public).to_string(), first.address, "intact");
+        let state_backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.starts_with("wallet.signing-state.json.set-aside."));
+        assert!(state_backup.is_some(), "the signing state was renamed, not deleted");
+
+        create_at(&path, None).unwrap();
+        let second = set_aside_at(&path).unwrap();
+        assert_ne!(second, backup, "a second set-aside does not overwrite the first");
+        assert!(backup.exists() && second.exists());
+
+        assert!(set_aside_at(&path).is_err(), "nothing there, nothing to set aside");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn create_then_load_round_trips_the_same_address() {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, DEFAULT_NODE, LOCAL_NODE, isLocalNode } from "./api";
+import { api, DEFAULT_NODE, LOCAL_NODE, isLocalNode, usableStoredNode } from "./api";
 import { nextNode } from "./nodeChoice";
 import { nodeOfferAnswered, shouldOfferOwnNode } from "./nodePrompt";
 import OwnNodeOffer from "./components/OwnNodeOffer";
@@ -26,7 +26,14 @@ type Route = "home" | "send" | "receive" | "validate" | "earn" | "identity" | "g
 
 export default function App() {
   const [meta, setMeta] = useState<WalletMeta | null>(null);
-  const [node, setNode] = useState<string>(localStorage.getItem("helix-node") || DEFAULT_NODE);
+  const [node, setNode] = useState<string>(() => {
+    // A stored endpoint that no longer exists is forgotten here, once, so the wallet reads from
+    // the public node and auto-detection works again — see `usableStoredNode`.
+    const stored = localStorage.getItem("helix-node");
+    const usable = usableStoredNode(stored);
+    if (stored !== null && usable === null) localStorage.removeItem("helix-node");
+    return usable || DEFAULT_NODE;
+  });
   const [route, setRoute] = useState<Route>("home");
   const [net, setNet] = useState<NetworkStatus | null>(null);
   const [newMnemonic, setNewMnemonic] = useState<string | null>(null);
@@ -315,7 +322,15 @@ export default function App() {
           {route === "identity" && <Identity node={node} address={meta.address ?? ""} />}
           {route === "governance" && <Governance node={node} chainHeight={net?.height ?? 0} />}
           {route === "settings" && (
-            <Settings address={meta.address ?? ""} encrypted={meta.encrypted} onPassphraseChanged={refreshMeta} />
+            <Settings
+              address={meta.address ?? ""}
+              encrypted={meta.encrypted}
+              onPassphraseChanged={refreshMeta}
+              onWalletSetAside={() => {
+                setRoute("home");
+                refreshMeta();
+              }}
+            />
           )}
         </section>
 
