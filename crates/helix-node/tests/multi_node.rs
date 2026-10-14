@@ -893,6 +893,21 @@ async fn three_nodes_converge_on_identical_height_hash_and_state() {
 #[tokio::test]
 #[ignore = "spawns 3 real validator processes and grows the set by funding+staking two at runtime, waiting out their activation epochs at an accelerated block time (~2 min wall-clock) — run explicitly with --ignored, not on every CI push"]
 async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
+    three_validators_finalize_together(true).await;
+}
+
+/// The same set with one validator on `HELIX_P2P_RELAY=off`, the setting for a validator on a home
+/// line. Such a node follows committed blocks by block sync instead of hearing every peer's copy of
+/// them, so this asserts that a validator can do that and keep its place: at three equal voters
+/// the quorum is all three, so every block the chain finalizes carries this node's precommit, and
+/// it has to propose its own turns — which no amount of reading can fake.
+#[tokio::test]
+#[ignore = "spawns 3 real validator processes, one of them with relay off, and grows the set at runtime (~2 min wall-clock) — run explicitly with --ignored, not on every CI push"]
+async fn a_validator_that_does_not_relay_keeps_up_and_proposes_its_turns() {
+    three_validators_finalize_together(false).await;
+}
+
+async fn three_validators_finalize_together(c_relays: bool) {
     let _serialized = NODE_TEST_LOCK.lock().await;
     // B and C's validator identities are generated up front so their processes can start with a
     // matching `validator-key.json` (so they control the stake staked to their addresses) and so
@@ -928,7 +943,11 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
     // voting — a real multi-validator BFT round, proposal + two-phase commit, not a single-proposer
     // shortcut.
     let _node_b = spawn_node_with(VAL_B_RPC, VAL_B_P2P, Some(VAL_A_RPC), &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_b)], Some(&kp_b));
-    let _node_c = spawn_node_with(VAL_C_RPC, VAL_C_P2P, Some(VAL_A_RPC), &[fast, ("HELIX_P2P_SEED_PEERS", &seeds_c)], Some(&kp_c));
+    let mut env_c = vec![fast, ("HELIX_P2P_SEED_PEERS", seeds_c.as_str())];
+    if !c_relays {
+        env_c.push(("HELIX_P2P_RELAY", "off"));
+    }
+    let _node_c = spawn_node_with(VAL_C_RPC, VAL_C_P2P, Some(VAL_A_RPC), &env_c, Some(&kp_c));
     wait_until_reachable(VAL_B_RPC, Duration::from_secs(15)).await;
     wait_until_reachable(VAL_C_RPC, Duration::from_secs(15)).await;
 
@@ -976,6 +995,16 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
          proposer rotation isn't actually happening despite 3 active validators",
         distinct_proposers, target_height - start
     );
+    if !c_relays {
+        // Proposing is the part reading cannot fake: C's proposals and its committed blocks have to
+        // reach A and B although C hears no committed block over gossip itself.
+        assert!(
+            distinct_proposers.contains(&addr_c.to_string()),
+            "C, the validator with relay off, never proposed in the {} blocks after all three \
+             activated — proposers seen: {distinct_proposers:?}",
+            target_height - start
+        );
+    }
 
     // Same convergence check as the single-validator test above — rotation happening across
     // independent processes must not cost agreement on the result. Given a grace window rather

@@ -821,3 +821,147 @@ async fn a_follower_hears_neither_votes_nor_gossiped_blocks_and_votes_again_once
     }
     assert!(back, "told it validates again, the node did not hear votes again");
 }
+
+/// A validator that does not relay hears votes but no gossiped committed blocks, while a relaying
+/// node on the same sender, measured in the same seconds, hears both — and its own committed block
+/// still reaches its peer, because gossipsub sends to whoever is subscribed whether or not the
+/// sender is.
+///
+/// Why: on a home line the copies of each committed block every peer forwards were the largest
+/// thing on the download (~2 MB/s on V1 on 2026-10-13, with votes and proposals already off), and a
+/// validator finalizes each block itself from the precommits; a height it misses comes by block
+/// sync. Turning relay off is the operator's statement that the line is thin, so it turns these off
+/// too — for a validator, not only for a follower.
+#[tokio::test]
+async fn a_validator_that_does_not_relay_hears_votes_but_not_committed_blocks_and_still_sends_its_own()
+{
+    let kp = KeyPair::generate();
+    let (sender, sender_cmd, mut sender_events) =
+        P2PService::new(config(19_807, None), Arc::new(AtomicU64::new(0)), Arc::new(NoBlocks));
+    tokio::spawn(async move { sender.run().await });
+    let (relaying, _relaying_cmd, mut relaying_events) = P2PService::new(
+        config(19_808, Some(19_807)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(NoBlocks),
+    );
+    tokio::spawn(async move { relaying.run().await });
+    let (home, home_cmd, mut home_events) = P2PService::new(
+        P2PConfig { relay: false, ..config(19_809, Some(19_807)) },
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(NoBlocks),
+    );
+    tokio::spawn(async move { home.run().await });
+
+    // Enough distinct blocks that none repeats inside gossipsub's duplicate window (60 s), which
+    // would make the relaying control lose blocks for a reason that is not the one under test.
+    let blocks = chained_blocks(&kp, 200);
+    let mut next_block = 0usize;
+    let mut round = 0u32;
+    #[derive(Default, Debug)]
+    struct Heard {
+        relaying_votes: u32,
+        relaying_committed: u32,
+        home_votes: u32,
+        home_committed: u32,
+        sender_committed: u32,
+    }
+    // For `window`, the sender publishes a fresh vote and a fresh committed block every second;
+    // count what each of the three receives. A disconnect fails the test: silence must mean "not
+    // subscribed".
+    macro_rules! heard_within {
+        ($window:expr) => {{
+            let deadline = tokio::time::Instant::now() + $window;
+            let mut heard = Heard::default();
+            let mut next_send = tokio::time::Instant::now();
+            while tokio::time::Instant::now() < deadline {
+                if tokio::time::Instant::now() >= next_send {
+                    round += 1;
+                    sender_cmd.send(P2PCommand::BroadcastVote(a_prevote(&kp, round))).await.unwrap();
+                    let block = blocks[next_block % blocks.len()].clone();
+                    next_block += 1;
+                    sender_cmd
+                        .send(P2PCommand::BroadcastBlock(block, stand_in_certificate(&kp)))
+                        .await
+                        .unwrap();
+                    next_send = tokio::time::Instant::now() + Duration::from_secs(1);
+                }
+                tokio::select! {
+                    event = relaying_events.recv() => match event {
+                        Some(P2PEvent::NewVote(_)) => heard.relaying_votes += 1,
+                        Some(P2PEvent::NewCommittedBlock(..)) => heard.relaying_committed += 1,
+                        Some(P2PEvent::PeerDisconnected(p)) => {
+                            panic!("the relaying node lost a peer ({p}) — silence would prove nothing")
+                        }
+                        Some(_) => {}
+                        None => panic!("the relaying node stopped"),
+                    },
+                    event = home_events.recv() => match event {
+                        Some(P2PEvent::NewVote(_)) => heard.home_votes += 1,
+                        Some(P2PEvent::NewCommittedBlock(..)) => heard.home_committed += 1,
+                        Some(P2PEvent::PeerDisconnected(p)) => {
+                            panic!("the home node lost a peer ({p}) — silence would prove nothing")
+                        }
+                        Some(_) => {}
+                        None => panic!("the home node stopped"),
+                    },
+                    event = sender_events.recv() => match event {
+                        Some(P2PEvent::NewCommittedBlock(..)) => heard.sender_committed += 1,
+                        Some(_) => {}
+                        None => panic!("the sender stopped"),
+                    },
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                }
+            }
+            heard
+        }};
+    }
+
+    // Control: both receivers connected and hearing votes.
+    let connect_by = tokio::time::Instant::now() + Duration::from_secs(60);
+    let (mut relaying_up, mut home_up) = (false, false);
+    while tokio::time::Instant::now() < connect_by && !(relaying_up && home_up) {
+        let heard = heard_within!(Duration::from_secs(2));
+        relaying_up |= heard.relaying_votes > 0;
+        home_up |= heard.home_votes > 0;
+    }
+    assert!(
+        relaying_up && home_up,
+        "votes never reached both receivers (relaying {relaying_up}, home {home_up}) — the \
+         connections are broken and this test proves nothing"
+    );
+
+    // Same sender, same seconds: the relaying node hears committed blocks — the control that makes
+    // the home node's zero mean something — and the home node hears votes but none of them.
+    let _ = heard_within!(Duration::from_secs(4));
+    let heard = heard_within!(Duration::from_secs(10));
+    assert!(
+        heard.relaying_committed >= 3,
+        "the relaying node must hear committed blocks, or the home node's silence proves nothing: \
+         {heard:?}"
+    );
+    assert!(heard.home_votes >= 3, "a validator that does not relay still hears votes: {heard:?}");
+    assert_eq!(
+        heard.home_committed, 0,
+        "a node that does not relay follows committed blocks by block sync, not gossip: {heard:?}"
+    );
+
+    // Its own committed block — it proposed it — still reaches the peer it is connected to.
+    let own = chained_blocks(&KeyPair::generate(), 1).remove(0);
+    home_cmd
+        .send(P2PCommand::BroadcastBlock(own, stand_in_certificate(&kp)))
+        .await
+        .unwrap();
+    let mut arrived = false;
+    let by = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < by && !arrived {
+        match tokio::time::timeout(Duration::from_millis(500), sender_events.recv()).await {
+            Ok(Some(P2PEvent::NewCommittedBlock(..))) => arrived = true,
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => panic!("the sender stopped"),
+        }
+    }
+    assert!(
+        arrived,
+        "a node that does not subscribe to committed blocks must still be able to publish its own"
+    );
+}

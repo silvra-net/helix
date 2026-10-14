@@ -492,6 +492,13 @@ impl P2PService {
             committed: &committed_topic,
             transactions: &tx_topic,
         };
+        if !config.relay {
+            set_consensus_gossip(&mut swarm, &consensus_topics, false, false, false, false);
+            info!(
+                "Relay is off — this node follows committed blocks by block sync instead of hearing \
+                 every peer's copy of them; it still hears proposals and votes while it validates"
+            );
+        }
 
         let listen_addr: Multiaddr = format!(
             "/ip4/{}/tcp/{}",
@@ -1368,6 +1375,7 @@ impl P2PService {
                                 !consensus_gossip_on,
                                 follow_only,
                                 follower_fallback,
+                                config.relay,
                             );
                         }
                         continue;
@@ -1405,7 +1413,7 @@ impl P2PService {
                             best_claimed,
                             catch_up_still_ticks,
                         );
-                        let fallback = follow_only
+                        let fallback = committed_by_block_sync(follow_only, config.relay)
                             && follower_needs_committed_gossip(
                                 follower_fallback,
                                 our_tip,
@@ -1420,13 +1428,14 @@ impl P2PService {
                                 !consensus_gossip_on,
                                 follow_only,
                                 follower_fallback,
+                                config.relay,
                             );
                             let behind = best_claimed.map(|b| b.saturating_sub(our_tip));
                             if fallback {
                                 warn!(
                                     height = our_tip,
                                     behind = ?behind,
-                                    "Block sync has not moved this follower for 90 s — hearing \
+                                    "Block sync has not moved this node for 90 s — hearing \
                                      committed blocks over gossip again until it is close"
                                 );
                             } else {
@@ -1441,6 +1450,7 @@ impl P2PService {
                                 !consensus_gossip_on,
                                 follow_only,
                                 follower_fallback,
+                                config.relay,
                             );
                             let behind = best_claimed.map(|b| b.saturating_sub(our_tip));
                             if listen {
@@ -1879,6 +1889,7 @@ impl P2PService {
                                     !consensus_gossip_on,
                                     follow_only,
                                     follower_fallback,
+                                    config.relay,
                                 );
                                 if follow {
                                     info!(
@@ -1886,8 +1897,14 @@ impl P2PService {
                                          sync, without the votes, proposals and gossiped copies of \
                                          blocks the validators exchange"
                                     );
-                                } else {
+                                } else if config.relay {
                                     info!("In the validator set — hearing votes and proposals again");
+                                } else {
+                                    info!(
+                                        "In the validator set — hearing votes and proposals again; \
+                                         committed blocks still come by block sync, because this \
+                                         node does not relay"
+                                    );
                                 }
                             }
                         }
@@ -3148,7 +3165,8 @@ fn listen_to_consensus_gossip(
 /// hears committed blocks over gossip again.
 const FOLLOWER_FALLBACK_GAP: u64 = 10;
 
-/// Whether a follower should hear committed blocks over gossip after all, given whether it does.
+/// Whether a node that follows committed blocks by block sync ([`committed_by_block_sync`]) should
+/// hear them over gossip after all, given whether it does.
 ///
 /// A follower follows by block sync, even at the tip: it asks for what its peers announce, and each
 /// block reaches it once. Over gossip each block reached it many times — every validator that
@@ -3171,6 +3189,21 @@ fn follower_needs_committed_gossip(
     hearing || ticks_since_rise >= CATCH_UP_STALL_TICKS
 }
 
+/// Whether this node follows committed blocks by block sync rather than hearing them over gossip.
+///
+/// A follower always does (`P2PCommand::FollowOnly`). So does a validator that does not relay:
+/// `relay: false` is the switch for a node on a thin line, and gossiped committed blocks were the
+/// largest thing on that line — every peer forwards every copy to every other, ~2 MB/s of V1's
+/// ~25 Mbit download on 2026-10-13 with votes and proposals already off. A validator does not need
+/// them to keep up: it finalizes each block itself from the precommits it hears, and a height it
+/// missed comes by block sync, whose tip it learns from the very next proposal. What it publishes
+/// is untouched — gossipsub sends to every peer subscribed to a topic whether or not the sender is,
+/// so its own committed blocks still go out (`7ab6c82`: as their proposer). With relay on nothing
+/// changes, so this is a choice the operator makes with the switch, not a new default for the set.
+fn committed_by_block_sync(follow_only: bool, relay: bool) -> bool {
+    follow_only || !relay
+}
+
 /// The gossip topics a node may stop hearing, in the two groups the rules decide about.
 struct ConsensusTopics<'a> {
     proposals: &'a gossipsub::IdentTopic,
@@ -3181,7 +3214,8 @@ struct ConsensusTopics<'a> {
 
 /// Subscribe to, or unsubscribe from, each topic as the rules say: a node catching up from far
 /// behind hears none of them ([`listen_to_consensus_gossip`]); a follower hears transactions only
-/// (`P2PCommand::FollowOnly`) and follows by block sync, unless that has stalled
+/// (`P2PCommand::FollowOnly`); a follower and a node that does not relay follow committed blocks by
+/// block sync ([`committed_by_block_sync`]), unless that has stalled
 /// ([`follower_needs_committed_gossip`]). Idempotent —
 /// gossipsub answers a repeated subscribe or unsubscribe with "no change". The peer-exchange topic
 /// is never touched.
@@ -3191,9 +3225,11 @@ fn set_consensus_gossip(
     catching_up_deaf: bool,
     follow_only: bool,
     follower_fallback: bool,
+    relay: bool,
 ) {
     let hear_votes = !catching_up_deaf && !follow_only;
-    let hear_committed = !catching_up_deaf && (!follow_only || follower_fallback);
+    let hear_committed = !catching_up_deaf
+        && (!committed_by_block_sync(follow_only, relay) || follower_fallback);
     let hear_transactions = !catching_up_deaf;
     for (topic, hear) in [
         (topics.proposals, hear_votes),
@@ -4433,6 +4469,26 @@ mod peer_exchange_tests {
         // and goes off once close.
         assert!(needs(true, tip, behind, 0), "on and still behind: stays on");
         assert!(!needs(true, tip, close, 0), "on and close again: off");
+    }
+
+    /// Committed blocks come by block sync for a follower and for a node that does not relay —
+    /// a validator included — and over gossip only for a relaying validator, which is every node
+    /// that has not turned the switch.
+    #[test]
+    fn only_a_relaying_validator_hears_committed_blocks_over_gossip() {
+        use super::committed_by_block_sync;
+        for (follow_only, relay, by_block_sync) in [
+            (false, true, false),
+            (true, true, true),
+            (false, false, true),
+            (true, false, true),
+        ] {
+            assert_eq!(
+                committed_by_block_sync(follow_only, relay),
+                by_block_sync,
+                "follow_only {follow_only}, relay {relay}"
+            );
+        }
     }
 
     /// Only the failures that look like an answer too big for the link shrink the request. A dial

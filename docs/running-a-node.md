@@ -327,8 +327,8 @@ things about that by itself:
 - **Not in the validator set** (no stake, pending or jailed), it follows the chain by block sync
   even at the tip and does not take votes, proposals or gossiped copies of blocks at all: each block
   arrives once. *"Not in the validator set — following the chain by block sync …"*. Once its key is
-  in the set — probation included, where its signatures are already collected — it hears everything
-  again on the next tick.
+  in the set — probation included, where its signatures are already collected — it hears votes and
+  proposals again on the next tick, and gossiped blocks too unless relay is off (below).
 - **When block-sync answers do not arrive in time**, it asks for fewer blocks at once and for more
   again as answers come in: *"Block-sync answers are not arriving in time — asking for fewer
   blocks at once"*.
@@ -337,6 +337,16 @@ For the upload, `HELIX_P2P_RELAY=off` stops this node passing others' gossip on,
 `HELIX_RPC_SYNC_RATE` paces the block batches it serves over RPC — set it below the line's upload
 rate with room to spare: a tunnel adds its own overhead (measured on 2026-10-13: at `700K` on a
 ~10 Mbit/s line the tunnel sent about 60 % more than the node gave it, and the line was full).
+
+`HELIX_P2P_RELAY=off` also takes the largest part of the download away from a validator: such a
+node does not hear the finished blocks its peers publish (every validator that finalizes a block
+sends its own copy, each with a full commit certificate — measured on 2026-10-13 about 2 MB/s on a
+fifteen-validator network). It still hears every proposal and vote, so it finalizes each block
+itself from the precommits it hears, and the block it proposes still reaches everyone. A height it
+misses arrives by block sync, as it does for a follower. *"Relay is off — this node follows
+committed blocks by block sync …"* at the start says so. If block sync does not move the node for
+90 seconds while it is more than ten blocks behind, it hears the gossiped blocks again until it is
+close.
 
 ---
 
