@@ -486,7 +486,7 @@ async fn get_blocks_range(
 ) -> axum::response::Response {
     let from = params.get("from").copied().unwrap_or(0);
     let count = params.get("count").copied().unwrap_or(100).min(500);
-    let _permit = match heavy_response_permit().await {
+    let _permit = match view_response_permit().await {
         Ok(permit) => permit,
         Err(busy) => return busy,
     };
@@ -502,7 +502,8 @@ async fn get_blocks_range(
     (StatusCode::OK, Json(blocks)).into_response()
 }
 
-/// How many large answers — a block range, a bincode block batch — this node builds at once.
+/// How many large answers — a bincode block batch, a state snapshot, a checkpoint — this node
+/// builds at once. Block ranges have their own places, `VIEW_RESPONSES`.
 ///
 /// Each one holds its blocks in memory while it is being built, and these endpoints need no
 /// account and cost the asker nothing: without a bound, memory was whatever the number of
@@ -518,6 +519,23 @@ const HEAVY_RESPONSE_WAIT: std::time::Duration = std::time::Duration::from_secs(
 async fn heavy_response_permit(
 ) -> Result<tokio::sync::SemaphorePermit<'static>, axum::response::Response> {
     permit_or_busy(&HEAVY_RESPONSES, HEAVY_RESPONSE_WAIT).await
+}
+
+/// The same bound for `/blocks/range`, the block listing explorers and wallets read — kept apart
+/// from `HEAVY_RESPONSES` on purpose.
+///
+/// With an upload limit (`HELIX_RPC_SYNC_RATE`), a block batch holds its heavy place while it
+/// waits for its turn to be sent — up to ~25 s, and that is the point of the limit. Shared, the
+/// four places were held by joining nodes' batches whenever more than a few joined, and a 3 KB
+/// listing of forty blocks waited behind them: measured on 2026-10-14 at 12–20 s for every visitor
+/// of explorer.silvra.net, against 1 ms for a single block. A range is still built whole (up to 500
+/// blocks with their transactions), so it keeps a bound of its own; it just never queues behind
+/// a sync.
+static VIEW_RESPONSES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+async fn view_response_permit(
+) -> Result<tokio::sync::SemaphorePermit<'static>, axum::response::Response> {
+    permit_or_busy(&VIEW_RESPONSES, HEAVY_RESPONSE_WAIT).await
 }
 
 /// The upload `/sync/blocks` answers may use, when this node's operator has set one
@@ -4661,6 +4679,41 @@ mod tests {
             }
         );
         assert!(got.is_ok(), "a place freed during the wait must be handed over");
+    }
+
+    /// The explorer's block listing has places of its own: it answers while every place a block
+    /// batch can hold is taken, and is still bounded when its own are.
+    #[tokio::test]
+    async fn a_block_range_does_not_wait_behind_block_batches_but_keeps_a_bound_of_its_own() {
+        let state = fresh_test_state_with_blocks(3).await;
+        let query = || {
+            let mut params = std::collections::HashMap::new();
+            params.insert("from".to_string(), 0u64);
+            params.insert("count".to_string(), 3u64);
+            Query(params)
+        };
+
+        // Every heavy place held — as by joining nodes' batches waiting for their paced turn. The
+        // explorer's listing answers anyway (2026-10-14: it waited 12–20 s here).
+        let every_heavy_place = HEAVY_RESPONSES.acquire_many(4).await.unwrap();
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            get_blocks_range(State(state.clone()), query()),
+        )
+        .await;
+        assert!(answered.is_ok(), "a block range waited for a place a block batch holds");
+        assert_eq!(answered.unwrap().status(), StatusCode::OK);
+        drop(every_heavy_place);
+
+        // Its own places are still a bound: taken, it waits.
+        let every_view_place = VIEW_RESPONSES.acquire_many(4).await.unwrap();
+        let while_taken = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            get_blocks_range(State(state), query()),
+        )
+        .await;
+        assert!(while_taken.is_err(), "answered while every place for block ranges was taken");
+        drop(every_view_place);
     }
 
     /// `/sync/checkpoint` reads a whole stored state per request, so it takes one of the heavy
