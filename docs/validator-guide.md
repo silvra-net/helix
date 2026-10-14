@@ -48,7 +48,7 @@ Everything from A, plus:
 
 ```ini
 Environment=HELIX_P2P_RELAY=off
-# From the release after 1.0.1:
+# From 1.1.0:
 # Environment=HELIX_P2P_OUTBOUND_PEERS=4
 ```
 
