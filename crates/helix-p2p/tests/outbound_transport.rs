@@ -120,16 +120,24 @@ async fn without_an_outbound_target_the_same_node_dials_every_seed() {
 /// the target is reached — and not one more. Three seeds are up at the start, two are not; a node
 /// dialing in keeps the total above the floor, so only the top-up can explain a new peer. Once both
 /// missing seeds are up, exactly one of them is dialed.
+///
+/// Every other node here dials nothing it does not have to: the seeds dial nothing at all
+/// (`Some(0)`), the one that dials in stops at that one (`Some(1)`). Otherwise the count measured
+/// the network instead of this node: the node hands the later seeds' addresses on in its peer
+/// exchange, another peer dials one, that one learns this node's address the same way and dials it
+/// — an inbound peer this node rightly admits, and a sixth peer the assertion read as a dial too
+/// many. CI caught exactly that on 2026-10-14 (`906891d`, 6 against 5); this node's own dials are
+/// capped where they complete, before they are announced, so a sixth can only ever be inbound.
 #[tokio::test]
 async fn a_node_short_of_its_outbound_target_makes_it_up_on_the_redial_tick_and_stops_there() {
     let up = [19_861, 19_862, 19_863];
     let later = [19_864, 19_865];
     for port in up {
-        spawn_and_drain(config(port, &[], None));
+        spawn_and_drain(config(port, &[], Some(0)));
     }
     let seeds: Vec<u16> = up.iter().chain(later.iter()).copied().collect();
     let mut events = spawn(config(19_866, &seeds, Some(4)));
-    spawn_and_drain(config(19_867, &[19_866], None));
+    spawn_and_drain(config(19_867, &[19_866], Some(1)));
 
     let mut peers = HashSet::new();
     connected_after(&mut events, &mut peers, 10).await;
@@ -140,7 +148,7 @@ async fn a_node_short_of_its_outbound_target_makes_it_up_on_the_redial_tick_and_
     );
 
     for port in later {
-        spawn_and_drain(config(port, &[], None));
+        spawn_and_drain(config(port, &[], Some(0)));
     }
     // The redial tick is 30 s; its first run was at startup, before the two were up.
     connected_after(&mut events, &mut peers, 45).await;
