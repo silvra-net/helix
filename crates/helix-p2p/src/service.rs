@@ -579,6 +579,8 @@ impl P2PService {
         // Tip each peer last announced, so the block-sync driver below knows who to ask (#138).
         // Bounded by the connection limit and pruned on disconnect, so it cannot grow unbounded.
         let mut peer_tips: HashMap<PeerId, PeerRange> = HashMap::new();
+        // Each announcer's previous tip, to tell a stuck peer from a moving one (2026-10-20).
+        let mut announced_tips: AnnouncedTips<PeerId> = AnnouncedTips::new();
         // Unreadable peer-exchange messages per peer (backlog #166). Lives beside `peer_tips`
         // because it is the same kind of thing: per-peer state the loop owns and the pure helpers
         // must not.
@@ -797,6 +799,10 @@ impl P2PService {
 
                             match gossiped {
                                 Gossiped::PeerExchange(msg) => {
+                                    // Who wrote it — see the comment on `record_peer_tip` below.
+                                    let origin = message.source.unwrap_or(propagation_source);
+                                    let previous_tip =
+                                        announced_tips.observe(origin, msg.tip_height);
                                     let outcome = handle_peer_exchange_message(
                                         msg,
                                         &mut known_addrs,
@@ -811,6 +817,7 @@ impl P2PService {
                                             config.outbound_peers,
                                             outbound_peers.len() + pending_dials.len(),
                                         ),
+                                        previous_tip,
                                     );
                                     if let Some(range) = outcome.announced_range {
                                         // Credit the tip to whoever *wrote* the announcement, not to
@@ -832,7 +839,6 @@ impl P2PService {
                                         // signature-checked origin, not a self-declared one. Falling
                                         // back to the relay keeps the old behaviour for the case the
                                         // types allow but Strict rejects before it reaches us.
-                                        let origin = message.source.unwrap_or(propagation_source);
                                         if record_peer_tip(
                                             &mut peer_tips,
                                             &foreign_by_evidence,
@@ -2102,14 +2108,60 @@ struct PeerExchangeMsg {
 }
 
 /// Whether a peer announcing `peer_tip` should be served the blocks it is missing, given our own
-/// committed tip. Behind us, and by no more than [`MAX_CATCHUP_SERVE_BLOCKS`].
+/// committed tip and what the same peer announced the time before (`previous_tip`). Behind us, by
+/// no more than [`MAX_CATCHUP_SERVE_BLOCKS`] — **and stuck there**: its tip has not moved since its
+/// last announcement.
 ///
-/// Split out as a pure function so the bound is testable without a `Swarm` — including the two
-/// cases that matter and are easy to get backwards: a peer *ahead* of us must never trigger a
-/// serve (we are the ones behind then, and we have nothing it needs), and a peer claiming an
-/// absurdly low height must be refused rather than served the whole chain.
-fn should_serve_catchup(peer_tip: u64, our_tip: u64) -> bool {
-    peer_tip < our_tip && our_tip - peer_tip <= MAX_CATCHUP_SERVE_BLOCKS
+/// The last condition is from 2026-10-20 and it is most of what this function now decides.
+/// Announcements go out every 30 seconds and are gossiped across the network, so by the time one
+/// arrives the chain has usually moved on a few blocks: almost every peer looks "behind" in its own
+/// announcement while being perfectly current. With ~50 nodes that is more than one announcement a
+/// second, and each one made this node re-publish the newest blocks, each with a full commit
+/// certificate (~40 signatures), to every peer. Measured on the production node: in two minutes it
+/// re-published 52 of the 57 blocks finalized in them, a few hundred kB/s of a ~1.2 MB/s home
+/// uplink, while its own votes came late enough to cost it a third of its co-signatures.
+///
+/// The peer this exists for (#137) is one that stopped: a validator a block behind with no way to
+/// get that block, whose announcements therefore repeat the same height. One that is moving is
+/// catching up on its own, by gossip or block sync (#138, which did not exist when #137 was
+/// written). The first announcement from a peer is never evidence of either, so it is not served.
+///
+/// Split out as a pure function so the bound is testable without a `Swarm` — including the cases
+/// that are easy to get backwards: a peer *ahead* of us must never trigger a serve (we are the ones
+/// behind then), and a peer claiming an absurdly low height must be refused rather than served the
+/// whole chain.
+fn should_serve_catchup(peer_tip: u64, previous_tip: Option<u64>, our_tip: u64) -> bool {
+    previous_tip == Some(peer_tip)
+        && peer_tip < our_tip
+        && our_tip - peer_tip <= MAX_CATCHUP_SERVE_BLOCKS
+}
+
+/// The tip each announcer gave in its last peer-exchange message — the memory
+/// [`should_serve_catchup`] needs to tell a stuck peer from a moving one.
+///
+/// Keyed by the signed origin of the announcement, not the hop that relayed it. Announcers are
+/// network-wide and an identity costs nothing to make, so the map is bounded: past
+/// [`MAX_TRACKED_ANNOUNCERS`] it starts over, which only means the next announcement from each peer
+/// is a first one again — a serve delayed by one announcement, never a wrong one.
+struct AnnouncedTips<K> {
+    last: HashMap<K, u64>,
+}
+
+/// See [`AnnouncedTips`]. Several times any network this has run on, and each entry is small.
+const MAX_TRACKED_ANNOUNCERS: usize = 1024;
+
+impl<K: std::hash::Hash + Eq> AnnouncedTips<K> {
+    fn new() -> Self {
+        AnnouncedTips { last: HashMap::new() }
+    }
+
+    /// Records `tip` as `announcer`'s latest and returns the one it announced before, if any.
+    fn observe(&mut self, announcer: K, tip: u64) -> Option<u64> {
+        if self.last.len() >= MAX_TRACKED_ANNOUNCERS && !self.last.contains_key(&announcer) {
+            self.last.clear();
+        }
+        self.last.insert(announcer, tip)
+    }
 }
 
 /// Merges `incoming` into `known`, skipping our own address, anything already known, and anything
@@ -2600,6 +2652,8 @@ fn handle_peer_exchange_message(
     // False once this node has dialed as many peers as `P2PConfig::outbound_peers` allows: the
     // addresses are still learned — the redial tick may need them — only not dialed now.
     dial_new: bool,
+    // What the same announcer reported last time (`AnnouncedTips`).
+    previous_tip: Option<u64>,
 ) -> PeerExchangeOutcome {
     // Catch a peer that upgraded (or downgraded) while we keep running — the gap join-time
     // `peer_version_warning` cannot see (#109).
@@ -2631,7 +2685,7 @@ fn handle_peer_exchange_message(
         }
     }
 
-    tip_outcome(&msg, our_tip, our_genesis)
+    tip_outcome(&msg, our_tip, our_genesis, previous_tip)
 }
 
 /// What a decoded peer-exchange message means for syncing: whose tip we record, and whom we serve.
@@ -2639,7 +2693,12 @@ fn handle_peer_exchange_message(
 /// Split out from `handle_peer_exchange_message` because that one needs a live `Swarm` to dial the
 /// addresses it learns, which is exactly the kind of dependency that leaves the interesting decision
 /// untested. This half is pure.
-fn tip_outcome(msg: &PeerExchangeMsg, our_tip: u64, our_genesis: &str) -> PeerExchangeOutcome {
+fn tip_outcome(
+    msg: &PeerExchangeMsg,
+    our_tip: u64,
+    our_genesis: &str,
+    previous_tip: Option<u64>,
+) -> PeerExchangeOutcome {
     // A peer on another chain gets no say in what we sync (backlog #175). Its height is a real
     // number about a chain we are not on, and letting it through made a freshly reset node chase
     // its own dead history: right after the 2026-08-07 reset, V1 sat at height 70 while operator
@@ -2672,7 +2731,8 @@ fn tip_outcome(msg: &PeerExchangeMsg, our_tip: u64, our_genesis: &str) -> PeerEx
             tip: msg.tip_height,
             earliest: msg.earliest_block,
         }),
-        serve_from_tip: should_serve_catchup(msg.tip_height, our_tip).then_some(msg.tip_height),
+        serve_from_tip: should_serve_catchup(msg.tip_height, previous_tip, our_tip)
+            .then_some(msg.tip_height),
     }
 }
 
@@ -4061,6 +4121,7 @@ mod peer_exchange_tests {
     use super::{
         at, decode_peer_exchange, foreign_chain_warning, foreign_version_warning,
         peer_chain, select_new_addrs, should_serve_catchup, tip_outcome, unreadable_peer_exchange,
+        AnnouncedTips, MAX_TRACKED_ANNOUNCERS,
         PeerChain, PeerExchangeMsg, PeerExchangeMsgV1, PeerExchangeMsgV2, MAX_CATCHUP_SERVE_BLOCKS,
         MAX_KNOWN_PEER_ADDRS, OUR_VERSION, UNREADABLE_PEER_EXCHANGE_TOLERANCE,
     };
@@ -4122,10 +4183,28 @@ mod peer_exchange_tests {
 
     /// The production incident in one assertion (#137): a validator one block behind the rest of
     /// the set. Before this mechanism existed there was no way for it to ever obtain that block,
-    /// and because it was part of the quorum the whole chain stopped with it.
+    /// and because it was part of the quorum the whole chain stopped with it. It is stuck, so its
+    /// announcements repeat the same height.
     #[test]
-    fn a_peer_one_block_behind_is_served() {
-        assert!(should_serve_catchup(26261, 26262));
+    fn a_peer_stuck_one_block_behind_is_served() {
+        assert!(should_serve_catchup(26261, Some(26261), 26262));
+    }
+
+    /// 2026-10-20: an announcement is up to 30 seconds old when it arrives, so a peer that is
+    /// keeping up looks a few blocks behind in it. Serving it re-published nearly every block to
+    /// every peer — 52 of 57 in two minutes on the production node. Its tip moved since its last
+    /// announcement, so it is not stuck, and it is not served.
+    #[test]
+    fn a_peer_whose_tip_moved_since_its_last_announcement_is_not_served() {
+        assert!(!should_serve_catchup(638365, Some(638352), 638368));
+        assert!(!should_serve_catchup(26261, Some(26260), 26262), "one block is progress");
+    }
+
+    /// Nothing is known about a peer from its first announcement, so it is not served yet; if it is
+    /// stuck, its next one says so, thirty seconds later.
+    #[test]
+    fn a_peers_first_announcement_is_not_evidence_that_it_is_stuck() {
+        assert!(!should_serve_catchup(26261, None, 26262));
     }
 
     /// The direction that must stay silent. When the peer is ahead, *we* are the ones missing
@@ -4133,12 +4212,12 @@ mod peer_exchange_tests {
     /// would have every node in a healthy set spraying its tip at every other node forever.
     #[test]
     fn a_peer_ahead_of_us_is_never_served() {
-        assert!(!should_serve_catchup(26263, 26262));
+        assert!(!should_serve_catchup(26263, Some(26263), 26262));
     }
 
     #[test]
     fn a_peer_at_our_own_height_is_never_served() {
-        assert!(!should_serve_catchup(26262, 26262));
+        assert!(!should_serve_catchup(26262, Some(26262), 26262));
     }
 
     /// The anti-amplification bound. `tip_height` arrives unauthenticated over gossip, so the
@@ -4146,7 +4225,7 @@ mod peer_exchange_tests {
     #[test]
     fn a_peer_claiming_to_be_hopelessly_behind_is_refused() {
         assert!(
-            !should_serve_catchup(0, 26262),
+            !should_serve_catchup(0, Some(0), 26262),
             "a peer claiming height 0 on a long chain must not make us republish the chain"
         );
     }
@@ -4155,11 +4234,19 @@ mod peer_exchange_tests {
     fn the_serve_bound_is_inclusive_at_its_edge_and_refuses_beyond_it() {
         let our_tip = 26262;
         assert!(
-            should_serve_catchup(our_tip - MAX_CATCHUP_SERVE_BLOCKS, our_tip),
+            should_serve_catchup(
+                our_tip - MAX_CATCHUP_SERVE_BLOCKS,
+                Some(our_tip - MAX_CATCHUP_SERVE_BLOCKS),
+                our_tip
+            ),
             "exactly at the bound must still be served"
         );
         assert!(
-            !should_serve_catchup(our_tip - MAX_CATCHUP_SERVE_BLOCKS - 1, our_tip),
+            !should_serve_catchup(
+                our_tip - MAX_CATCHUP_SERVE_BLOCKS - 1,
+                Some(our_tip - MAX_CATCHUP_SERVE_BLOCKS - 1),
+                our_tip
+            ),
             "one past the bound belongs on the bulk RPC sync path"
         );
     }
@@ -4168,7 +4255,7 @@ mod peer_exchange_tests {
     /// fresh node — otherwise two empty nodes would serve each other nothing, noisily.
     #[test]
     fn two_nodes_at_genesis_do_not_serve_each_other() {
-        assert!(!should_serve_catchup(0, 0));
+        assert!(!should_serve_catchup(0, Some(0), 0));
     }
 
     // ── Block-sync stall reporting (#190) ────────────────────────────────────
@@ -4663,7 +4750,7 @@ mod peer_exchange_tests {
     fn a_foreign_chains_tip_is_not_recorded_or_served() {
         let ours = "6860abda";
         let foreign = msg_announcing(36378, "ff271e4a");
-        let outcome = tip_outcome(&foreign, 70, ours);
+        let outcome = tip_outcome(&foreign, 70, ours, None);
         assert_eq!(
             outcome.announced_range, None,
             "a foreign tip must not drive our sync"
@@ -4675,7 +4762,7 @@ mod peer_exchange_tests {
 
         // Positive control: the identical message from a peer on our chain still counts. Without
         // this, the test above would pass just as well if tips had stopped working altogether.
-        let outcome = tip_outcome(&msg_announcing(36378, ours), 70, ours);
+        let outcome = tip_outcome(&msg_announcing(36378, ours), 70, ours, None);
         assert_eq!(outcome.announced_range.map(|r| r.tip), Some(36378));
     }
 
@@ -4683,8 +4770,42 @@ mod peer_exchange_tests {
     /// `Unknown` arm load-bearing rather than decorative.
     #[test]
     fn a_peer_that_announced_no_genesis_is_still_worth_asking_for_blocks() {
-        let outcome = tip_outcome(&msg_announcing(500, ""), 70, "6860abda");
+        let outcome = tip_outcome(&msg_announcing(500, ""), 70, "6860abda", None);
         assert_eq!(outcome.announced_range.map(|r| r.tip), Some(500));
+    }
+
+    /// The memory and the rule together, the way the swarm loop uses them: a peer that keeps
+    /// announcing the same height behind ours is served from its second announcement on; one that
+    /// keeps moving never is, however far behind each announcement looks.
+    #[test]
+    fn a_stuck_announcer_is_served_and_a_moving_one_is_not() {
+        let ours = "6860abda";
+        let mut announced = AnnouncedTips::new();
+        let mut serve = |announcer: u8, tip: u64, our_tip: u64| {
+            let previous = announced.observe(announcer, tip);
+            tip_outcome(&msg_announcing(tip, ours), our_tip, ours, previous).serve_from_tip
+        };
+        assert_eq!(serve(1, 100, 103), None, "first announcement");
+        assert_eq!(serve(1, 100, 115), Some(100), "stuck at 100 while we moved on");
+        assert_eq!(serve(1, 100, 118), Some(100), "and still");
+        assert_eq!(serve(1, 100, 121), None, "but not past the bound: that is bulk sync's job");
+
+        assert_eq!(serve(2, 100, 103), None);
+        assert_eq!(serve(2, 112, 115), None, "moving, three behind in an old announcement");
+        assert_eq!(serve(2, 125, 128), None);
+    }
+
+    /// The memory is bounded — identities cost nothing — and starting over only delays a serve.
+    #[test]
+    fn the_announcer_memory_is_bounded() {
+        let mut announced = AnnouncedTips::new();
+        for announcer in 0..MAX_TRACKED_ANNOUNCERS as u32 {
+            announced.observe(announcer, 7);
+        }
+        assert_eq!(announced.observe(0, 7), Some(7), "a known announcer is remembered at the cap");
+        assert_eq!(announced.observe(u32::MAX, 7), None, "a new one past the cap starts over");
+        assert!(announced.last.len() <= MAX_TRACKED_ANNOUNCERS);
+        assert_eq!(announced.observe(u32::MAX, 7), Some(7), "and is remembered from then on");
     }
 
     /// Backlog #166: the first unreadable message explains itself, and does not cost a strike.
