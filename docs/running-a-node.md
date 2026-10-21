@@ -109,7 +109,7 @@ not start.
 | `HELIX_RPC_SYNC_RATE` | (none) | Upload the block batches other nodes fetch from this node's RPC (`/sync/blocks`) may use, e.g. `400K` (bytes per second, units K/M/G, binary; leave room below the line's upload rate — see [On a home connection](#on-a-home-connection)). Set, batches go out one at a time at that rate, only in the compact form (`encoding=bincode`; the JSON form is refused with 503). A batch that would wait longer than its client can still receive it is answered 503 with `Retry-After` at once: on a thin uplink, several joining nodes at once otherwise share the line so thinly that none of their batches finishes before the client gives up, and they retry forever. Unset serves at full speed. Zero or an unreadable value stops the start. |
 | `HELIX_P2P_OUTBOUND_PEERS` | (none) | **From 1.1.0** — older nodes do not read it. At most this many peers this node dials itself, e.g. `4`; at least 3. Peers that dial in are still accepted. Every peer passes every message on to every other, so a node hears each vote once per peer — on a home line, a few peers are enough and each one more is another copy of everything (see [On a home connection](#on-a-home-connection)). Unset dials every address it learns. A value below 3 or not a number stops the start. |
 | `HELIX_P2P_RELAY` | on | `off` stops this node passing other nodes' gossip on. It still receives and acts on everything and still sends its own votes, proposals and transactions. For a validator on a home connection whose upload fills up: a relay sends every message it receives to every other peer. Leave it on if other nodes reach the network only through yours. A value that is not yes/no stops the start. |
-| `HELIX_SYNC_PEER` | `https://node.silvra.net` | RPC endpoint of a node on the chain to join: the genesis and missing blocks come from it, and a follower polls it every 4 seconds for new blocks. |
+| `HELIX_SYNC_PEER` | `https://node.silvra.net` | RPC endpoint of a node on the chain to join: the genesis and the history come from it at the first start; after that it is the fallback when P2P stops closing a gap for 30 seconds (the node checks its height every 4 seconds). |
 | `HELIX_NEW_CHAIN` | off | `1` starts a chain of your own: the node signs its own genesis. For private chains and a new network's first node. |
 | `HELIX_GENESIS_VALIDATOR_LIQUID_HLX` | 1000 | How much the bootstrap validator holds liquid in the genesis of a chain this node launches (`HELIX_NEW_CHAIN=1`), in whole HLX — for a devnet that funds its validators from it. A node that joins a chain takes that chain's allocations from its peer and does not use it. A value the node cannot read stops the start. |
 | `HELIX_GENESIS_HASH` | the public chain's, compiled in | The genesis hash of the chain this node must be on — checked before anything is written, and at every start against the chain already stored. Set it to join another network, or when a binary's compiled-in hash predates a reset. |
@@ -310,9 +310,9 @@ never announces one nobody could reach. Set `HELIX_P2P_PUBLIC_ADDR` when discove
 ### Behind a reverse proxy or tunnel
 
 A proxy or Cloudflare tunnel forwards HTTPS and WebSockets on port 443, not raw TCP. Such a node can
-follow the chain over RPC, but a validator needs peers to reach its P2P port — votes and proposals
-travel only over P2P. So carry P2P inside a WebSocket, point the tunnel at it, and announce the
-public address:
+follow the chain over RPC, in steps of about 30 seconds, but a validator needs peers to reach its
+P2P port — votes and proposals travel only over P2P. So carry P2P inside a WebSocket, point the
+tunnel at it, and announce the public address:
 
 ```bash
 HELIX_P2P_WS_LISTEN="127.0.0.1:8547"                         # tunnel forwards 443 -> here

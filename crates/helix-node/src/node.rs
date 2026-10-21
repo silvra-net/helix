@@ -61,19 +61,18 @@ const VALIDATOR_KEY_PASSPHRASE_ENV: &str = "HELIX_VALIDATOR_KEY_PASSPHRASE";
 const DEFAULT_VALIDATOR_KEY_FILE: &str = "validator-key.json";
 
 
-/// The public production network's RPC endpoint. When a node has no local chain and no
-/// `sync_peer`/`HELIX_SYNC_PEER` configured, it seeds from here by default — so a freshly
-/// downloaded release joins the live Helix chain out of the box, with no manual peer setup.
-/// This one HTTPS endpoint supplies everything a joiner needs: the real genesis block, the
-/// full historical block download, an attempted direct P2P dial, and the target of the
-/// periodic RPC catch-up ([`rpc_sync_loop`]) that keeps a follower current even when the raw
-/// P2P port isn't publicly reachable (it runs behind a Cloudflare HTTPS tunnel). Opt out with
-/// `HELIX_NEW_CHAIN=1` to run a standalone chain instead (the production origin node and any
-/// local devnet do this). Override the endpoint itself with `HELIX_SYNC_PEER`.
 /// The chain database's filename, in the working directory. Named because the run record sits
 /// beside it and both paths have to agree.
 const CHAIN_DB_FILE: &str = "helix-data.redb";
 
+/// The public production network's RPC endpoint. When a node has no local chain and no
+/// `sync_peer`/`HELIX_SYNC_PEER` configured, it seeds from here by default — so a freshly
+/// downloaded release joins the live Helix chain out of the box, with no manual peer setup.
+/// This one HTTPS endpoint supplies everything a joiner needs: the real genesis block, the
+/// full historical block download, an attempted direct P2P dial, and the fallback of the
+/// periodic RPC catch-up ([`rpc_sync_loop`]) for a node whose P2P does not keep it current.
+/// Opt out with `HELIX_NEW_CHAIN=1` to run a standalone chain instead (the production origin
+/// node and any local devnet do this). Override the endpoint itself with `HELIX_SYNC_PEER`.
 pub use helix_core::DEFAULT_SEED_PEER;
 
 /// Re-exported from `helix_core::chain`, which is where it has to live: the wallet needs this
@@ -179,9 +178,30 @@ const RPC_SYNC_POLL_SECS: u64 = 4;
 /// network never had a working second validator.
 ///
 /// Above this gap the round is genuinely stale (the chain moved on without us) and catching up
-/// is the right call — that is the follower case this loop exists for, and it still applies
-/// immediately when no round is in flight.
+/// is the right call — as it is with no round in flight, once [`RpcCatchupGate`] lets the loop
+/// pull at all.
 const RPC_CATCHUP_ROUND_GRACE_BLOCKS: u64 = 3;
+
+/// How long the gap to the sync peer must stop closing before the periodic RPC catch-up pulls
+/// blocks itself (see [`RpcCatchupGate`]).
+///
+/// For nearly every node the sync peer is `node.silvra.net`: one validator on a home line with
+/// ~10 Mbit/s up. Until 2026-10-20 every node pulled from it on the first poll that found it
+/// ahead, so whenever validators fell behind, that one uplink carried their catch-up — and its
+/// own votes queued behind it. V1 was jailed on 2026-10-18, and on 2026-10-20 it co-signed 26 %
+/// of the blocks until its sync rate was throttled to 150 KB/s. P2P block sync spreads the same
+/// work over every peer a node has; this loop puts it on one. So the loop is the fallback now:
+/// it pulls only when P2P has had this long to close the gap and has not.
+///
+/// Thirty seconds is ~13 blocks and fifteen block-sync driver ticks — time for gossip and for the
+/// driver to ask more than one peer (a failed peer sits out ten seconds) — and short against the
+/// ~70 minutes a validator that signs nothing has before it is jailed.
+const RPC_CATCHUP_STALL_SECS: u64 = 30;
+
+/// The longest the RPC catch-up waits after pulls that failed in a row. The wait doubles from
+/// twice [`RPC_SYNC_POLL_SECS`] up to this, so a busy or broken sync peer is asked less often
+/// rather than on every poll.
+const RPC_CATCHUP_MAX_BACKOFF_SECS: u64 = 120;
 
 /// A yes/no setting: `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`/empty, in any case. `None`
 /// for anything else — `ture`, `enabled`, `y` — which [`flag_setting`] reads as "no", out loud.
@@ -1860,10 +1880,10 @@ impl HelixNode {
             }
         });
 
-        // Periodic RPC catch-up loop — keeps a follower current over the sync peer's HTTP RPC
-        // even when the peer's raw P2P port isn't publicly reachable (production runs behind a
-        // Cloudflare HTTPS tunnel that only exposes RPC). No-op for a standalone chain (no sync
-        // peer) or when P2P already keeps us current (each tick is then just a cheap probe).
+        // Periodic RPC catch-up loop — the fallback for a node whose P2P does not keep it current:
+        // pulls from the sync peer's HTTP RPC once the gap has stopped closing (`RpcCatchupGate`).
+        // No-op for a standalone chain (no sync peer); when P2P keeps us current, each tick is
+        // just a cheap height probe.
         tokio::spawn(rpc_sync_loop(
             self.sync_peer.clone(),
             self.store.clone(),
@@ -6515,21 +6535,6 @@ async fn fetch_peer_height(client: &reqwest::Client, peer_url: &str) -> Result<u
         .ok_or_else(|| anyhow::anyhow!("peer's /status has no height field"))
 }
 
-/// Periodic RPC catch-up: pull any blocks the sync peer has beyond our tip over plain HTTP,
-/// on a fixed interval, independent of P2P gossip.
-///
-/// libp2p gossip is the primary way a node stays current, but it needs the peer's raw P2P
-/// port to be reachable. The production node is served through a Cloudflare HTTPS tunnel that
-/// only exposes its RPC (not the raw libp2p TCP port), so a freshly downloaded follower would
-/// otherwise fetch history once at startup and then never see another block. This loop closes
-/// that gap over the one channel that *is* publicly reachable — the same RPC endpoint used for
-/// startup sync — so "download a node → it follows the live chain" holds even with no P2P
-/// connectivity at all. When P2P *is* reachable, gossip keeps the node current between polls
-/// and each tick is just one cheap height probe that finds nothing new.
-///
-/// Race-safe with the P2P/BFT apply path: it claims the shared `last_applied_height` guard
-/// (the same one `apply_finalized_block` uses) across the whole apply, so the two never
-/// double-apply a height — see `apply_finalized_block`'s doc comment for that race.
 /// Should the periodic RPC catch-up leave this poll alone and let consensus finish?
 ///
 /// Split out of [`rpc_sync_loop`] so the rule can be tested without a peer, a store or a clock —
@@ -6539,6 +6544,81 @@ fn catchup_defers_to_consensus(our_height: u64, peer_height: u64, round_in_fligh
     round_in_flight && peer_height.saturating_sub(our_height) <= RPC_CATCHUP_ROUND_GRACE_BLOCKS
 }
 
+/// When [`rpc_sync_loop`] may pull blocks from the sync peer: when P2P has stopped closing the
+/// gap — no new low for [`RPC_CATCHUP_STALL_SECS`] — and not again soon after a pull that failed.
+///
+/// "Stopped closing", not "behind": a node that P2P is carrying towards the tip, however far
+/// back it starts, never asks the sync peer, and one whose gap holds or grows does, whether P2P
+/// is down, too slow or merely keeping pace. A node level with the peer, or one that just pulled
+/// something, starts over.
+///
+/// A plain value, fed the time by its caller, so the rule is tested without a clock or a peer.
+#[derive(Debug, Default)]
+struct RpcCatchupGate {
+    /// When the gap reached its lowest value since this node was last level, and that value.
+    lowest_gap: Option<(std::time::Instant, u64)>,
+    /// After a failed pull, no further pull before this.
+    retry_at: Option<std::time::Instant>,
+    /// Failed pulls in a row.
+    failures: u32,
+}
+
+impl RpcCatchupGate {
+    /// Records the gap one poll saw and answers whether to pull now.
+    ///
+    /// `held`: production is held after a failed startup sync (#152). Such a node signs nothing
+    /// until it has caught up, so it does not wait for P2P — only the back-off applies to it.
+    fn should_pull(&mut self, gap: u64, held: bool, now: std::time::Instant) -> bool {
+        if gap == 0 {
+            *self = Self::default();
+            return false;
+        }
+        let since = match self.lowest_gap {
+            Some((since, lowest)) if gap >= lowest => since,
+            _ => {
+                self.lowest_gap = Some((now, gap));
+                now
+            }
+        };
+        if self.retry_at.is_some_and(|at| now < at) {
+            return false;
+        }
+        held || now.duration_since(since) >= Duration::from_secs(RPC_CATCHUP_STALL_SECS)
+    }
+
+    /// Records how a pull went. Blocks applied: start over. Nothing applied, or an error: wait
+    /// twice as long as last time before the next pull, up to [`RPC_CATCHUP_MAX_BACKOFF_SECS`].
+    fn pulled(&mut self, applied_any: bool, now: std::time::Instant) {
+        if applied_any {
+            *self = Self::default();
+            return;
+        }
+        self.failures = self.failures.saturating_add(1);
+        let wait = RPC_SYNC_POLL_SECS
+            .saturating_mul(1u64 << self.failures.min(16))
+            .min(RPC_CATCHUP_MAX_BACKOFF_SECS);
+        self.retry_at = Some(now + Duration::from_secs(wait));
+    }
+}
+
+/// Periodic RPC catch-up: pull blocks the sync peer has beyond our tip over plain HTTP, when P2P
+/// has not brought them (see [`RpcCatchupGate`]).
+///
+/// libp2p is how a node stays current: gossip at the tip, P2P block sync when it falls behind,
+/// both spread over every peer it has. This loop is the fallback for a node whose P2P does not
+/// carry it — no reachable peer, or none that serves — over the one channel every node has, the
+/// sync peer's RPC, the same endpoint as the startup sync. Every tick is one cheap height probe;
+/// a pull follows only when the gap has stopped closing for [`RPC_CATCHUP_STALL_SECS`]. A node
+/// with no P2P at all therefore follows the chain in steps of about that long.
+///
+/// Until 2026-10-20 it pulled on the first probe that found the peer ahead, which put the
+/// catch-up of every node that fell behind on one home uplink — see [`RPC_CATCHUP_STALL_SECS`].
+///
+/// Also releases block production held after a failed startup sync (#152) once level.
+///
+/// Race-safe with the P2P/BFT apply path: it claims the shared `last_applied_height` guard
+/// (the same one `apply_finalized_block` uses) across the whole apply, so the two never
+/// double-apply a height — see `apply_finalized_block`'s doc comment for that race.
 #[allow(clippy::too_many_arguments)]
 async fn rpc_sync_loop(
     sync_peer: Option<String>,
@@ -6566,6 +6646,7 @@ async fn rpc_sync_loop(
     let mut ticker = tokio::time::interval(Duration::from_secs(RPC_SYNC_POLL_SECS));
     // The first tick fires immediately; skip missed ticks rather than bursting to catch up.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut gate = RpcCatchupGate::default();
 
     loop {
         ticker.tick().await;
@@ -6580,16 +6661,22 @@ async fn rpc_sync_loop(
             }
         };
         let our_height = store.read().await.latest_height();
-        if peer_height <= our_height {
-            // Level with the peer. If a failed startup sync left production held (#152), this is
-            // the moment it is safe to release: we have what the peer has. Ordinary ticks reach
-            // here constantly and the store is a no-op after the first, so this costs nothing.
-            if syncing.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                info!(
-                    height = our_height,
-                    "Caught up with the sync peer — resuming block production"
-                );
+        let gap = peer_height.saturating_sub(our_height);
+        let held = syncing.load(std::sync::atomic::Ordering::Relaxed);
+        if !gate.should_pull(gap, held, std::time::Instant::now()) {
+            if peer_height <= our_height {
+                // Level with the peer. If a failed startup sync left production held (#152), this
+                // is the moment it is safe to release: we have what the peer has. Ordinary ticks
+                // reach here constantly and the store is a no-op after the first, so this costs
+                // nothing.
+                if syncing.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    info!(
+                        height = our_height,
+                        "Caught up with the sync peer — resuming block production"
+                    );
+                }
             }
+            // Otherwise behind, but P2P is still closing the gap or a failed pull is backing off.
             continue;
         }
 
@@ -6626,6 +6713,8 @@ async fn rpc_sync_loop(
         // Same as the gap-fill path: a partial apply returns `Err` and must still move the guard,
         // or the next ingest path re-executes what this one already wrote (#145).
         settle_applied_height(&mut last, &store).await;
+        let applied_any = matches!(result, Ok((applied, _, _)) if applied > 0);
+        gate.pulled(applied_any, std::time::Instant::now());
         match result {
             Ok((applied, new_height, new_hash)) if applied > 0 => {
                 *last = new_height;
@@ -6666,7 +6755,8 @@ async fn rpc_sync_loop(
                 info!(
                     applied,
                     height = new_height,
-                    "Periodic RPC catch-up: pulled new blocks from the sync peer"
+                    "Periodic RPC catch-up: pulled blocks from the sync peer (P2P had not \
+                     brought them)"
                 );
             }
             Ok(_) => {}
@@ -6759,6 +6849,10 @@ async fn fetch_sync_blocks(
 #[derive(Debug)]
 struct PeerBusy {
     retry_after: Duration,
+    /// How many blocks the peer would send, when it refused a batch as too large to send before
+    /// this client stops reading (`helix_rpc::server::SYNC_FITS_HEADER`, 2026-10-20). `None` for
+    /// an ordinary busy answer, and from peers that do not say.
+    fits: Option<u32>,
 }
 
 impl PeerBusy {
@@ -6773,17 +6867,34 @@ impl PeerBusy {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
+        let fits = resp
+            .headers()
+            .get(helix_rpc::server::SYNC_FITS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u32>().ok());
         PeerBusy {
             retry_after: named
                 .unwrap_or(Duration::from_secs(5))
                 .clamp(Duration::from_secs(1), Self::LONGEST_WAIT),
+            fits,
         }
     }
 }
 
 impl std::fmt::Display for PeerBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the sync peer is busy and asked to come back in {} s", self.retry_after.as_secs())
+        match self.fits {
+            Some(fits) => write!(
+                f,
+                "the sync peer cannot send this many blocks before this node stops reading — it \
+                 offers {fits} at a time"
+            ),
+            None => write!(
+                f,
+                "the sync peer is busy and asked to come back in {} s",
+                self.retry_after.as_secs()
+            ),
+        }
     }
 }
 
@@ -7126,6 +7237,8 @@ async fn sync_blocks_from_peer(
     let mut total_applied = 0u64;
     // Tried once per sync, not once per batch — see `fetch_sync_blocks`.
     let mut binary_encoding = true;
+    // Blocks asked for at once: 200, unless the peer has said fewer fit (below).
+    let mut batch: u32 = 200;
 
     loop {
         // A node stopped at a protocol upgrade (#267) fetches nothing: every block from here would
@@ -7148,7 +7261,23 @@ async fn sync_blocks_from_peer(
         // against ~0.4 s of local work — so holding a lock across it buys nothing and costs
         // everything.
         let blocks: Vec<Block> =
-            fetch_sync_blocks(&client, peer_url, from, 200, &mut binary_encoding).await?;
+            match fetch_sync_blocks(&client, peer_url, from, batch, &mut binary_encoding).await {
+                Ok(blocks) => blocks,
+                // A paced peer refuses a batch its sync rate cannot deliver before this client
+                // stops reading, and says how many blocks would fit (2026-10-20: 200 blocks were
+                // 44 s at the production node's 150 KiB/s, and every one of those answers was
+                // thrown away). Ask for that many at once, for the rest of this sync. Never fewer
+                // than two — a batch holds its last block back for the next to prove, so one block
+                // at a time applies nothing — and only ever fewer than before, so this cannot loop.
+                Err(e) => match e.downcast_ref::<PeerBusy>().and_then(|busy| busy.fits) {
+                    Some(fits) if fits.max(2) < batch => {
+                        debug!(blocks = fits.max(2), "Sync peer offers fewer blocks at a time");
+                        batch = fits.max(2);
+                        continue;
+                    }
+                    _ => return Err(e),
+                },
+            };
         if blocks.is_empty() {
             break; // caught up
         }
@@ -7156,7 +7285,7 @@ async fn sync_blocks_from_peer(
         // uncertified, and let the next batch — which begins with it and carries its successor —
         // prove it (backlog #158). Costs one re-fetched block per batch and closes the gap for
         // every block except the chain tip itself.
-        let peer_has_more = blocks.len() >= 200;
+        let peer_has_more = blocks.len() >= batch as usize;
         let apply_count = if peer_has_more { blocks.len() - 1 } else { blocks.len() };
 
         // Locks held for this batch only, and released again at the bottom of the loop.
@@ -8376,6 +8505,104 @@ mod sync_blocks_from_peer_tests {
         );
     }
 
+    /// When each `/sync/blocks` request reached a test peer.
+    type Pulls = Arc<std::sync::Mutex<Vec<std::time::Instant>>>;
+
+    /// A peer that is ten blocks ahead on `/status` and answers every `/sync/blocks` "busy" (503)
+    /// — recording when each request arrived, which is all these tests ask.
+    async fn serve_ahead_recording_pulls() -> (String, Pulls) {
+        let pulls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = pulls.clone();
+        let app = Router::new()
+            .route(
+                "/status",
+                get(move || async move { Json(serde_json::json!({ "height": 10 })) }),
+            )
+            .route(
+                "/sync/blocks",
+                get(move || {
+                    let recorded = recorded.clone();
+                    async move {
+                        recorded.lock().unwrap().push(std::time::Instant::now());
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [(axum::http::header::RETRY_AFTER, "1")],
+                            "busy",
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), pulls)
+    }
+
+    /// `rpc_sync_loop` on a fresh store, against `peer_url`, with production held or not.
+    fn spawn_catch_up(peer_url: String, held: bool) -> tokio::task::JoinHandle<()> {
+        let addr = Address::from_public_key(&KeyPair::generate().public);
+        let validators = vec![Validator::new(addr.clone(), 1, true)];
+        let vset = ValidatorSet::new(validators, 0, helix_crypto::Hash::ZERO);
+        tokio::spawn(rpc_sync_loop(
+            Some(peer_url),
+            Arc::new(RwLock::new(fresh_store())),
+            Arc::new(RwLock::new(ChainState::new(TOTAL_SUPPLY_HLX * NANO_PER_HLX))),
+            Arc::new(RwLock::new(BftEngine::new(vset, addr, 0))),
+            Arc::new(RwLock::new(Mempool::new())),
+            Arc::new(Mutex::new(0u64)),
+            Arc::new(RwLock::new(TipCertificate::default())),
+            Arc::new(std::sync::atomic::AtomicBool::new(held)),
+        ))
+    }
+
+    /// 2026-10-20: the loop no longer pulls on the first poll that finds the peer ahead. It gives
+    /// P2P its window first, and a busy peer is not asked again on the next poll.
+    ///
+    /// The running loop against a real HTTP peer, because the wiring is the question: the gate is
+    /// consulted, its window counts from the first probe, and a failed pull reaches `pulled`.
+    #[tokio::test]
+    async fn the_catch_up_pulls_only_once_p2p_has_had_its_window_and_backs_off_a_busy_peer() {
+        let (peer_url, pulls) = serve_ahead_recording_pulls().await;
+        let started = std::time::Instant::now();
+        let handle = spawn_catch_up(peer_url, false);
+
+        let deadline = started + Duration::from_secs(RPC_CATCHUP_STALL_SECS + 25);
+        while std::time::Instant::now() < deadline && pulls.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        handle.abort();
+        let pulls = pulls.lock().unwrap().clone();
+
+        assert!(pulls.len() >= 2, "expected two pulls within the deadline, saw {}", pulls.len());
+        let first = pulls[0] - started;
+        assert!(
+            first >= Duration::from_secs(RPC_CATCHUP_STALL_SECS),
+            "pulled {first:?} after starting — before P2P had its {RPC_CATCHUP_STALL_SECS} s"
+        );
+        let again = pulls[1] - pulls[0];
+        assert!(
+            again >= Duration::from_secs(2 * RPC_SYNC_POLL_SECS),
+            "a busy peer was asked again after {again:?}"
+        );
+    }
+
+    /// #152 keeps its old speed: a node that signs nothing until it has caught up does not wait.
+    #[tokio::test]
+    async fn a_node_held_after_a_failed_startup_sync_pulls_at_once() {
+        let (peer_url, pulls) = serve_ahead_recording_pulls().await;
+        let handle = spawn_catch_up(peer_url, true);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && pulls.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        handle.abort();
+
+        assert!(!pulls.lock().unwrap().is_empty(), "a held node must pull on its first poll");
+    }
+
     fn fresh_store() -> HelixDb {
         HelixDb::open_temporary("helix-test-sync-store").unwrap()
     }
@@ -9562,6 +9789,138 @@ mod sync_blocks_from_peer_tests {
             0,
             "and nothing was asked in JSON"
         );
+    }
+
+    /// A peer that refuses any batch of more than `fits` blocks the way a paced sync peer does —
+    /// 503 naming how many fit — recording every count it was asked for, and how often it was
+    /// asked for a tip certificate (it has none to give).
+    async fn serve_blocks_fitting(
+        blocks: Vec<Block>,
+        fits: usize,
+    ) -> (String, Arc<std::sync::Mutex<Vec<usize>>>, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = asked.clone();
+        let tip_asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tip_counted = tip_asks.clone();
+        let blocks = Arc::new(blocks);
+        let app = Router::new()
+            .route(
+                "/sync/tip-certificate",
+                get(move || {
+                    let tip_counted = tip_counted.clone();
+                    async move {
+                        tip_counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::http::StatusCode::NOT_FOUND
+                    }
+                }),
+            )
+            .route(
+                "/sync/blocks",
+                get(move |Query(params): Query<HashMap<String, String>>| {
+                    let blocks = blocks.clone();
+                    let recorded = recorded.clone();
+                    async move {
+                        let number = |key: &str| params.get(key).and_then(|s| s.parse().ok());
+                        let from: u64 = number("from").unwrap_or(0);
+                        let count: usize = number("count").map(|n: u64| n as usize).unwrap_or(200);
+                        recorded.lock().unwrap().push(count);
+                        let page: Vec<Block> = blocks
+                            .iter()
+                            .filter(|b| b.height() >= from)
+                            .take(count)
+                            .cloned()
+                            .collect();
+                        if page.len() > fits {
+                            return (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                [
+                                    (axum::http::header::RETRY_AFTER.as_str(), "1".to_string()),
+                                    (helix_rpc::server::SYNC_FITS_HEADER, fits.to_string()),
+                                ],
+                                "too large",
+                            )
+                                .into_response();
+                        }
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            bincode::serialize(&page).unwrap(),
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), asked, tip_asks)
+    }
+
+    /// 2026-10-20: a paced sync peer refuses a batch it cannot send before the client stops reading
+    /// and names how many blocks fit. The sync asks for that many from then on and gets every
+    /// block — before, it asked for 200 again on every poll and nothing arrived.
+    #[tokio::test]
+    async fn a_sync_peer_that_names_how_many_blocks_fit_is_asked_for_that_many() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let heights: Vec<u64> = (1..=8).collect();
+        let base = staked_state(0, &[&a, &b]);
+        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &heights, &base);
+        let (peer_url, asked, tip_asks) = serve_blocks_fitting(blocks, 3).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &a);
+        stake_validator(&mut *chain_state.write().await, &b);
+
+        let applied = sync_blocks_from_peer(&peer_url, 0, &store, &chain_state)
+            .await
+            .expect("a peer that says how many blocks fit can be synced from");
+
+        assert_eq!(applied, 8, "every block");
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked[0], 200, "premise: the first request asked for 200 and was refused");
+        assert!(
+            asked[1..].iter().all(|&n| n == 3),
+            "after the refusal, only as many as fit: {asked:?}"
+        );
+        // A full small batch still holds its last block back for the next batch to prove (#158):
+        // only the real tip, block 8, is applied on a tip certificate. Counting a full batch of
+        // three as "the peer has no more" would apply the last block of every batch unproven, and
+        // ask once per batch.
+        assert_eq!(
+            tip_asks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the chain tip is applied without a successor to prove it"
+        );
+    }
+
+    /// The smallest batch a sync can use is two: it holds the last block of a batch back for the
+    /// next to prove, so one block at a time would apply nothing, forever. A peer that offers only
+    /// one is asked for two once and then the sync gives up — it does not loop.
+    #[tokio::test]
+    async fn a_sync_peer_that_offers_one_block_at_a_time_is_not_asked_forever() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let heights: Vec<u64> = (1..=8).collect();
+        let base = staked_state(0, &[&a, &b]);
+        let blocks = chained_blocks_certified_by(&a, &[&a, &b], &heights, &base);
+        let (peer_url, asked, _) = serve_blocks_fitting(blocks, 1).await;
+
+        let store = Arc::new(RwLock::new(fresh_store()));
+        let chain_state = Arc::new(RwLock::new(ChainState::new(0)));
+        stake_validator(&mut *chain_state.write().await, &a);
+        stake_validator(&mut *chain_state.write().await, &b);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            sync_blocks_from_peer(&peer_url, 0, &store, &chain_state),
+        )
+        .await
+        .expect("the sync must end, not keep asking")
+        .expect_err("two blocks do not fit either");
+        assert!(err.downcast_ref::<PeerBusy>().is_some(), "ends with the peer's answer: {err:#}");
+        assert_eq!(*asked.lock().unwrap(), vec![200, 2], "200, then two, then stop");
     }
 
     #[tokio::test]
@@ -14041,14 +14400,141 @@ mod catchup_tests {
             "past the grace window the round cannot close the gap and must not block the sync"
         );
 
-        // A follower has no round to protect and must keep syncing exactly as before — this is
-        // the case the loop was built for (P2P unreachable behind the HTTPS tunnel).
+        // A follower has no round to protect, so consensus never stands in its way. Whether it
+        // may pull at all is `RpcCatchupGate`'s question, not this one.
         for gap in 1..=(RPC_CATCHUP_ROUND_GRACE_BLOCKS + 5) {
             assert!(
                 !catchup_defers_to_consensus(100, 100 + gap, false),
-                "a follower must never defer — nothing else will bring it the blocks"
+                "a follower must never defer to a round it is not in"
             );
         }
+    }
+
+    fn at(start: std::time::Instant, secs: u64) -> std::time::Instant {
+        start + Duration::from_secs(secs)
+    }
+
+    /// The point of the gate (2026-10-20): a node that P2P is carrying towards the tip never asks
+    /// the sync peer — which for nearly every node is one validator's home uplink — however far
+    /// behind it starts.
+    #[test]
+    fn a_gap_that_keeps_closing_never_pulls_from_the_sync_peer() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        // 5,000 blocks behind, two blocks closer each poll: over forty minutes of polls.
+        let (mut gap, mut t) = (5_000u64, 0u64);
+        while gap > 0 {
+            assert!(
+                !gate.should_pull(gap, false, at(t0, t)),
+                "pulled at gap {gap}, {t} s in, while P2P was closing it"
+            );
+            gap -= 2;
+            t += RPC_SYNC_POLL_SECS;
+        }
+    }
+
+    /// A gap that holds or grows means P2P is not carrying this node, and the RPC is the fallback.
+    #[test]
+    fn a_gap_that_stops_closing_pulls_once_the_window_has_passed() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(7, false, at(t0, 0)));
+        assert!(!gate.should_pull(7, false, at(t0, RPC_CATCHUP_STALL_SECS - 1)));
+        assert!(gate.should_pull(7, false, at(t0, RPC_CATCHUP_STALL_SECS)));
+
+        // The same, polled as the loop polls, for a gap that holds and one that grows.
+        for (shape, step) in [("holds", 0u64), ("grows", 1)] {
+            let mut gate = RpcCatchupGate::default();
+            let mut gap = 40u64;
+            let first = (0..20u64)
+                .map(|poll| poll * RPC_SYNC_POLL_SECS)
+                .find(|&t| {
+                    let due = gate.should_pull(gap, false, at(t0, t));
+                    gap += step;
+                    due
+                })
+                .unwrap_or_else(|| panic!("a gap that {shape} was never pulled"));
+            let window = RPC_CATCHUP_STALL_SECS..RPC_CATCHUP_STALL_SECS + RPC_SYNC_POLL_SECS;
+            assert!(window.contains(&first), "a gap that {shape} was first pulled {first} s in");
+        }
+    }
+
+    #[test]
+    fn a_new_low_or_being_level_starts_the_window_over() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(10, false, at(t0, 0)));
+        assert!(!gate.should_pull(9, false, at(t0, 20)));
+        assert!(!gate.should_pull(12, false, at(t0, 24)), "a gap that rose again is no new low");
+        assert!(
+            !gate.should_pull(9, false, at(t0, 20 + RPC_CATCHUP_STALL_SECS - 1)),
+            "the new low at 20 s restarted the window"
+        );
+        assert!(gate.should_pull(9, false, at(t0, 20 + RPC_CATCHUP_STALL_SECS)));
+
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(5, false, at(t0, 0)));
+        assert!(!gate.should_pull(0, false, at(t0, 28)));
+        assert!(!gate.should_pull(5, false, at(t0, 32)));
+        assert!(
+            !gate.should_pull(5, false, at(t0, 32 + RPC_CATCHUP_STALL_SECS - 1)),
+            "being level at 28 s restarted the window"
+        );
+        assert!(gate.should_pull(5, false, at(t0, 32 + RPC_CATCHUP_STALL_SECS)));
+    }
+
+    /// A busy or broken sync peer is asked less and less often, not on every poll.
+    #[test]
+    fn failed_pulls_back_off_doubling_up_to_the_cap() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(50, false, at(t0, 0)));
+        let mut t = RPC_CATCHUP_STALL_SECS;
+        assert!(gate.should_pull(50, false, at(t0, t)));
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            gate.pulled(false, at(t0, t));
+            let mut next = t + 1;
+            while !gate.should_pull(50, false, at(t0, next)) {
+                next += 1;
+            }
+            waits.push(next - t);
+            t = next;
+        }
+        assert_eq!(waits, [8, 16, 32, 64, 120, 120, 120]);
+        assert_eq!(RPC_CATCHUP_MAX_BACKOFF_SECS, 120);
+    }
+
+    #[test]
+    fn a_pull_that_brought_blocks_starts_over() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(3, false, at(t0, 0)));
+        assert!(gate.should_pull(3, false, at(t0, 30)));
+        gate.pulled(false, at(t0, 30));
+        assert!(gate.should_pull(3, false, at(t0, 38)));
+        gate.pulled(true, at(t0, 38));
+        // Still behind (the peer moved on while this pulled): P2P gets its window again.
+        assert!(!gate.should_pull(3, false, at(t0, 42)));
+        assert!(!gate.should_pull(3, false, at(t0, 42 + RPC_CATCHUP_STALL_SECS - 1)));
+        assert!(gate.should_pull(3, false, at(t0, 42 + RPC_CATCHUP_STALL_SECS)));
+        // And the failures before the success are forgotten.
+        gate.pulled(false, at(t0, 72));
+        assert!(!gate.should_pull(3, false, at(t0, 79)));
+        assert!(gate.should_pull(3, false, at(t0, 80)));
+    }
+
+    /// A node whose production is held after a failed startup sync (#152) signs nothing until it
+    /// has caught up, so waiting for P2P only keeps it mute longer.
+    #[test]
+    fn a_node_held_after_a_failed_startup_sync_pulls_at_once_but_still_backs_off() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        assert!(gate.should_pull(5, true, at(t0, 0)));
+        gate.pulled(false, at(t0, 0));
+        assert!(!gate.should_pull(5, true, at(t0, 7)));
+        assert!(gate.should_pull(5, true, at(t0, 8)));
+        assert!(!gate.should_pull(0, true, at(t0, 9)), "level: nothing to pull");
     }
 }
 
