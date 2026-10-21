@@ -275,6 +275,27 @@ pub fn self_bond_ratio_ok(self_staked: u64, delegated: u64) -> bool {
     self_staked as u128 * 10_000 >= effective * MIN_SELF_BOND_RATIO_BPS as u128
 }
 
+/// What one account holds, in nano-HLX, by where it sits — see [`ChainState::top_holders`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Holdings {
+    /// Spendable now.
+    pub liquid: u64,
+    /// Its own stake as a validator.
+    pub staked: u64,
+    /// What its delegations to validators' pools are worth.
+    pub delegated: u64,
+    /// Unstaked or undelegated, waiting out the unbonding period.
+    pub unbonding: u64,
+}
+
+impl Holdings {
+    /// All four together. Wider than the parts: each fits a `u64`, and so does the whole supply,
+    /// but a sum of four is not something the type promises.
+    pub fn total(&self) -> u128 {
+        self.liquid as u128 + self.staked as u128 + self.delegated as u128 + self.unbonding as u128
+    }
+}
+
 /// A validator's delegation pool: the collective stake backing it from delegators (kept
 /// separate from the validator's own `AccountState::staked`, which is untouched by
 /// delegation). Uses a shares-based accounting scheme (the same one Cosmos SDK's F1
@@ -1755,6 +1776,78 @@ impl ChainState {
         Some((shares as u128 * pool.total_delegated_stake as u128 / pool.total_shares as u128) as u64)
     }
 
+    /// The `limit` accounts holding the most, largest first, and the same four amounts summed over
+    /// every account — for a rich list and a supply breakdown.
+    ///
+    /// "Holding" counts everything an account could have back: its liquid balance, its own stake,
+    /// what its delegations are worth now, and stake waiting out the unbonding period. Counting the
+    /// balance alone would rank a validator with 15,000 HLX staked below an address holding 20 HLX.
+    ///
+    /// The delegated total is the pools' own sum rather than the sum of each delegator's share:
+    /// a share is valued rounded down, so the per-account figures can fall a few nano short of
+    /// what the pools hold, and the total should be the pools'. Ties are broken by address so the
+    /// order does not depend on hash-map iteration — two nodes asked the same question answer it
+    /// the same way. Accounts holding nothing are left out.
+    ///
+    /// One pass over the accounts and one over the delegations, plus a partial sort for the top:
+    /// linear in the chain's size, so a node with a hundred thousand accounts answers in
+    /// milliseconds, under the read lock the caller already holds for any account query.
+    pub fn top_holders(&self, limit: usize) -> (Vec<(String, Holdings)>, Holdings) {
+        let mut delegated: HashMap<String, u64> = HashMap::new();
+        for (validator, delegators) in self.delegator_shares.iter() {
+            let Some(pool) = self.validator_pools.get(validator) else { continue };
+            if pool.total_shares == 0 {
+                continue;
+            }
+            for (delegator, shares) in delegators {
+                let value = (*shares as u128 * pool.total_delegated_stake as u128
+                    / pool.total_shares as u128) as u64;
+                *delegated.entry(delegator.clone()).or_default() += value;
+            }
+        }
+
+        let mut totals = Holdings {
+            delegated: self.validator_pools.values().map(|p| p.total_delegated_stake).sum(),
+            ..Holdings::default()
+        };
+        let mut ranked: Vec<(String, Holdings)> = Vec::with_capacity(self.accounts.len());
+        for (address, account) in self.accounts.iter() {
+            totals.liquid += account.balance;
+            totals.staked += account.staked;
+            totals.unbonding += account.unbonding_stake;
+            let held = Holdings {
+                liquid: account.balance,
+                staked: account.staked,
+                delegated: delegated.remove(address).unwrap_or(0),
+                unbonding: account.unbonding_stake,
+            };
+            if held.total() > 0 {
+                ranked.push((address.clone(), held));
+            }
+        }
+        // A delegator the account map does not know — not reachable by any transaction today, but
+        // a holder all the same, and leaving it out would make the list disagree with the total.
+        for (address, value) in delegated {
+            if value > 0 {
+                ranked.push((address, Holdings { delegated: value, ..Holdings::default() }));
+            }
+        }
+
+        let order = |a: &(String, Holdings), b: &(String, Holdings)| {
+            b.1.total().cmp(&a.1.total()).then_with(|| a.0.cmp(&b.0))
+        };
+        if ranked.len() > limit {
+            if limit == 0 {
+                ranked.clear();
+            } else {
+                ranked.select_nth_unstable_by(limit - 1, order);
+                ranked.truncate(limit);
+            }
+        }
+        ranked.sort_unstable_by(order);
+        (ranked, totals)
+    }
+
 
     /// Why a build that executes protocols up to `supported` must not execute block `height` on
     /// this state — `None` if it may.
@@ -2973,6 +3066,84 @@ mod tests {
         silent_until_jailed(&mut state, 0);
         assert_eq!(state.validator_pools[&addr(2).to_string()].total_delegated_stake, 495_000);
         assert_eq!(state.get(&addr(2)).unwrap().staked, 990_000);
+    }
+
+    /// A rich list counts everything an account could have back, not just its balance: a validator
+    /// with its stake bonded ranks above an address with more liquid HLX, and a delegator's shares
+    /// count at what they are worth today.
+    #[test]
+    fn holdings_count_stake_delegations_and_unbonding() {
+        let mut state = ChainState::new(0);
+        state.set_balance(&addr(1), 20);
+        state.set_balance(&addr(2), 5);
+        state.set_validator_stake(&addr(2), 1_000);
+        state.update_account(&addr(3), |a| {
+            a.balance = 1;
+            a.unbonding_stake = 300;
+        });
+        state.set_balance(&addr(4), 2);
+        // 600 and 400 shares of 1,000 in a pool now worth 1,500: 900 and 600.
+        state.validator_pools.insert(
+            addr(2).to_string(),
+            DelegationPool { total_shares: 1_000, total_delegated_stake: 1_500, commission_bps: 0 },
+        );
+        state.delegator_shares.insert(
+            addr(2).to_string(),
+            HashMap::from([(addr(4).to_string(), 600), (addr(5).to_string(), 400)]),
+        );
+
+        let (top, totals) = state.top_holders(10);
+        let ranked: Vec<(String, u128)> = top.iter().map(|(a, h)| (a.clone(), h.total())).collect();
+        assert_eq!(
+            ranked,
+            vec![
+                (addr(2).to_string(), 1_005),
+                (addr(4).to_string(), 902),
+                (addr(5).to_string(), 600), // shares only, no account of its own
+                (addr(3).to_string(), 301),
+                (addr(1).to_string(), 20),
+            ]
+        );
+        assert_eq!(top[1].1, Holdings { liquid: 2, staked: 0, delegated: 900, unbonding: 0 });
+        assert_eq!(totals, Holdings { liquid: 28, staked: 1_000, delegated: 1_500, unbonding: 300 });
+    }
+
+    /// A share is valued rounded down, so the delegators' figures can fall short of what the pool
+    /// holds. The total is the pool's: the supply breakdown must add up to what exists.
+    #[test]
+    fn the_delegated_total_is_what_the_pools_hold_not_the_rounded_shares() {
+        let mut state = ChainState::new(0);
+        state.validator_pools.insert(
+            addr(9).to_string(),
+            DelegationPool { total_shares: 3, total_delegated_stake: 10, commission_bps: 0 },
+        );
+        state.delegator_shares.insert(
+            addr(9).to_string(),
+            HashMap::from([(addr(1).to_string(), 1), (addr(2).to_string(), 1), (addr(3).to_string(), 1)]),
+        );
+        let (top, totals) = state.top_holders(10);
+        let per_account: u64 = top.iter().map(|(_, h)| h.delegated).sum();
+        assert_eq!(per_account, 9, "three shares of 10/3, each rounded down");
+        assert_eq!(totals.delegated, 10);
+    }
+
+    /// The order does not depend on hash-map iteration: equal holdings rank by address, the limit
+    /// takes the first of them, and an account holding nothing is not listed at all.
+    #[test]
+    fn holders_rank_by_amount_then_address_and_the_empty_are_left_out() {
+        let mut state = ChainState::new(0);
+        for seed in [7u8, 3, 5] {
+            state.set_balance(&addr(seed), 7);
+        }
+        state.set_balance(&addr(1), 0);
+        let mut by_address: Vec<String> = [3u8, 5, 7].iter().map(|s| addr(*s).to_string()).collect();
+        by_address.sort();
+
+        let (all, _) = state.top_holders(10);
+        assert_eq!(all.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>(), by_address);
+        let (two, _) = state.top_holders(2);
+        assert_eq!(two.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>(), by_address[..2]);
+        assert!(state.top_holders(0).0.is_empty());
     }
 
     /// Promotion under protocol 2 starts the validator at a debt of 2400: silent from the start,

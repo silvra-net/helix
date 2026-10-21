@@ -19,6 +19,7 @@ your own node (or wherever you've bound/proxied it — see `HELIX_RPC_BIND`).
 | GET | `/blocks/hash/:hash` | Block by hash |
 | GET | `/blocks/range` | Range of blocks (`?from=&count=`) — display view, per-tx status included; not the sync path (see `/sync/blocks`) |
 | GET | `/accounts/:address` | Balance, staked amount, nonce, and `state_height` — the block the balance is as of, read together with it. A valid address the chain has never seen answers **404** with `state_height` too: its balance is zero as of that block. 400 on invalid address format |
+| GET | `/accounts/top` | The accounts holding the most (`?limit=`, default 25, at most 100), largest first: per account `liquid_nano`, `staked_nano` (own stake), `delegated_nano` (delegations at today's value), `unbonding_nano`, `held_nano` (all four) and its `.hlx` `name`; plus `totals` — the same four summed over **every** account — `total_accounts` and `state_height`. The delegated total is what the pools hold; per-account values are rounded down, so they can sum a few nano less. New in 1.1.1 — an older node reads `top` as an address and answers 400 |
 | GET | `/accounts/:address/name` | Registered `.hlx` name for this address |
 | GET | `/accounts/:address/personhood` | Proof of Personhood status |
 | GET | `/accounts/:address/guardians` | Social-recovery guardian set |

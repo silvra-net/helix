@@ -219,6 +219,7 @@ fn routes() -> Router<AppState> {
         .route("/blocks/height/:n/proof/:tx_hash", get(get_tx_proof))
         .route("/blocks/hash/:hash", get(get_block_by_hash))
         .route("/blocks/range", get(get_blocks_range))
+        .route("/accounts/top", get(get_top_accounts))
         .route("/accounts/:address", get(get_account))
         .route("/accounts/:address/name", get(get_account_name))
         .route("/accounts/:address/personhood", get(get_account_personhood))
@@ -1270,6 +1271,59 @@ async fn get_tx_proof(
             proof: proof.iter().map(ProofStepResponse::from).collect(),
         })),
     )
+}
+
+/// Most accounts `GET /accounts/top` lists in one answer.
+const TOP_ACCOUNTS_MAX: u64 = 100;
+
+/// `GET /accounts/top?limit=N` — the `N` accounts holding the most (default 25, at most
+/// [`TOP_ACCOUNTS_MAX`]), largest first, each with what it holds by where it sits, and the same
+/// four amounts summed over every account on the chain (`ChainState::top_holders`).
+///
+/// For a rich list and a supply breakdown, which until now needed an indexer: the node could
+/// answer about one address, never about all of them. Amounts are exact nano strings like every
+/// other amount here. `state_height` is the block the figures are as of.
+///
+/// A view, not a sync path, so it takes one of the view places like `/blocks/range`: the work is
+/// linear in the number of accounts and done under the chain-state read lock.
+async fn get_top_accounts(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, u64>>,
+) -> axum::response::Response {
+    let limit = params.get("limit").copied().unwrap_or(25).clamp(1, TOP_ACCOUNTS_MAX) as usize;
+    let _permit = match view_response_permit().await {
+        Ok(permit) => permit,
+        Err(busy) => return busy,
+    };
+    let chain = state.chain_state.read().await;
+    let (top, totals) = chain.top_holders(limit);
+    let names: std::collections::HashMap<&str, &str> =
+        chain.names.iter().map(|(name, owner)| (owner.as_str(), name.as_str())).collect();
+    let amounts = |h: &helix_executor::state::Holdings| {
+        json!({
+            "liquid_nano": h.liquid.to_string(),
+            "staked_nano": h.staked.to_string(),
+            "delegated_nano": h.delegated.to_string(),
+            "unbonding_nano": h.unbonding.to_string(),
+            "held_nano": h.total().to_string(),
+        })
+    };
+    let accounts: Vec<Value> = top
+        .iter()
+        .map(|(address, held)| {
+            let mut entry = amounts(held);
+            entry["address"] = json!(address);
+            entry["name"] = json!(names.get(address.as_str()));
+            entry
+        })
+        .collect();
+    Json(json!({
+        "state_height": chain.applied_height,
+        "total_accounts": chain.account_count(),
+        "totals": amounts(&totals),
+        "accounts": accounts,
+    }))
+    .into_response()
 }
 
 async fn get_account(
@@ -4609,6 +4663,52 @@ mod tests {
         flate2::read::GzDecoder::new(&body[..]).read_to_string(&mut json).unwrap();
         let blocks: Vec<Block> = serde_json::from_str(&json).unwrap();
         assert_eq!(blocks.len(), 3);
+    }
+
+    /// `/accounts/top` through the production router: answered by its own handler — not read as an
+    /// address `top` and refused 400, which is how a node without it answers — largest holder
+    /// first, a registered name beside its address, the limit honoured, and the totals over every
+    /// account rather than over the ones listed.
+    #[tokio::test]
+    async fn the_rich_list_ranks_holders_and_totals_every_account() {
+        use tower::ServiceExt;
+
+        let state = fresh_test_state();
+        let [big, mid, small] = [(); 3].map(|_| Address::from_public_key(&KeyPair::generate().public));
+        {
+            let mut chain = state.chain_state.write().await;
+            chain.set_balance(&small, 3);
+            chain.set_balance(&mid, 50);
+            chain.set_balance(&big, 7);
+            chain.set_validator_stake(&big, 1_000);
+            chain.names.insert("whale".to_string(), big.to_string());
+        }
+        let mut request = axum::http::Request::builder()
+            .uri("/accounts/top?limit=2")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_001))));
+        let limiter = Arc::new(RateLimiter::new(1_000.0, 1_000.0));
+        let response = router(state, limiter).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "taken for an address?");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let listed: Vec<(&str, &str)> = json["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| (a["address"].as_str().unwrap(), a["held_nano"].as_str().unwrap()))
+            .collect();
+        assert_eq!(listed, vec![(big.to_string().as_str(), "1007"), (mid.to_string().as_str(), "50")]);
+        assert_eq!(json["accounts"][0]["name"], "whale");
+        assert_eq!(json["accounts"][0]["staked_nano"], "1000");
+        assert_eq!(json["accounts"][1]["name"], Value::Null);
+        assert_eq!(json["totals"]["liquid_nano"], "60", "all three accounts, not the two listed");
+        assert_eq!(json["totals"]["held_nano"], "1060");
+        assert_eq!(json["total_accounts"], 3);
     }
 
     /// A paced bincode batch (`HELIX_RPC_SYNC_RATE`) through the production stack — rate limit,
