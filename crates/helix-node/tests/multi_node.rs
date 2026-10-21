@@ -2595,17 +2595,37 @@ async fn a_protocol_upgrade_runs_where_the_build_supports_it_and_stops_every_nod
     }
     // The same state at the same height, read from both — a follower that executed the new rules
     // differently from the validator that produced the blocks would disagree here.
+    //
+    // Compared at heights both were *seen* at, not at a moment both are level. B follows over
+    // block sync, not gossip, so it draws level with A only for the instant after each pull while
+    // A goes on at 20 ms a block — asking both at once for the same height is a race B nearly
+    // always loses, and it says nothing about the state. B rests at every height it pulls to, and
+    // A passed through it a moment before, so recording each (height, state) either reports gives
+    // common heights within seconds.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut seen: [std::collections::HashMap<u64, serde_json::Value>; 2] = Default::default();
     loop {
-        let (sa, sb) = (status(UP_A_RPC).await, status(UP_B_RPC).await);
-        if let (Some(sa), Some(sb)) = (&sa, &sb) {
-            if sa["state_height"] == sb["state_height"] && sa["state_height"].as_u64() >= Some(at) {
-                assert_eq!(sa["state_hash"], sb["state_hash"], "different state after protocol 2: {sa} / {sb}");
-                break;
+        for (i, port) in [UP_A_RPC, UP_B_RPC].into_iter().enumerate() {
+            if let Some(s) = status(port).await {
+                if let Some(h) = s["state_height"].as_u64().filter(|h| *h >= at) {
+                    seen[i].insert(h, s["state_hash"].clone());
+                }
             }
         }
-        assert!(std::time::Instant::now() < deadline, "no common state height after the upgrade: {sa:?} / {sb:?}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let common: Vec<u64> = seen[1].keys().filter(|h| seen[0].contains_key(h)).copied().collect();
+        for h in &common {
+            assert_eq!(seen[0][h], seen[1][h], "different state after protocol 2 at height {h}");
+        }
+        if common.len() >= 3 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fewer than 3 heights seen on both after the upgrade (A at {:?}, B at {:?})",
+            seen[0].keys().max(),
+            seen[1].keys().max()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // ── 2 → 3: one this build does not run.
