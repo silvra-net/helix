@@ -212,6 +212,7 @@ fn routes() -> Router<AppState> {
         .route("/", get(root))
         .route("/logo.png", get(logo))
         .route("/chainquiry.png", get(chainquiry_logo))
+        .route("/fonts/:file", get(font))
         .route("/status", get(get_status))
         .route("/blocks/latest", get(get_latest_block))
         .route("/blocks/height/:n", get(get_block_by_height))
@@ -318,6 +319,39 @@ async fn logo() -> impl IntoResponse {
     )
 }
 
+/// silvra.net's type, for the status page — compiled in like the logo, so the page draws in the
+/// site's letters and still asks nothing of anyone but this node. Latin only: the page is English
+/// and its numbers are digits. All four families are under the SIL Open Font License 1.1; the
+/// licences sit beside the files in `fonts/`.
+///
+/// The names are the whole interface: the page asks for exactly these, and a test reads the
+/// page's `@font-face` rules to hold the two sides together — a name that drifts on one side
+/// would not fail anything visible, the browser would just draw in a fallback.
+const FONTS: [(&str, &[u8]); 5] = [
+    ("inter.woff2", include_bytes!("fonts/inter.woff2")),
+    ("jetbrains-mono.woff2", include_bytes!("fonts/jetbrains-mono.woff2")),
+    ("barlow-condensed-600.woff2", include_bytes!("fonts/barlow-condensed-600.woff2")),
+    ("barlow-condensed-700.woff2", include_bytes!("fonts/barlow-condensed-700.woff2")),
+    ("unbounded.woff2", include_bytes!("fonts/unbounded.woff2")),
+];
+
+/// `GET /fonts/{file}` — one of the status page's fonts, cached like the logo (same reasoning:
+/// the bytes change only with a new binary). Anything else is 404; the name is looked up in the
+/// fixed table above, never used as a path.
+async fn font(Path(file): Path<String>) -> axum::response::Response {
+    match FONTS.iter().find(|(name, _)| *name == file) {
+        Some((_, bytes)) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "font/woff2"),
+                (axum::http::header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            *bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn chainquiry_logo() -> impl IntoResponse {
     (
         [
@@ -357,12 +391,14 @@ fn api_index() -> Json<Value> {
         "crypto": "ML-DSA-65 — NIST FIPS 204",
         "endpoints": [
             "GET  /logo.png",
+            "GET  /fonts/{file}",
             "GET  /status",
             "GET  /blocks/latest",
             "GET  /blocks/height/{n}",
             "GET  /blocks/height/{n}/header",
             "GET  /blocks/height/{n}/proof/{tx_hash}",
             "GET  /blocks/hash/{hash}",
+            "GET  /accounts/top",
             "GET  /accounts/{address}",
             "GET  /accounts/{address}/name",
             "GET  /accounts/{address}/personhood",
@@ -4325,6 +4361,31 @@ mod tests {
         assert!(!body.is_empty(), "the logo must not be empty");
         // PNG magic number — proves we're serving an actual image, not a stray text file.
         assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "must be a real PNG");
+    }
+
+    /// Every font the status page declares is one the node serves, as a real WOFF2 — and nothing
+    /// else under `/fonts/` answers. Without the first half a renamed file would leave the page in
+    /// a fallback face and fail nothing; without the second the route would be a file server.
+    #[tokio::test]
+    async fn the_status_pages_fonts_are_served_by_the_node() {
+        use axum::http::header;
+
+        let mut asked = Vec::new();
+        for part in STATUS_HTML.split("url(\"/fonts/").skip(1) {
+            asked.push(part.split('"').next().unwrap().to_string());
+        }
+        assert_eq!(asked.len(), FONTS.len(), "precondition: the page declares every served font");
+        for name in asked {
+            let response = font(Path(name.clone())).await;
+            assert_eq!(response.status(), StatusCode::OK, "the page asks for {name}");
+            assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "font/woff2");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..4], b"wOF2", "{name} must be a WOFF2 file");
+        }
+        for stranger in ["../server.rs", "inter.woff", "logo.png", ""] {
+            let response = font(Path(stranger.to_string())).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{stranger:?}");
+        }
     }
 
     /// The status page must not reach for anything off the node. A node has to work where there

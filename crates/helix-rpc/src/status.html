@@ -1,7 +1,9 @@
 <!--
   Served by the node itself at `/` to browsers (see `root`). Deliberately ONE self-contained
   file with no external requests: a node has to work on a machine that cannot reach a CDN, and a
-  page that quietly depends on someone else's font server is not one you can run air-gapped.
+  page that quietly depends on someone else's font server is not one you can run air-gapped. The
+  only other things it loads come from this node too: the logo and silvra.net's type
+  (`/logo.png`, `/fonts/…`), both compiled into the binary.
 
   This page is about **this node**, not about the chain. It answers the question its operator
   actually has — is my node healthy, is it keeping up, is it co-signing? — from `/status` and
@@ -30,70 +32,92 @@
 <meta name="description" content="Live status of this Helix node: height, sync state, peers, memory and whether it is co-signing blocks.">
 <link rel="icon" type="image/png" href="/logo.png">
 <style>
-  /* Helix design system, aligned with silvra.net: a truly achromatic grey scale, black (light)
-     or white (dark) as the only accent, and colour reserved for state — red for a fault, green
-     for health, amber for a warning. Nothing is coloured merely to look designed.
+  /* Helix, in the register of silvra.net: night olive, digital camouflage at the edge, amber as
+     the colour of Helix, condensed capitals for the verdict and a mono face for every number and
+     label. The values are the site's own and the same as the explorer's and the desktop wallet's,
+     so an operator moving between the three sees one product.
 
-     The greys are neutral, not slate. Slate reads as dark *blue*, which is a colour, and a
-     palette described as "black and white" should not have a hue in its largest surface. Dark
-     mode grounds on true #000: on an OLED panel those pixels are simply off, which is the right
-     look for something meant to be glanced at in a dim room, and it matches silvra.net's own
-     use of #000 for its chrome.
+     Colour beyond amber is for state — red for a fault, green for health, orange for a warning.
+     Square corners: a board of readings, not a set of cards.
 
-     Two deliberate exceptions to "pure": panels sit at #0c0c0c rather than #000 so the 1px grid
-     lines have something to separate, and body text is #f5f5f5 rather than #fff — pure white on
-     pure black haloes badly at small sizes. The accent stays a true #fff so emphasis is still
-     distinguishable from ordinary text.
+     The type is the site's too, and it comes from this node: `/fonts/…` is compiled into the
+     binary like the logo, so the page still makes no request to anyone else and still works on a
+     machine that cannot reach the internet.
 
-     Consequence worth stating: with a monochrome accent, colour can no longer distinguish a link
-     from body text, so links carry an underline instead. That is not a compromise — a link told
-     apart by hue alone fails for anyone who cannot separate those hues.
+     Three theme states, so an explicit choice wins over the OS preference in both directions:
+     bare :root is light, the media query covers "system", [data-theme] wins over both. */
+  @font-face { font-family: "Inter Variable"; font-style: normal; font-display: swap;
+    font-weight: 100 900; src: url("/fonts/inter.woff2") format("woff2-variations"); }
+  @font-face { font-family: "JetBrains Mono Variable"; font-style: normal; font-display: swap;
+    font-weight: 100 800; src: url("/fonts/jetbrains-mono.woff2") format("woff2-variations"); }
+  @font-face { font-family: "Barlow Condensed"; font-style: normal; font-display: swap;
+    font-weight: 600; src: url("/fonts/barlow-condensed-600.woff2") format("woff2"); }
+  @font-face { font-family: "Barlow Condensed"; font-style: normal; font-display: swap;
+    font-weight: 700; src: url("/fonts/barlow-condensed-700.woff2") format("woff2"); }
+  @font-face { font-family: "Unbounded Variable"; font-style: normal; font-display: swap;
+    font-weight: 200 900; src: url("/fonts/unbounded.woff2") format("woff2-variations"); }
 
-     Three theme states, so an explicit choice wins over the OS preference in both directions. */
   :root {
     /* Tells the browser which way round this page is, so it draws scrollbars, focus rings and
        form controls to match. Without it a dark page gets a white native scrollbar — the one
        piece of the design the stylesheet cannot reach any other way. */
     color-scheme: light;
-    --ground: #fafafa; --panel: #ffffff; --panel-2: #f5f5f5; --line: #e5e5e5;
-    --ink: #0a0a0a; --dim: #737373; --accent: #000000; --accent-soft: #f5f5f5;
-    --warn-bg: #fdf4e3; --warn-line: #ecd7a4; --warn-ink: #8a5a06;
-    --ok: #15803d; --ok-bg: #e9f7ee; --bad: #c81e1e; --bad-bg: #fceaea;
-    --bar: #d4d4d4;
+    --ground: #f7f7f3; --panel: #ffffff; --panel-2: #f1f2ec; --line: #d9ddd8;
+    --ink: #0f2535; --dim: #44525c; --faint: #5f6b73;
+    --accent: #8a5a06; --accent-soft: #f6f0e6; --amber: #8a5a06;
+    --warn-bg: #fbf0e6; --warn-line: #ecc9a8; --warn-ink: #9a4a0b;
+    --ok: #0a6e53; --ok-bg: #e6f2ee; --bad: #b42318; --bad-bg: #f8e7e5;
+    --bar: #c7ccbf; --line-2: rgba(15, 37, 53, 0.24); --scan: rgba(15, 37, 53, 0.035);
+    --camo: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAMAAADVRocKAAAAD1BMVEXn6d3Z3cvL0bm8w6WuybmVoLHYAAAE5ElEQVR42q2a2XaEIAxAs/D/39yjQMgK2NaXVmcm1yyEJAqISPMARER4DzZHv/Z8FfsxfwDjnwYoB8jV59uAmkBC4IJg5C/A8+mEGPkeMBHsCRNi5BMs3aFTnj8YAPierIupEksLDgoMFMyv5IBlQthZiVnJAs0CbUi513HmpcNjJ16nTCKflXztg8kQP3WJ69YN4PlfAabQAAALeH5iAI/tUoIGdJn94BxAxqiows0DhLIAr0RhdABHAJED9M9qAHANYEarA0QAHABd4fdeWSxDNqS0fG0i8xFFAhjTy82JfB1sQDpoo/wNQG7aAnw41wAqASjfJfHne2YMnB0cCXZxaBWEEJZ1BfCrXrsHNipQX2mGkIhHm1ZUFEGtwlpERCcNkHMNhogMQCZXfgEoAqi9zAHIHiVg2oBTAqjUfQnAsA5uAAmhADj75PInQQHoChAWAek8HhEaEAgJAOMq+wCgPQDCpmRiCE0QvLl+reQF0HtnAYjCXx3Q7TaySt9FQFGPEtDyNIRuM7MAU+2E8kpvkZWNXonKxK8TCgChR+gbLwgWMKzVCkAguGoAM/moFZj+kBBDygC+1JNyYxwN8lyMvlhjUqXjAuj/UwCcAPAPgHYBAMx9YNwB+2NrosrJ1t1GHOAFAL4B0EnTVbIDhKSN+TpwO5G/4w9OLpYB2d30AwD3PsYDALcAViqoj4mShdzXYVLYR69vABw3L+PYrDV5T9e1eZq5ecQSRQIvOUu+RmvAsoPKpbAARIUKmQMjYCaEBcD3tgeA4pFbpQRI6oS1eOQDoAsA1IDWWlOpeeYXIUMKIDzqoDRYuV9+rjqYHEDU948Ra34znA12CSDVIK3+y1dBA/CWIC4CEx/4EkG6i1y+A4QQ1yZ8QtqbGo4AJct6wLXCeZEj3e/sbfcAIyp28wVAq5K4wFtDIimV/8w8PADYdPJZmBoxsrUk0t1MaxHC/CjtFXpVY3eCE4Bsrj0BxuJsM73AQYPQ3gZ7SDZ15cUgYGEj1bGppv/p4POM7grUN6IGIIfo9GUAhV2d6jMlPIRCPiZThTATNT+2sWtWeZoE41yhb5lAoAcIVWh8AKzbZ1uIXMhXANwCZMsvik2iDaHcJuZE1ExaUwKdAYmXJXLGP9iX/u8AuXzWMYoIbsR3BSCGPEZXeuPZekKhwB5AxRJYo1zpbH8HgC1A7C8AzKZvWx/sADpJFAAuAVwDwiITQNqA5QA3Pa3SBLC1VXZEt34BCOha/BGwb0LbUTzJQ5MBgEr+qeE1T36qwOewPx0mARaAewDYkisrxLfyjysXbJ0URP4ZYItG+Ab4kntMkzUwrbWTi0PWcTOXMjwvJiYJQAajmWMv5Nn06Z9M0kyrcn+XiwurXVg9mATptLAA9O8X2/lZg/70y7bZDvDUOvAFYD3gVU2cm9//zttVgTy3MPItTTlbuwU0uYwegEAZAe8ANqHTaCFcBk06gVS8vjIC1G1NBFL+x7o7G5psAU4BKbFiwvBjjXJA2Q2aAszDGE/Y5KgIQMJI8KNDP0raJEHZKVEAhP4BvX867G/5AgD6tQf1psQGoAwUx4QeYF57SNZXeKPiaQTnywa0cokMOt1zPkwAuAFAL88zwHonxUwuML7bgmEQl706s2JUPRFXAP1YC+Hm9R8oXv9BFXcLYF//+QFMcCnZRELiaQAAAABJRU5ErkJggg==");
+    --r: 2px;
+    --mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono",
+      Menlo, Consolas, monospace;
+    --sans: "Inter Variable", "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+    --brand: "Unbounded Variable", "Unbounded", system-ui, sans-serif;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       color-scheme: dark;
-      --ground: #000000; --panel: #0c0c0c; --panel-2: #171717; --line: #262626;
-      --ink: #f5f5f5; --dim: #a3a3a3; --accent: #ffffff; --accent-soft: #171717;
-      --warn-bg: #241c0d; --warn-line: #4d3c17; --warn-ink: #e0a44a;
-      --ok: #22c55e; --ok-bg: #0d2114; --bad: #ef4444; --bad-bg: #241113;
-      --bar: #404040;
+      --ground: #0a0c09; --panel: #0e110d; --panel-2: #12160f; --line: #23271f;
+      --ink: #eef0e9; --dim: #a8ae9c; --faint: #7d8473;
+      --accent: #e0a44a; --accent-soft: #241f13; --amber: #e8b15c;
+      --warn-bg: #291f14; --warn-line: #523520; --warn-ink: #f08a4b;
+      --ok: #3fe0b0; --ok-bg: #142a21; --bad: #f26b5b; --bad-bg: #291c16;
+      --bar: #3a4231; --line-2: rgba(214, 222, 196, 0.2); --scan: rgba(238, 240, 233, 0.025);
+      --camo: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAMAAADVRocKAAAAD1BMVEULDgoUGhEcJRcoMh8bTTzwoYfyAAAE5ElEQVR42q2a2XaEIAxAs/D/39yjQMgK2NaXVmcm1yyEJAqISPMARER4DzZHv/Z8FfsxfwDjnwYoB8jV59uAmkBC4IJg5C/A8+mEGPkeMBHsCRNi5BMs3aFTnj8YAPierIupEksLDgoMFMyv5IBlQthZiVnJAs0CbUi513HmpcNjJ16nTCKflXztg8kQP3WJ69YN4PlfAabQAAALeH5iAI/tUoIGdJn94BxAxqiows0DhLIAr0RhdABHAJED9M9qAHANYEarA0QAHABd4fdeWSxDNqS0fG0i8xFFAhjTy82JfB1sQDpoo/wNQG7aAnw41wAqASjfJfHne2YMnB0cCXZxaBWEEJZ1BfCrXrsHNipQX2mGkIhHm1ZUFEGtwlpERCcNkHMNhogMQCZXfgEoAqi9zAHIHiVg2oBTAqjUfQnAsA5uAAmhADj75PInQQHoChAWAek8HhEaEAgJAOMq+wCgPQDCpmRiCE0QvLl+reQF0HtnAYjCXx3Q7TaySt9FQFGPEtDyNIRuM7MAU+2E8kpvkZWNXonKxK8TCgChR+gbLwgWMKzVCkAguGoAM/moFZj+kBBDygC+1JNyYxwN8lyMvlhjUqXjAuj/UwCcAPAPgHYBAMx9YNwB+2NrosrJ1t1GHOAFAL4B0EnTVbIDhKSN+TpwO5G/4w9OLpYB2d30AwD3PsYDALcAViqoj4mShdzXYVLYR69vABw3L+PYrDV5T9e1eZq5ecQSRQIvOUu+RmvAsoPKpbAARIUKmQMjYCaEBcD3tgeA4pFbpQRI6oS1eOQDoAsA1IDWWlOpeeYXIUMKIDzqoDRYuV9+rjqYHEDU948Ra34znA12CSDVIK3+y1dBA/CWIC4CEx/4EkG6i1y+A4QQ1yZ8QtqbGo4AJct6wLXCeZEj3e/sbfcAIyp28wVAq5K4wFtDIimV/8w8PADYdPJZmBoxsrUk0t1MaxHC/CjtFXpVY3eCE4Bsrj0BxuJsM73AQYPQ3gZ7SDZ15cUgYGEj1bGppv/p4POM7grUN6IGIIfo9GUAhV2d6jMlPIRCPiZThTATNT+2sWtWeZoE41yhb5lAoAcIVWh8AKzbZ1uIXMhXANwCZMsvik2iDaHcJuZE1ExaUwKdAYmXJXLGP9iX/u8AuXzWMYoIbsR3BSCGPEZXeuPZekKhwB5AxRJYo1zpbH8HgC1A7C8AzKZvWx/sADpJFAAuAVwDwiITQNqA5QA3Pa3SBLC1VXZEt34BCOha/BGwb0LbUTzJQ5MBgEr+qeE1T36qwOewPx0mARaAewDYkisrxLfyjysXbJ0URP4ZYItG+Ab4kntMkzUwrbWTi0PWcTOXMjwvJiYJQAajmWMv5Nn06Z9M0kyrcn+XiwurXVg9mATptLAA9O8X2/lZg/70y7bZDvDUOvAFYD3gVU2cm9//zttVgTy3MPItTTlbuwU0uYwegEAZAe8ANqHTaCFcBk06gVS8vjIC1G1NBFL+x7o7G5psAU4BKbFiwvBjjXJA2Q2aAszDGE/Y5KgIQMJI8KNDP0raJEHZKVEAhP4BvX867G/5AgD6tQf1psQGoAwUx4QeYF57SNZXeKPiaQTnywa0cokMOt1zPkwAuAFAL88zwHonxUwuML7bgmEQl706s2JUPRFXAP1YC+Hm9R8oXv9BFXcLYF//+QFMcCnZRELiaQAAAABJRU5ErkJggg==");
     }
   }
   :root[data-theme="dark"] {
     color-scheme: dark;
-    --ground: #000000; --panel: #0c0c0c; --panel-2: #171717; --line: #262626;
-    --ink: #f5f5f5; --dim: #a3a3a3; --accent: #ffffff; --accent-soft: #171717;
-    --warn-bg: #241c0d; --warn-line: #4d3c17; --warn-ink: #e0a44a;
-    --ok: #22c55e; --ok-bg: #0d2114; --bad: #ef4444; --bad-bg: #241113;
-    --bar: #404040;
+    --ground: #0a0c09; --panel: #0e110d; --panel-2: #12160f; --line: #23271f;
+    --ink: #eef0e9; --dim: #a8ae9c; --faint: #7d8473;
+    --accent: #e0a44a; --accent-soft: #241f13; --amber: #e8b15c;
+    --warn-bg: #291f14; --warn-line: #523520; --warn-ink: #f08a4b;
+    --ok: #3fe0b0; --ok-bg: #142a21; --bad: #f26b5b; --bad-bg: #291c16;
+    --bar: #3a4231; --line-2: rgba(214, 222, 196, 0.2); --scan: rgba(238, 240, 233, 0.025);
+    --camo: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAMAAADVRocKAAAAD1BMVEULDgoUGhEcJRcoMh8bTTzwoYfyAAAE5ElEQVR42q2a2XaEIAxAs/D/39yjQMgK2NaXVmcm1yyEJAqISPMARER4DzZHv/Z8FfsxfwDjnwYoB8jV59uAmkBC4IJg5C/A8+mEGPkeMBHsCRNi5BMs3aFTnj8YAPierIupEksLDgoMFMyv5IBlQthZiVnJAs0CbUi513HmpcNjJ16nTCKflXztg8kQP3WJ69YN4PlfAabQAAALeH5iAI/tUoIGdJn94BxAxqiows0DhLIAr0RhdABHAJED9M9qAHANYEarA0QAHABd4fdeWSxDNqS0fG0i8xFFAhjTy82JfB1sQDpoo/wNQG7aAnw41wAqASjfJfHne2YMnB0cCXZxaBWEEJZ1BfCrXrsHNipQX2mGkIhHm1ZUFEGtwlpERCcNkHMNhogMQCZXfgEoAqi9zAHIHiVg2oBTAqjUfQnAsA5uAAmhADj75PInQQHoChAWAek8HhEaEAgJAOMq+wCgPQDCpmRiCE0QvLl+reQF0HtnAYjCXx3Q7TaySt9FQFGPEtDyNIRuM7MAU+2E8kpvkZWNXonKxK8TCgChR+gbLwgWMKzVCkAguGoAM/moFZj+kBBDygC+1JNyYxwN8lyMvlhjUqXjAuj/UwCcAPAPgHYBAMx9YNwB+2NrosrJ1t1GHOAFAL4B0EnTVbIDhKSN+TpwO5G/4w9OLpYB2d30AwD3PsYDALcAViqoj4mShdzXYVLYR69vABw3L+PYrDV5T9e1eZq5ecQSRQIvOUu+RmvAsoPKpbAARIUKmQMjYCaEBcD3tgeA4pFbpQRI6oS1eOQDoAsA1IDWWlOpeeYXIUMKIDzqoDRYuV9+rjqYHEDU948Ra34znA12CSDVIK3+y1dBA/CWIC4CEx/4EkG6i1y+A4QQ1yZ8QtqbGo4AJct6wLXCeZEj3e/sbfcAIyp28wVAq5K4wFtDIimV/8w8PADYdPJZmBoxsrUk0t1MaxHC/CjtFXpVY3eCE4Bsrj0BxuJsM73AQYPQ3gZ7SDZ15cUgYGEj1bGppv/p4POM7grUN6IGIIfo9GUAhV2d6jMlPIRCPiZThTATNT+2sWtWeZoE41yhb5lAoAcIVWh8AKzbZ1uIXMhXANwCZMsvik2iDaHcJuZE1ExaUwKdAYmXJXLGP9iX/u8AuXzWMYoIbsR3BSCGPEZXeuPZekKhwB5AxRJYo1zpbH8HgC1A7C8AzKZvWx/sADpJFAAuAVwDwiITQNqA5QA3Pa3SBLC1VXZEt34BCOha/BGwb0LbUTzJQ5MBgEr+qeE1T36qwOewPx0mARaAewDYkisrxLfyjysXbJ0URP4ZYItG+Ab4kntMkzUwrbWTi0PWcTOXMjwvJiYJQAajmWMv5Nn06Z9M0kyrcn+XiwurXVg9mATptLAA9O8X2/lZg/70y7bZDvDUOvAFYD3gVU2cm9//zttVgTy3MPItTTlbuwU0uYwegEAZAe8ANqHTaCFcBk06gVS8vjIC1G1NBFL+x7o7G5psAU4BKbFiwvBjjXJA2Q2aAszDGE/Y5KgIQMJI8KNDP0raJEHZKVEAhP4BvX867G/5AgD6tQf1psQGoAwUx4QeYF57SNZXeKPiaQTnywa0cokMOt1zPkwAuAFAL88zwHonxUwuML7bgmEQl706s2JUPRFXAP1YC+Hm9R8oXv9BFXcLYF//+QFMcCnZRELiaQAAAABJRU5ErkJggg==");
   }
 
   * { box-sizing: border-box; }
+  /* A tile is display:flex, which outranks the browser's own rule for `hidden` — without this the
+     checkpoint tile shows as an empty box on a node that has no checkpoint to offer. */
+  [hidden] { display: none !important; }
   html, body { height: 100%; }
   body {
     margin: 0; background: var(--line); color: var(--ink);
-    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font: 14px/1.5 var(--sans);
     -webkit-font-smoothing: antialiased;
     overflow: hidden;
   }
-  .mono, .num { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; }
+  .mono, .num { font-family: var(--mono); }
   .num { font-variant-numeric: tabular-nums; }
   .dim { color: var(--dim); }
   a { color: var(--ink); text-decoration: underline; text-decoration-thickness: 1px;
-      text-underline-offset: 3px; text-decoration-color: var(--dim); }
-  a:hover { text-decoration-color: var(--ink); }
+      text-underline-offset: 3px; text-decoration-color: var(--faint); }
+  a:hover { text-decoration-color: var(--accent); }
+  ::selection { background: var(--accent); color: var(--panel); }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   /* ---------- the board ---------- */
@@ -129,6 +153,8 @@
   .inspect-cell { grid-area: inspector; }
 
   .cell {
+    position: relative;
+    isolation: isolate;
     background: var(--panel);
     min-height: 0;
     min-width: 0;
@@ -136,101 +162,179 @@
     flex-direction: column;
     overflow: hidden;
   }
+  /* A panel's name in the site's section-label voice: an amber index, a short rule, the name in
+     spaced mono capitals. The index is the order a reader meets the panels in, left to right. */
   .cell > header {
-    display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
-    padding: 9px 14px 7px;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 12px 16px 10px;
     flex: none;
   }
   .cell > header h2 {
-    margin: 0; font-size: 10.5px; font-weight: 700; letter-spacing: .14em;
-    text-transform: uppercase; color: var(--dim);
+    display: flex; align-items: center; gap: 10px; flex: none; margin: 0;
+    font: 500 10.5px/1.4 var(--mono); letter-spacing: .14em;
+    text-transform: uppercase; color: var(--dim); white-space: nowrap;
   }
-  .cell > header .aside { font-size: 11.5px; color: var(--dim); }
+  .cell-index { display: inline-flex; align-items: center; gap: 10px; color: var(--amber); }
+  .cell-index::after { content: ""; width: 20px; height: 1px; background: currentColor; opacity: .6; }
+  .cell > header .aside {
+    font: 500 11px/1.4 var(--mono); color: var(--faint); text-align: right;
+    min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .cell .body { flex: 1; min-height: 0; overflow: auto; }
+  .cell .body.pad { padding: 0 16px 14px; }
 
-  /* Scrollbars, made part of the design rather than a hole in it. `color-scheme` above already
-     gets the browser to draw them dark; these two rules make them thin and monochrome so a
-     panel that happens to overflow does not grow a heavy grey chrome bar down its edge.
-     Overlay-style (no track, no buttons) because the board is dense and every pixel of width in
-     a panel is content. */
+  /* The panel that answers "is this node healthy" wears the frame of the site's situation
+     displays: the pattern at its edges, faint scan lines, four corner marks. Only that one — a
+     frame on every panel says nothing about any of them. Decoration only: behind the content,
+     click-through, hidden from assistive technology. */
+  .hud-deco { position: absolute; inset: 0; z-index: -1; pointer-events: none; }
+  .hud-camo, .hud-scan { position: absolute; inset: 0; }
+  .hud-camo {
+    background: var(--camo) 0 0 / 384px;
+    image-rendering: pixelated;
+    opacity: .4;
+    -webkit-mask-image: radial-gradient(95% 90% at 30% 40%, transparent 46%, #000 100%);
+    mask-image: radial-gradient(95% 90% at 30% 40%, transparent 46%, #000 100%);
+  }
+  .hud-scan { background: repeating-linear-gradient(180deg, var(--scan) 0 1px, transparent 1px 3px); }
+  .cell.hud::after {
+    --hc: color-mix(in srgb, var(--accent) 75%, transparent);
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background:
+      linear-gradient(var(--hc), var(--hc)) left top / 14px 2px,
+      linear-gradient(var(--hc), var(--hc)) left top / 2px 14px,
+      linear-gradient(var(--hc), var(--hc)) right top / 14px 2px,
+      linear-gradient(var(--hc), var(--hc)) right top / 2px 14px,
+      linear-gradient(var(--hc), var(--hc)) left bottom / 14px 2px,
+      linear-gradient(var(--hc), var(--hc)) left bottom / 2px 14px,
+      linear-gradient(var(--hc), var(--hc)) right bottom / 14px 2px,
+      linear-gradient(var(--hc), var(--hc)) right bottom / 2px 14px;
+    background-repeat: no-repeat;
+  }
+
+  /* Scrollbars, made part of the design rather than a hole in it: thin, in the bar colour, no
+     track and no buttons, because the board is dense and every pixel of width is content. */
   * { scrollbar-width: thin; scrollbar-color: var(--bar) transparent; }
   ::-webkit-scrollbar { width: 8px; height: 8px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--bar); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb { background: var(--bar); border-radius: var(--r); }
   ::-webkit-scrollbar-thumb:hover { background: var(--dim); }
   ::-webkit-scrollbar-corner { background: transparent; }
-  .cell .body.pad { padding: 0 14px 12px; }
 
   /* ---------- top bar ---------- */
 
   .topbar {
-    background: var(--panel);
-    display: flex; align-items: center; gap: 12px;
-    padding: 9px 14px;
+    position: relative; isolation: isolate;
+    background: var(--ground);
+    display: flex; align-items: center; gap: 14px;
+    min-height: 56px; padding: 6px 16px;
     flex: none;
   }
-  .topbar img { width: 22px; height: 22px; border-radius: 5px; display: block; }
-  .topbar .name { font-weight: 700; letter-spacing: .1em; font-size: 12px; text-transform: uppercase; }
-  .topbar .ver { font-size: 11.5px; color: var(--dim); font-family: ui-monospace, monospace; }
-  .topbar .spacer { margin-left: auto; }
-  .topbar .clock { font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
-  .tbtn {
-    background: transparent; border: 1px solid var(--line); color: var(--dim);
-    border-radius: 6px; padding: 4px 9px; font: inherit; font-size: 11.5px; cursor: pointer;
+  /* The pattern at the bar's left edge, under the mark, fading out within a few centimetres — the
+     site's own top bar does the same. */
+  .topbar::before {
+    content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+    background: var(--camo) 0 0 / 384px;
+    image-rendering: pixelated;
+    opacity: .5;
+    -webkit-mask-image: linear-gradient(90deg, #000 0, transparent 220px);
+    mask-image: linear-gradient(90deg, #000 0, transparent 220px);
   }
-  .tbtn:hover { color: var(--ink); border-color: var(--dim); }
+  .brand { display: flex; align-items: center; gap: 12px; color: var(--ink); flex: none; }
+  .brand img { width: 30px; height: 30px; border-radius: 50%; box-shadow: 0 0 0 1px var(--line-2); display: block; }
+  .brand-name { font: 500 13px/1 var(--brand); letter-spacing: .26em; text-transform: uppercase; }
+  /* The wordmark alone is Unbounded; the part beside it is a label, in the labels' type. */
+  .brand-world {
+    display: inline-flex; align-items: center; gap: 10px;
+    font: 600 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--amber);
+  }
+  .brand-slash { color: var(--faint); font-weight: 300; }
+  .topbar .ver { font: 11.5px/1 var(--mono); color: var(--faint); }
+  .topbar .spacer { margin-left: auto; }
+  .topbar .clock { font: 11.5px/1 var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+  /* The way out to the explorer, drawn as the site draws a way out: the display face, capitals,
+     an amber edge. */
+  .topbar .out {
+    display: inline-flex; align-items: center; min-height: 32px; padding: 0 12px;
+    font: 600 14px/1 var(--display); letter-spacing: .06em; text-transform: uppercase;
+    color: var(--ink); text-decoration: none;
+    border: 1.5px solid color-mix(in srgb, var(--accent) 60%, transparent); border-radius: var(--r);
+    transition: border-color .25s;
+  }
+  .topbar .out:hover { border-color: var(--accent); }
+  /* Small controls: square, outlined, spaced mono capitals — the site's language switch. */
+  .tbtn {
+    min-height: 32px; padding: 0 11px;
+    background: transparent; border: 1px solid var(--line-2); color: var(--ink);
+    border-radius: var(--r); font: 600 11px/1 var(--mono); letter-spacing: .08em;
+    text-transform: uppercase; cursor: pointer; transition: border-color .25s;
+  }
+  .tbtn:hover { border-color: var(--ink); }
 
   /* ---------- the verdict ---------- */
 
-  .verdict-cell .body { display: flex; flex-direction: column; justify-content: center; padding: 0 16px 14px; }
+  .verdict-cell .body { display: flex; flex-direction: column; justify-content: center; padding: 0 18px 16px; }
   .state {
-    font-size: clamp(24px, 3.2vw, 40px); font-weight: 800; letter-spacing: -.03em;
-    line-height: 1; margin: 0 0 2px; display: flex; align-items: center; gap: 11px;
+    font: 700 clamp(30px, 2.9vw, 44px)/.95 var(--display); letter-spacing: .01em; text-transform: uppercase;
+    margin: 0 0 4px; display: flex; align-items: center; gap: 12px;
   }
-  .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot { position: relative; width: 10px; height: 10px; border-radius: var(--r); background: var(--faint); flex: none; }
   .dot.ok  { background: var(--ok); }
   .dot.bad { background: var(--bad); animation: blink 1.4s steps(1, end) infinite; }
   .dot.warn{ background: var(--warn-ink); }
   @keyframes blink { 50% { opacity: .25; } }
-  .state-why { font-size: 12.5px; color: var(--dim); margin: 6px 0 0; max-width: 34ch; }
+  .state-why { font-size: 12.5px; color: var(--dim); margin: 6px 0 0; max-width: 36ch; }
   .height {
-    font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums;
-    font-size: clamp(28px, 4vw, 52px); font-weight: 700; letter-spacing: -.04em; line-height: 1.05;
-    margin-top: 14px;
+    font: 600 clamp(28px, 3.4vw, 46px)/1.05 var(--mono); font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em; color: var(--amber);
+    margin-top: 16px;
   }
-  .height small { display: block; font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase;
-                  color: var(--dim); font-weight: 700; font-family: system-ui, sans-serif; margin-bottom: 2px; }
-  .since { margin-top: 10px; font-size: 12.5px; color: var(--dim); }
-  .since b { color: var(--ink); font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .height small, .tile .k, .kv dt, .strip span b, thead th {
+    display: block; font: 500 10px/1.4 var(--mono); letter-spacing: .14em;
+    text-transform: uppercase; color: var(--faint);
+  }
+  .height small { margin-bottom: 2px; }
+  .since { margin-top: 10px; font: 11.5px/1.45 var(--mono); color: var(--dim); }
+  .since b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
 
   /* The heartbeat: fills over the interval this chain has actually been keeping, and empties the
      moment a block lands. On a healthy chain it is a slow sweep you stop noticing; during a stall
      it sits full and red, which is the point — a stall should look wrong before it is read. */
-  .beat { height: 3px; background: var(--panel-2); border-radius: 2px; margin-top: 12px; overflow: hidden; }
-  .beat i {
-    display: block; height: 100%; width: 0; background: var(--ink);
-    transition: width .18s linear;
-  }
+  .beat { height: 3px; background: var(--line); margin-top: 12px; overflow: hidden; }
+  .beat i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .18s linear; }
   .beat i.over { background: var(--bad); }
 
   /* One block landing lights the whole board briefly — see `onNewBlock`. */
   @keyframes land { from { background: var(--accent-soft); } to { background: transparent; } }
   .landed { animation: land .7s ease-out; }
   @keyframes grow-in { from { transform: scaleY(.05); opacity: .3; } to { transform: scaleY(1); opacity: 1; } }
-  .rhythm .b.fresh { animation: grow-in .35s cubic-bezier(.16, 1, .3, 1); transform-origin: bottom; }
-  @keyframes beat-pulse { 0%,100% { box-shadow: 0 0 0 0 transparent; } 35% { box-shadow: 0 0 0 5px var(--accent-soft); } }
+  .rhythm .b.fresh { animation: grow-in .35s var(--ease-out); transform-origin: bottom; }
+  @keyframes beat-pulse { 0%,100% { box-shadow: 0 0 0 0 transparent; } 35% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 25%, transparent); } }
   .dot.ok.pulse { animation: beat-pulse .8s ease-out; }
 
   /* ---------- metric tiles ---------- */
 
-  .metrics-cell .body { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); overflow: hidden; }
-  .tile { background: var(--panel); padding: 10px 14px; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
-  .tile .k { font-size: 9.5px; letter-spacing: .13em; text-transform: uppercase; color: var(--dim); font-weight: 700; }
-  .tile .v { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums;
-             font-size: clamp(15px, 1.5vw, 21px); font-weight: 700; letter-spacing: -.02em; margin-top: 1px; }
-  .tile .v small { font-size: 11px; font-weight: 500; color: var(--dim); letter-spacing: 0; }
-  .meter { height: 3px; background: var(--panel-2); border-radius: 2px; margin-top: 5px; overflow: hidden; }
-  .meter i { display: block; height: 100%; background: var(--ink); }
+  /* Readings as the site draws its stat row: what a value is in spaced mono capitals, the value
+     in amber. */
+  /* Rows share the panel's height while there is room and the panel scrolls when there is not.
+     It used to clip instead, and a three-part checkpoint with its note is tall enough to push disk,
+     memory and load — the tiles an operator opens this page for — out of sight. */
+  .metrics-cell .body {
+    display: grid; grid-template-columns: 1fr 1fr; grid-auto-rows: minmax(min-content, 1fr);
+    gap: 1px; background: var(--line); overflow: auto;
+  }
+  /* The checkpoint is a line to copy, not a reading: full width, in the text colour, small. */
+  #cp-tile { grid-column: 1 / -1; }
+  #checkpoint { font: 500 11px/1.5 var(--mono); color: var(--ink); word-break: break-all; letter-spacing: 0; }
+  .tile { background: var(--panel); padding: 10px 16px; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+  .tile .v {
+    font: 600 clamp(15px, 1.45vw, 20px)/1.2 var(--mono); font-variant-numeric: tabular-nums;
+    letter-spacing: -.01em; color: var(--amber); margin-top: 3px; overflow-wrap: anywhere;
+  }
+  .tile .v small { font-size: 11px; font-weight: 500; color: var(--faint); letter-spacing: 0; }
+  .tile > small { font-size: 11px; color: var(--faint); }
+  .meter { height: 3px; background: var(--line); margin-top: 6px; overflow: hidden; }
+  .meter i { display: block; height: 100%; background: var(--accent); }
   .meter i.warn { background: var(--warn-ink); }
   .meter i.bad { background: var(--bad); }
 
@@ -238,24 +342,29 @@
 
   /* Bars, not a line: each block is a discrete event and the question is "was this one late",
      not "what is the trend". A missed round is one tall bar, which is exactly how it feels. */
-  .rhythm { display: flex; align-items: flex-end; gap: 2px; height: 100%; min-height: 60px; padding: 0 14px 6px; }
+  .rhythm {
+    display: flex; align-items: flex-end; gap: 2px; height: 100%; min-height: 60px;
+    margin: 0 16px; border-bottom: 1px solid var(--line-2);
+  }
   .rhythm .b {
-    flex: 1 1 0; min-width: 2px; background: var(--bar); border-radius: 1px 1px 0 0;
+    flex: 1 1 0; min-width: 2px; background: var(--bar);
     transition: height .25s ease, background-color .15s ease;
     cursor: crosshair;
   }
   .rhythm .b.warn { background: var(--warn-ink); }
   .rhythm .b.bad { background: var(--bad); }
-  .rhythm:hover .b { opacity: .45; }
+  .rhythm:hover .b { opacity: .4; }
   .rhythm .b:hover { opacity: 1; background: var(--accent); }
   .rhythm .b.warn:hover { background: var(--warn-ink); }
   .rhythm .b.bad:hover { background: var(--bad); }
+  .rhythm-axis { display: flex; justify-content: space-between; padding: 6px 16px 12px; font: 10.5px/1.4 var(--mono); color: var(--faint); }
 
   /* A validator selected in the set panel dims every block it did not propose, which turns the
      recent-blocks list into "show me this validator's turns". Cheap, and it answers a question
      an operator genuinely asks: is my node actually taking its slots? */
   tbody tr.faded td { opacity: .32; }
   tbody tr.pick td { background: var(--accent-soft); }
+  tbody tr.pick td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
   tbody tr { cursor: pointer; }
 
   /* ---------- inspector ---------- */
@@ -263,57 +372,62 @@
   /* The board answers "is it healthy" at a glance; this answers "what exactly is that" without
      leaving the page. Bottom right because it is the last thing you look at, and because a
      detail pane that pushes the live panels around would defeat the point of a fixed board. */
-  .inspect-cell .body { padding: 0 14px 12px; }
-  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12px; align-items: baseline; }
-  .kv dt { color: var(--dim); font-size: 9.5px; letter-spacing: .11em; text-transform: uppercase; font-weight: 700; white-space: nowrap; }
-  .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
-  .inspect-empty { color: var(--dim); font-size: 12.5px; padding-top: 4px; }
+  .inspect-cell .body { padding: 0 16px 14px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 5px 14px; font-size: 12px; align-items: baseline; margin: 0; }
+  .kv dt { white-space: nowrap; }
+  .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .inspect-empty { color: var(--dim); font-size: 12.5px; padding-top: 4px; margin: 0; }
   .inspect-empty kbd {
-    font: inherit; font-family: ui-monospace, monospace; background: var(--panel-2);
-    border-radius: 4px; padding: 1px 5px; color: var(--ink);
+    font: 11px/1 var(--mono); background: var(--panel-2); border: 1px solid var(--line-2);
+    border-radius: var(--r); padding: 2px 5px; color: var(--ink);
   }
   .clear-btn {
-    background: transparent; border: 1px solid var(--line); color: var(--dim);
-    border-radius: 5px; padding: 2px 7px; font: inherit; font-size: 10.5px; cursor: pointer;
+    background: transparent; border: 1px solid var(--line-2); color: var(--dim);
+    border-radius: var(--r); padding: 3px 8px; font: 600 10px/1 var(--mono); letter-spacing: .08em;
+    text-transform: uppercase; cursor: pointer;
   }
-  .clear-btn:hover { color: var(--ink); border-color: var(--dim); }
-  .rhythm-axis { display: flex; justify-content: space-between; padding: 4px 14px 10px; font-size: 10.5px; color: var(--dim); }
+  .clear-btn:hover { color: var(--ink); border-color: var(--ink); }
 
   /* ---------- tables ---------- */
 
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   thead th {
+    display: table-cell;
     position: sticky; top: 0; background: var(--panel); z-index: 1;
-    text-align: left; font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase;
-    color: var(--dim); font-weight: 700; padding: 4px 14px 6px; white-space: nowrap;
+    text-align: left; padding: 4px 16px 7px; white-space: nowrap;
+    border-bottom: 1px solid var(--line-2);
   }
-  td { padding: 5px 14px; white-space: nowrap; border-top: 1px solid var(--line); }
+  td { padding: 6px 16px; white-space: nowrap; border-top: 1px solid var(--line); }
+  tbody tr:first-child td { border-top: none; }
   tbody tr:hover td { background: var(--panel-2); }
   td.r, th.r { text-align: right; }
 
+  /* The site's badge: square, outlined, spaced mono capitals. */
   .pill {
-    display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
-    background: var(--panel-2); color: var(--dim); letter-spacing: .04em; text-transform: uppercase;
+    display: inline-block; font: 500 9.5px/1.2 var(--mono); padding: 2px 6px; border-radius: var(--r);
+    border: 1px solid var(--line-2); background: var(--panel-2); color: var(--dim);
+    letter-spacing: .08em; text-transform: uppercase;
   }
-  .pill.ok { background: var(--ok-bg); color: var(--ok); }
-  .pill.bad { background: var(--bad-bg); color: var(--bad); }
-  .pill.warn { background: var(--warn-bg); color: var(--warn-ink); }
+  .pill.ok { background: var(--ok-bg); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn-ink); border-color: color-mix(in srgb, var(--warn-ink) 40%, transparent); }
 
   /* ---------- alerts ---------- */
 
   .alerts { display: flex; flex-direction: column; gap: 1px; }
-  .alert { padding: 7px 14px; font-size: 12px; background: var(--warn-bg); color: var(--warn-ink); }
+  .alert { padding: 8px 16px; font-size: 12.5px; background: var(--warn-bg); color: var(--warn-ink); box-shadow: inset 3px 0 0 currentColor; }
   .alert.bad { background: var(--bad-bg); color: var(--bad); }
-  .alert b { font-weight: 700; }
+  .alert b { font: 600 14px/1 var(--display); letter-spacing: .04em; text-transform: uppercase; }
 
   /* ---------- footer identity strip ---------- */
 
   .strip {
-    background: var(--panel); display: flex; flex-wrap: wrap; gap: 0 22px;
-    padding: 7px 14px; font-size: 11px; color: var(--dim); flex: none; align-items: center;
+    background: var(--ground); display: flex; flex-wrap: wrap; gap: 4px 22px;
+    padding: 8px 16px; font-size: 11px; color: var(--dim); flex: none; align-items: center;
   }
-  .strip span b { color: var(--dim); font-weight: 700; letter-spacing: .1em; text-transform: uppercase; font-size: 9.5px; margin-right: 5px; }
-  .strip span i { font-style: normal; color: var(--ink); font-family: ui-monospace, monospace; }
+  .strip span b { display: inline; margin-right: 6px; }
+  .strip span i { font-style: normal; color: var(--ink); font-family: var(--mono); }
+  .strip span i b { display: inline; color: var(--bad); font: 600 11px/1 var(--mono); letter-spacing: .06em; }
   .strip .spacer { margin-left: auto; }
 
   /* ---------- fallback: a board that does not fit is worse than a document ---------- */
@@ -322,11 +436,10 @@
     body { overflow: auto; }
     html, body { height: auto; }
     .app { height: auto; }
-    /* Every area the board names has to be named here too. `inspector` was missing, and a
-       `grid-area` pointing at a name the template does not define does not fall back to the
-       flow — it gets auto-placed into an *implicit* column beside the explicit one. The result
-       was the whole board crushed into the left half of the screen with the inspector alone on
-       the right, from 1100px down to a phone. Nothing about it looked like a missing word. */
+    /* Every area the board names has to be named here too. A `grid-area` pointing at a name the
+       template does not define does not fall back to the flow — it gets auto-placed into an
+       *implicit* column beside the explicit one, which crushed the whole board into the left
+       half of the screen once, from 1100px down to a phone. */
     /* `minmax(0, 1fr)`, not `1fr`: a bare `1fr` track carries an automatic *minimum* of its
        content's min-content width, so one nowrap table wider than the screen silently stretches
        the entire grid — and with it the top bar and every panel — past the viewport. The cells
@@ -338,17 +451,25 @@
     }
     .cell { overflow: visible; }
     .cell .body { overflow: visible; }
+    .verdict-cell .body { padding-top: 8px; padding-bottom: 20px; }
     .vals-cell .body, .blocks-cell .body { max-height: 320px; overflow: auto; }
     .rhythm { min-height: 90px; }
+    .metrics-cell .body { grid-auto-rows: auto; }
   }
 
   /* On a phone these tables are wider than the screen. Rather than let them drag the page
      sideways, the columns that answer the least are dropped — a column somebody has to scroll to
-     find is a column that is not there. The remaining gutters give back the last few pixels. */
+     find is a column that is not there. The top bar keeps the mark and the two controls; the clock
+     and the version are what it can do without. */
   @media (max-width: 620px) {
     .opt { display: none; }
-    td, thead th { padding-left: 9px; padding-right: 9px; }
+    td, thead th { padding-left: 10px; padding-right: 10px; }
     .metrics-cell .body { grid-template-columns: 1fr 1fr; }
+    .topbar { gap: 8px; padding: 6px 12px; }
+    .topbar .clock, .topbar .ver { display: none; }
+    .topbar .out, .tbtn { min-height: 30px; padding: 0 9px; }
+    .brand { gap: 9px; }
+    .brand-name { font-size: 11.5px; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -359,18 +480,22 @@
 
 <div class="app">
   <div class="topbar">
-    <img src="/logo.png" alt="">
-    <span class="name">Helix node</span>
+    <div class="brand">
+      <img src="/logo.png" alt="" width="30" height="30">
+      <span class="brand-name">Helix</span>
+      <span class="brand-world"><span class="brand-slash">/</span>Node</span>
+    </div>
     <span class="ver" id="version">—</span>
     <span class="spacer"></span>
     <span class="clock" id="clock">—</span>
-    <a href="https://explorer.silvra.net">Explorer</a>
+    <a class="out" href="https://explorer.silvra.net">Explorer</a>
     <button class="tbtn" id="theme" type="button">System</button>
   </div>
 
   <div class="board">
-    <section class="cell verdict-cell">
-      <header><h2>This node</h2><span class="aside" id="uptime">—</span></header>
+    <section class="cell verdict-cell hud">
+      <div class="hud-deco" aria-hidden="true"><div class="hud-camo"></div><div class="hud-scan"></div></div>
+      <header><h2><span class="cell-index">01</span>This node</h2><span class="aside" id="uptime">—</span></header>
       <div class="body">
         <p class="state"><span class="dot" id="dot"></span><span id="state">…</span></p>
         <p class="state-why" id="why">Reading this node.</p>
@@ -381,7 +506,7 @@
     </section>
 
     <section class="cell metrics-cell">
-      <header><h2>Resources &amp; network</h2></header>
+      <header><h2><span class="cell-index">04</span>Resources &amp; network</h2></header>
       <div class="body">
         <div class="tile"><span class="k">Peers</span><span class="v" id="peers">—</span></div>
         <div class="tile"><span class="k">Mempool</span><span class="v" id="mempool">—</span></div>
@@ -393,17 +518,6 @@
         -->
         <div class="tile">
           <span class="k">Chain on disk</span><span class="v" id="chainsize">—</span>
-        </div>
-        <!--
-          A joining node can skip replaying the chain if it is given a height and block hash to
-          anchor to. Published here so it is one copy away — but a checkpoint taken from the node
-          you are about to sync from proves nothing on its own, which is why the note under it
-          says to compare. The same endpoint answers on every node, so comparing is cheap.
-        -->
-        <div class="tile" id="cp-tile" hidden>
-          <span class="k">Sync checkpoint</span>
-          <span class="v mono" id="checkpoint" style="font-size:.75rem;word-break:break-all">—</span>
-          <small id="cp-note"></small>
         </div>
         <div class="tile">
           <span class="k">Disk free</span><span class="v" id="diskfree">—</span>
@@ -421,11 +535,22 @@
              it rather than being left for the reader to remember. -->
         <div class="tile"><span class="k">Load</span><span class="v" id="load">—</span></div>
         <div class="tile"><span class="k">State height</span><span class="v" id="stateh">—</span></div>
+        <!--
+          A joining node can skip replaying the chain if it is given a height and block hash to
+          anchor to. Published here so it is one copy away — but a checkpoint taken from the node
+          you are about to sync from proves nothing on its own, which is why the note under it
+          says to compare. The same endpoint answers on every node, so comparing is cheap.
+        -->
+        <div class="tile" id="cp-tile" hidden>
+          <span class="k">Sync checkpoint</span>
+          <span class="v mono" id="checkpoint">—</span>
+          <small id="cp-note"></small>
+        </div>
       </div>
     </section>
 
     <section class="cell rhythm-cell">
-      <header><h2>Block rhythm</h2><span class="aside" id="rhythm-note">seconds between blocks</span></header>
+      <header><h2><span class="cell-index">02</span>Block rhythm</h2><span class="aside" id="rhythm-note">seconds between blocks</span></header>
       <div class="body" style="display:flex;flex-direction:column">
         <div class="rhythm" id="rhythm"></div>
         <div class="rhythm-axis"><span id="rhythm-old">—</span><span id="rhythm-max">—</span><span id="rhythm-new">newest</span></div>
@@ -433,7 +558,7 @@
     </section>
 
     <section class="cell blocks-cell">
-      <header><h2>Recent blocks</h2><span class="aside">full history in the explorer</span></header>
+      <header><h2><span class="cell-index">05</span>Recent blocks</h2><span class="aside">full history in the explorer</span></header>
       <div class="body">
         <table>
           <!-- `opt` columns are dropped on a phone. What survives answers what the panel is for:
@@ -446,7 +571,7 @@
     </section>
 
     <section class="cell vals-cell">
-      <header><h2>Validator set</h2><span class="aside" id="quorum">—</span></header>
+      <header><h2><span class="cell-index">03</span>Validator set</h2><span class="aside" id="quorum">—</span></header>
       <div class="alerts" id="alerts"></div>
       <div class="body">
         <table>
@@ -460,7 +585,7 @@
 
     <section class="cell inspect-cell">
       <header>
-        <h2 id="inspect-title">Inspector</h2>
+        <h2><span class="cell-index">06</span><span id="inspect-title">Inspector</span></h2>
         <button class="clear-btn" id="inspect-clear" type="button" hidden>Clear</button>
       </header>
       <div class="body">
@@ -638,7 +763,7 @@
         "The chain is moving but this node's signature is not in recent blocks."];
     }
     if (isValidator) return ["ok", "VALIDATING", "Producing and co-signing blocks with the rest of the set."];
-    return ["ok", "IN SYNC", "Following the chain. This node holds no stake, so it does not vote."];
+    return ["ok", "IN SYNC", "Following the chain without co-signing: this node holds no stake, or its validator is jailed or not yet in the active set."];
   }
 
   function alerts(diag) {
