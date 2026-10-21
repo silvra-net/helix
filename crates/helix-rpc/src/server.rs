@@ -606,11 +606,39 @@ const SYNC_CLIENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2
 /// client's window leaves after sending it. A request that waits longer would have its client give
 /// up while it is being sent — bytes for nobody — so it is told to come back instead, before it has
 /// cost a byte. Zero when the batch alone takes the whole window: then it is sent only if the line
-/// is free this instant. (A fixed 15 s, the first version, was right for 700 KiB/s and wrong for
-/// 400: a 9 MB batch takes 23 s there.)
+/// is free this instant — since 2026-10-20 only for a single block, because a larger batch that
+/// long is refused before it waits (`blocks_that_fit`). (A fixed 15 s, the first version, was right
+/// for 700 KiB/s and wrong for 400: a 9 MB batch takes 23 s there.)
 fn sync_turn_wait(len: usize, bytes_per_sec: u64) -> std::time::Duration {
     let sending = std::time::Duration::from_secs_f64(len as f64 / bytes_per_sec.max(1) as f64);
     SYNC_CLIENT_WINDOW.saturating_sub(sending)
+}
+
+/// The response header that names how many blocks a refused batch should have asked for (see
+/// [`blocks_that_fit`]). A client that reads it asks again for that many; one that does not sees
+/// an ordinary 503.
+pub const SYNC_FITS_HEADER: &str = "x-helix-sync-fits";
+
+/// How many blocks of a built batch of `len` bytes can be sent at `bytes_per_sec` inside the
+/// client's window — `None` when the whole batch can, or when it is a single block (nothing
+/// smaller exists to offer, so it is sent as before).
+///
+/// A batch that cannot is not sent at all. Until 2026-10-20 it was, whenever the line was free,
+/// and every byte of it was lost: the client stops reading after 30 s, a bincode batch is useless
+/// until its last byte, and the next poll asked for the same batch again. Measured that day after
+/// the production node's rate went down to 150 KiB/s: a 200-block batch was ~6.8 MB, 44 s of
+/// sending, and the tunnel logged 61 such aborted answers in an hour — about half of the rate the
+/// operator had set aside for syncing, spent on nobody.
+///
+/// Always fewer than `blocks`, so a client that keeps asking for what it is told arrives at a
+/// batch that fits, or at one block.
+fn blocks_that_fit(len: usize, blocks: usize, bytes_per_sec: u64) -> Option<u64> {
+    let budget = SYNC_CLIENT_WINDOW.as_secs_f64() * bytes_per_sec.max(1) as f64;
+    if blocks <= 1 || len as f64 <= budget {
+        return None;
+    }
+    let fit = (blocks as f64 * budget / len as f64).floor() as u64;
+    Some(fit.clamp(1, blocks as u64 - 1))
 }
 
 /// `bytes`, as a stream that takes `bytes.len() / bytes_per_sec` seconds to drain and holds `turn`
@@ -952,6 +980,24 @@ async fn get_sync_blocks(
             // building ones always were.
             if let Some(pacer) = state.sync_pacer.as_deref() {
                 drop(store);
+                if let Some(fit) = blocks_that_fit(bytes.len(), blocks.len(), pacer.bytes_per_sec) {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [
+                            (axum::http::header::RETRY_AFTER.as_str(), "1".to_string()),
+                            (SYNC_FITS_HEADER, fit.to_string()),
+                        ],
+                        Json(json!({
+                            "error": format!(
+                                "{} blocks take longer to send at this node's sync rate than a \
+                                 client waits — ask for at most {fit}",
+                                blocks.len()
+                            ),
+                            "fits": fit,
+                        })),
+                    )
+                        .into_response();
+                }
                 let turn = match pacer.turn(sync_turn_wait(bytes.len(), pacer.bytes_per_sec)).await {
                     Ok(turn) => turn,
                     Err(busy) => return busy,
@@ -2392,7 +2438,7 @@ async fn get_transaction_status(
 
 #[cfg(test)]
 mod paced_sync_tests {
-    use super::{paced, sync_turn_wait, SyncPacer};
+    use super::{blocks_that_fit, paced, sync_turn_wait, SyncPacer};
     use futures_util::StreamExt;
     use std::time::Duration;
 
@@ -2435,6 +2481,32 @@ mod paced_sync_tests {
         assert!((at(400) - 2.8).abs() < 0.3, "400 KiB/s: {}", at(400));
         assert_eq!(at(300), 0.0, "longer than the window alone: no waiting");
         assert!(sync_turn_wait(1_000, 1024 * 1024).as_secs_f64() > 24.9, "a small batch may wait");
+    }
+
+    /// 2026-10-20: at 150 KiB/s a 200-block batch of ~6.8 MB takes 44 s against a client that waits
+    /// 30. It is refused with the number that fits, and a client that keeps asking for what it is
+    /// told gets there.
+    #[test]
+    fn a_batch_its_client_cannot_receive_in_time_is_refused_with_the_number_that_fits() {
+        let rate = 150 * 1024;
+        let block = 34_000;
+        let fit = blocks_that_fit(200 * block, 200, rate).expect("6.8 MB does not fit in 25 s");
+        assert_eq!(fit, 112, "25 s × 150 KiB/s = 3.84 MB = 112 blocks of 34 KB");
+        assert_eq!(blocks_that_fit(fit as usize * block, fit as usize, rate), None, "and those do");
+
+        assert_eq!(blocks_that_fit(100 * block, 100, 400 * 1024), None, "fits at 400 KiB/s");
+        assert_eq!(blocks_that_fit(2_000_000, 1, 1_000), None, "one block is never refused");
+
+        // Large blocks at a slow rate: each refusal names fewer than were asked for, down to one.
+        let mut asked = 200usize;
+        let mut rounds = 0;
+        while let Some(fit) = blocks_that_fit(asked * 250_000, asked, 10_000) {
+            assert!((fit as usize) < asked, "{fit} is not fewer than {asked}");
+            asked = fit as usize;
+            rounds += 1;
+            assert!(rounds < 20, "never converged");
+        }
+        assert_eq!(asked, 1, "2.5 MB blocks at 10 kB/s fit only one at a time");
     }
 
     /// One batch at a time: the next waits for the one being sent, and gets its turn the moment that
@@ -4612,6 +4684,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(compact.status(), StatusCode::OK, "the compact form is still served");
+    }
+
+    /// Through the production stack: a paced batch its client could not receive in time is refused
+    /// before a byte of it is sent, and the answer names how many blocks would fit — in a header a
+    /// client can read, and in the body for a person. One block is still served (the positive
+    /// control: the refusal is about the size).
+    #[tokio::test]
+    async fn a_paced_batch_too_large_for_its_client_is_refused_with_the_number_that_fits() {
+        use tower::ServiceExt;
+        let state = AppState {
+            // 100 B/s × 25 s = 2.5 kB: less than three blocks, more than none.
+            sync_pacer: Some(Arc::new(SyncPacer::new(100))),
+            ..fresh_test_state_with_blocks(5).await
+        };
+        let limiter = Arc::new(RateLimiter::new(1_000.0, 1_000.0));
+        let ask = |uri: &str| {
+            let mut request =
+                axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_004))));
+            request
+        };
+        let refused = router(state.clone(), limiter.clone())
+            .oneshot(ask("/sync/blocks?from=1&count=3&encoding=bincode"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let fit: u64 = refused
+            .headers()
+            .get(SYNC_FITS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("the refusal names how many blocks fit");
+        assert!((1..3).contains(&fit), "fewer than asked for, at least one: {fit}");
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        assert!(body.len() < 1_000, "an explanation, not the batch: {} bytes", body.len());
+
+        let one = router(state, limiter)
+            .oneshot(ask("/sync/blocks?from=1&count=1&encoding=bincode"))
+            .await
+            .unwrap();
+        assert_eq!(one.status(), StatusCode::OK, "a single block is never refused");
     }
 
     /// A built batch waiting for its turn does not hold the block store: the node applies blocks
