@@ -81,7 +81,7 @@ resets since 1.0.0; a protocol change activates at a height scheduled on the cha
 
 ```json
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "height": 1248,
   "best_hash": "e430e388…",
   "peer_count": 3,
@@ -150,7 +150,7 @@ also reports disk and memory totals, load, threads and open file descriptors):
 
 ```json
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "uptime_secs": 8412,
   "height": 36377,
   "state_height": 36377,
@@ -170,7 +170,7 @@ also reports disk and memory totals, load, threads and open file descriptors):
   "rss_kb": 344328,
   "machine_total_kb": 32758376,
   "previous_run": {
-    "version": "1.1.0",
+    "version": "1.1.1",
     "clean_exit": false,
     "ran_for_secs": 553,
     "last_height": 36119,
