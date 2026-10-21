@@ -5170,10 +5170,7 @@ async fn block_production_loop(
         // validators exchange — they were most of what filled a home node's download on 2026-10-13.
         // Told on the first tick and on every change; a full command queue means "tell it next
         // tick", never "assume it heard".
-        let follow_only = {
-            let eng = engine.read().await;
-            eng.validator_set().get(&eng.address).is_none()
-        };
+        let follow_only = follows_only(&*engine.read().await);
         if follow_only_told != Some(follow_only)
             && p2p_tx.try_send(P2PCommand::FollowOnly(follow_only)).is_ok()
         {
@@ -6544,6 +6541,16 @@ fn catchup_defers_to_consensus(our_height: u64, peer_height: u64, round_in_fligh
     round_in_flight && peer_height.saturating_sub(our_height) <= RPC_CATCHUP_ROUND_GRACE_BLOCKS
 }
 
+/// Whether this node follows the chain rather than validating it: its key is not in the current
+/// validator set — never staked, still pending, or jailed.
+///
+/// One definition for the two places that act on it: the production loop tells the P2P service
+/// (`P2PCommand::FollowOnly`), and the RPC catch-up treats a follower at the tip differently
+/// ([`RpcCatchupGate`]). Two copies of the condition would be two answers.
+fn follows_only(engine: &BftEngine) -> bool {
+    engine.validator_set().get(&engine.address).is_none()
+}
+
 /// When [`rpc_sync_loop`] may pull blocks from the sync peer: when P2P has stopped closing the
 /// gap — no new low for [`RPC_CATCHUP_STALL_SECS`] — and not again soon after a pull that failed.
 ///
@@ -6552,11 +6559,24 @@ fn catchup_defers_to_consensus(our_height: u64, peer_height: u64, round_in_fligh
 /// is down, too slow or merely keeping pace. A node level with the peer, or one that just pulled
 /// something, starts over.
 ///
+/// **One exception: a follower at the tip.** A node outside the validator set hears no votes,
+/// no proposals and — following by block sync since 2026-10-13 — no committed blocks; P2P tells
+/// it the tip only in the 30-second peer exchange. Behind the gate it trailed the chain by up to
+/// half a minute (the multi-node upgrade test caught it: a follower 87 blocks behind with no way
+/// to draw level). So a follower that was level within [`RPC_CATCHUP_STALL_SECS`] pulls on the
+/// next poll, as every node did before: one or two blocks every few seconds, ~20 KB/s per
+/// follower from the sync peer. That is not the load the gate exists for — that was validators,
+/// which do hear the chain over P2P, pulling whenever they slipped a block or two, and a follower
+/// far behind, which waits for P2P like everyone else.
+///
 /// A plain value, fed the time by its caller, so the rule is tested without a clock or a peer.
 #[derive(Debug, Default)]
 struct RpcCatchupGate {
     /// When the gap reached its lowest value since this node was last level, and that value.
     lowest_gap: Option<(std::time::Instant, u64)>,
+    /// When this node was last level with the peer: a poll found no gap, or a pull reached the
+    /// height the peer reported.
+    level_at: Option<std::time::Instant>,
     /// After a failed pull, no further pull before this.
     retry_at: Option<std::time::Instant>,
     /// Failed pulls in a row.
@@ -6568,9 +6588,16 @@ impl RpcCatchupGate {
     ///
     /// `held`: production is held after a failed startup sync (#152). Such a node signs nothing
     /// until it has caught up, so it does not wait for P2P — only the back-off applies to it.
-    fn should_pull(&mut self, gap: u64, held: bool, now: std::time::Instant) -> bool {
+    /// `following`: this node is outside the validator set ([`follows_only`]); see the type's doc.
+    fn should_pull(
+        &mut self,
+        gap: u64,
+        held: bool,
+        following: bool,
+        now: std::time::Instant,
+    ) -> bool {
         if gap == 0 {
-            *self = Self::default();
+            *self = Self { level_at: Some(now), ..Self::default() };
             return false;
         }
         let since = match self.lowest_gap {
@@ -6583,14 +6610,18 @@ impl RpcCatchupGate {
         if self.retry_at.is_some_and(|at| now < at) {
             return false;
         }
-        held || now.duration_since(since) >= Duration::from_secs(RPC_CATCHUP_STALL_SECS)
+        let window = Duration::from_secs(RPC_CATCHUP_STALL_SECS);
+        let at_the_tip = self.level_at.is_some_and(|t| now.duration_since(t) < window);
+        held || (following && at_the_tip) || now.duration_since(since) >= window
     }
 
-    /// Records how a pull went. Blocks applied: start over. Nothing applied, or an error: wait
-    /// twice as long as last time before the next pull, up to [`RPC_CATCHUP_MAX_BACKOFF_SECS`].
-    fn pulled(&mut self, applied_any: bool, now: std::time::Instant) {
+    /// Records how a pull went. Blocks applied: start over, and level now if the pull reached
+    /// the height the peer reported (`reached_peer`). Nothing applied, or an error: wait twice as
+    /// long as last time before the next pull, up to [`RPC_CATCHUP_MAX_BACKOFF_SECS`].
+    fn pulled(&mut self, applied_any: bool, reached_peer: bool, now: std::time::Instant) {
         if applied_any {
-            *self = Self::default();
+            let level_at = if reached_peer { Some(now) } else { self.level_at };
+            *self = Self { level_at, ..Self::default() };
             return;
         }
         self.failures = self.failures.saturating_add(1);
@@ -6663,7 +6694,8 @@ async fn rpc_sync_loop(
         let our_height = store.read().await.latest_height();
         let gap = peer_height.saturating_sub(our_height);
         let held = syncing.load(std::sync::atomic::Ordering::Relaxed);
-        if !gate.should_pull(gap, held, std::time::Instant::now()) {
+        let following = follows_only(&*engine.read().await);
+        if !gate.should_pull(gap, held, following, std::time::Instant::now()) {
             if peer_height <= our_height {
                 // Level with the peer. If a failed startup sync left production held (#152), this
                 // is the moment it is safe to release: we have what the peer has. Ordinary ticks
@@ -6714,7 +6746,8 @@ async fn rpc_sync_loop(
         // or the next ingest path re-executes what this one already wrote (#145).
         settle_applied_height(&mut last, &store).await;
         let applied_any = matches!(result, Ok((applied, _, _)) if applied > 0);
-        gate.pulled(applied_any, std::time::Instant::now());
+        let reached_peer = matches!(result, Ok((_, new_height, _)) if new_height >= peer_height);
+        gate.pulled(applied_any, reached_peer, std::time::Instant::now());
         match result {
             Ok((applied, new_height, new_hash)) if applied > 0 => {
                 *last = new_height;
@@ -8511,12 +8544,24 @@ mod sync_blocks_from_peer_tests {
     /// A peer that is ten blocks ahead on `/status` and answers every `/sync/blocks` "busy" (503)
     /// — recording when each request arrived, which is all these tests ask.
     async fn serve_ahead_recording_pulls() -> (String, Pulls) {
+        serve_recording_pulls(false, 10).await
+    }
+
+    /// A peer that reports height `ahead` and refuses every pull, recording when each came. With
+    /// `level_first` the first height probe finds it level with a fresh store (height 0) — a node
+    /// that was at the tip and then sees blocks it does not have.
+    async fn serve_recording_pulls(level_first: bool, ahead: u64) -> (String, Pulls) {
         let pulls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = pulls.clone();
+        let probes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let app = Router::new()
             .route(
                 "/status",
-                get(move || async move { Json(serde_json::json!({ "height": 10 })) }),
+                get(move || {
+                    let first = probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+                    let height = if first && level_first { 0 } else { ahead };
+                    async move { Json(serde_json::json!({ "height": height })) }
+                }),
             )
             .route(
                 "/sync/blocks",
@@ -8540,10 +8585,20 @@ mod sync_blocks_from_peer_tests {
         (format!("http://{}", addr), pulls)
     }
 
-    /// `rpc_sync_loop` on a fresh store, against `peer_url`, with production held or not.
-    fn spawn_catch_up(peer_url: String, held: bool) -> tokio::task::JoinHandle<()> {
+    /// `rpc_sync_loop` on a fresh store, against `peer_url`, with production held or not, as a
+    /// validator (its key in the set) or a follower.
+    fn spawn_catch_up_as(
+        peer_url: String,
+        held: bool,
+        follower: bool,
+    ) -> tokio::task::JoinHandle<()> {
         let addr = Address::from_public_key(&KeyPair::generate().public);
-        let validators = vec![Validator::new(addr.clone(), 1, true)];
+        let member = if follower {
+            Address::from_public_key(&KeyPair::generate().public)
+        } else {
+            addr.clone()
+        };
+        let validators = vec![Validator::new(member, 1, true)];
         let vset = ValidatorSet::new(validators, 0, helix_crypto::Hash::ZERO);
         tokio::spawn(rpc_sync_loop(
             Some(peer_url),
@@ -8555,6 +8610,34 @@ mod sync_blocks_from_peer_tests {
             Arc::new(RwLock::new(TipCertificate::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(held)),
         ))
+    }
+
+    /// `rpc_sync_loop` as a validator — the node the gate is for.
+    fn spawn_catch_up(peer_url: String, held: bool) -> tokio::task::JoinHandle<()> {
+        spawn_catch_up_as(peer_url, held, false)
+    }
+
+    /// A follower that was level pulls on the very next poll that finds the peer ahead — the
+    /// running loop, so the wiring is covered: the role comes from the engine's set, and a level
+    /// probe counts as being at the tip.
+    #[tokio::test]
+    async fn a_follower_at_the_tip_pulls_on_the_next_poll() {
+        let (peer_url, pulls) = serve_recording_pulls(true, 1).await;
+        let started = std::time::Instant::now();
+        let handle = spawn_catch_up_as(peer_url, false, true);
+
+        let deadline = started + Duration::from_secs(3 * RPC_SYNC_POLL_SECS);
+        while std::time::Instant::now() < deadline && pulls.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        handle.abort();
+        let pulls = pulls.lock().unwrap().clone();
+        assert!(!pulls.is_empty(), "a follower at the tip did not pull within {deadline:?}");
+        let after = pulls[0] - started;
+        assert!(
+            after < Duration::from_secs(RPC_CATCHUP_STALL_SECS),
+            "pulled {after:?} after starting — it waited out the window meant for validators"
+        );
     }
 
     /// 2026-10-20: the loop no longer pulls on the first poll that finds the peer ahead. It gives
@@ -14425,7 +14508,7 @@ mod catchup_tests {
         let (mut gap, mut t) = (5_000u64, 0u64);
         while gap > 0 {
             assert!(
-                !gate.should_pull(gap, false, at(t0, t)),
+                !gate.should_pull(gap, false, false, at(t0, t)),
                 "pulled at gap {gap}, {t} s in, while P2P was closing it"
             );
             gap -= 2;
@@ -14438,9 +14521,9 @@ mod catchup_tests {
     fn a_gap_that_stops_closing_pulls_once_the_window_has_passed() {
         let t0 = std::time::Instant::now();
         let mut gate = RpcCatchupGate::default();
-        assert!(!gate.should_pull(7, false, at(t0, 0)));
-        assert!(!gate.should_pull(7, false, at(t0, RPC_CATCHUP_STALL_SECS - 1)));
-        assert!(gate.should_pull(7, false, at(t0, RPC_CATCHUP_STALL_SECS)));
+        assert!(!gate.should_pull(7, false, false, at(t0, 0)));
+        assert!(!gate.should_pull(7, false, false, at(t0, RPC_CATCHUP_STALL_SECS - 1)));
+        assert!(gate.should_pull(7, false, false, at(t0, RPC_CATCHUP_STALL_SECS)));
 
         // The same, polled as the loop polls, for a gap that holds and one that grows.
         for (shape, step) in [("holds", 0u64), ("grows", 1)] {
@@ -14449,7 +14532,7 @@ mod catchup_tests {
             let first = (0..20u64)
                 .map(|poll| poll * RPC_SYNC_POLL_SECS)
                 .find(|&t| {
-                    let due = gate.should_pull(gap, false, at(t0, t));
+                    let due = gate.should_pull(gap, false, false, at(t0, t));
                     gap += step;
                     due
                 })
@@ -14463,24 +14546,27 @@ mod catchup_tests {
     fn a_new_low_or_being_level_starts_the_window_over() {
         let t0 = std::time::Instant::now();
         let mut gate = RpcCatchupGate::default();
-        assert!(!gate.should_pull(10, false, at(t0, 0)));
-        assert!(!gate.should_pull(9, false, at(t0, 20)));
-        assert!(!gate.should_pull(12, false, at(t0, 24)), "a gap that rose again is no new low");
+        assert!(!gate.should_pull(10, false, false, at(t0, 0)));
+        assert!(!gate.should_pull(9, false, false, at(t0, 20)));
         assert!(
-            !gate.should_pull(9, false, at(t0, 20 + RPC_CATCHUP_STALL_SECS - 1)),
+            !gate.should_pull(12, false, false, at(t0, 24)),
+            "a gap that rose again is no new low"
+        );
+        assert!(
+            !gate.should_pull(9, false, false, at(t0, 20 + RPC_CATCHUP_STALL_SECS - 1)),
             "the new low at 20 s restarted the window"
         );
-        assert!(gate.should_pull(9, false, at(t0, 20 + RPC_CATCHUP_STALL_SECS)));
+        assert!(gate.should_pull(9, false, false, at(t0, 20 + RPC_CATCHUP_STALL_SECS)));
 
         let mut gate = RpcCatchupGate::default();
-        assert!(!gate.should_pull(5, false, at(t0, 0)));
-        assert!(!gate.should_pull(0, false, at(t0, 28)));
-        assert!(!gate.should_pull(5, false, at(t0, 32)));
+        assert!(!gate.should_pull(5, false, false, at(t0, 0)));
+        assert!(!gate.should_pull(0, false, false, at(t0, 28)));
+        assert!(!gate.should_pull(5, false, false, at(t0, 32)));
         assert!(
-            !gate.should_pull(5, false, at(t0, 32 + RPC_CATCHUP_STALL_SECS - 1)),
+            !gate.should_pull(5, false, false, at(t0, 32 + RPC_CATCHUP_STALL_SECS - 1)),
             "being level at 28 s restarted the window"
         );
-        assert!(gate.should_pull(5, false, at(t0, 32 + RPC_CATCHUP_STALL_SECS)));
+        assert!(gate.should_pull(5, false, false, at(t0, 32 + RPC_CATCHUP_STALL_SECS)));
     }
 
     /// A busy or broken sync peer is asked less and less often, not on every poll.
@@ -14488,14 +14574,14 @@ mod catchup_tests {
     fn failed_pulls_back_off_doubling_up_to_the_cap() {
         let t0 = std::time::Instant::now();
         let mut gate = RpcCatchupGate::default();
-        assert!(!gate.should_pull(50, false, at(t0, 0)));
+        assert!(!gate.should_pull(50, false, false, at(t0, 0)));
         let mut t = RPC_CATCHUP_STALL_SECS;
-        assert!(gate.should_pull(50, false, at(t0, t)));
+        assert!(gate.should_pull(50, false, false, at(t0, t)));
         let mut waits = Vec::new();
         for _ in 0..7 {
-            gate.pulled(false, at(t0, t));
+            gate.pulled(false, false, at(t0, t));
             let mut next = t + 1;
-            while !gate.should_pull(50, false, at(t0, next)) {
+            while !gate.should_pull(50, false, false, at(t0, next)) {
                 next += 1;
             }
             waits.push(next - t);
@@ -14509,19 +14595,19 @@ mod catchup_tests {
     fn a_pull_that_brought_blocks_starts_over() {
         let t0 = std::time::Instant::now();
         let mut gate = RpcCatchupGate::default();
-        assert!(!gate.should_pull(3, false, at(t0, 0)));
-        assert!(gate.should_pull(3, false, at(t0, 30)));
-        gate.pulled(false, at(t0, 30));
-        assert!(gate.should_pull(3, false, at(t0, 38)));
-        gate.pulled(true, at(t0, 38));
+        assert!(!gate.should_pull(3, false, false, at(t0, 0)));
+        assert!(gate.should_pull(3, false, false, at(t0, 30)));
+        gate.pulled(false, false, at(t0, 30));
+        assert!(gate.should_pull(3, false, false, at(t0, 38)));
+        gate.pulled(true, false, at(t0, 38));
         // Still behind (the peer moved on while this pulled): P2P gets its window again.
-        assert!(!gate.should_pull(3, false, at(t0, 42)));
-        assert!(!gate.should_pull(3, false, at(t0, 42 + RPC_CATCHUP_STALL_SECS - 1)));
-        assert!(gate.should_pull(3, false, at(t0, 42 + RPC_CATCHUP_STALL_SECS)));
+        assert!(!gate.should_pull(3, false, false, at(t0, 42)));
+        assert!(!gate.should_pull(3, false, false, at(t0, 42 + RPC_CATCHUP_STALL_SECS - 1)));
+        assert!(gate.should_pull(3, false, false, at(t0, 42 + RPC_CATCHUP_STALL_SECS)));
         // And the failures before the success are forgotten.
-        gate.pulled(false, at(t0, 72));
-        assert!(!gate.should_pull(3, false, at(t0, 79)));
-        assert!(gate.should_pull(3, false, at(t0, 80)));
+        gate.pulled(false, false, at(t0, 72));
+        assert!(!gate.should_pull(3, false, false, at(t0, 79)));
+        assert!(gate.should_pull(3, false, false, at(t0, 80)));
     }
 
     /// A node whose production is held after a failed startup sync (#152) signs nothing until it
@@ -14530,11 +14616,72 @@ mod catchup_tests {
     fn a_node_held_after_a_failed_startup_sync_pulls_at_once_but_still_backs_off() {
         let t0 = std::time::Instant::now();
         let mut gate = RpcCatchupGate::default();
-        assert!(gate.should_pull(5, true, at(t0, 0)));
-        gate.pulled(false, at(t0, 0));
-        assert!(!gate.should_pull(5, true, at(t0, 7)));
-        assert!(gate.should_pull(5, true, at(t0, 8)));
-        assert!(!gate.should_pull(0, true, at(t0, 9)), "level: nothing to pull");
+        assert!(gate.should_pull(5, true, false, at(t0, 0)));
+        gate.pulled(false, false, at(t0, 0));
+        assert!(!gate.should_pull(5, true, false, at(t0, 7)));
+        assert!(gate.should_pull(5, true, false, at(t0, 8)));
+        assert!(!gate.should_pull(0, true, false, at(t0, 9)), "level: nothing to pull");
+    }
+
+    /// A follower hears the tip from P2P only every 30 s (no votes, no committed blocks), so one
+    /// that is at the tip keeps itself there over the RPC: every poll that finds the peer ahead
+    /// pulls, as before 2026-10-20. Found by the multi-node upgrade test, where a follower behind
+    /// the gate ended 87 blocks behind with no way to draw level.
+    #[test]
+    fn a_follower_at_the_tip_pulls_on_every_poll() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(0, false, true, at(t0, 0)), "level: nothing to pull");
+        for poll in 1..=10u64 {
+            let now = at(t0, poll * RPC_SYNC_POLL_SECS);
+            assert!(gate.should_pull(2, false, true, now), "poll {poll} found the peer ahead");
+            gate.pulled(true, true, now);
+        }
+    }
+
+    /// The same poll on a validator does not pull: validators hear the chain over P2P, and their
+    /// pulls whenever they slipped a block or two were the load the gate exists for.
+    #[test]
+    fn a_validator_at_the_tip_still_waits_for_p2p() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(0, false, false, at(t0, 0)));
+        assert!(!gate.should_pull(2, false, false, at(t0, RPC_SYNC_POLL_SECS)));
+        assert!(!gate.should_pull(2, false, false, at(t0, RPC_CATCHUP_STALL_SECS)));
+        let stalled = RPC_SYNC_POLL_SECS + RPC_CATCHUP_STALL_SECS;
+        assert!(gate.should_pull(2, false, false, at(t0, stalled)));
+    }
+
+    /// A follower far behind is not "at the tip": it waits for P2P like a validator, and a pull
+    /// that brings blocks but stops short of the peer does not make it level.
+    #[test]
+    fn a_follower_far_behind_waits_for_p2p_and_a_short_pull_is_not_level() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(500, false, true, at(t0, 0)));
+        assert!(!gate.should_pull(500, false, true, at(t0, RPC_CATCHUP_STALL_SECS - 1)));
+        assert!(gate.should_pull(500, false, true, at(t0, RPC_CATCHUP_STALL_SECS)));
+        gate.pulled(true, false, at(t0, RPC_CATCHUP_STALL_SECS));
+        let next = RPC_CATCHUP_STALL_SECS + RPC_SYNC_POLL_SECS;
+        assert!(!gate.should_pull(300, false, true, at(t0, next)), "200 blocks short is not level");
+    }
+
+    /// Level once is not level forever: a follower that has trailed for a whole window waits for
+    /// P2P again, and a failed pull backs a follower off like anyone.
+    #[test]
+    fn a_follower_level_long_ago_or_just_refused_does_not_pull_at_once() {
+        let t0 = std::time::Instant::now();
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(0, false, true, at(t0, 0)));
+        let late = RPC_CATCHUP_STALL_SECS + 1;
+        assert!(!gate.should_pull(3, false, true, at(t0, late)), "level {late} s ago");
+
+        let mut gate = RpcCatchupGate::default();
+        assert!(!gate.should_pull(0, false, true, at(t0, 0)));
+        assert!(gate.should_pull(2, false, true, at(t0, 4)));
+        gate.pulled(false, false, at(t0, 4));
+        assert!(!gate.should_pull(2, false, true, at(t0, 8)), "refused: back off first");
+        assert!(gate.should_pull(2, false, true, at(t0, 12)));
     }
 }
 
