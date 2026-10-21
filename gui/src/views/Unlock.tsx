@@ -32,7 +32,7 @@ export default function Unlock({
     <div className="onboarding">
       <div className="card onboard-card">
         <div className="onboard-head">
-          <span className="brand-mark big" aria-hidden>⛓</span>
+          <img className="brand-mark big" src="/logo.png" alt="" width={64} height={64} />
           <h1>Unlock your wallet</h1>
         </div>
 

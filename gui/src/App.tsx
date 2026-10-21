@@ -232,9 +232,15 @@ export default function App() {
   return (
     <div className="app">
       <aside className="sidebar">
+        {/* The site's wordmark: the round mark, HELIX in the brand face, the world beside it as a
+            label. The wallet is one of silvra.net's places and should say so in the same voice. */}
         <div className="brand">
-          <span className="brand-mark" aria-hidden>⛓</span>
-          <span>Helix Wallet</span>
+          <img className="brand-mark" src="/logo.png" alt="" width={28} height={28} />
+          <span className="brand-name">Helix</span>
+          <span className="brand-world" aria-hidden>
+            <span className="brand-slash">/</span>
+            Wallet
+          </span>
         </div>
         {/* Grouped by how often you actually need it, not by how the features were built.
             Send and Receive were previously reachable only as buttons inside Home, while

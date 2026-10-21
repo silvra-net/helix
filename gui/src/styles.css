@@ -1,90 +1,116 @@
-/* Helix shared design system — a truly achromatic grey scale, black (light) or white (dark) as
-   the only accent, and colour reserved for state. Identical hexes to the node's status board
-   (crates/helix-rpc/src/status.html) and the network explorer, so the three surfaces read as one
-   product. Aligned with silvra.net, which uses the same monochrome vocabulary.
+/* Helix Wallet, in the register of silvra.net: night olive, digital camouflage at the edge, amber
+   as the colour of Helix, condensed capitals for what a reader should see first and a mono face for
+   every number and label. The values are the site's own — read off its stylesheet, not imitated —
+   and the same as the explorer's and the node's status page, so the three surfaces read as one
+   product and as one of the site's places.
 
-   The greys are neutral, not slate: a palette described as "black and white" should not have a
-   hue in its largest surface, and the graphite this replaced was noticeably blue.
+   Colour beyond amber is for state: green for what arrived or works, orange for a caution, red for
+   a fault. Square corners — 4px for cards, 2px for controls.
 
-   Two deliberate exceptions to "pure": surfaces sit above the background rather than on the same
-   black, so panels are separable without a border doing all the work; and body text is #f5f5f5
-   rather than #fff, because pure white on pure black haloes at small sizes. `--accent` stays a
-   true #fff so emphasis is still distinguishable from ordinary text.
+   `color-scheme` tells the webview which way round the window is, so scrollbars, focus rings and
+   native controls match; without it a dark window grows a white scrollbar.
 
-   `color-scheme` tells the browser which way round the page is, so it draws scrollbars, focus
-   rings and native form controls to match — without it a dark window gets a white scrollbar,
-   which is the one piece of the design a stylesheet cannot otherwise reach.
-
-   Default :root is dark; the media query and the manual data-theme override below carry light. */
+   Default :root is dark, as the site's is; the media query and the manual data-theme override
+   below carry light. */
 :root {
   color-scheme: dark;
-  --bg: #000000;
-  --surface: #0c0c0c;
-  --surface-2: #171717;
-  --border: #262626;
-  --text: #f5f5f5;
-  --muted: #a3a3a3;
-  --accent: #ffffff;
-  --accent-ink: #000000;
-  --ok: #22c55e;
-  --ok-bg: #0d2114;
-  --bad: #ef4444;
-  --bad-bg: #241113;
-  --warn: #e0a44a;
-  --warn-bg: #241c0d;
-  --radius: 10px;
-  --font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --bg: #0a0c09;
+  --surface: #0e110d;
+  --surface-2: #12160f;
+  --border: #23271f;
+  --line-2: rgba(214, 222, 196, 0.2);
+  --text: #eef0e9;
+  --muted: #a8ae9c;
+  --faint: #7d8473;
+  --accent: #e0a44a;
+  --accent-ink: #160f04;
+  --amber: #e8b15c;
+  --accent-soft: #241f13;
+  --ok: #3fe0b0;
+  --ok-bg: #142a21;
+  --bad: #f26b5b;
+  --bad-bg: #291c16;
+  --warn: #f08a4b;
+  --warn-bg: #291f14;
+  --scan: rgba(238, 240, 233, 0.025);
+  --camo: url("/camo-dark.png");
+  --radius: 4px;
+  --r-ctl: 2px;
+  --font: "Inter Variable", "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+    monospace;
+  --display: "Barlow Condensed", "Barlow Condensed Fallback", sans-serif;
+  --brand: "Unbounded Variable", "Unbounded", system-ui, sans-serif;
 }
 
 /* Light palette, applied when the OS prefers light AND no manual theme is set. */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
     color-scheme: light;
-    --bg: #fafafa;
+    --bg: #f7f7f3;
     --surface: #ffffff;
-    --surface-2: #f5f5f5;
-    --border: #e5e5e5;
-    --text: #0a0a0a;
-    --muted: #737373;
-    --accent: #000000;
+    --surface-2: #f1f2ec;
+    --border: #d9ddd8;
+    --line-2: rgba(15, 37, 53, 0.24);
+    --text: #0f2535;
+    --muted: #44525c;
+    --faint: #5f6b73;
+    --accent: #8a5a06;
     --accent-ink: #ffffff;
-    --ok: #15803d;
-    --ok-bg: #e9f7ee;
-    --bad: #c81e1e;
-    --bad-bg: #fceaea;
-    --warn: #8a5a06;
-    --warn-bg: #fdf4e3;
+    --amber: #8a5a06;
+    --accent-soft: #f6f0e6;
+    --ok: #0a6e53;
+    --ok-bg: #e6f2ee;
+    --bad: #b42318;
+    --bad-bg: #f8e7e5;
+    --warn: #9a4a0b;
+    --warn-bg: #fbf0e6;
+    --scan: rgba(15, 37, 53, 0.035);
+    --camo: url("/camo-light.png");
   }
 }
 
 /* Manual theme toggle (Settings) — data-theme on <html> wins over the OS preference both ways. */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #000000; --surface: #0c0c0c; --surface-2: #171717; --border: #262626; --text: #f5f5f5;
-  --muted: #a3a3a3; --accent: #ffffff; --accent-ink: #000000;
-  --ok: #22c55e; --ok-bg: #0d2114; --bad: #ef4444; --bad-bg: #241113; --warn: #e0a44a; --warn-bg: #241c0d;
+  --bg: #0a0c09; --surface: #0e110d; --surface-2: #12160f; --border: #23271f;
+  --line-2: rgba(214, 222, 196, 0.2); --text: #eef0e9; --muted: #a8ae9c; --faint: #7d8473;
+  --accent: #e0a44a; --accent-ink: #160f04; --amber: #e8b15c; --accent-soft: #241f13;
+  --ok: #3fe0b0; --ok-bg: #142a21; --bad: #f26b5b; --bad-bg: #291c16; --warn: #f08a4b;
+  --warn-bg: #291f14; --scan: rgba(238, 240, 233, 0.025); --camo: url("/camo-dark.png");
 }
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #fafafa; --surface: #ffffff; --surface-2: #f5f5f5; --border: #e5e5e5; --text: #0a0a0a;
-  --muted: #737373; --accent: #000000; --accent-ink: #ffffff;
-  --ok: #15803d; --ok-bg: #e9f7ee; --bad: #c81e1e; --bad-bg: #fceaea; --warn: #8a5a06; --warn-bg: #fdf4e3;
+  --bg: #f7f7f3; --surface: #ffffff; --surface-2: #f1f2ec; --border: #d9ddd8;
+  --line-2: rgba(15, 37, 53, 0.24); --text: #0f2535; --muted: #44525c; --faint: #5f6b73;
+  --accent: #8a5a06; --accent-ink: #ffffff; --amber: #8a5a06; --accent-soft: #f6f0e6;
+  --ok: #0a6e53; --ok-bg: #e6f2ee; --bad: #b42318; --bad-bg: #f8e7e5; --warn: #9a4a0b;
+  --warn-bg: #fbf0e6; --scan: rgba(15, 37, 53, 0.035); --camo: url("/camo-light.png");
 }
 
-/* Thin, monochrome scrollbars — the same treatment as the status board, so a wallet pane that
-   overflows does not grow a heavy grey chrome bar down its edge. */
+/* Thin scrollbars in the hairline colour, so a pane that overflows does not grow a heavy chrome
+   bar down its edge. */
 * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: var(--r-ctl); }
 ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 ::-webkit-scrollbar-corner { background: transparent; }
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
-body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
 button { font-family: inherit; }
+::selection { background: var(--accent); color: var(--accent-ink); }
+/* The ring keeps the element's own corners: square things get a square ring. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .center { height: 100%; display: grid; place-items: center; }
 .muted { color: var(--muted); }
@@ -92,222 +118,345 @@ button { font-family: inherit; }
 .mono { font-family: var(--mono); }
 
 /* ---------- app shell ---------- */
-.app { display: grid; grid-template-columns: 200px 1fr; height: 100vh; }
+.app { display: grid; grid-template-columns: 220px 1fr; height: 100vh; }
 
+/* The sidebar is the window's identity panel, so it wears the site's situation-display frame: the
+   pattern at its outer edge, fading into the panel, and faint scan lines. Decoration only. */
 .sidebar {
+  position: relative;
+  isolation: isolate;
   background: var(--surface);
   border-right: 1px solid var(--border);
-  padding: 16px 12px;
+  padding: 18px 14px 14px 20px;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  overflow: hidden;
 }
-.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; padding: 4px 8px 16px; }
-.brand-mark { color: var(--accent); font-size: 18px; }
-.brand-mark.big { font-size: 30px; }
+.sidebar::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--camo) 0 0 / 384px;
+  image-rendering: pixelated;
+  opacity: 0.55;
+  -webkit-mask-image: linear-gradient(90deg, #000 0, #000 8px, transparent 70px);
+  mask-image: linear-gradient(90deg, #000 0, #000 8px, transparent 70px);
+}
+.sidebar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: repeating-linear-gradient(180deg, var(--scan) 0 1px, transparent 1px 3px);
+  pointer-events: none;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 6px 20px;
+  color: var(--text);
+}
+.brand-mark { width: 28px; height: 28px; border-radius: 50%; box-shadow: 0 0 0 1px var(--line-2); flex: none; }
+.brand-mark.big { width: 64px; height: 64px; }
+.brand-name { font: 500 12px/1 var(--brand); letter-spacing: 0.26em; text-transform: uppercase; }
+.brand-world {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font: 600 10.5px/1 var(--mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--amber);
+}
+.brand-slash { color: var(--faint); font-weight: 300; }
 nav { display: flex; flex-direction: column; gap: 2px; }
+/* The site marks the current page with a bar in the accent and no fill; in a vertical list the
+   bar stands at the left. */
 .nav-item {
   text-align: left; background: transparent; border: none; color: var(--muted);
-  padding: 9px 10px; border-radius: 8px; cursor: pointer; font-size: 14px;
+  padding: 9px 12px; border-radius: var(--r-ctl); cursor: pointer;
+  font: 500 14px/1.2 var(--font); text-transform: none; letter-spacing: 0;
+  transition: color 0.2s, background 0.2s;
 }
-.nav-item:hover { background: var(--surface-2); color: var(--text); }
-.nav-item.active { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
-/* Section label between nav groups — quiet enough to read as structure, not as an entry. */
+.nav-item:hover:not(:disabled) { background: var(--surface-2); color: var(--text); border-color: transparent; }
+.nav-item.active { background: var(--surface-2); color: var(--text); box-shadow: inset 2px 0 0 var(--accent); }
+/* A group's name in the site's section-label voice: spaced mono capitals and a short rule. */
 .nav-group {
-  font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
-  color: var(--muted); opacity: 0.65; padding: 16px 10px 4px;
+  display: flex; align-items: center; gap: 10px;
+  font: 500 10px/1.4 var(--mono); text-transform: uppercase; letter-spacing: 0.14em;
+  color: var(--amber); padding: 18px 12px 6px;
 }
+.nav-group::after { content: ""; width: 20px; height: 1px; background: currentColor; opacity: 0.6; }
 .sidebar-foot { margin-top: auto; display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
-.key-note { font-size: 11px; color: var(--muted); line-height: 1.4; }
+.key-note { font: 11px/1.45 var(--mono); color: var(--faint); }
 
-.content { display: flex; flex-direction: column; min-width: 0; }
+.content { display: flex; flex-direction: column; min-width: 0; background: var(--bg); }
 .topbar {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 12px 18px; border-bottom: 1px solid var(--border);
+  min-height: 52px; padding: 8px 20px; border-bottom: 1px solid var(--border); background: var(--bg);
 }
-.net { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.net { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.dot { width: 8px; height: 8px; border-radius: var(--r-ctl); flex: none; }
 .dot.ok { background: var(--ok); }
-.dot.off { background: var(--muted); }
+.dot.off { background: var(--faint); }
 .node-input {
-  background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
-  border-radius: 8px; padding: 5px 8px; font-size: 12px; width: 240px; font-family: var(--mono);
+  background: var(--surface); border: 1px solid var(--line-2); color: var(--text);
+  border-radius: var(--r-ctl); padding: 6px 10px; font: 12px/1.3 var(--mono); width: 250px;
 }
-.net-meta { font-size: 12px; color: var(--muted); white-space: nowrap; }
-/* Catch-up notice. Uses the warning palette: it reports that what is on screen may be stale,
-   which is a caution rather than an error — the node is working. */
+.net-meta { font: 11.5px/1.3 var(--mono); color: var(--muted); white-space: nowrap; }
+/* Catch-up notice. The warning palette: what is on screen may be stale, which is a caution
+   rather than an error — the node is working. */
 .sync-banner {
   background: var(--warn-bg); color: var(--warn);
-  padding: 8px 18px; font-size: 12px; line-height: 1.4;
+  padding: 9px 20px; font-size: 12.5px; line-height: 1.45;
+  box-shadow: inset 3px 0 0 currentColor;
   border-bottom: 1px solid var(--border);
 }
 
-.view { padding: 18px; overflow-y: auto; flex: 1; }
+.view { padding: 22px 24px; overflow-y: auto; flex: 1; }
 .statusbar {
-  display: flex; justify-content: space-between; padding: 8px 18px;
-  border-top: 1px solid var(--border); font-size: 12px; color: var(--muted);
+  display: flex; justify-content: space-between; padding: 8px 20px;
+  border-top: 1px solid var(--border); font: 11px/1.4 var(--mono); color: var(--faint);
 }
 
 /* ---------- primitives ---------- */
-.stack { display: flex; flex-direction: column; gap: 14px; max-width: 720px; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
-.section-title { font-weight: 600; margin-bottom: 12px; }
+.stack { display: flex; flex-direction: column; gap: 16px; max-width: 760px; }
+.card {
+  position: relative;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px 20px;
+}
+/* A card title in the display face, sentence case, as the site titles its cards. */
+.section-title { font: 600 20px/1.15 var(--display); letter-spacing: 0.005em; margin-bottom: 12px; }
 
-.metric-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-.metric { background: var(--surface-2); border-radius: var(--radius); padding: 14px 16px; }
-.metric-label { color: var(--muted); font-size: 13px; }
-.metric-value { font-size: 22px; font-weight: 600; margin-top: 4px; }
-.metric-unit { font-size: 13px; color: var(--muted); font-weight: 400; }
+/* Readings: what a value is in spaced mono capitals, the value in amber — the site's stat row. */
+.metric-row {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px;
+  background: var(--border); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+}
+.metric { background: var(--surface); padding: 16px 18px; min-width: 0; }
+.metric-label {
+  font: 500 10px/1.4 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--faint);
+}
+.metric-value {
+  font: 600 24px/1.1 var(--mono); font-variant-numeric: tabular-nums; color: var(--amber);
+  margin-top: 8px; overflow-wrap: anywhere;
+}
+.metric-unit { font-size: 12px; color: var(--faint); font-weight: 400; }
 
 .address-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .address-block { min-width: 0; }
-.address { font-size: 13px; word-break: break-all; }
-.row-actions { display: flex; gap: 8px; }
+.address { font-size: 13px; word-break: break-all; margin-top: 4px; }
+.row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .row-actions.end { justify-content: flex-end; margin-top: 8px; }
 
+/* Buttons as the site draws them: condensed capitals, square, an amber edge; the primary one
+   filled, answering the pointer with a hard inner edge rather than a glow. */
 button {
-  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
-  border-radius: 8px; padding: 8px 14px; cursor: pointer; font-size: 13px;
+  background: transparent; color: var(--text);
+  border: 1.5px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  border-radius: var(--r-ctl); padding: 8px 16px; cursor: pointer;
+  font: 600 14px/1.1 var(--display); letter-spacing: 0.05em; text-transform: uppercase;
+  transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
 }
-button:hover:not(:disabled) { border-color: var(--accent); }
-button:disabled { opacity: 0.5; cursor: not-allowed; }
-button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+button:hover:not(:disabled) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.primary:hover:not(:disabled) { background: var(--accent); box-shadow: inset 0 0 0 2px var(--accent-ink); }
 
-.theme-choice { display: inline-flex; gap: 4px; padding: 4px; background: var(--surface-2);
-  border: 1px solid var(--border); border-radius: 10px; }
-.theme-opt { background: transparent; border: none; color: var(--muted); font-weight: 600;
-  font-size: 13px; padding: 6px 14px; border-radius: 7px; cursor: pointer; }
-.theme-opt:hover { color: var(--text); }
-.theme-opt.active { background: var(--surface); color: var(--accent);
-  box-shadow: 0 1px 2px rgba(0,0,0,.12); }
-button.ghost { background: transparent; }
+/* The theme choice as the site's language switch: a framed group, the chosen one inverted. */
+.theme-choice { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line-2); border-radius: var(--r-ctl); }
+.theme-opt {
+  background: transparent; border: none; color: var(--muted);
+  font: 600 10.5px/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 8px 12px; border-radius: var(--r-ctl); cursor: pointer;
+}
+.theme-opt:hover:not(:disabled) { color: var(--text); background: transparent; }
+.theme-opt.active { background: var(--text); color: var(--bg); }
+button.ghost { background: transparent; border-color: var(--line-2); color: var(--muted); }
+button.ghost:hover:not(:disabled) { border-color: var(--text); color: var(--text); background: transparent; }
 
 .list { padding: 0; overflow: hidden; }
-.list-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.list-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--border); }
 .list-row:last-child { border-bottom: none; }
 .list-title { font-size: 14px; }
 .list-right { display: flex; align-items: center; gap: 12px; white-space: nowrap; }
-.amount { font-size: 14px; }
+.amount { font: 500 13.5px/1.3 var(--mono); font-variant-numeric: tabular-nums; }
 /* A stacked value: a tiny caption over the number, so an amount that grows on its own (a
    compounding delegation) reads as "current value" rather than a static balance. */
 .amount-block { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.2; }
-.micro { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
-/* A QR always sits on white with dark modules (see Receive.tsx) — this just frames and centres
-   it so the white block doesn't clash with a dark card background. */
-.qr-frame { display: flex; justify-content: center; width: max-content; margin: 8px auto 14px; padding: 14px; background: #fff; border-radius: 12px; }
-/* Incoming is tinted, outgoing stays in the normal text colour rather than red: spending your
-   own coins is not an error, and colouring every payment like a warning trains people to
-   ignore the colour that should mean something. The +/- sign carries the direction. */
+.micro { font: 500 9.5px/1.3 var(--mono); text-transform: uppercase; letter-spacing: 0.12em; color: var(--faint); }
+/* A QR always sits on white with dark modules (see Receive.tsx) — this frames and centres it so
+   the white block does not clash with a dark card. */
+.qr-frame { display: flex; justify-content: center; width: max-content; margin: 8px auto 14px; padding: 14px; background: #fff; border-radius: var(--radius); }
+/* Incoming is tinted, outgoing stays in the text colour rather than red: spending your own coins
+   is not an error, and colouring every payment like a warning trains people to ignore the colour
+   that should mean something. The +/- sign carries the direction. */
 .amount-in { color: var(--ok); }
 .amount-out { color: var(--text); }
-.empty { padding: 20px; text-align: center; }
+.empty { padding: 22px; text-align: center; }
 
-.pill { font-size: 12px; padding: 2px 9px; border-radius: 99px; }
-.pill.ok { background: var(--ok-bg); color: var(--ok); }
-.pill.bad { background: var(--bad-bg); color: var(--bad); }
+/* The site's badge: square, outlined, spaced mono capitals. */
+.pill {
+  display: inline-flex; align-items: center;
+  font: 500 9.5px/1.2 var(--mono); letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 3px 7px; border-radius: var(--r-ctl); border: 1px solid var(--line-2);
+}
+.pill.ok { background: var(--ok-bg); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+.pill.bad { background: var(--bad-bg); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
 .pill.neutral { background: var(--surface-2); color: var(--muted); }
 
-.field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
-.field span { font-size: 13px; color: var(--muted); }
+.field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 14px; }
+.field span {
+  font: 500 10px/1.4 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--faint);
+}
 input, textarea, select {
-  background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
-  border-radius: 8px; padding: 9px 10px; font-size: 14px; font-family: inherit; width: 100%;
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text);
+  border-radius: var(--r-ctl); padding: 10px 11px; font-size: 14px; font-family: inherit; width: 100%;
 }
 input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
 textarea { resize: vertical; }
 
 /* Inline warning (e.g. before revealing the recovery phrase) */
 .warn-inline {
-  background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn);
-  border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 12px;
+  background: var(--warn-bg); color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  box-shadow: inset 3px 0 0 currentColor;
+  border-radius: var(--r-ctl); padding: 10px 12px 10px 14px; font-size: 13px; margin-bottom: 12px;
 }
 
 /* Progress toward the validator stake threshold (Node panel) */
 .progress {
-  height: 8px; background: var(--surface-2); border: 1px solid var(--border);
-  border-radius: 99px; overflow: hidden; margin: 12px 0 2px;
+  height: 6px; background: var(--border);
+  border-radius: 1px; overflow: hidden; margin: 12px 0 2px;
 }
-.progress-bar { height: 100%; background: var(--accent); border-radius: 99px; transition: width 0.4s ease; }
+.progress-bar { height: 100%; background: var(--accent); transition: width 0.4s ease; }
 
 /* A shell command shown to copy (Node panel) */
 .codeblock {
-  background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
-  padding: 10px 12px; font-family: var(--mono); font-size: 13px; margin: 6px 0; overflow-x: auto;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-ctl);
+  padding: 10px 12px; font-family: var(--mono); font-size: 12.5px; margin: 6px 0; overflow-x: auto;
 }
 
-.error { background: var(--bad-bg); color: var(--bad); border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 12px; }
+.error {
+  background: var(--bad-bg); color: var(--bad); box-shadow: inset 3px 0 0 currentColor;
+  border-radius: var(--r-ctl); padding: 10px 12px 10px 14px; font-size: 13px; margin-bottom: 12px;
+}
 
 /* Live node console (Node panel) — a real terminal, not a styled log list, so it reads exactly
-   like `helix start` running in a shell: dark regardless of app theme, monospace, stderr picked
-   out in a warmer color the way most terminals distinguish it. */
+   like `helix start` running in a shell: night olive regardless of app theme, monospace, stderr
+   picked out in amber the way most terminals give it a warmer colour. */
 .console {
-  background: #0d1117; color: #c9d1d9; border: 1px solid var(--border); border-radius: 8px;
+  background: #0a0c09; color: #d6dccb; border: 1px solid var(--border); border-radius: var(--r-ctl);
   padding: 10px 12px; font-family: var(--mono); font-size: 12px; line-height: 1.5;
   height: 260px; overflow-y: auto; margin: 10px 0; white-space: pre-wrap; word-break: break-all;
 }
 .console-line + .console-line { margin-top: 1px; }
-.console-stderr { color: #f0a868; }
+.console-stderr { color: #e8b15c; }
 .console-empty { padding: 4px 0; }
 .kv { display: flex; justify-content: space-between; padding: 6px 0; }
-.receive-address { background: var(--surface-2); border-radius: 8px; padding: 14px; word-break: break-all; margin: 12px 0; }
-.receive-card, .form-card, .success-card { max-width: 560px; }
+.receive-address { background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-ctl); padding: 14px; word-break: break-all; margin: 12px 0; font-family: var(--mono); }
+.receive-card, .form-card, .success-card { max-width: 580px; }
 
-/* ---------- onboarding ---------- */
-.onboarding { height: 100vh; display: grid; place-items: center; padding: 24px; }
-.onboard-card { width: 100%; max-width: 460px; }
-.onboard-head { text-align: center; margin-bottom: 18px; }
-.onboard-head h1 { font-size: 22px; margin: 8px 0 4px; }
-.tabs { display: flex; gap: 6px; margin-bottom: 16px; }
-.tabs button { flex: 1; }
-.tabs button.active { border-color: var(--accent); color: var(--accent); }
+/* ---------- onboarding ----------
+   The first screen is the site's page opening: the pattern at the edges of the window, scan
+   lines, and the card in the middle with the four corner marks the site puts on a reading. */
+.onboarding {
+  position: relative; isolation: isolate;
+  height: 100vh; display: grid; place-items: center; padding: 24px; overflow: auto;
+}
+.onboarding::before {
+  content: "";
+  position: absolute; inset: 0; z-index: -1;
+  background: var(--camo) 0 0 / 384px;
+  image-rendering: pixelated;
+  opacity: 0.5;
+  -webkit-mask-image: radial-gradient(80% 75% at 50% 50%, transparent 40%, #000 100%);
+  mask-image: radial-gradient(80% 75% at 50% 50%, transparent 40%, #000 100%);
+}
+.onboarding::after {
+  content: "";
+  position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: repeating-linear-gradient(180deg, var(--scan) 0 1px, transparent 1px 3px);
+}
+.onboard-card { width: 100%; max-width: 470px; padding: 26px 26px 22px; }
+.onboard-card::after {
+  --hc: color-mix(in srgb, var(--accent) 75%, transparent);
+  content: "";
+  position: absolute; inset: -1px; pointer-events: none; border-radius: inherit;
+  background:
+    linear-gradient(var(--hc), var(--hc)) left top / 16px 2px,
+    linear-gradient(var(--hc), var(--hc)) left top / 2px 16px,
+    linear-gradient(var(--hc), var(--hc)) right top / 16px 2px,
+    linear-gradient(var(--hc), var(--hc)) right top / 2px 16px,
+    linear-gradient(var(--hc), var(--hc)) left bottom / 16px 2px,
+    linear-gradient(var(--hc), var(--hc)) left bottom / 2px 16px,
+    linear-gradient(var(--hc), var(--hc)) right bottom / 16px 2px,
+    linear-gradient(var(--hc), var(--hc)) right bottom / 2px 16px;
+  background-repeat: no-repeat;
+}
+.onboard-head { text-align: center; margin-bottom: 20px; display: flex; flex-direction: column; align-items: center; }
+.onboard-head h1 {
+  font: 700 34px/1 var(--display); letter-spacing: 0.005em; text-transform: uppercase; margin: 14px 0 8px;
+}
+.tabs { display: flex; gap: 2px; margin-bottom: 18px; padding: 3px; border: 1px solid var(--line-2); border-radius: var(--r-ctl); }
+.tabs button { flex: 1; border: none; color: var(--muted); font: 600 11px/1 var(--mono); letter-spacing: 0.08em; padding: 9px 10px; }
+.tabs button:hover:not(:disabled) { background: transparent; color: var(--text); }
+.tabs button.active { background: var(--text); color: var(--bg); }
 .fineprint { margin-top: 12px; font-size: 12px; }
 .checkbox { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--muted); margin: 14px 0; }
-.checkbox input { width: auto; }
+.checkbox input { width: auto; accent-color: var(--accent); }
 
-.mnemonic-grid { list-style: none; padding: 0; margin: 16px 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.mnemonic-grid li { background: var(--surface-2); border-radius: 8px; padding: 8px 10px; display: flex; gap: 8px; align-items: baseline; }
-.mnemonic-grid .idx { color: var(--muted); font-size: 11px; width: 16px; }
+.mnemonic-grid { list-style: none; padding: 0; margin: 16px 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.mnemonic-grid li { background: var(--surface); padding: 9px 11px; display: flex; gap: 10px; align-items: baseline; }
+.mnemonic-grid .idx { color: var(--amber); font: 500 10.5px/1 var(--mono); width: 18px; }
 .mnemonic-grid .word { font-family: var(--mono); font-size: 13px; }
 
 /* ---------- staking ---------- */
-.notice { background: var(--ok-bg); color: var(--ok); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+.notice {
+  background: var(--ok-bg); color: var(--ok); box-shadow: inset 3px 0 0 currentColor;
+  border-radius: var(--r-ctl); padding: 10px 12px 10px 14px; font-size: 13px;
+}
 .metric-row.two { grid-template-columns: repeat(2, 1fr); }
-.action-panel { border-color: var(--accent); }
+.action-panel { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); box-shadow: inset 0 2px 0 var(--accent); }
 .unbonding-note {
   display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
-  background: var(--surface-2); border-radius: 8px; padding: 10px 12px; margin: 12px 0;
+  background: var(--surface-2); border-radius: var(--r-ctl); padding: 10px 12px; margin: 12px 0;
 }
-.list.bordered { border: 1px solid var(--border); border-radius: 10px; }
-button.mini { padding: 4px 9px; font-size: 12px; }
+.list.bordered { border: 1px solid var(--border); border-radius: var(--radius); }
+button.mini { padding: 5px 10px; font-size: 12.5px; }
 
 /* ---------- names ---------- */
-.your-name { font-size: 22px; font-weight: 600; }
-.text-accent { color: var(--accent); }
+.your-name { font: 600 26px/1.1 var(--mono); color: var(--amber); }
+.text-accent { color: var(--amber); }
 .text-warn { color: var(--warn); }
 .name-input { display: flex; align-items: stretch; }
-.name-input input { border-radius: 8px 0 0 8px; border-right: none; }
+.name-input input { border-radius: var(--r-ctl) 0 0 var(--r-ctl); border-right: none; }
 .name-input .suffix {
   display: flex; align-items: center; padding: 0 12px;
-  background: var(--surface-2); border: 1px solid var(--border); border-left: none;
-  border-radius: 0 8px 8px 0; color: var(--muted); font-family: var(--mono); font-size: 13px;
+  background: var(--surface-2); border: 1px solid var(--line-2); border-left: none;
+  border-radius: 0 var(--r-ctl) var(--r-ctl) 0; color: var(--muted); font-family: var(--mono); font-size: 13px;
 }
 .resolve-line { margin: -8px 0 12px 2px; }
 .resolve-result { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
 
 /* Validator picker rows are buttons, so they need the list-row look without the button look. */
 .picker-row {
-  width: 100%; text-align: left; background: transparent; border: none;
+  width: 100%; text-align: left; background: transparent; border: none; border-radius: 0;
   border-bottom: 1px solid var(--border); cursor: pointer; font: inherit; color: inherit;
+  text-transform: none; letter-spacing: 0;
 }
 .picker-row:hover:not(:disabled) { background: var(--surface-2); }
-.picker-row.active { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.picker-row.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
 .picker-row:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* The one-time offer to run your own node (see nodePrompt.ts). Sits above the balance on
-   Overview, using the ordinary card surface rather than the warning palette: this is a choice
-   worth making, not a problem to fix, and dressing it as an alert would be the same
-   attention-grabbing that makes people click past prompts without reading them. */
+   Overview, on the ordinary card surface rather than the warning palette: this is a choice worth
+   making, not a problem to fix, and dressing it as an alert is the same attention-grabbing that
+   makes people click past prompts without reading them. */
 .own-node-offer { display: flex; flex-direction: column; gap: 12px; }
 .own-node-offer p { margin: 6px 0 0; line-height: 1.5; }
-.own-node-offer strong { font-size: 15px; }
+.own-node-offer strong { font: 600 18px/1.15 var(--display); letter-spacing: 0.005em; }
 .tiny { font-size: 12px; margin: 0; }

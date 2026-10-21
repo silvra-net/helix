@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { attachConsole, error as logError } from "@tauri-apps/plugin-log";
 import App from "./App";
 import { applyStoredTheme } from "./theme";
+import "./styles/fonts.css";
 import "./styles.css";
 
 // Apply the saved light/dark choice before first paint, so a manual theme doesn't flash the OS
