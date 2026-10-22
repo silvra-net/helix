@@ -327,7 +327,7 @@ it); no seed configuration is needed on its side.
 ### On a home connection
 
 Every connected peer sends a node every block, vote and proposal — on a network of fifteen
-validators that is a few MB/s, and on a home line it can take the whole download. A node does three
+validators that is a few MB/s, and on a home line it can take the whole download. A node does four
 things about that by itself:
 
 - **Far behind and catching up** (more than 1,000 blocks behind the best tip its peers announce,
@@ -341,6 +341,9 @@ things about that by itself:
   arrives once. *"Not in the validator set — following the chain by block sync …"*. Once its key is
   in the set — probation included, where its signatures are already collected — it hears votes and
   proposals again on the next tick, and gossiped blocks too unless relay is off (below).
+- **Behind by more than one batch**, it asks up to four peers at once, each for its own range of
+  blocks, and applies the answers in order. A peer that answers slowly no longer holds up the
+  others, and nothing is fetched twice — the same bytes, spread over more uplinks.
 - **When block-sync answers do not arrive in time**, it asks for fewer blocks at once and for more
   again as answers come in: *"Block-sync answers are not arriving in time — asking for fewer
   blocks at once"*.

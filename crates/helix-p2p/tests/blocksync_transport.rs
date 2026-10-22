@@ -965,3 +965,124 @@ async fn a_validator_that_does_not_relay_hears_votes_but_not_committed_blocks_an
         "a node that does not subscribe to committed blocks must still be able to publish its own"
     );
 }
+
+/// Serves like [`FixedBlocks`], but every answer takes `delay` — the shape of a peer whose answers
+/// are slow for reasons that have nothing to do with their size. Counts how many answers the
+/// peers sharing `busy` are building at the same moment, and the most there ever were.
+struct SlowAnswers {
+    blocks: Vec<Block>,
+    certificate: Vec<Vote>,
+    delay: Duration,
+    busy: Arc<std::sync::atomic::AtomicUsize>,
+    most_at_once: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl BlockProvider for SlowAnswers {
+    fn blocks<'a>(
+        &'a self,
+        from_height: u64,
+        count: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BlockSyncResponse> + Send + 'a>> {
+        use std::sync::atomic::Ordering;
+        Box::pin(async move {
+            let now = self.busy.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.busy.fetch_sub(1, Ordering::SeqCst);
+            let served: Vec<Block> = self
+                .blocks
+                .iter()
+                .filter(|b| b.height() >= from_height)
+                .take(count as usize)
+                .cloned()
+                .collect();
+            if served.is_empty() {
+                return BlockSyncResponse::empty();
+            }
+            BlockSyncResponse { blocks: served, tip_certificate: self.certificate.clone() }
+        })
+    }
+}
+
+/// A node far behind asks several peers at once, each for its own range, and the node layer gets
+/// the batches in order — each one continuing the tip the last one left.
+///
+/// On 2026-10-21 the production validator, 340 blocks behind, kept one request out at a time, and
+/// each answer took 10–30 s whatever its size: about five blocks per 20 s against a chain adding
+/// one every 2.2 s. Here four peers each take 4 s per answer. One at a time, at most one answer is
+/// ever being built; the point of this test is that several are.
+#[tokio::test]
+async fn a_node_far_behind_asks_several_peers_at_once_and_gets_the_batches_in_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let kp = KeyPair::generate();
+    // Four signing groups of 100: a request never crosses one, so there are four ranges to fetch.
+    let blocks = chained_blocks(&kp, 400);
+    let busy = Arc::new(AtomicUsize::new(0));
+    let most_at_once = Arc::new(AtomicUsize::new(0));
+
+    let ports = [19_901u16, 19_902, 19_903, 19_904];
+    for port in ports {
+        let (ahead, _cmd, mut events) = P2PService::new(
+            config(port, None),
+            Arc::new(AtomicU64::new(400)),
+            Arc::new(SlowAnswers {
+                blocks: blocks.clone(),
+                certificate: stand_in_certificate(&kp),
+                delay: Duration::from_secs(4),
+                busy: busy.clone(),
+                most_at_once: most_at_once.clone(),
+            }),
+        );
+        tokio::spawn(async move { ahead.run().await });
+        tokio::spawn(async move { while events.recv().await.is_some() {} });
+    }
+
+    let behind_tip = Arc::new(AtomicU64::new(0));
+    let (behind, behind_cmd, mut behind_events) = P2PService::new(
+        config_multi(19_905, ports.to_vec()),
+        behind_tip.clone(),
+        Arc::new(NoBlocks),
+    );
+    tokio::spawn(async move { behind.run().await });
+
+    // Stand in for the node layer: take each batch, move the tip to its last block, report it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut firsts = Vec::new();
+    while behind_tip.load(Ordering::SeqCst) < 400 && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), behind_events.recv()).await {
+            Ok(Some(P2PEvent::BlocksSynced(batch, _peer))) => {
+                let tip = behind_tip.load(Ordering::SeqCst);
+                let first = batch.blocks.first().map(|b| b.height()).unwrap_or(0);
+                let last = batch.blocks.last().map(|b| b.height()).unwrap_or(0);
+                firsts.push(first);
+                assert_eq!(
+                    first,
+                    tip + 1,
+                    "every batch must continue the tip the last one left: got {first} at tip {tip} \
+                     (batches so far start at {firsts:?})"
+                );
+                behind_tip.store(last, Ordering::SeqCst);
+                behind_cmd
+                    .send(P2PCommand::BlocksyncAdvance(last))
+                    .await
+                    .expect("the service is running");
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
+    let most = most_at_once.load(Ordering::SeqCst);
+    assert_eq!(
+        behind_tip.load(Ordering::SeqCst),
+        400,
+        "the node must reach the peers' tip; batches started at {firsts:?}, at most {most} answers \
+         were built at once"
+    );
+    assert!(
+        most >= 2,
+        "the peers never built more than {most} answer at a time — the node kept one request out \
+         at a time. Batches started at {firsts:?}"
+    );
+}

@@ -1,4 +1,5 @@
 pub mod blocksync;
+mod catch_up;
 pub mod compact;
 pub mod config;
 mod conn_limits;

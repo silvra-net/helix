@@ -22,6 +22,7 @@ use crate::blocksync::{
     clamp_batch, BlockProvider, BlockSyncCodec, BlockSyncRequest, BlockSyncResponse,
     BLOCKSYNC_PROTOCOL, MAX_BLOCKSYNC_BATCH,
 };
+use crate::catch_up::{Answered, CatchUp};
 use crate::compact::{CompactBlock, CompactProposal};
 use crate::config::P2PConfig;
 use crate::conn_limits::IpConnLimiter;
@@ -250,8 +251,7 @@ pub enum P2PCommand {
     /// The service cannot detect this for itself either: it hands the batch off and never learns
     /// whether or when it was applied. Requesting only on the 2s interval made that period the
     /// floor on the gap between consecutive batches, holding catch-up to `MAX_BLOCKSYNC_BATCH`
-    /// blocks per tick — 50 blocks/s — with the link idle in between. See
-    /// `request_blocks_if_behind`.
+    /// blocks per tick — 50 blocks/s — with the link idle in between. See `drive_catch_up`.
     ///
     /// Carries the height the node just reached. That height is not merely a convenience: the
     /// `tip_height` this service requests against is a **5-second sample** of the store
@@ -616,11 +616,11 @@ impl P2PService {
         let mut dialed_links: HashMap<libp2p::swarm::ConnectionId, Multiaddr> = HashMap::new();
         // Makes a peer that never stays connected visible (backlog #149).
         let mut flaps = FlapTracker::new(std::time::Instant::now());
-        // One outstanding request at a time. Without this, every driver tick while a slow batch is
-        // in transit would fire another request for the same range — turning our own catch-up into
-        // a flood. Cleared on a response and on any failure, so a peer that never answers costs one
-        // request and one timeout, not a wedged sync.
-        let mut blocksync_in_flight = false;
+        // The block-sync requests this node has out and the answers it holds until their turn —
+        // several at once, each to its own peer for its own range (`catch_up`). It was one at a
+        // time until 2026-10-21, which made a single answer's latency the bound on catching up.
+        let mut catch_up: CatchUp<PeerId, request_response::OutboundRequestId, BlockSyncResponse> =
+            CatchUp::default();
         // How many blocks the next request asks for — see `next_blocksync_batch`.
         let mut blocksync_batch = MAX_BLOCKSYNC_BATCH;
         // The block-sync answers this node is building or sending — see `BlockSyncServing`.
@@ -1030,47 +1030,73 @@ impl P2PService {
                                             .send_response(channel, BlockSyncResponse::empty());
                                     }
                                 }
-                                request_response::Message::Response { response, .. } => {
-                                    blocksync_in_flight = false;
-                                    if response.blocks.is_empty() {
-                                        // We only ask peers that claim a tip above ours, so an
-                                        // empty answer contradicts what this peer announced. It
-                                        // costs the peer nothing to keep claiming a high tip and
-                                        // serving nothing, and selection is by highest claim — so
-                                        // without a cooldown here that is a free way to occupy our
-                                        // one in-flight request forever (backlog #140). The
-                                        // charitable readings — pruned history, a tip announced a
-                                        // moment before a restart — are equally well served by
-                                        // asking someone else for the next ten seconds.
-                                        blocksync_cooldown
-                                            .insert(peer, BLOCKSYNC_PEER_COOLDOWN_TICKS);
-                                        debug!(peer = %peer, "Block-sync peer claimed to be ahead but served nothing — trying another peer");
-                                    } else {
-                                        blocksync_batch = next_blocksync_batch(
-                                            blocksync_batch,
-                                            BatchOutcome::Delivered,
-                                        );
-                                        info!(
-                                            peer = %peer,
-                                            blocks = response.blocks.len(),
-                                            "Received a block-sync batch"
-                                        );
-                                        let _ = event_tx
-                                            .send(P2PEvent::BlocksSynced(response, peer.to_string()))
-                                            .await;
+                                request_response::Message::Response { request_id, response } => {
+                                    let heights = response
+                                        .blocks
+                                        .first()
+                                        .zip(response.blocks.last())
+                                        .map(|(first, last)| (first.height(), last.height()));
+                                    let blocks = response.blocks.len();
+                                    match catch_up.answered(&request_id, response, heights) {
+                                        Answered::Held => {
+                                            blocksync_batch = next_blocksync_batch(
+                                                blocksync_batch,
+                                                BatchOutcome::Delivered,
+                                            );
+                                            info!(peer = %peer, blocks, "Received a block-sync batch");
+                                        }
+                                        Answered::Empty(_) => {
+                                            // We only ask peers that claim a tip above the range,
+                                            // so an empty answer contradicts what this peer
+                                            // announced. It costs the peer nothing to keep claiming
+                                            // a high tip and serving nothing, and selection is by
+                                            // highest claim — so without a cooldown here that is a
+                                            // free way to occupy one of our requests forever
+                                            // (backlog #140). The charitable readings — pruned
+                                            // history, a tip announced a moment before a restart,
+                                            // no serving place free — are equally well served by
+                                            // asking someone else for the next ten seconds.
+                                            blocksync_cooldown
+                                                .insert(peer, BLOCKSYNC_PEER_COOLDOWN_TICKS);
+                                            debug!(peer = %peer, "Block-sync peer claimed to be ahead but served nothing — trying another peer");
+                                        }
+                                        Answered::Misfit(_) => {
+                                            blocksync_cooldown
+                                                .insert(peer, BLOCKSYNC_PEER_COOLDOWN_TICKS);
+                                            warn!(
+                                                peer = %peer,
+                                                blocks,
+                                                "A peer answered a block-sync request with blocks other \
+                                                 than the ones asked for — asking someone else"
+                                            );
+                                        }
+                                        // The range was dropped while the answer was on its way —
+                                        // our tip passed it, or its peer was forgotten.
+                                        Answered::Unknown => {}
                                     }
+                                    let our_tip = tip_height.load(Ordering::Relaxed);
+                                    hand_next_batch(&mut catch_up, our_tip, &event_tx).await;
+                                    drive_catch_up(
+                                        &mut swarm,
+                                        &mut catch_up,
+                                        &peer_tips,
+                                        &blocksync_cooldown,
+                                        our_tip,
+                                        blocksync_batch,
+                                        blocksync_halt,
+                                    );
                                 }
                             }
                         }
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
-                            request_response::Event::OutboundFailure { peer, error, .. }
+                            request_response::Event::OutboundFailure { peer, request_id, error, .. }
                         )) => {
-                            // Clearing the in-flight flag alone is not enough: `best_blocksync_peer`
-                            // is deterministic, so the next tick would pick this same unresponsive
-                            // peer again, and the one after that, forever — this comment used to
-                            // claim "possibly against a different peer", which was never true
-                            // (backlog #140). The cooldown is what actually moves us to someone else.
-                            blocksync_in_flight = false;
+                            // Freeing the range alone is not enough: `best_blocksync_peer` is
+                            // deterministic, so the next ask would pick this same unresponsive peer
+                            // again, and the one after that, forever — this comment used to claim
+                            // "possibly against a different peer", which was never true (backlog
+                            // #140). The cooldown is what actually moves us to someone else.
+                            catch_up.failed(&request_id);
                             blocksync_cooldown.insert(peer, BLOCKSYNC_PEER_COOLDOWN_TICKS);
                             debug!(peer = %peer, err = %error, "Block-sync request failed — trying another peer");
                             if let Some(outcome) = batch_outcome_of_failure(&error) {
@@ -1084,6 +1110,15 @@ impl P2PService {
                                 }
                                 blocksync_batch = smaller;
                             }
+                            drive_catch_up(
+                                &mut swarm,
+                                &mut catch_up,
+                                &peer_tips,
+                                &blocksync_cooldown,
+                                tip_height.load(Ordering::Relaxed),
+                                blocksync_batch,
+                                blocksync_halt,
+                            );
                         }
                         SwarmEvent::Behaviour(HelixBehaviourEvent::Blocksync(
                             request_response::Event::InboundFailure { peer, request_id, error, .. }
@@ -1417,13 +1452,16 @@ impl P2PService {
                         }
                         continue;
                     }
-                    request_blocks_if_behind(
+                    catch_up.tick(our_tip);
+                    hand_next_batch(&mut catch_up, our_tip, &event_tx).await;
+                    drive_catch_up(
                         &mut swarm,
+                        &mut catch_up,
                         &peer_tips,
                         &blocksync_cooldown,
                         our_tip,
                         blocksync_batch,
-                        &mut blocksync_in_flight,
+                        blocksync_halt,
                     );
 
                     // Far behind and catching up: stop hearing what this node cannot use yet, so
@@ -1509,7 +1547,7 @@ impl P2PService {
                     }
 
                     // Report a catch-up that is not happening (backlog #190). Read *after* the
-                    // request above, so `blocksync_in_flight` answers the question the line is for:
+                    // requests above, so `catch_up.is_asking()` answers the question the line is for:
                     // is this node asking at all, or asking and getting nothing?
                     if our_tip > blocksync_progress_tip {
                         blocksync_progress_tip = our_tip;
@@ -1528,7 +1566,7 @@ impl P2PService {
                         if let Some(stall) = blocksync_stall_report(
                             our_tip,
                             best_claimed,
-                            blocksync_in_flight,
+                            catch_up.is_asking(),
                             blocksync_stall_ticks,
                         ) {
                             blocksync_stall_reported = true;
@@ -1936,6 +1974,11 @@ impl P2PService {
                                     }
                                     peer_tips.remove(&peer_id);
                                     publish_highest_peer_tip(&highest_peer_tip, &peer_tips);
+                                    // The node threw away the batch it was given — it is this
+                                    // report instead of `BlocksyncBatchRejected` — and nothing else
+                                    // this peer served is worth handing over.
+                                    catch_up.node_rejected();
+                                    catch_up.forget_peer(&peer_id);
                                 }
                                 Err(_) => warn!(peer = %peer, "Unparseable peer id in block-sync report"),
                             }
@@ -1990,6 +2033,7 @@ impl P2PService {
                             // A cooldown, not a ban: an honest peer can serve a batch we reject
                             // because our own tip moved underneath it. Repeat offenders simply keep
                             // earning cooldowns, and never get to hold up catch-up in between.
+                            catch_up.node_rejected();
                             match peer.parse::<PeerId>() {
                                 Ok(peer_id) => {
                                     blocksync_cooldown.insert(peer_id, BLOCKSYNC_PEER_COOLDOWN_TICKS);
@@ -2003,16 +2047,19 @@ impl P2PService {
                             // only: this races the 5s announce loop, and a command that waited in
                             // the queue must never walk the tip backwards.
                             let our_tip = tip_height.fetch_max(new_tip, Ordering::Relaxed).max(new_tip);
+                            catch_up.node_reported(our_tip);
                             if blocksync_halted(our_tip, blocksync_halt) {
                                 continue;
                             }
-                            request_blocks_if_behind(
+                            hand_next_batch(&mut catch_up, our_tip, &event_tx).await;
+                            drive_catch_up(
                                 &mut swarm,
+                                &mut catch_up,
                                 &peer_tips,
                                 &blocksync_cooldown,
                                 our_tip,
                                 blocksync_batch,
-                                &mut blocksync_in_flight,
+                                blocksync_halt,
                             );
                         }
                     }
@@ -3125,59 +3172,87 @@ fn blocksync_halted(our_tip: u64, halt: Option<u64>) -> bool {
     halt.is_some_and(|h| our_tip.saturating_add(1) >= h)
 }
 
-/// Send one block-sync request if we are behind and a usable peer is available. Returns whether
-/// a request went out. No-op while one is already in flight.
+/// Send every block-sync request the catch-up plan has room for: one per usable peer, each for the
+/// lowest range nothing covers yet, up to `catch_up::PARALLEL_REQUESTS` at once. Returns how many
+/// went out.
 ///
 /// Extracted so catch-up can be driven by **progress** and not only by the clock. Requests used
 /// to be issued exclusively from `blocksync_interval`, which made that 2s period a floor on the
 /// time between one batch and the next: catch-up was capped at `MAX_BLOCKSYNC_BATCH` blocks per
 /// tick — 50 blocks/s — however fast the link, the peer and the local apply actually were. At
 /// the 2026-08-25 tip of ~477k blocks that is 2.7 hours of syncing with the connection idle
-/// ~99% of the time. The node now reports each applied batch (`P2PCommand::BlocksyncAdvance`)
-/// and this runs again immediately, so the next request leaves as soon as the previous batch is
-/// on disk.
+/// ~99% of the time. It now also runs on every answer, every failure and every report from the
+/// node (`P2PCommand::BlocksyncAdvance`), so a request goes out as soon as there is room for it.
 ///
-/// The interval stays, as the backstop: it covers every case where no progress report arrives —
-/// a rejected batch, a dropped event, a peer that only just announced a higher tip, or a tip we
-/// learned from a gossiped block while nothing was in flight.
-fn request_blocks_if_behind(
+/// The interval stays, as the backstop: it covers every case where nothing else happens — a peer
+/// that only just announced a higher tip, a cooldown running out, or a tip we learned from a
+/// gossiped block while nothing was out.
+///
+/// `halt` is where a protocol upgrade this build does not run begins (#267): nothing at or above
+/// it is worth asking for.
+fn drive_catch_up(
     swarm: &mut libp2p::Swarm<HelixBehaviour>,
+    catch_up: &mut CatchUp<PeerId, request_response::OutboundRequestId, BlockSyncResponse>,
     peer_tips: &HashMap<PeerId, PeerRange>,
     cooldown: &HashMap<PeerId, u32>,
     our_tip: u64,
     batch: u32,
-    in_flight: &mut bool,
-) -> bool {
-    if *in_flight {
-        return false;
+    halt: Option<u64>,
+) -> usize {
+    if blocksync_halted(our_tip, halt) {
+        return 0;
     }
-    let candidate = {
-        let connected = &*swarm;
-        best_blocksync_peer(peer_tips, our_tip, cooldown, |p| connected.is_connected(p))
-    };
-    let Some((peer, peer_tip)) = candidate else {
-        return false;
-    };
-    let count = blocksync_request_count(our_tip, peer_tip).min(batch);
-    if count == 0 {
-        return false;
+    let limit = halt.map(|h| h.saturating_sub(1));
+    let mut sent = 0;
+    loop {
+        let ask = {
+            let connected = &*swarm;
+            catch_up.next_ask(
+                our_tip,
+                limit,
+                batch,
+                |from, busy| {
+                    best_blocksync_peer(peer_tips, from - 1, cooldown, |p| {
+                        !busy.contains(p) && connected.is_connected(p)
+                    })
+                },
+                blocksync_request_count,
+            )
+        };
+        let Some(ask) = ask else {
+            return sent;
+        };
+        debug!(
+            peer = %ask.peer,
+            from = ask.from,
+            count = ask.count,
+            "Requesting missing blocks from a peer that is ahead"
+        );
+        let id = swarm.behaviour_mut().blocksync.send_request(
+            &ask.peer,
+            BlockSyncRequest {
+                from_height: ask.from,
+                count: ask.count,
+            },
+        );
+        catch_up.asked_for(ask, id);
+        sent += 1;
     }
-    debug!(
-        peer = %peer,
-        from = our_tip + 1,
-        count,
-        peer_tip,
-        "Requesting missing blocks from a peer that is ahead"
-    );
-    swarm.behaviour_mut().blocksync.send_request(
-        &peer,
-        BlockSyncRequest {
-            from_height: our_tip + 1,
-            count,
-        },
-    );
-    *in_flight = true;
-    true
+}
+
+/// Hand the node the next batch, if it is the one that continues our tip and the node is not still
+/// applying the previous one. The node reports how it went (`BlocksyncAdvance`,
+/// `BlocksyncBatchRejected`), and that report is what frees the way for the batch after it.
+async fn hand_next_batch(
+    catch_up: &mut CatchUp<PeerId, request_response::OutboundRequestId, BlockSyncResponse>,
+    our_tip: u64,
+    event_tx: &mpsc::Sender<P2PEvent>,
+) {
+    if let Some((batch, peer)) = catch_up.take_next(our_tip) {
+        let _ = event_tx
+            .send(P2PEvent::BlocksSynced(batch, peer.to_string()))
+            .await;
+    }
 }
 
 /// How many blocks to ask for, given where we are and what the peer claims. Zero when we are not
@@ -3435,8 +3510,8 @@ struct BlockSyncAnswer {
 ///
 /// A place is held from the request until libp2p has written the answer or given up on it — not
 /// merely until it is built, because an answer handed to a peer that reads slowly stays in memory
-/// until then. Honest nodes ask one at a time (`blocksync_in_flight`), so one per peer costs them
-/// nothing and bounds what a single connection can make this node hold.
+/// until then. Honest nodes ask each peer one request at a time (`catch_up`), so one per peer costs
+/// them nothing and bounds what a single connection can make this node hold.
 ///
 /// Generic over the request id only so that it can be tested: libp2p's `InboundRequestId` has no
 /// public constructor.
