@@ -2759,7 +2759,7 @@ fn store_execution_record(
 /// the batch as a whole, so a peer that lies costs a round trip rather than a corrupted store.
 #[allow(clippy::too_many_arguments)]
 async fn apply_synced_batch(
-    batch: BlockSyncResponse,
+    mut batch: BlockSyncResponse,
     peer: String,
     store: &Arc<RwLock<HelixDb>>,
     chain_state: &Arc<RwLock<ChainState>>,
@@ -2798,6 +2798,28 @@ async fn apply_synced_batch(
             last = batch.blocks.last().map(|b| b.height()).unwrap_or(0),
             "Discarding a block-sync batch we no longer need — our tip moved while it was in flight"
         );
+        report_synced_height(p2p_tx, base);
+        return;
+    }
+    // A batch that reaches back below our tip is the same case, only partly: another path applied
+    // its first blocks while it was in flight. The rest is exactly what a request from our tip
+    // would have brought, with the same certificate for its last block, so it is verified and
+    // applied like one. Until 2026-10-21 it was rejected as "starts at height X but we need Y" and
+    // its peer — honest, it served what was asked — cooled down: three times in six minutes on
+    // the production validator while it was trying to catch up.
+    let already_held = batch.blocks.iter().take_while(|b| b.height() <= base).count();
+    batch.blocks.drain(..already_held);
+    // And one that begins above our tip is not the peer's doing either: the P2P service hands
+    // batches over in order against a tip it samples, and a sample can only lag the store. Nothing
+    // applies; the report sends the service back to what the store holds.
+    if batch.blocks.first().is_some_and(|b| b.height() > base + 1) {
+        debug!(
+            peer = %peer,
+            base,
+            first = batch.blocks.first().map(|b| b.height()).unwrap_or(0),
+            "A block-sync batch begins above our tip — keeping it out until the blocks before it are here"
+        );
+        report_synced_height(p2p_tx, base);
         return;
     }
 
@@ -2882,7 +2904,10 @@ async fn apply_synced_batch(
     };
 
     if new_height <= base {
-        return; // nothing actually persisted; the only way here is the logged storage error above
+        // Nothing actually persisted; the only way here is the logged storage error above. Still
+        // reported, so the service does not wait for a batch that is not coming.
+        report_synced_height(p2p_tx, base);
+        return;
     }
     *last = new_height;
 
@@ -2912,12 +2937,20 @@ async fn apply_synced_batch(
     // Ask for the next batch now. Sent last, once the blocks are on disk and every derived piece
     // of state above has been brought in step, so the height we report is one we can actually
     // serve and build on.
-    //
-    // `try_send`, not `send`: this is an optimisation, and a full command queue is precisely the
-    // moment not to block the event loop waiting to add more work to it. A dropped nudge costs
-    // one `blocksync_interval` tick, which is what used to drive every request anyway.
-    if let Err(e) = p2p_tx.try_send(P2PCommand::BlocksyncAdvance(new_height)) {
-        debug!(err = %e, "Could not ask for the next block-sync batch immediately — the interval will pick it up");
+    report_synced_height(p2p_tx, new_height);
+}
+
+/// Tell the P2P service the batch it handed over is done with and where our tip now stands, so it
+/// hands over the next one and asks for more (`P2PCommand::BlocksyncAdvance`). Sent on every way
+/// out of [`apply_synced_batch`] except a rejection, which has its own report: the service hands
+/// over one batch at a time and waits for this.
+///
+/// `try_send`, not `send`: a full command queue is precisely the moment not to block the event loop
+/// waiting to add more work to it. A dropped report costs at most a few seconds — the service also
+/// reads the tip every tick, and stops waiting once it shows the batch applied.
+fn report_synced_height(p2p_tx: &mpsc::Sender<P2PCommand>, height: u64) {
+    if let Err(e) = p2p_tx.try_send(P2PCommand::BlocksyncAdvance(height)) {
+        debug!(err = %e, "Could not report a block-sync batch done — the next tick will pick it up");
     }
 }
 
@@ -12156,6 +12189,130 @@ mod handle_p2p_event_tests {
 
         assert_eq!(store.read().await.latest_height(), 3, "the whole batch must be applied");
         assert_eq!(store.read().await.latest_hash(), blocks[2].hash());
+    }
+
+    /// Like [`deliver_batch`], and returns what the node told the P2P service about it.
+    async fn deliver_batch_and_listen(
+        batch: BlockSyncResponse,
+        store: &Arc<RwLock<HelixDb>>,
+        chain_state: &Arc<RwLock<ChainState>>,
+        engine: &Arc<RwLock<BftEngine>>,
+        tip_certificate: &Arc<RwLock<TipCertificate>>,
+    ) -> Vec<P2PCommand> {
+        let (p2p_tx, mut rx) = mpsc::channel(8);
+        handle_p2p_event(
+            P2PEvent::BlocksSynced(batch, "12D3KooWtest".to_string()),
+            &Arc::new(RwLock::new(Mempool::new())),
+            &Arc::new(AtomicUsize::new(0)),
+            store,
+            chain_state,
+            engine,
+            &KeyPair::generate(),
+            &p2p_tx,
+            &None,
+            &Arc::new(Mutex::new(0)),
+            &Arc::new(std::sync::Mutex::new(SigningGuard::unguarded())),
+            tip_certificate,
+        )
+        .await;
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            commands.push(command);
+        }
+        commands
+    }
+
+    fn blames_the_peer(commands: &[P2PCommand]) -> bool {
+        commands.iter().any(|c| {
+            matches!(
+                c,
+                P2PCommand::BlocksyncBatchRejected(_) | P2PCommand::BlocksyncPeerOnAnotherChain(_)
+            )
+        })
+    }
+
+    fn reported_height(commands: &[P2PCommand]) -> Option<u64> {
+        commands.iter().find_map(|c| match c {
+            P2PCommand::BlocksyncAdvance(h) => Some(*h),
+            _ => None,
+        })
+    }
+
+    /// Another path applied the first blocks of a batch while it was in flight. The rest is what a
+    /// request from our tip would have brought, certified by the same tip certificate — applied,
+    /// and the peer that served it honestly is not blamed. Until 2026-10-21 this was rejected as
+    /// "starts at height 2 but we need 4", and the peer cooled down: three times in six minutes on
+    /// the production validator while it was catching up.
+    #[tokio::test]
+    async fn a_batch_reaching_back_below_our_tip_applies_the_rest_and_blames_no_one() {
+        let kp = KeyPair::generate();
+        let (store, chain_state, engine, cell) = blocksync_fixture(&kp).await;
+        let root = chain_state.read().await.state_hash();
+        let first = chained_blocks_on_state(&kp, &[1, 2, 3], root);
+        let certify = |b: &Block| {
+            commit_sigs_to_votes(
+                tip_commit_sigs(b.height(), b.hash(), &[&kp]),
+                b.height(),
+                b.hash(),
+                &key_from_pairs(&[&kp]),
+            )
+        };
+        let applied = deliver_batch_and_listen(
+            BlockSyncResponse { tip_certificate: certify(&first[2]), blocks: first.clone() },
+            &store,
+            &chain_state,
+            &engine,
+            &cell,
+        )
+        .await;
+        assert_eq!(store.read().await.latest_height(), 3, "precondition: 1..=3 applied");
+        assert_eq!(reported_height(&applied), Some(3), "an applied batch is reported");
+
+        let root3 = chain_state.read().await.state_hash();
+        let mut more = chained_blocks_on_state(&kp, &[4, 5], root3);
+        rechain_onto(&mut more, first[2].hash(), &kp);
+        let overlapping = vec![first[1].clone(), first[2].clone(), more[0].clone(), more[1].clone()];
+
+        let commands = deliver_batch_and_listen(
+            BlockSyncResponse { tip_certificate: certify(&more[1]), blocks: overlapping },
+            &store,
+            &chain_state,
+            &engine,
+            &cell,
+        )
+        .await;
+
+        assert_eq!(store.read().await.latest_height(), 5, "4 and 5 must be applied");
+        assert_eq!(store.read().await.latest_hash(), more[1].hash());
+        assert!(!blames_the_peer(&commands), "the peer served what was asked: {commands:?}");
+        assert_eq!(reported_height(&commands), Some(5));
+    }
+
+    /// A batch that begins above our tip is not the peer's doing — the service hands batches over
+    /// in order against a tip it samples, and the sample lags the store. Nothing applies, nobody is
+    /// blamed, and the report sends the service back to what the store holds.
+    #[tokio::test]
+    async fn a_batch_beginning_above_our_tip_waits_without_blame() {
+        let kp = KeyPair::generate();
+        let (store, chain_state, engine, cell) = blocksync_fixture(&kp).await;
+        let root = chain_state.read().await.state_hash();
+        let ahead = chained_blocks_on_state(&kp, &[3, 4, 5], root);
+        let tip = ahead.last().unwrap();
+        let batch = BlockSyncResponse {
+            tip_certificate: commit_sigs_to_votes(
+                tip_commit_sigs(tip.height(), tip.hash(), &[&kp]),
+                tip.height(),
+                tip.hash(),
+                &key_from_pairs(&[&kp]),
+            ),
+            blocks: ahead,
+        };
+
+        let commands = deliver_batch_and_listen(batch, &store, &chain_state, &engine, &cell).await;
+
+        assert_eq!(store.read().await.latest_height(), 0, "nothing applies above a gap");
+        assert!(!blames_the_peer(&commands), "{commands:?}");
+        assert_eq!(reported_height(&commands), Some(0));
     }
 
     /// The security property the batch rests on. Everything else about these blocks is impeccable —
