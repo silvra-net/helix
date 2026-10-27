@@ -897,10 +897,10 @@ async fn three_validators_rotate_proposer_and_finalize_blocks_together() {
 }
 
 /// The same set with one validator on `HELIX_P2P_RELAY=off`, the setting for a validator on a home
-/// line. Such a node follows committed blocks by block sync instead of hearing every peer's copy of
-/// them, so this asserts that a validator can do that and keep its place: at three equal voters
-/// the quorum is all three, so every block the chain finalizes carries this node's precommit, and
-/// it has to propose its own turns — which no amount of reading can fake.
+/// line. Such a node passes on nothing it did not write, so this asserts that a validator can do
+/// that and keep its place: at three equal voters the quorum is all three, so every block the chain
+/// finalizes carries this node's precommit, and it has to propose its own turns — which no amount
+/// of reading can fake.
 #[tokio::test]
 #[ignore = "spawns 3 real validator processes, one of them with relay off, and grows the set at runtime (~2 min wall-clock) — run explicitly with --ignored, not on every CI push"]
 async fn a_validator_that_does_not_relay_keeps_up_and_proposes_its_turns() {

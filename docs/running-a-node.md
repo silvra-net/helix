@@ -353,15 +353,15 @@ For the upload, `HELIX_P2P_RELAY=off` stops this node passing others' gossip on,
 rate with room to spare: a tunnel adds its own overhead (measured on 2026-10-13: at `700K` on a
 ~10 Mbit/s line the tunnel sent about 60 % more than the node gave it, and the line was full).
 
-`HELIX_P2P_RELAY=off` also takes the largest part of the download away from a validator: such a
-node does not hear the finished blocks its peers publish (every validator that finalizes a block
-sends its own copy, each with a full commit certificate — measured on 2026-10-13 about 2 MB/s on a
-fifteen-validator network). It still hears every proposal and vote, so it finalizes each block
-itself from the precommits it hears, and the block it proposes still reaches everyone. A height it
-misses arrives by block sync, as it does for a follower. *"Relay is off — this node follows
-committed blocks by block sync …"* at the start says so. If block sync does not move the node for
-90 seconds while it is more than ten blocks behind, it hears the gossiped blocks again until it is
-close.
+A validator hears the finished blocks its peers publish, relay on or off. From 1.0.1 to 1.1.2 a
+validator with relay off did not, to save its download, and followed them by block sync instead.
+That failed where it mattered: a validator that fell one block behind finalized nothing itself any
+more (the votes it heard were all for later heights), block sync brought each block 10–30 s late
+under load, and it never got back to the tip in time to vote — on 2026-10-24 that cost the
+production validator a second downtime jail. One block behind, the gossiped block is what brings it
+back. Since only a block's proposer publishes it, that costs one copy per block from each peer that
+forwards it. *"Relay is off — this node passes on nothing it did not write itself …"* at the start
+says so.
 
 What is left for a validator are the proposals and votes, and it hears each of them once from every
 peer, because every peer passes every message on. On 2026-10-14 the production validator, back in

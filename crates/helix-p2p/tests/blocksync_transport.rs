@@ -822,18 +822,18 @@ async fn a_follower_hears_neither_votes_nor_gossiped_blocks_and_votes_again_once
     assert!(back, "told it validates again, the node did not hear votes again");
 }
 
-/// A validator that does not relay hears votes but no gossiped committed blocks, while a relaying
-/// node on the same sender, measured in the same seconds, hears both — and its own committed block
-/// still reaches its peer, because gossipsub sends to whoever is subscribed whether or not the
-/// sender is.
+/// A validator that does not relay hears votes and gossiped committed blocks, like a relaying node
+/// on the same sender measured in the same seconds — and its own committed block still reaches its
+/// peer.
 ///
-/// Why: on a home line the copies of each committed block every peer forwards were the largest
-/// thing on the download (~2 MB/s on V1 on 2026-10-13, with votes and proposals already off), and a
-/// validator finalizes each block itself from the precommits; a height it misses comes by block
-/// sync. Turning relay off is the operator's statement that the line is thin, so it turns these off
-/// too — for a validator, not only for a follower.
+/// Why: until 1.1.3 such a validator did not hear committed blocks, on the reasoning that it
+/// finalizes each block itself and a height it misses comes by block sync. On 2026-10-24 the
+/// production validator, back in the set after an unjail and one block behind, finalized nothing
+/// itself for seventeen minutes — the votes it heard were all for heights above its own — and block
+/// sync, 10–30 s an answer, never brought it to the tip before it was jailed again. One block
+/// behind, the gossiped committed block is the only path that brings the missing one in time.
 #[tokio::test]
-async fn a_validator_that_does_not_relay_hears_votes_but_not_committed_blocks_and_still_sends_its_own()
+async fn a_validator_that_does_not_relay_hears_votes_and_committed_blocks_and_still_sends_its_own()
 {
     let kp = KeyPair::generate();
     let (sender, sender_cmd, mut sender_events) =
@@ -930,19 +930,19 @@ async fn a_validator_that_does_not_relay_hears_votes_but_not_committed_blocks_an
          connections are broken and this test proves nothing"
     );
 
-    // Same sender, same seconds: the relaying node hears committed blocks — the control that makes
-    // the home node's zero mean something — and the home node hears votes but none of them.
+    // Same sender, same seconds: both hear votes and committed blocks — relay off is about what a
+    // node passes on, not what it hears.
     let _ = heard_within!(Duration::from_secs(4));
     let heard = heard_within!(Duration::from_secs(10));
     assert!(
         heard.relaying_committed >= 3,
-        "the relaying node must hear committed blocks, or the home node's silence proves nothing: \
-         {heard:?}"
+        "the relaying node must hear committed blocks, or the sender is not sending them: {heard:?}"
     );
     assert!(heard.home_votes >= 3, "a validator that does not relay still hears votes: {heard:?}");
-    assert_eq!(
-        heard.home_committed, 0,
-        "a node that does not relay follows committed blocks by block sync, not gossip: {heard:?}"
+    assert!(
+        heard.home_committed >= 3,
+        "a validator that does not relay must hear committed blocks too — one block behind, they \
+         are what brings it back to the tip in time to vote: {heard:?}"
     );
 
     // Its own committed block — it proposed it — still reaches the peer it is connected to.

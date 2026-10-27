@@ -66,9 +66,11 @@ a ~25 Mbit down / ~10 Mbit up home line:
 \* Including about 0.4 MB/s that node serves to others over its public RPC. A home validator that
 serves no public RPC sends less.
 
-With relay off a validator still hears every proposal and vote, finalizes each block itself and
-follows finished blocks by block sync instead of hearing every peer's copy of them (1.0.1). It signed
-82–84 % of the certificates in the first hours — the jail threshold is two thirds. Do **not** relay
+With relay off a validator still hears every proposal, vote and finished block; it only stops
+passing on what it did not write. **Run 1.1.3 or later with relay off:** from 1.0.1 to 1.1.2 such a
+validator followed finished blocks by block sync, and one that fell a block behind could not get
+back to the tip in time to vote — since protocol 2 that ends in a downtime jail and a penalty
+(2026-10-24, the production validator). Do **not** relay
 off a node that other nodes reach the network only through. If you also serve your RPC publicly,
 pace what it sends to joining nodes: `HELIX_RPC_SYNC_RATE=400K` (well below your upload). Details:
 [On a home connection](running-a-node.md#on-a-home-connection).

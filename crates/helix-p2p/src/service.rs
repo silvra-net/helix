@@ -493,10 +493,9 @@ impl P2PService {
             transactions: &tx_topic,
         };
         if !config.relay {
-            set_consensus_gossip(&mut swarm, &consensus_topics, false, false, false, false);
             info!(
-                "Relay is off — this node follows committed blocks by block sync instead of hearing \
-                 every peer's copy of them; it still hears proposals and votes while it validates"
+                "Relay is off — this node passes on nothing it did not write itself; it still hears \
+                 proposals, votes and committed blocks while it validates"
             );
         }
 
@@ -1447,7 +1446,6 @@ impl P2PService {
                                 !consensus_gossip_on,
                                 follow_only,
                                 follower_fallback,
-                                config.relay,
                             );
                         }
                         continue;
@@ -1488,7 +1486,7 @@ impl P2PService {
                             best_claimed,
                             catch_up_still_ticks,
                         );
-                        let fallback = committed_by_block_sync(follow_only, config.relay)
+                        let fallback = committed_by_block_sync(follow_only)
                             && follower_needs_committed_gossip(
                                 follower_fallback,
                                 our_tip,
@@ -1503,7 +1501,6 @@ impl P2PService {
                                 !consensus_gossip_on,
                                 follow_only,
                                 follower_fallback,
-                                config.relay,
                             );
                             let behind = best_claimed.map(|b| b.saturating_sub(our_tip));
                             if fallback {
@@ -1525,7 +1522,6 @@ impl P2PService {
                                 !consensus_gossip_on,
                                 follow_only,
                                 follower_fallback,
-                                config.relay,
                             );
                             let behind = best_claimed.map(|b| b.saturating_sub(our_tip));
                             if listen {
@@ -1993,7 +1989,6 @@ impl P2PService {
                                     !consensus_gossip_on,
                                     follow_only,
                                     follower_fallback,
-                                    config.relay,
                                 );
                                 if follow {
                                     info!(
@@ -2001,13 +1996,10 @@ impl P2PService {
                                          sync, without the votes, proposals and gossiped copies of \
                                          blocks the validators exchange"
                                     );
-                                } else if config.relay {
-                                    info!("In the validator set — hearing votes and proposals again");
                                 } else {
                                     info!(
-                                        "In the validator set — hearing votes and proposals again; \
-                                         committed blocks still come by block sync, because this \
-                                         node does not relay"
+                                        "In the validator set — hearing votes, proposals and \
+                                         committed blocks again"
                                     );
                                 }
                             }
@@ -3400,19 +3392,27 @@ fn follower_needs_committed_gossip(
     hearing || ticks_since_rise >= CATCH_UP_STALL_TICKS
 }
 
-/// Whether this node follows committed blocks by block sync rather than hearing them over gossip.
+/// Whether this node follows committed blocks by block sync rather than hearing them over gossip:
+/// a follower does (`P2PCommand::FollowOnly`), a validator does not — whether or not it relays.
 ///
-/// A follower always does (`P2PCommand::FollowOnly`). So does a validator that does not relay:
-/// `relay: false` is the switch for a node on a thin line, and gossiped committed blocks were the
-/// largest thing on that line — every peer forwards every copy to every other, ~2 MB/s of V1's
-/// ~25 Mbit download on 2026-10-13 with votes and proposals already off. A validator does not need
-/// them to keep up: it finalizes each block itself from the precommits it hears, and a height it
-/// missed comes by block sync, whose tip it learns from the very next proposal. What it publishes
-/// is untouched — gossipsub sends to every peer subscribed to a topic whether or not the sender is,
-/// so its own committed blocks still go out (`7ab6c82`: as their proposer). With relay on nothing
-/// changes, so this is a choice the operator makes with the switch, not a new default for the set.
-fn committed_by_block_sync(follow_only: bool, relay: bool) -> bool {
-    follow_only || !relay
+/// Until 1.1.3 a validator with relay off followed them by block sync too, on the reasoning that it
+/// finalizes each block itself from the precommits it hears and a height it misses comes by block
+/// sync. Measured on the production validator after protocol 2 began jailing for downtime, that
+/// reasoning fails exactly when it matters: back in the set after an unjail on 2026-10-24 it was
+/// one to seven heights behind, the votes it heard were all for heights above its own, and in
+/// seventeen minutes it finalized not one block itself — every block came by block sync, one to
+/// seven at a time, 10–30 s per answer, slower than the chain adds them. It never reached the tip,
+/// never voted, and was jailed again 700 blocks later, with the second, larger penalty; seven other
+/// validators promoted in the same epoch were jailed within the same minutes. A validator that
+/// falls one block behind needs that block the moment the chain finalizes it, and gossip is the
+/// only path that delivers it then.
+///
+/// The cost that made it worth turning off is mostly gone: since `7ab6c82` only a block's proposer
+/// publishes it (it was every finalizing validator, each copy with its own certificate — ~2 MB/s on
+/// a home line on 2026-10-13), and a home validator keeps few peers (`HELIX_P2P_OUTBOUND_PEERS`).
+/// Relay off keeps its meaning: this node passes on nothing it did not write.
+fn committed_by_block_sync(follow_only: bool) -> bool {
+    follow_only
 }
 
 /// The gossip topics a node may stop hearing, in the two groups the rules decide about.
@@ -3436,11 +3436,10 @@ fn set_consensus_gossip(
     catching_up_deaf: bool,
     follow_only: bool,
     follower_fallback: bool,
-    relay: bool,
 ) {
     let hear_votes = !catching_up_deaf && !follow_only;
     let hear_committed = !catching_up_deaf
-        && (!committed_by_block_sync(follow_only, relay) || follower_fallback);
+        && (!committed_by_block_sync(follow_only) || follower_fallback);
     let hear_transactions = !catching_up_deaf;
     for (topic, hear) in [
         (topics.proposals, hear_votes),
@@ -4709,24 +4708,14 @@ mod peer_exchange_tests {
         assert!(!needs(true, tip, close, 0), "on and close again: off");
     }
 
-    /// Committed blocks come by block sync for a follower and for a node that does not relay —
-    /// a validator included — and over gossip only for a relaying validator, which is every node
-    /// that has not turned the switch.
+    /// Committed blocks come by block sync for a follower, and over gossip for every validator —
+    /// one that does not relay included: one block behind, gossip is the only path that brings the
+    /// block it missed in time to vote on the next (2026-10-24).
     #[test]
-    fn only_a_relaying_validator_hears_committed_blocks_over_gossip() {
+    fn every_validator_hears_committed_blocks_over_gossip_and_a_follower_does_not() {
         use super::committed_by_block_sync;
-        for (follow_only, relay, by_block_sync) in [
-            (false, true, false),
-            (true, true, true),
-            (false, false, true),
-            (true, false, true),
-        ] {
-            assert_eq!(
-                committed_by_block_sync(follow_only, relay),
-                by_block_sync,
-                "follow_only {follow_only}, relay {relay}"
-            );
-        }
+        assert!(committed_by_block_sync(true), "a follower follows by block sync");
+        assert!(!committed_by_block_sync(false), "a validator hears them over gossip");
     }
 
     /// Only the failures that look like an answer too big for the link shrink the request. A dial
